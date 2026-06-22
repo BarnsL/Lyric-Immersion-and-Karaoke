@@ -7,11 +7,12 @@ floats synced lyrics over your screen with:
 
 - **Furigana** above every kanji (漢字 → かんじ), **romaji** reading
 - **Chinese → pinyin** and **Korean → romaja** readings too
-- **English** translation
+- **English** translation (incl. **Spanish** songs & corridos)
 - a **karaoke fill** that sweeps across each line *at singing speed*
 
 Japanese, Chinese, and Korean are detected per song and romanized
-appropriately; English (and other) songs just show the synced line.
+appropriately. Spanish songs (and corridos) show the line plus an English
+translation; English songs just show the synced line.
 
 No window, no panel — just clean outlined text over whatever's on screen. It
 never steals focus, so you can keep working / watching while it runs.

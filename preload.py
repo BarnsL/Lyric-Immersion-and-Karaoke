@@ -120,6 +120,22 @@ SONGS = [
     ("稻香", "周杰伦", False),
     ("起风了", "买辣椒也用券", False),
     ("孤勇者", "陈奕迅", False),
+
+    # ── Corridos / Spanish (main line + English; no romanization needed) ──
+    ("Ella Baila Sola", "Eslabon Armado", True),
+    ("Lady Gaga", "Peso Pluma", True),
+    ("La Bebe - Remix", "Yng Lvcas", True),
+    ("PRC", "Peso Pluma", True),
+    ("AMG", "Natanael Cano", True),
+    ("Amor Tumbado", "Natanael Cano", True),
+    ("El Azul", "Junior H", True),
+    ("Bebe Dame", "Fuerza Regida", True),
+    ("El Belicón", "Peso Pluma", True),
+    ("Contrabando y Traición", "Los Tigres del Norte", True),
+    ("Jefe de Jefes", "Los Tigres del Norte", True),
+    ("La Puerta Negra", "Los Tigres del Norte", True),
+    ("Nieves de Enero", "Chalino Sánchez", True),
+    ("El Rey", "Vicente Fernández", True),
 ]
 
 

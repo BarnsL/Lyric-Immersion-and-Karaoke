@@ -84,12 +84,29 @@ _CREDIT_RE = re.compile(
 )
 
 
+_ES_DIA = re.compile(r"[ñáéíóúü¿¡]", re.I)
+_ES_WORDS = {
+    "que", "qué", "más", "pero", "una", "por", "con", "los", "las", "está",
+    "están", "cómo", "dónde", "corazón", "nada", "vida", "amor", "soy", "eres",
+    "muy", "también", "aquí", "así", "mujer", "noche", "quiero", "él", "ella",
+    "tú", "porque", "cuando", "siempre", "nunca", "todo", "todos", "mis", "tus",
+    "señor", "tierra", "hombre", "dios", "compa", "plebe", "morena",
+}
+
+
 def is_japanese(text: str) -> bool:
     return bool(_JP_RE.search(text))
 
 
+def _is_spanish(text: str) -> bool:
+    if _ES_DIA.search(text):
+        return True
+    words = set(re.findall(r"[a-zñáéíóúü]+", text.lower()))
+    return len(words & _ES_WORDS) >= 2
+
+
 def detect_lang(text: str) -> str:
-    """Coarse language of a string/lyric by dominant script."""
+    """Coarse language of a string/lyric by dominant script / markers."""
     hang = len(_HANGUL.findall(text))
     kana = len(_KANA.findall(text))
     han = len(_HAN.findall(text))
@@ -99,6 +116,8 @@ def detect_lang(text: str) -> str:
         return "ja"
     if han:
         return "zh"
+    if _is_spanish(text):
+        return "es"
     return "other"
 
 
@@ -318,14 +337,24 @@ def _song_lang(lines: list[dict]) -> str:
     return detect_lang(" ".join(ln["jp"] for ln in lines[:40]))
 
 
-def _translate_lines(lines: list[dict]) -> int:
+def _translate_lines(lines: list[dict], song_lang: str | None = None) -> int:
     try:
         from deep_translator import GoogleTranslator
     except ImportError:
         return 0
     tr = GoogleTranslator(source="auto", target="en")
-    idx = [i for i, ln in enumerate(lines)
-           if detect_lang(re.sub(r"\(.*?\)", "", ln["jp"])) in ("ja", "ko", "zh")]
+    whole = song_lang in ("ja", "ko", "zh", "es")
+
+    def want(jp):
+        raw = re.sub(r"\(.*?\)", "", jp)
+        if not raw.strip():
+            return False
+        ll = detect_lang(raw)
+        if ll in ("ja", "ko", "zh", "es"):
+            return True
+        return whole and ll == "other"     # Spanish line w/o accents, etc.
+
+    idx = [i for i, ln in enumerate(lines) if want(ln["jp"])]
     raws = [re.sub(r"\(.*?\)", "", lines[i]["jp"]) for i in idx]
     done = 0
     for k in range(0, len(raws), 20):
@@ -359,9 +388,9 @@ def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict
         elif lang in ("zh", "ko") and ll == lang:
             ln["rm"] = romanize(raw, lang)
         else:
-            ln["rm"] = ""  # English / other lines shown as-is
+            ln["rm"] = ""  # Spanish / English / other — shown as-is, no romaji
     if translate:
-        _translate_lines(lines)
+        _translate_lines(lines, lang)
     return lines
 
 
@@ -369,7 +398,7 @@ def translate_file(path) -> bool:
     path = Path(path)
     try:
         data = json.loads(path.read_text("utf-8"))
-        n = _translate_lines(data["lines"])
+        n = _translate_lines(data["lines"], data.get("meta", {}).get("lang"))
         if n:
             path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return n > 0
