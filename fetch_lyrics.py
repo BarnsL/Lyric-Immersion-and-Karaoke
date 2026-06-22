@@ -141,11 +141,24 @@ _CREDIT_RE = re.compile(
 
 _ES_DIA = re.compile(r"[ñáéíóúü¿¡]", re.I)
 _ES_WORDS = {
-    "que", "qué", "más", "pero", "una", "por", "con", "los", "las", "está",
-    "están", "cómo", "dónde", "corazón", "nada", "vida", "amor", "soy", "eres",
-    "muy", "también", "aquí", "así", "mujer", "noche", "quiero", "él", "ella",
-    "tú", "porque", "cuando", "siempre", "nunca", "todo", "todos", "mis", "tus",
-    "señor", "tierra", "hombre", "dios", "compa", "plebe", "morena",
+    # function words (unaccented forms too — corridos rarely use accents)
+    "que", "qué", "como", "cómo", "pero", "porque", "para", "por", "con", "sin",
+    "una", "uno", "unos", "unas", "los", "las", "del", "este", "esta", "esto",
+    "ese", "esa", "eso", "esos", "esas", "mas", "más", "muy", "tan", "donde",
+    "dónde", "cuando", "cuándo", "quien", "aqui", "aquí", "alli", "allá", "asi",
+    "así", "tambien", "también", "siempre", "nunca", "todo", "todos", "toda",
+    "nada", "algo", "mucho", "poco", "bien", "mal", "ya", "aunque",
+    # verbs / pronouns
+    "soy", "eres", "está", "están", "estoy", "es", "son", "tengo", "tiene",
+    "tienes", "tenemos", "quiero", "quieres", "vamos", "voy", "vas", "ven",
+    "dame", "dime", "mira", "siento", "puedo", "hacer", "decir", "amar",
+    "él", "ella", "ellos", "nosotros", "tú", "tu", "mi", "mis", "tus", "su",
+    "sus", "me", "te", "le", "nos", "lo",
+    # lyric nouns
+    "corazón", "corazon", "vida", "amor", "mujer", "hombre", "noche", "día",
+    "sol", "luna", "cielo", "tierra", "señor", "dios", "sangre", "fuego",
+    "calle", "dinero", "plata", "amigo", "amiga", "hermano", "jefe", "patrón",
+    "compa", "plebe", "morena", "morra", "morro", "carnal", "sancho", "cuentes",
 }
 
 
@@ -575,7 +588,15 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None):
 # ── Annotation ───────────────────────────────────────────────────────
 
 def _song_lang(lines: list[dict]) -> str:
-    return detect_lang(" ".join(ln["jp"] for ln in lines[:40]))
+    """Whole-song language. Scans ALL lines (not just the first 40) so a song
+    that opens with a kanji-only or instrumental section is still classified
+    right. Crucially: ANY kana anywhere ⇒ Japanese — Chinese never uses kana, so
+    a kanji-heavy J-pop/VTuber song (e.g. 花譜) is never mistaken for Chinese
+    (which would give pinyin instead of furigana)."""
+    body = " ".join(ln["jp"] for ln in lines)
+    if _KANA.search(body):
+        return "ja"
+    return detect_lang(body)
 
 
 def _make_translator():

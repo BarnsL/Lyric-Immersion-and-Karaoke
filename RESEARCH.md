@@ -8,6 +8,36 @@ Each item is tagged: ✅ implemented · 📝 documented only · ⏭️ deferred.
 
 ---
 
+## 0. Display correctness (the recurring "pushed down / boxes" bugs)
+
+These were reported repeatedly, so the **root causes** are documented here.
+
+- ✅ **Lyrics drifting down — ROOT CAUSE.** The overlay window was sized to the
+  content and re-anchored each song (`H` changed in `_relayout_song`, position
+  via `_geom_y`). Bottom-anchored, a shorter window sits lower; and the runtime
+  **backfill adds romaji/English rows mid-song**, which grew the blocks and
+  re-ran layout, so the window physically jumped **down** a few seconds in.
+  Earlier patches (work-area sizing, a lane-trimming watchdog that *moved* the
+  window) only reduced it. **Fix:** make the window a **fixed, full-work-area,
+  click-through** surface (`WS_EX_TRANSPARENT`) that never moves or resizes;
+  position content inside it with `_lane_y0` (bottom-anchored content stays
+  pinned and grows upward). The watchdog no longer moves anything.
+- ✅ **Boxes (□) instead of letters — ROOT CAUSE.** Korean (Hangul) and some
+  Chinese glyphs aren't in Yu Gothic, so they rendered as tofu. **Fix:**
+  per-script fonts (`_script_of` → Malgun Gothic for Korean, Microsoft YaHei for
+  Chinese, Yu Gothic for Japanese), chosen per line.
+- ✅ **Japanese read as Chinese (pinyin) — ROOT CAUSE.** A kanji-only line
+  detects as `zh`, and a kanji-heavy J-pop/VTuber song (花譜/KAF) could push the
+  whole song to `zh` → pinyin instead of furigana. **Fix:** `_song_lang` treats
+  **any kana anywhere** as decisive proof of Japanese (Chinese never uses kana).
+- ✅ **Spanish not translated — ROOT CAUSE.** The Spanish detector only listed
+  accented words (`cómo`), but corridos are written without accents (`como`), so
+  songs fell through to `other` and skipped translation. **Fix:** expanded the
+  Spanish word list with common unaccented forms; corridos now detect as `es`
+  and get English.
+- ✅ **Responsive to display size.** `_auto_scale` scales text to the work-area
+  height so a big TV / 4K screen gets larger lyrics automatically.
+
 ## 1. Lyric sources
 
 **Current stack:** LRCLIB first (duration-exact `/api/get`, then scored
@@ -65,6 +95,19 @@ timing) isn't available for free. No code change beyond documentation.
 - ⏭️ **pyopenjtalk** could add pitch-accent marks (a nice learning aid) but it's
   a heavy native dependency; deferred.
 
+## 6. On-screen dancing character
+
+- ✅ **Toggleable companion** (`character.py`, tray → "Dancing character"): a
+  small, draggable, click-through avatar themed to the **detected song's
+  artist** that bobs/sways while music plays and hops when clicked.
+- 📝 **Why a procedural avatar, not real VTuber models.** The request was for
+  high-quality models of specific groups (ReGLOSS, V.W.P, hololive…). Those are
+  **copyrighted** and aren't freely downloadable or redistributable, so the app
+  cannot ship them. The avatar is drawn procedurally and artist-themed instead.
+  A drop-in path is provided: a user-supplied `characters/<artist>.png` is used
+  if present. A fully rigged VRM/Live2D avatar would need a real 3D/Live2D engine
+  in a webview — a large dependency, ⏭️ deferred and documented as the path.
+
 ## 3. Synchronization
 
 **Current:** Windows `GlobalSystemMediaTransportControls` (GSMTC) gives the real
@@ -119,6 +162,8 @@ call; lanes + block height adapt per song.
 | Perf | Reuse GSMTC session manager across polls | `main.py` `MediaWatcher._loop` |
 | Translation | Use DeepL when `DEEPL_API_KEY` is set | `fetch_lyrics.py` `_make_translator` |
 | Coverage | Per-line furigana/romaji + runtime self-heal (no more bare Japanese) | `fetch_lyrics.py` `annotate`/`backfill_file`, `main.py` `_maybe_translate`, `reannotate.py` |
+| Display | Fixed click-through window (no drift), per-script fonts (no boxes), kana⇒ja, Spanish detection, responsive scaling | `main.py` `_relayout_song`/`_script_of`/`_auto_scale`, `fetch_lyrics.py` `_song_lang`/`_ES_WORDS` |
+| Companion | Optional tray-toggled dancing character themed to the artist | `character.py`, `main.py` |
 | Docs | Word-level finding, candidates, this file | `fetch_lyrics.py` header, `RESEARCH.md` |
 
 Everything else researched (word-level providers, GPU backend, event-driven

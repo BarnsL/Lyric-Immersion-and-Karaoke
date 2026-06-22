@@ -25,6 +25,17 @@ plus a `pystray` tray menu.
   `.match(artist, title, duration)` (duration-guarded), `.refresh()`, `.add()`.
 - **`load_lyrics` / `split_furigana` / `draw_text` / `measure_text`** — IO &
   rendering helpers. `draw_text` honours the perf mode's outline weight.
+- **Fonts (`_PIL_FONTS`, `_TK_MAIN_FONT`, `_script_of`)** — per-script so text
+  never renders as boxes (□): Yu Gothic has no Hangul, so Korean uses **Malgun
+  Gothic** and Chinese uses **Microsoft YaHei**; bare kanji follows the song's
+  language. The main row's font is chosen per line by its script.
+- **`_work_area`** — desktop work area (screen minus taskbar). The overlay is a
+  **fixed, full-work-area, click-through** window (added `WS_EX_TRANSPARENT`):
+  it never moves or resizes, which is the **root fix for lyrics drifting down**
+  (it used to resize per song and re-anchor to the bottom; backfill adding rows
+  mid-song made it jump). Content is positioned *inside* via `_lane_y0`.
+- **`Character`** (`character.py`) — optional tray-toggled dancing companion
+  themed to the detected artist (see that file's header).
 - **`Overlay`** — the window. Notable methods:
   - lifecycle: `__init__`, `run`, `quit`, `_tick` (the ~60fps loop)
   - matching/fetch: `_on_track_change`, `_start_fetch`, `_consume_async`,
@@ -44,11 +55,14 @@ plus a `pystray` tray menu.
     picks a per-song minimum scroll speed so dense/fast songs don't overlap
     (same-lane lines sit `speed × Δtime` apart) while slow songs keep the
     user's comfortable pace.
-  - **viewport safety**: layout sizes to the desktop **work area** (`_work_area`,
-    screen minus taskbar) with a margin, and `_geom_y` anchors the window inside
-    it, so the bottom lane can't slide under the taskbar. `_viewport_watchdog`
-    (~2.5s) is a backstop: if anything renders past the window edge it trims a
-    lane and re-asserts the window's place in the work area.
+  - **fixed window + placement**: `_relayout_song` no longer resizes the window
+    — it computes `_lane_y0` (where the lane stack sits inside the fixed window:
+    top-anchored, or bottom-anchored growing upward). `_viewport_watchdog` (~3s)
+    just re-asserts the fixed geometry/topmost and, as a backstop, trims a lane
+    if content ever overflows — **without moving the window**.
+  - **responsive sizing**: `_auto_scale` (from the work-area height, ≈1.0 on
+    1080p) multiplies the user's font %, so a 1440p/4K display or big TV gets
+    proportionally larger lyrics automatically.
   - settings (all persisted via `_persist`): `set_opacity`, `set_position`,
     `set_scroll`, `set_scroll_speed`, `set_font_scale`, `set_quality`,
     `set_recal`, `apply_preset`, `set_git_sync`, `git_backup`, `set_startup`

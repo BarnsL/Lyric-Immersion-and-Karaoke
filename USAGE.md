@@ -34,6 +34,7 @@ Both are just starting points — tweak anything afterward.
 | **Scroll-in** | Stationary · Slide from left/right · **Scroll-through →/←** (continuous ticker). |
 | **Scroll-through speed** | Slow / Medium / Fast / Very fast (continuous mode only). |
 | **Performance** | *Smooth* (60fps, full outline) or *Performance* (30fps, light outline). |
+| **Dancing character** | On/off. A small companion themed to the current song's artist that dances while music plays. Drag to move it; click it to make it hop. Drop a `characters/<artist>.png` next to the app to use your own image for that artist. |
 | **Start with Windows** | Launch automatically at login. |
 | **Show / Hide**, **Re-fetch lyrics**, **Quit** | Self-explanatory. |
 

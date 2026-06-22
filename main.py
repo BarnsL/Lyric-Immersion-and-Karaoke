@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from character import Character
+
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(0)
 except Exception:
@@ -41,13 +43,36 @@ except ImportError:
     import pystray
     from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-# Windows font files for PIL block rendering (first that loads wins).
+# Windows font files for PIL block rendering (first that loads wins). Per-script
+# so non-Japanese text doesn't render as boxes (□): Yu Gothic has no Hangul,
+# so Korean needs Malgun Gothic; Chinese gets Microsoft YaHei for full coverage.
 _PIL_FONTS = {
     "jp":   ("YuGothB.ttc", "meiryob.ttc", "msgothic.ttc", "yugothb.ttf"),
+    "ko":   ("malgunbd.ttf", "malgun.ttf", "gulim.ttc", "batang.ttc"),
+    "zh":   ("msyhbd.ttc", "msyh.ttc", "simhei.ttf", "simsun.ttc"),
     "furi": ("YuGothR.ttc", "meiryo.ttc", "msgothic.ttc", "yugothr.ttf"),
     "rm":   ("seguisb.ttf", "segoeui.ttf"),
     "en":   ("segoeui.ttf",),
 }
+# tkinter font families per script (fallback path when PIL blocks are off).
+_TK_MAIN_FONT = {"jp": "Yu Gothic UI", "ko": "Malgun Gothic", "zh": "Microsoft YaHei"}
+
+_HANGUL_RE = re.compile(r"[가-힣ㄱ-ㆎ]")
+_KANA_RE = re.compile(r"[ぁ-ゖァ-ヺ]")
+_HAN_RE = re.compile(r"[一-鿿㐀-䶿々]")
+
+
+def _script_of(text, song_lang=None):
+    """Dominant CJK script of a line → which font to use. Korean (Hangul) and
+    Japanese (kana) are unambiguous; bare kanji is read as Japanese unless the
+    whole song is Chinese."""
+    if _HANGUL_RE.search(text or ""):
+        return "ko"
+    if _KANA_RE.search(text or ""):
+        return "jp"
+    if _HAN_RE.search(text or ""):
+        return "zh" if song_lang == "zh" else "jp"
+    return "jp"
 
 BASE = Path(__file__).parent
 # Portable: keep the library + settings right next to the .exe so the whole
@@ -409,6 +434,16 @@ class Overlay:
         self.work_left, self.work_top, _wr, self.work_bottom = wa or (0, 0, sw, sh - 48)
         self.work_h = self.work_bottom - self.work_top
         self._win_margin = 28          # gap from the work-area edge
+        self._lane_y0 = self._win_margin
+        # Responsive sizing: scale text to the display so a big TV / 4K screen
+        # gets proportionally larger lyrics automatically (≈1.0 on 1080p). The
+        # tray font % is a multiplier ON TOP of this auto base.
+        self._auto_scale = min(2.5, max(0.7, self.work_h / 1000.0))
+        # The overlay window is FIXED to the whole work area and never moves or
+        # resizes — content is positioned inside it. This is what stops lyrics
+        # from drifting down. It's made click-through below so covering the
+        # screen doesn't block anything.
+        self.H = self.work_h
 
         s = _load_settings()
         self.opacity = float(s.get("opacity", 1.0))
@@ -419,6 +454,7 @@ class Overlay:
         self.perf = s.get("perf", "smooth")            # 'smooth' | 'fast'
         self.recal_secs = int(s.get("recal_secs", 30))  # auto re-sync interval (0=off)
         self.git_sync = bool(s.get("git_sync", False))  # push new songs to git
+        self.character_on = bool(s.get("character", False))  # dancing companion
         self._fps = 16
         self._last_pos = 0.0
         self._strm_rem = 0.0
@@ -433,7 +469,7 @@ class Overlay:
         self._apply_scale()                            # sets fonts + layout + H
 
         self.root.overrideredirect(True)
-        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self.work_top}")
         self.root.configure(bg=TRANSPARENT)
         self.root.attributes("-topmost", True)
         self.root.attributes("-transparentcolor", TRANSPARENT)
@@ -443,7 +479,10 @@ class Overlay:
         hwnd = ctypes.windll.user32.GetAncestor(self.root.winfo_id(), 2) \
             or self.root.winfo_id()
         ex = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-        ex |= 0x08000000 | 0x00000080  # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        # NOACTIVATE | TOOLWINDOW (no focus steal / no taskbar button) +
+        # LAYERED | TRANSPARENT → click-through, so the full-screen overlay never
+        # intercepts mouse input.
+        ex |= 0x08000000 | 0x00000080 | 0x00080000 | 0x00000020
         ctypes.windll.user32.SetWindowLongW(hwnd, -20, ex)
 
         self.cv = tk.Canvas(self.root, bg=TRANSPARENT, highlightthickness=0)
@@ -471,6 +510,9 @@ class Overlay:
 
         self.index = LyricsIndex()
         self.media = MediaWatcher()
+        self.character = Character(self.root, _DATA)
+        if self.character_on:
+            self.character.set_enabled(True)
         self._hint("Waiting for music…")
         self.root.after(300, self._tick)
         self.root.after(7000, self._health_check)
@@ -484,6 +526,7 @@ class Overlay:
         if not artist and " - " in title:
             a, t = title.split(" - ", 1)
             artist, title = a.strip(), t.strip()
+        self.character.set_artist(artist or title)   # spawn this song's artist
         self._cur_duration = duration
         self._health_attempts = 0
         self.offset = 0.0          # fresh baseline; sound calibration sets it
@@ -650,24 +693,22 @@ class Overlay:
             self._arm_recal(nxt)
 
     def _viewport_watchdog(self):
-        """Safety net against lyrics creeping below the visible window (e.g. a
-        bottom scroll lane sliding under the taskbar). If anything is drawn past
-        the window's bottom or top edge, trim a scroll lane so it fits and
-        re-assert the window's place in the work area. Checked every ~2.5s."""
+        """Light keeper for the FIXED full-work-area window. The window never
+        moves now, so this only (a) re-asserts the fixed geometry + topmost in
+        case another app disturbed it, and (b) as a belt-and-braces guard, trims
+        a lane if content somehow overflows the window — WITHOUT moving the
+        window. Checked every ~3s."""
         try:
-            if self.lines and self.root.winfo_viewable():
-                bb = self.cv.bbox("all")
-                if bb and (bb[3] - self.H > 8 or bb[1] < -8):
-                    if self.scroll_dir in ("lr", "rl") and self._lanes > 1:
-                        self._lanes -= 1            # fewer lanes → everything sits higher
-                        s = self.font_scale
-                        self.H = min(self.H, self._lane_top + self._block_h
-                                     + self._lane_gap * (self._lanes - 1) + round(14 * s))
+            if self.root.winfo_viewable():
+                self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self.work_top}")
+                if self.lines and self.scroll_dir in ("lr", "rl"):
+                    bb = self.cv.bbox("all")
+                    if bb and bb[3] > self.work_h and self._lanes > 1:
+                        self._lanes -= 1
+                        self._relayout_song()      # recompute _lane_y0 (window stays put)
                         self._clear_stream()
-                    self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
-                    self.root.attributes("-topmost", True)
         finally:
-            self.root.after(2500, self._viewport_watchdog)
+            self.root.after(3000, self._viewport_watchdog)
 
     def _suspect(self, st):
         """Signs the current lyrics don't belong to what's actually playing."""
@@ -780,6 +821,8 @@ class Overlay:
             self._track = track
             self._on_track_change(track, self._trusted_duration(state))
 
+        self.character.set_playing(state["status"] == PLAYING)   # dance when playing
+
         if state["status"] != PLAYING or not self.lines:
             self.root.after(80, self._tick)   # frozen while paused — no advancing
             return
@@ -818,24 +861,25 @@ class Overlay:
         max_w = self.W - 2 * pad
         cur_y = 0.0
 
-        # ── Japanese (furigana over kanji); wrap at segment boundaries ──
+        # ── main line (furigana over kanji); wrap at segment boundaries ──
         if ln.jp:
-            jp_h, furi_h = self._text_h(self.JP_FONT), self._text_h(self.FURI_FONT)
+            jpf = self._main_tk_font(ln)   # script-aware: Hangul→Malgun, etc.
+            jp_h, furi_h = self._text_h(jpf), self._text_h(self.FURI_FONT)
             line_h = jp_h + furi_h + 10
             chars = []
             cur_y += furi_h + jp_h / 2 + 6
             cx = pad
             for base, reading in split_furigana(ln.jp):
-                seg_w = max(measure_text(self.cv, base, self.JP_FONT),
+                seg_w = max(measure_text(self.cv, base, jpf),
                             measure_text(self.cv, reading, self.FURI_FONT) if reading else 0)
                 if cx + seg_w > pad + max_w and cx > pad:      # wrap underneath
                     cx, cur_y = pad, cur_y + line_h
                 seg_start = cx
                 for ch in base:
-                    w = measure_text(self.cv, ch, self.JP_FONT)
+                    w = measure_text(self.cv, ch, jpf)
                     if w <= 0:
                         continue
-                    fid = draw_text(self.cv, cx + w / 2, cur_y, ch, self.JP_FONT, WHITE)
+                    fid = draw_text(self.cv, cx + w / 2, cur_y, ch, jpf, WHITE)
                     chars.append({"fill": fid, "last": WHITE})
                     cx += w
                 if reading:
@@ -854,7 +898,9 @@ class Overlay:
             self._kara.append({"chars": chars, "base": EN_C, "sung": SUNG})
 
         # anchor the whole block: near the top, or near the bottom of the window
-        dy = 28 if self.position == "top" else max(18, self.H - cur_y - 24)
+        # anchor within the FIXED window: near the top, or pinned to the bottom
+        dy = (self._win_margin if self.position == "top"
+              else max(self._win_margin, self.work_h - cur_y - self._win_margin))
         self.cv.move("cur", 0, dy)
         self._animate_in()
 
@@ -937,8 +983,8 @@ class Overlay:
     def _block_spec(self, i):
         """Lay out line i for image rendering (positions only, no drawing)."""
         ln = self.lines[i]
-        s = self.font_scale
-        fj = self._pil_font("jp", max(10, round(38 * s)))
+        s = self.font_scale * self._auto_scale
+        fj = self._pil_font(self._main_pil_kind(ln), max(10, round(38 * s)))
         ff = self._pil_font("furi", max(7, round(17 * s)))
         fr = self._pil_font("rm", max(8, round(23 * s)))
         fe = self._pil_font("en", max(8, round(21 * s)))
@@ -970,7 +1016,7 @@ class Overlay:
         """Render the block to a PhotoImage with the sung portion highlighted."""
         img = Image.new("RGBA", (max(1, spec["w"]), max(1, spec["h"])), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        sw = max(1, round(2 * self.font_scale))
+        sw = max(1, round(2 * self.font_scale * self._auto_scale))
         for text, cx in spec["furi"]:
             d.text((cx, spec["furi_y"]), text, font=spec["furi_font"], fill=FURI_C,
                    anchor="mm", stroke_width=1, stroke_fill=INK)
@@ -987,7 +1033,7 @@ class Overlay:
         tag = f"blk{self._blk_seq}"
         spec = self._block_spec(i)
         photo = self._paint_block(spec, frac)
-        lane_y = self._lane_top + (i % self._lanes) * self._lane_gap
+        lane_y = self._lane_y0 + (i % self._lanes) * self._lane_gap
         self.cv.create_image(0, lane_y, image=photo, anchor="nw", tags=(tag, "strm"))
         return {"idx": i, "tag": tag, "x": 0.0, "w": spec["w"], "img": True,
                 "spec": spec, "photo": photo, "sung_n": -1,
@@ -1001,18 +1047,19 @@ class Overlay:
         ln = self.lines[i]
         self._blk_seq += 1
         tag = f"blk{self._blk_seq}"
-        dy = self._lane_top + (i % self._lanes) * self._lane_gap
+        dy = self._lane_y0 + (i % self._lanes) * self._lane_gap
+        jpf = self._main_tk_font(ln)
         tracks, right = [], 0
         if ln.jp:
             chars, cx = [], 0
             for base, reading in split_furigana(ln.jp):
                 seg = cx
                 for ch in base:
-                    w = measure_text(self.cv, ch, self.JP_FONT)
+                    w = measure_text(self.cv, ch, jpf)
                     if w <= 0:
                         continue
                     fid = draw_text(self.cv, cx + w / 2, self.b_main + dy, ch,
-                                    self.JP_FONT, WHITE, tags=(tag, "strm"))
+                                    jpf, WHITE, tags=(tag, "strm"))
                     chars.append({"fill": fid, "last": WHITE})
                     cx += w
                 if reading:
@@ -1063,7 +1110,7 @@ class Overlay:
         n, L = len(lines), max(1, self._lanes)
         if n <= L:
             return
-        s = self.font_scale
+        s = self.font_scale * self._auto_scale
         fj = self._pil_font("jp", max(10, round(38 * s)))
         fr = self._pil_font("rm", max(8, round(23 * s)))
         fe = self._pil_font("en", max(8, round(21 * s)))
@@ -1199,11 +1246,9 @@ class Overlay:
     # ── appearance (persisted) ──
 
     def _geom_y(self):
-        if self.position == "top":
-            return self.work_top + self._win_margin
-        # bottom: sit just above the taskbar, never below the work area
-        return max(self.work_top + self._win_margin,
-                   self.work_bottom - self.H - self._win_margin)
+        # Window is fixed to the work area; vertical placement of content is
+        # handled by _lane_y0, not by moving the window.
+        return self.work_top
 
     def set_recal(self, secs):
         self.recal_secs = int(secs)
@@ -1232,6 +1277,11 @@ class Overlay:
         self.git_sync = bool(on)
         self._persist()
 
+    def set_character(self, on):
+        self.character_on = bool(on)
+        self.character.set_enabled(self.character_on)
+        self._persist()
+
     def git_backup(self):
         """Commit + push ONLY the lyrics library, if this folder is a git repo
         with a remote. Stages just lyrics/ (never code/settings), so in the
@@ -1255,7 +1305,8 @@ class Overlay:
         _save_settings({"opacity": self.opacity, "position": self.position,
                         "scroll": self.scroll_dir, "font_scale": self.font_scale,
                         "scroll_speed": self.scroll_speed, "perf": self.perf,
-                        "recal_secs": self.recal_secs, "git_sync": self.git_sync})
+                        "recal_secs": self.recal_secs, "git_sync": self.git_sync,
+                        "character": self.character_on})
 
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
@@ -1305,8 +1356,17 @@ class Overlay:
         self.idx = -1
         self._persist()
 
+    def _main_tk_font(self, ln):
+        """Main-row tkinter font chosen by the line's script (so Korean/Chinese
+        don't render as boxes in Yu Gothic)."""
+        fam = _TK_MAIN_FONT[_script_of(ln.jp, self.meta.get("lang"))]
+        return (fam, max(10, round(38 * self.font_scale * self._auto_scale)), "bold")
+
+    def _main_pil_kind(self, ln):
+        return _script_of(ln.jp, self.meta.get("lang"))
+
     def _apply_scale(self):
-        s = self.font_scale
+        s = self.font_scale * self._auto_scale
         self.JP_FONT     = ("Yu Gothic UI", max(10, round(38 * s)), "bold")
         self.FURI_FONT   = ("Yu Gothic UI", max(7,  round(17 * s)))
         self.ROMAJI_FONT = ("Segoe UI Semibold", max(8, round(23 * s)))
@@ -1330,10 +1390,13 @@ class Overlay:
         self._relayout_song()              # sets _block_h, _lane_gap, _lanes, H
 
     def _relayout_song(self):
-        """Size blocks + lanes to the CURRENT song's rows. A 1-row Latin song
-        gets short blocks and more lanes; a furigana+romaji+English song gets
-        tall blocks. Also refreshes the anti-overlap speed floor."""
-        s = self.font_scale
+        """Size blocks + lanes to the CURRENT song's rows, and place the lane
+        stack WITHIN the fixed full-work-area window. The window itself never
+        moves or resizes (that was the cause of lyrics drifting down: it used to
+        shrink/grow per song and re-anchor to the bottom). Here only the content
+        offset `_lane_y0` changes, so bottom-anchored lines stay pinned to the
+        bottom and simply grow upward when there are more rows."""
+        s = self.font_scale * self._auto_scale
         has_rm = has_en = False
         for ln in getattr(self, "lines", None) or []:
             has_rm = has_rm or bool(ln.rm.strip())
@@ -1347,16 +1410,16 @@ class Overlay:
         else:
             self._block_h = self.b_main + round(46 * s)    # single main row
         self._lane_gap = self._block_h + round(14 * s)
-        # Fit within the WORK AREA (screen minus taskbar), with a margin, so the
-        # bottom lane can never slide under the taskbar / off-screen.
         usable = self.work_h - 2 * self._win_margin
         fit = 1 + max(0, (usable - self._lane_top - self._block_h) // self._lane_gap)
         self._lanes = max(1, min(4, int(fit)))     # up to 4 when blocks are short
-        if self.scroll_dir in ("lr", "rl"):
-            self.H = min(usable, self._lane_top + self._block_h
-                         + self._lane_gap * (self._lanes - 1) + round(14 * s))
+        # First-lane Y inside the fixed window: top-anchored or bottom-anchored.
+        stack = self._block_h + self._lane_gap * (self._lanes - 1)
+        if self.position == "top":
+            self._lane_y0 = self._win_margin + self._lane_top
         else:
-            self.H = min(usable, round(460 * s))    # room for wrapped lines
+            self._lane_y0 = max(self._win_margin,
+                                self.work_h - self._win_margin - stack)
         self._compute_scroll_floor()
 
     def set_font_scale(self, v):
@@ -1519,6 +1582,7 @@ def main():
     )
     def _toggle_git(*_):   ov.root.after(0, lambda: ov.set_git_sync(not ov.git_sync))
     def _backup_now(*_):   ov.root.after(0, ov.git_backup)
+    def _toggle_char(*_):  ov.root.after(0, lambda: ov.set_character(not ov.character_on))
     git_menu = pystray.Menu(
         pystray.MenuItem("Auto-push new songs", _toggle_git,
                          checked=lambda i: ov.git_sync),
@@ -1554,6 +1618,8 @@ def main():
         pystray.MenuItem("Scroll-in", scroll_menu),
         pystray.MenuItem("Scroll-through speed", speed_menu),
         pystray.MenuItem("Performance", perf_menu),
+        pystray.MenuItem("Dancing character", _toggle_char,
+                         checked=lambda i: ov.character_on),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Start with Windows", _toggle_startup,
                          checked=lambda i: startup_enabled()),
