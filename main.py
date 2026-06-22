@@ -418,19 +418,22 @@ class Overlay:
         self._cur_duration = duration
         self._health_attempts = 0
 
+        # Provisional: show the title/artist match instantly (so there's no
+        # dead air) — but AUDIO is primary and confirms/overrides it below.
         path = self.index.match(artist, title, duration)
         if path and self._file_valid(path, duration):
             if path != self._lyrics_path:
                 self.load(path)
-            self._maybe_translate()   # fill English once, then it's cached forever
-            return
+            self._maybe_translate()
+        else:
+            self.lines, self._lyrics_path, self.idx = [], None, -1
+            self._kara = []
+            self._verified = False
+            self._hint(f"♪ {title} — identifying…")
+            self._start_fetch(artist, title, duration)
 
-        # nothing valid cached → fetch (and overwrite a bad file if present)
-        self.lines, self._lyrics_path, self.idx = [], None, -1
-        self._kara = []
-        self._verified = False
-        self._hint(f"♪ {title} — fetching lyrics…")
-        self._start_fetch(artist, title, duration)
+        # PRIMARY signal: identify by sound and let it decide the real song.
+        self._start_identify()
 
     def _trusted_duration(self, state):
         # YouTube/browser report the VIDEO length (intro/outro) which differs
@@ -503,8 +506,8 @@ class Overlay:
     # ── audio identification (detect by SOUND, not title) ──
 
     def _start_identify(self):
-        if self._identifying:
-            return
+        if self._identifying or self._identified == self._track:
+            return                       # one sound-check per track
         self._identifying = True
         self._identified = self._track
 
@@ -578,16 +581,16 @@ class Overlay:
             self._identify_result = None
             self._identifying = False
             if res:
+                # AUDIO IS AUTHORITATIVE: fetch the heard song and swap it in,
+                # overriding any (possibly wrong) title match. Doesn't re-key
+                # self._track, so detection won't loop.
                 title, artist = res
-                # Re-key the track to the sound-identified song and fetch it.
-                self._track = (artist, title)
-                self._fetch_key = None
                 cached = self.index.match(artist, title, self._cur_duration)
                 if cached and self._file_valid(cached, self._cur_duration):
-                    self.load(cached)
+                    if cached != self._lyrics_path:
+                        self.load(cached)
+                    self._maybe_translate()
                 else:
-                    self.lines, self.idx, self._kara = [], -1, []
-                    self._hint(f"🎧 {title} — {artist}")
                     self._start_fetch(artist, title, self._cur_duration)
 
     def load(self, path, keep_idx=False):
@@ -634,7 +637,7 @@ class Overlay:
             else:
                 self.cv.delete("all")
                 self._kara = []
-        elif new >= 0:
+        elif new >= 0 and self.scroll_dir not in ("lr", "rl"):
             self._karaoke(pos)
 
         self.root.after(16, self._tick)   # ~60fps for tight, on-time sweeping
@@ -703,11 +706,37 @@ class Overlay:
 
     def _animate_in(self):
         d = self.scroll_dir
+        if d in ("lr", "rl"):
+            self._marquee()                      # continuous scroll-through
+            return
         if d in ("none", "off", "stationary"):
             return                               # appear in place, no motion
-        ox = 460 if "r" in d else -460           # horizontal only: from right / left
+        ox = 460 if d == "right" else -460       # slide in from right / left, once
         self.cv.move("cur", ox, 0)
         self._anim_step(ox, 0)
+
+    def _marquee(self):
+        bbox = self.cv.bbox("cur")
+        if not bbox:
+            return
+        if self.scroll_dir == "lr":              # start off the left edge
+            self.cv.move("cur", -bbox[2] - 20, 0)
+        else:                                    # start off the right edge
+            self.cv.move("cur", self.W - bbox[0] + 20, 0)
+        self._marquee_step()
+
+    def _marquee_step(self):
+        if self.scroll_dir not in ("lr", "rl") or not self._kara:
+            self._anim_id = None
+            return
+        self.cv.move("cur", 3 if self.scroll_dir == "lr" else -3, 0)
+        bbox = self.cv.bbox("cur")
+        if bbox:
+            if self.scroll_dir == "lr" and bbox[0] > self.W:
+                self.cv.move("cur", -(bbox[2] + 20), 0)      # wrap back to left
+            elif self.scroll_dir == "rl" and bbox[2] < 0:
+                self.cv.move("cur", self.W - bbox[0] + 20, 0)  # wrap back to right
+        self._anim_id = self.root.after(16, self._marquee_step)
 
     def _anim_step(self, ox, step=0):
         steps = 20
@@ -774,8 +803,8 @@ class Overlay:
     def set_scroll(self, d):
         self.scroll_dir = d
         self._cancel_anim()
-        if self._kara:                # re-demo the entrance on the current line
-            self._animate_in()
+        if self.idx >= 0 and self.lines:   # re-render to reset positions + mode
+            self._render(self.lines[self.idx])
         self._persist()
 
     def _apply_scale(self):
@@ -915,6 +944,9 @@ def main():
         _scr_item("Stationary (appear in place)", "none"),
         _scr_item("Slide in from left", "left"),
         _scr_item("Slide in from right", "right"),
+        pystray.Menu.SEPARATOR,
+        _scr_item("Scroll through  →  (left to right)", "lr"),
+        _scr_item("Scroll through  ←  (right to left)", "rl"),
     )
 
     def _font_item(pct):
