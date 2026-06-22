@@ -70,6 +70,14 @@ dir), holding `lyrics/` and `settings.json`.
   UniDic** (via **cutlet** for romaji) for Japanese — a real morphological
   analyzer that segments correctly (今生きて → 今(いま)生き), with **pykakasi** as
   an automatic fallback. Chinese uses `pypinyin`, Korean `hangul-romanize`.
+  **Katakana English** is recovered as English: `_segment_katakana` splits
+  run-together loanwords using **`gairaigo.py`** (an extensible katakana→English
+  table) so ベイビーアイラブユー → "baby I love you", not "beibiiairabuyuu".
+- **Translation**: `_translate_lines` translates in **context windows** — each
+  block of lines is sent with a couple of neighbouring lines before/after, so a
+  line is translated in the flow of the song. DeepL when `DEEPL_API_KEY` is set,
+  else Google. `backfill_file` self-heals a cached song (romaji + translation)
+  the first time it plays.
 - **`split_artists`**, `parse_lrc_text` (strips stacked `[mm:ss]`/`<..>` tags &
   credit lines), `annotate`,
   `_translate_lines`/`translate_file`, **`fetch_and_save(...)`** (writes JSON

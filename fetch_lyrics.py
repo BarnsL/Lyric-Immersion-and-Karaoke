@@ -15,12 +15,20 @@ SOURCES USED
                   今/生きて "ima ikite", not 今生 "konjou"), which is the single
                   biggest accuracy win for furigana/romaji. pykakasi is kept as
                   an automatic fallback when the analyzer isn't installed.
+                  Katakana English is RECOVERED as English, not phoneticised:
+                  cutlet's foreign-spelling mode plus gairaigo.py (a curated,
+                  extensible katakana→English table) + _segment_katakana() split
+                  run-together loanwords, so ベイビーアイラブユー → "baby I love
+                  you" instead of "beibiiairabuyuu".
   • pypinyin      — Chinese → pinyin.
   • hangul-romanize — Korean → romaja.
   • deep-translator — line translation to English ('auto' source so it covers
                   ja / zh / ko / es alike). Uses the free Google endpoint by
                   default; if a DEEPL_API_KEY env var is set it uses DeepL
                   instead (noticeably better JP/CJK→EN). No key required to run.
+                  Lines are translated in CONTEXT WINDOWS (each block carries a
+                  couple of neighbouring lines before/after) so a line is read in
+                  the flow of the song, not in isolation. See _translate_lines.
   • Audio identification (recognize.py): soundcard (WASAPI loopback) +
                   shazamio (Shazam) — identifies the song by SOUND for covers
                   / mislabeled uploads. See recognize.py for details.
@@ -221,10 +229,16 @@ def _jp_engine():
     try:
         import fugashi
         import cutlet
+        from gairaigo import KATAKANA_EN
         _jp_tagger = fugashi.Tagger()
         _jp_katsu = cutlet.Cutlet()
-        _jp_katsu.use_foreign_spelling = False
-        for surf, rom in _ROMAJI_FIX.items():
+        # use_foreign_spelling=True renders known loanwords as English
+        # (コンピューター→computer, スマイル→smile) instead of phonetic romaji.
+        _jp_katsu.use_foreign_spelling = True
+        # Our curated katakana→English overrides take priority over cutlet's
+        # (which gets アイ→"eye", ミー→"Mi-", グッバイ→"Gubbai" wrong), plus the
+        # everyday-reading fixes for kanji.
+        for surf, rom in {**_ROMAJI_FIX, **KATAKANA_EN}.items():
             try:
                 _jp_katsu.add_exception(surf, rom)
             except Exception:
@@ -233,6 +247,38 @@ def _jp_engine():
     except Exception:
         _JP_READY = False
     return _JP_READY
+
+
+# Longest katakana loanword first → greedy segmentation of run-together strings.
+_KATA_RUN = re.compile(r"[ァ-ヶ]{2,}ー?|[ァ-ヶ][ァ-ヶー]+")
+
+
+def _segment_katakana(text: str) -> str:
+    """Insert spaces into run-together katakana English so the romanizer can
+    resolve each loanword: ベイビーアイラブユー → 'ベイビー アイ ラブ ユー'.
+    Only splits at known gairaigo boundaries; unknown katakana (names,
+    onomatopoeia) is left alone for normal phonetic romaji."""
+    from gairaigo import KATAKANA_EN
+    keys = KATAKANA_EN
+
+    def split_run(run: str) -> str:
+        i, parts = 0, []
+        while i < len(run):
+            for j in range(min(len(run), i + 10), i, -1):
+                if run[i:j] in keys and (j - i) >= 2:
+                    parts.append(run[i:j])
+                    i = j
+                    break
+            else:
+                # accrete unknown chars onto the previous/next chunk
+                if parts and parts[-1] not in keys:
+                    parts[-1] += run[i]
+                else:
+                    parts.append(run[i])
+                i += 1
+        return " ".join(parts)
+
+    return _KATA_RUN.sub(lambda m: split_run(m.group(0)), text)
 
 
 def _kakasi():
@@ -307,7 +353,9 @@ def romanize(text: str, lang: str) -> str:
         if lang == "ja":
             if _jp_engine():
                 try:
-                    r = _jp_katsu.romaji(text).strip()
+                    # split run-together katakana English first so the loanwords
+                    # render as English (ベイビーアイラブユー → baby I love you)
+                    r = _jp_katsu.romaji(_segment_katakana(text)).strip()
                     if r:
                         return r[0].lower() + r[1:]   # match the lowercase style
                 except Exception:
@@ -559,27 +607,48 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
             return True
         return whole and ll == "other"     # Spanish line w/o accents, etc.
 
-    idx = [i for i, ln in enumerate(lines) if want(lines[i])]
-    raws = [re.sub(r"\(.*?\)", "", lines[i]["jp"]) for i in idx]
-    done = 0
-    for k in range(0, len(raws), 20):
-        sl, chunk = idx[k:k + 20], raws[k:k + 20]
-        joined = "\n".join(c if c.strip() else "　" for c in chunk)
+    want_set = {i for i, ln in enumerate(lines) if want(ln)}
+    if not want_set:
+        return 0
+
+    def raw(i):
+        return re.sub(r"\(.*?\)", "", lines[i]["jp"])
+
+    # Translate in windows that CARRY CONTEXT: each block of focus lines is sent
+    # together with CTX neighbouring lines before and after, so a line is read in
+    # the flow of the song (pronouns/subjects often only make sense from the
+    # surrounding lines) instead of in isolation. Only the focus lines' results
+    # are kept; the context lines just steer the translation.
+    CTX, SIZE, n = 2, 24, len(lines)
+    done = pos = 0
+    while pos < n:
+        end = min(n, pos + SIZE)
+        focus = [i for i in range(pos, end) if i in want_set]
+        if not focus:
+            pos = end
+            continue
+        lo, hi = max(0, pos - CTX), min(n, end + CTX)
+        window = list(range(lo, hi))
+        joined = "\n".join(raw(w) if raw(w).strip() else "　" for w in window)
+        parts = None
         try:
             parts = tr.translate(joined).split("\n")
-            if len(parts) == len(chunk):
-                for j, gi in enumerate(sl):
-                    lines[gi]["en"] = parts[j].strip()
-                done += len(chunk)
-                continue
         except Exception:
-            pass
-        for j, gi in enumerate(sl):
-            try:
-                lines[gi]["en"] = tr.translate(chunk[j]) if chunk[j].strip() else ""
+            parts = None
+        if parts and len(parts) == len(window):           # aligned → keep focus
+            m = dict(zip(window, parts))
+            for i in focus:
+                lines[i]["en"] = m[i].strip()
                 done += 1
-            except Exception:
-                pass
+        else:                                              # fallback: per line
+            for i in focus:
+                try:
+                    t = raw(i)
+                    lines[i]["en"] = tr.translate(t) if t.strip() else ""
+                    done += 1
+                except Exception:
+                    pass
+        pos = end
     return done
 
 

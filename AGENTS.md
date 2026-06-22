@@ -102,6 +102,19 @@ translation):
 Extend `detect_lang()` and `romanize()` in `fetch_lyrics.py` with the script
 range and a romanizer, then `annotate()` will pick it up.
 
+## Improving katakana-English readings ("more data")
+
+When a katakana English phrase romanizes phonetically instead of as English
+(e.g. a new slang loanword), add the pair to **`gairaigo.py`**:
+
+```python
+"カタカナ": "english",   # e.g. "サンキュー": "thank you"
+```
+
+`_segment_katakana()` uses the keys to split run-together katakana and cutlet
+exceptions render the English. After adding entries, run `python reannotate.py`
+to refresh the cached romaji. No code changes needed — it's pure data.
+
 ## Verify your changes
 
 ```bash

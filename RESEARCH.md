@@ -51,6 +51,17 @@ timing) isn't available for free. No code change beyond documentation.
 - ✅ Already upgraded this session to **fugashi + UniDic + cutlet** (a real
   morphological analyzer) with pykakasi as fallback. This is the recommended
   modern approach and fixed the segmentation errors (今生きて → 今(いま)生き).
+- ✅ **Katakana English → English, not phonetic.** A phonetic romanizer turns
+  ベイビーアイラブユー into "beibiiairabuyuu". Fix: enable cutlet's
+  foreign-spelling mode (コンピューター→computer) AND add `gairaigo.py` (a curated
+  katakana→English table) + `_segment_katakana()` to split run-together
+  loanwords and override cutlet's misses (it gives アイ→"eye", ミー→"Mi-",
+  グッバイ→"Gubbai"). Result: ベイビーアイラブユー → "baby I love you". The table
+  is plain data, so coverage grows by appending pairs — no code change.
+- ✅ **Context-aware translation.** Translating line-by-line loses the subjects
+  and pronouns that only make sense from neighbouring lines. `_translate_lines`
+  now sends each block of lines together with a couple of context lines
+  before/after, keeping only the focus lines' results.
 - ⏭️ **pyopenjtalk** could add pitch-accent marks (a nice learning aid) but it's
   a heavy native dependency; deferred.
 
