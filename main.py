@@ -378,6 +378,22 @@ def measure_text(cv, text, font):
     return (bbox[2] - bbox[0]) if bbox else 0
 
 
+def _work_area():
+    """The desktop work area (screen minus the taskbar) as (left, top, right,
+    bottom). Sizing to THIS — not the raw screen — keeps the bottom scroll lane
+    from sliding under the taskbar. Returns None if the query fails."""
+    try:
+        from ctypes import wintypes
+        r = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0,
+                                                       ctypes.byref(r), 0) \
+                and r.bottom > r.top:
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    return None
+
+
 # ── Overlay ──────────────────────────────────────────────────────────
 
 class Overlay:
@@ -389,6 +405,10 @@ class Overlay:
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         self.W, self.H, self.sh = sw, 340, sh
+        wa = _work_area()
+        self.work_left, self.work_top, _wr, self.work_bottom = wa or (0, 0, sw, sh - 48)
+        self.work_h = self.work_bottom - self.work_top
+        self._win_margin = 28          # gap from the work-area edge
 
         s = _load_settings()
         self.opacity = float(s.get("opacity", 1.0))
@@ -454,6 +474,7 @@ class Overlay:
         self._hint("Waiting for music…")
         self.root.after(300, self._tick)
         self.root.after(7000, self._health_check)
+        self.root.after(4000, self._viewport_watchdog)
         self._arm_recal(max(8, self.recal_secs or 30))
 
     # ── per-track ──
@@ -624,6 +645,26 @@ class Overlay:
                     nxt = max(10, self.recal_secs)
         finally:
             self._arm_recal(nxt)
+
+    def _viewport_watchdog(self):
+        """Safety net against lyrics creeping below the visible window (e.g. a
+        bottom scroll lane sliding under the taskbar). If anything is drawn past
+        the window's bottom or top edge, trim a scroll lane so it fits and
+        re-assert the window's place in the work area. Checked every ~2.5s."""
+        try:
+            if self.lines and self.root.winfo_viewable():
+                bb = self.cv.bbox("all")
+                if bb and (bb[3] - self.H > 8 or bb[1] < -8):
+                    if self.scroll_dir in ("lr", "rl") and self._lanes > 1:
+                        self._lanes -= 1            # fewer lanes → everything sits higher
+                        s = self.font_scale
+                        self.H = min(self.H, self._lane_top + self._block_h
+                                     + self._lane_gap * (self._lanes - 1) + round(14 * s))
+                        self._clear_stream()
+                    self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+                    self.root.attributes("-topmost", True)
+        finally:
+            self.root.after(2500, self._viewport_watchdog)
 
     def _suspect(self, st):
         """Signs the current lyrics don't belong to what's actually playing."""
@@ -1155,7 +1196,11 @@ class Overlay:
     # ── appearance (persisted) ──
 
     def _geom_y(self):
-        return 40 if self.position == "top" else self.sh - self.H - 40
+        if self.position == "top":
+            return self.work_top + self._win_margin
+        # bottom: sit just above the taskbar, never below the work area
+        return max(self.work_top + self._win_margin,
+                   self.work_bottom - self.H - self._win_margin)
 
     def set_recal(self, secs):
         self.recal_secs = int(secs)
@@ -1299,14 +1344,16 @@ class Overlay:
         else:
             self._block_h = self.b_main + round(46 * s)    # single main row
         self._lane_gap = self._block_h + round(14 * s)
-        usable = self.sh - 70
+        # Fit within the WORK AREA (screen minus taskbar), with a margin, so the
+        # bottom lane can never slide under the taskbar / off-screen.
+        usable = self.work_h - 2 * self._win_margin
         fit = 1 + max(0, (usable - self._lane_top - self._block_h) // self._lane_gap)
         self._lanes = max(1, min(4, int(fit)))     # up to 4 when blocks are short
         if self.scroll_dir in ("lr", "rl"):
             self.H = min(usable, self._lane_top + self._block_h
                          + self._lane_gap * (self._lanes - 1) + round(14 * s))
         else:
-            self.H = min(self.sh - 60, round(460 * s))   # room for wrapped lines
+            self.H = min(usable, round(460 * s))    # room for wrapped lines
         self._compute_scroll_floor()
 
     def set_font_scale(self, v):

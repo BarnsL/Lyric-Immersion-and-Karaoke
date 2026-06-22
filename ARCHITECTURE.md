@@ -44,6 +44,11 @@ plus a `pystray` tray menu.
     picks a per-song minimum scroll speed so dense/fast songs don't overlap
     (same-lane lines sit `speed × Δtime` apart) while slow songs keep the
     user's comfortable pace.
+  - **viewport safety**: layout sizes to the desktop **work area** (`_work_area`,
+    screen minus taskbar) with a margin, and `_geom_y` anchors the window inside
+    it, so the bottom lane can't slide under the taskbar. `_viewport_watchdog`
+    (~2.5s) is a backstop: if anything renders past the window edge it trims a
+    lane and re-asserts the window's place in the work area.
   - settings (all persisted via `_persist`): `set_opacity`, `set_position`,
     `set_scroll`, `set_scroll_speed`, `set_font_scale`, `set_quality`,
     `set_recal`, `apply_preset`, `set_git_sync`, `git_backup`, `set_startup`
