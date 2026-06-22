@@ -21,12 +21,45 @@ never steals focus, so you can keep working / watching while it runs.
 
 ---
 
+## Use cases (try a preset)
+
+Right-click the tray icon → **Presets** for one-click setups:
+
+### 🎮 Learn a language while you game
+Keep a language ticking over in your peripheral vision while you play. The
+**Gaming** preset sets a faint top overlay that never gets in the way:
+> Opacity **45%**, Position **top**, Slide-in **from left**, Font **100%**,
+> **Performance** mode (30fps / light outline so it costs your game nothing).
+
+Put on a Japanese (or Chinese/Korean/Spanish) playlist, glance up between
+fights, and you'll absorb furigana + readings + meaning passively.
+
+### 🎤 Karaoke night for a room of people
+Big, bold, flowing lyrics everyone can read and sing from across the room. The
+**Karaoke** preset:
+> Opacity **100%**, Position **bottom**, **Scroll-through ←**, Font **150%**,
+> **Smooth** 60fps, **Auto re-sync by sound** on.
+
+Lines stream across in staggered lanes (up to 3, depending on font), the current
+line fills as it's sung, and the audio re-sync keeps it glued to the music — even
+across a **concert / live video** with many songs back-to-back.
+
+You can of course mix your own from the tray menu; both presets are starting
+points.
+
+---
+
 ## Why it stays in sync
 
 Most lyric overlays guess timing from when they launched. Desktop Karaoke reads
 the **actual song position** from the Windows `GlobalSystemMediaTransportControls`
 session (the same data behind the media keys), so it tracks scrubbing, pausing,
 and song changes for *any* player — and freezes when the music does.
+
+On top of that it **listens**: it identifies the song with Shazam and aligns the
+clock to the true offset, re-checking on an interval. That means **YouTube MV
+intros** are auto-corrected, drift is caught, and **concert/live videos** that
+contain many songs get the *right* lyrics for whatever is playing *right now*.
 
 ## Identify by **sound**, not just the title
 
@@ -113,9 +146,14 @@ pythonw main.py            # start the overlay (no console window)
 python  main.py --offset -1.5   # nudge sync earlier for videos with an intro
 ```
 
-A tray icon (あ) gives you **sync nudges**, **show/hide**, **re-fetch lyrics**
-and **quit**. Play a song and the matching lyrics appear automatically; unknown
-songs are fetched and added to your library on the fly.
+Everything is controlled from the tray icon (あ): presets, opacity, font,
+position, scroll style, sound re-sync, performance, library backup, and more —
+**see [USAGE.md](USAGE.md) for the full reference.** Play a song and the matching
+lyrics appear automatically; unknown songs are fetched and cached on the fly.
+
+**Portable & self-contained:** the packaged app keeps its library (`lyrics/`)
+and `settings.json` **right next to the .exe**, so the whole thing is one folder
+you can copy to a USB stick or back up wherever you like.
 
 ## Build a starter library
 

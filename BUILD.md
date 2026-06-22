@@ -29,8 +29,9 @@ iscc installer.iss                              :: -> dist\DesktopKaraoke-Setup.
 2. Two optional checkboxes: **desktop shortcut** and **Start with Windows**.
 3. Done. It launches and lives in the system tray (あ). Play any song.
 
-The packaged app keeps its lyric library and settings in
-`%APPDATA%\Desktop Karaoke\` so they persist across updates and reinstalls.
+The packaged app is **portable**: it keeps its lyric library (`lyrics/`) and
+`settings.json` right next to `DesktopKaraoke.exe`, so the whole folder is
+self-contained — copy it anywhere, or make it a git repo to back up.
 
 ## Notes
 

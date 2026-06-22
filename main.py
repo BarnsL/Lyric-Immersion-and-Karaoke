@@ -42,10 +42,10 @@ except ImportError:
     from PIL import Image, ImageDraw, ImageFont
 
 BASE = Path(__file__).parent
-# When packaged as an .exe, keep the writable library/settings in the user's
-# AppData (the exe's own folder may be read-only / a temp extract dir).
+# Portable: keep the library + settings right next to the .exe so the whole
+# app is one self-contained folder you can copy anywhere.
 if getattr(sys, "frozen", False):
-    _DATA = Path(os.environ.get("APPDATA", str(Path.home()))) / "Desktop Karaoke"
+    _DATA = Path(sys.executable).parent
 else:
     _DATA = BASE
 _DATA.mkdir(parents=True, exist_ok=True)
@@ -374,6 +374,7 @@ class Overlay:
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
         self.perf = s.get("perf", "smooth")            # 'smooth' | 'fast'
         self.recal_secs = int(s.get("recal_secs", 30))  # auto re-sync interval (0=off)
+        self.git_sync = bool(s.get("git_sync", False))  # push new songs to git
         self._fps = 16
         self._last_pos = 0.0
         self._strm_rem = 0.0
@@ -417,8 +418,7 @@ class Overlay:
         self._health_attempts = 0
         self._identifying = False
         self._identify_result = None
-        self._identified = None      # track tuple we've already sound-checked
-        self._calibrate_only = False
+        self._sound_song = None       # last (title, artist) heard by Shazam
 
         self.index = LyricsIndex()
         self.media = MediaWatcher()
@@ -437,6 +437,7 @@ class Overlay:
         self._cur_duration = duration
         self._health_attempts = 0
         self.offset = 0.0          # fresh baseline; sound calibration sets it
+        self._sound_song = None    # new video → re-identify by ear
 
         # Provisional: show the title/artist match instantly (so there's no
         # dead air) — but AUDIO is primary and confirms/overrides it below.
@@ -525,15 +526,10 @@ class Overlay:
 
     # ── audio identification (detect by SOUND, not title) ──
 
-    def _start_identify(self, calibrate_only=False):
+    def _start_identify(self):
         if self._identifying:
             return
-        if not calibrate_only and self._identified == self._track:
-            return                       # song already identified this track
         self._identifying = True
-        self._calibrate_only = calibrate_only   # timing-only re-lock vs full ID
-        if not calibrate_only:
-            self._identified = self._track
 
         def work():
             res = None
@@ -563,13 +559,13 @@ class Overlay:
             self.root.after(9000, self._health_check)
 
     def _recalibrate_loop(self):
-        """Every recal_secs while playing, re-lock the timing to the song by
-        ear (timing only — lyrics stay put)."""
+        """Every recal_secs while playing, listen again: re-lock the timing AND
+        catch a new song within the same video (concert / DJ set / livestream)."""
         try:
             st = self.media.get()
             if (self.recal_secs and st and st.get("status") == PLAYING
-                    and self.lines and not self._identifying):
-                self._start_identify(calibrate_only=True)
+                    and not self._identifying):
+                self._start_identify()
         finally:
             self.root.after(max(10, self.recal_secs or 30) * 1000,
                             self._recalibrate_loop)
@@ -578,8 +574,7 @@ class Overlay:
         """Signs the current lyrics don't belong to what's actually playing."""
         dur, pos = st.get("duration"), st.get("position", 0)
         if not self.lines:
-            # browser/cover with no match yet, and we haven't sound-checked it
-            return self._identified != self._track
+            return self._sound_song is None    # no match yet, not sound-checked
         md = self.meta.get("duration")
         last_end = self.lines[-1].end if self.lines else 0
         if dur and md and abs(md - dur) > 12:
@@ -587,7 +582,7 @@ class Overlay:
         if dur and last_end and last_end < dur * 0.6 and pos > last_end + 8 \
                 and pos < dur - 5:
             return True                                   # lyrics don't cover song
-        if not self._verified and self._identified != self._track:
+        if not self._verified and self._sound_song is None:
             return True                                   # unverified → confirm by ear
         return False
 
@@ -600,7 +595,9 @@ class Overlay:
                     self.index.add(p)
                     self.load(Path(p))
                     self._start_translate(Path(p))
-                elif not self._identifying and self._identified != self._track:
+                    if self.git_sync:           # back up the new song if opted in
+                        self.git_backup()
+                elif not self._identifying and self._sound_song is None:
                     # title/artist missed (e.g. name-variant) — Shazam returns
                     # the canonical name, which usually fetches fine.
                     self._hint("🎧 Finding the song by sound…")
@@ -617,23 +614,21 @@ class Overlay:
             self._identify_result = None
             self._identifying = False
             if res:
-                # AUDIO IS AUTHORITATIVE: fetch the heard song and swap it in,
-                # overriding any (possibly wrong) title match. Doesn't re-key
-                # self._track, so detection won't loop.
                 title, artist, offset, t_cap = res
-                # Audio-calibrated SYNC: Shazam's offset is the true song
-                # position; align our clock to it (fixes MV intros / drift).
+                # Audio-calibrated SYNC: align our clock to the true song
+                # position Shazam reports (fixes MV intros / drift / seeks).
                 if offset is not None and t_cap is not None:
                     st = self.media.get()
                     if st and st.get("status") == PLAYING:
                         true_now = offset + (time.time() - t_cap)
                         corr = true_now - st["position"]
-                        # re-lock only when it differs from the current offset
-                        # by more than Shazam's noise floor (avoids jitter, but
-                        # tracks real drift / seeks / MV intros)
                         if abs(corr - self.offset) > 1.5 and abs(corr) < 180:
                             self.offset = round(corr, 2)
-                if not self._calibrate_only:        # timing-only pass: keep lyrics
+                # Swap lyrics only when the HEARD song changes. Same song →
+                # timing-only. Different song → a new track inside this video
+                # (concert / DJ set / livestream) → load its lyrics.
+                if (title, artist) != self._sound_song:
+                    self._sound_song = (title, artist)
                     cached = self.index.match(artist, title, self._cur_duration)
                     if cached and self._file_valid(cached, self._cur_duration):
                         if cached != self._lyrics_path:
@@ -917,11 +912,50 @@ class Overlay:
         self.recal_secs = int(secs)
         self._persist()
 
+    def apply_preset(self, name):
+        """One-click settings bundles for common use cases."""
+        if name == "gaming":          # learn a language while gaming — subtle
+            self.opacity, self.position, self.scroll_dir = 0.45, "top", "left"
+            self.font_scale, self.perf = 1.0, "fast"
+        elif name == "karaoke":       # big, flowing lyrics for a room of people
+            self.opacity, self.position, self.scroll_dir = 1.0, "bottom", "rl"
+            self.font_scale, self.perf, self.scroll_speed = 1.5, "smooth", 200.0
+        self.root.attributes("-alpha", self.opacity)
+        self._apply_perf()
+        self._apply_scale()
+        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.attributes("-topmost", True)
+        self._cancel_anim(); self._clear_stream(); self.cv.delete("all")
+        self._kara, self.idx = [], -1
+        self.root.update_idletasks()
+        self._persist()
+
+    def set_git_sync(self, on):
+        self.git_sync = bool(on)
+        self._persist()
+
+    def git_backup(self):
+        """Commit + push the local library to git, if this folder is a repo
+        with a remote. Runs in the background; silently no-ops otherwise."""
+        if not (_DATA / ".git").exists():
+            return
+
+        def work():
+            for args in (["add", "-A"],
+                         ["commit", "-m", "Update lyric library"],
+                         ["push"]):
+                try:
+                    subprocess.run(["git", "-C", str(_DATA), *args],
+                                   capture_output=True, timeout=90)
+                except Exception:
+                    return
+        threading.Thread(target=work, daemon=True).start()
+
     def _persist(self):
         _save_settings({"opacity": self.opacity, "position": self.position,
                         "scroll": self.scroll_dir, "font_scale": self.font_scale,
                         "scroll_speed": self.scroll_speed, "perf": self.perf,
-                        "recal_secs": self.recal_secs})
+                        "recal_secs": self.recal_secs, "git_sync": self.git_sync})
 
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
@@ -1034,12 +1068,12 @@ class Overlay:
         self._fetch_key = None
         self._lyrics_path = None
         self.lines, self.idx, self._kara = [], -1, []
-        self._identified = None
+        self._sound_song = None
         self._hint("🎧 Listening to identify the song…")
         self._start_identify()
 
     def identify_by_sound(self):
-        self._identified = None
+        self._sound_song = None
         self._hint("🎧 Listening to identify the song…")
         self._start_identify()
 
@@ -1152,6 +1186,20 @@ def main():
         _recal_item("Every 30s", 30), _recal_item("Every 60s", 60),
     )
 
+    def _preset(name):
+        return lambda *_: ov.root.after(0, lambda: ov.apply_preset(name))
+    preset_menu = pystray.Menu(
+        pystray.MenuItem("🎮  Gaming  (subtle, learn while you play)", _preset("gaming")),
+        pystray.MenuItem("🎤  Karaoke  (big, scrolling, for a room)", _preset("karaoke")),
+    )
+    def _toggle_git(*_):   ov.root.after(0, lambda: ov.set_git_sync(not ov.git_sync))
+    def _backup_now(*_):   ov.root.after(0, ov.git_backup)
+    git_menu = pystray.Menu(
+        pystray.MenuItem("Auto-push new songs", _toggle_git,
+                         checked=lambda i: ov.git_sync),
+        pystray.MenuItem("Back up now", _backup_now),
+    )
+
     def _font_item(pct):
         v = pct / 100
         return pystray.MenuItem(f"{pct}%", _set_font(v), radio=True,
@@ -1167,9 +1215,12 @@ def main():
     )
 
     menu = pystray.Menu(
+        pystray.MenuItem("Presets", preset_menu),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
         pystray.MenuItem("🎧  Identify by sound", _ident),
         pystray.MenuItem("Auto re-sync by sound", recal_menu),
+        pystray.MenuItem("Library backup (Git)", git_menu),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),
         pystray.MenuItem("Opacity", opacity_menu),

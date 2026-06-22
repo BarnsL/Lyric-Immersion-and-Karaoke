@@ -83,7 +83,7 @@ if sys.platform == "win32":
         pass
 
 if getattr(sys, "frozen", False):
-    LYRICS_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "Desktop Karaoke" / "lyrics"
+    LYRICS_DIR = Path(sys.executable).parent / "lyrics"   # portable: next to the .exe
 else:
     LYRICS_DIR = Path(__file__).parent / "lyrics"
 
