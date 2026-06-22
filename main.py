@@ -433,6 +433,7 @@ class Overlay:
             artist, title = a.strip(), t.strip()
         self._cur_duration = duration
         self._health_attempts = 0
+        self.offset = 0.0          # fresh baseline; sound calibration sets it
 
         # Provisional: show the title/artist match instantly (so there's no
         # dead air) — but AUDIO is primary and confirms/overrides it below.
@@ -531,9 +532,9 @@ class Overlay:
             res = None
             try:
                 from recognize import recognize_playing
-                t, a = recognize_playing()
+                t, a, off, t_cap = recognize_playing()
                 if t:
-                    res = (t, a or "")
+                    res = (t, a or "", off, t_cap)
             except Exception:
                 res = None
             self._identify_result = ("done", res)
@@ -600,7 +601,18 @@ class Overlay:
                 # AUDIO IS AUTHORITATIVE: fetch the heard song and swap it in,
                 # overriding any (possibly wrong) title match. Doesn't re-key
                 # self._track, so detection won't loop.
-                title, artist = res
+                title, artist, offset, t_cap = res
+                # Audio-calibrated SYNC: Shazam's offset is the true song
+                # position; align our clock to it (fixes MV intros / drift).
+                if offset is not None and t_cap is not None:
+                    st = self.media.get()
+                    if st and st.get("status") == PLAYING:
+                        true_now = offset + (time.time() - t_cap)
+                        corr = true_now - st["position"]
+                        # only correct a real offset (e.g. MV intro); leave
+                        # already-accurate songs alone to avoid adding error
+                        if 1.2 < abs(corr) < 180:
+                            self.offset = round(corr, 2)
                 cached = self.index.match(artist, title, self._cur_duration)
                 if cached and self._file_valid(cached, self._cur_duration):
                     if cached != self._lyrics_path:
@@ -946,15 +958,19 @@ class Overlay:
         self.romaji_y = round(182 * s)
         self.en_y     = round(242 * s)
         # Scroll-through: staggered vertical lanes so consecutive lines sit at
-        # different heights instead of piling up at one level. Compact block.
+        # different heights instead of piling up at one level. The number of
+        # lanes is whatever the font size allows — up to 3.
         self.b_furi = round(22 * s)
         self.b_main = round(64 * s)
         self.b_rom  = round(128 * s)
         self.b_en   = round(166 * s)
-        self._lanes = 2
-        self._lane_gap = round(200 * s)
+        block_h = round(200 * s)
+        self._lane_gap = block_h + round(16 * s)
+        usable = self.sh - 80
+        fit = 1 + max(0, (usable - block_h) // self._lane_gap)
+        self._lanes = max(1, min(3, int(fit)))     # 3 lanes only if they fit
         if self.scroll_dir in ("lr", "rl"):
-            self.H = min(self.sh - 50, round(210 * s) + self._lane_gap * (self._lanes - 1))
+            self.H = min(usable, block_h + self._lane_gap * (self._lanes - 1))
         else:
             self.H = min(self.sh - 60, round(340 * s))
 
