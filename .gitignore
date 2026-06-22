@@ -23,3 +23,6 @@ lyrics/*.json
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Local UI preferences
+settings.json

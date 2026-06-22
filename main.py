@@ -42,6 +42,21 @@ except ImportError:
 
 BASE = Path(__file__).parent
 LYRICS_DIR = BASE / "lyrics"
+SETTINGS = BASE / "settings.json"
+
+
+def _load_settings():
+    try:
+        return json.loads(SETTINGS.read_text("utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_settings(data):
+    try:
+        SETTINGS.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 # ── Palette (21st.dev-inspired: clean, vivid, no muddy purple) ────────
 TRANSPARENT = "#0d0b14"   # dark chroma key → anti-aliased edges fade to shadow
@@ -292,13 +307,20 @@ class Overlay:
 
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        self.W, self.H = sw, 340
+        self.W, self.H, self.sh = sw, 340, sh
+
+        s = _load_settings()
+        self.opacity = float(s.get("opacity", 1.0))
+        self.position = s.get("position", "bottom")   # 'top' | 'bottom'
+        self.scroll_dir = s.get("scroll", "bl")        # 'tl'|'tr'|'bl'|'br'
+        self._anim_id = None
 
         self.root.overrideredirect(True)
-        self.root.geometry(f"{self.W}x{self.H}+0+{sh - self.H - 40}")
+        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
         self.root.configure(bg=TRANSPARENT)
         self.root.attributes("-topmost", True)
         self.root.attributes("-transparentcolor", TRANSPARENT)
+        self.root.attributes("-alpha", self.opacity)
         self.root.update_idletasks()
 
         hwnd = ctypes.windll.user32.GetAncestor(self.root.winfo_id(), 2) \
@@ -539,6 +561,7 @@ class Overlay:
     # ── drawing ──
 
     def _render(self, ln):
+        self._cancel_anim()
         self.cv.delete("all")
         self._kara = []
         pad = 64
@@ -567,6 +590,35 @@ class Overlay:
         if ln.en:
             draw_text(self.cv, pad, en_y, ln.en, EN_FONT, EN_C, anchor="w")
 
+        self._animate_in()
+
+    # ── entrance animation (scroll-in from chosen corner) ──
+
+    def _cancel_anim(self):
+        if self._anim_id:
+            try:
+                self.root.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+
+    def _animate_in(self):
+        d = self.scroll_dir
+        ox = -460 if "l" in d else 460          # slide from left / right
+        oy = -50 if "t" in d else 50            # and from above / below
+        self.cv.move("cur", ox, oy)
+        self._anim_step(ox, oy, 0)
+
+    def _anim_step(self, ox, oy, step):
+        steps = 20
+        if step >= steps:
+            self._anim_id = None
+            return
+        e0 = 1 - (1 - step / steps) ** 3
+        e1 = 1 - (1 - (step + 1) / steps) ** 3
+        self.cv.move("cur", -(e1 - e0) * ox, -(e1 - e0) * oy)
+        self._anim_id = self.root.after(16, self._anim_step, ox, oy, step + 1)
+
     def _karaoke(self, pos):
         if not self._kara:
             return
@@ -594,6 +646,30 @@ class Overlay:
 
     def reset_offset(self):
         self.offset = 0.0
+
+    # ── appearance (persisted) ──
+
+    def _geom_y(self):
+        return 40 if self.position == "top" else self.sh - self.H - 40
+
+    def _persist(self):
+        _save_settings({"opacity": self.opacity, "position": self.position,
+                        "scroll": self.scroll_dir})
+
+    def set_opacity(self, v):
+        self.opacity = max(0.15, min(1.0, v))
+        self.root.attributes("-alpha", self.opacity)
+        self._persist()
+
+    def set_position(self, p):
+        self.position = p
+        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.attributes("-topmost", True)
+        self._persist()
+
+    def set_scroll(self, d):
+        self.scroll_dir = d
+        self._persist()
 
     def toggle(self):
         if self.root.winfo_viewable():
@@ -678,9 +754,43 @@ def main():
         icon.stop()
         ov.root.after(0, ov.quit)
 
+    def _set_op(v):  return lambda *_: ov.root.after(0, lambda: ov.set_opacity(v))
+    def _set_pos(p): return lambda *_: ov.root.after(0, lambda: ov.set_position(p))
+    def _set_scr(d): return lambda *_: ov.root.after(0, lambda: ov.set_scroll(d))
+
+    def _op_item(label, v):
+        return pystray.MenuItem(label, _set_op(v), radio=True,
+                                checked=lambda i, v=v: abs(ov.opacity - v) < 0.02)
+
+    def _pos_item(label, p):
+        return pystray.MenuItem(label, _set_pos(p), radio=True,
+                                checked=lambda i, p=p: ov.position == p)
+
+    def _scr_item(label, d):
+        return pystray.MenuItem(label, _set_scr(d), radio=True,
+                                checked=lambda i, d=d: ov.scroll_dir == d)
+
+    opacity_menu = pystray.Menu(
+        _op_item("100%  (solid)", 1.0), _op_item("85%", 0.85),
+        _op_item("70%", 0.70), _op_item("55%", 0.55),
+        _op_item("40%  (faint — for games)", 0.40), _op_item("25%", 0.25),
+    )
+    position_menu = pystray.Menu(
+        _pos_item("Top of screen", "top"),
+        _pos_item("Bottom of screen", "bottom"),
+    )
+    scroll_menu = pystray.Menu(
+        _scr_item("Top-left",  "tl"), _scr_item("Top-right",  "tr"),
+        _scr_item("Bottom-left", "bl"), _scr_item("Bottom-right", "br"),
+    )
+
     menu = pystray.Menu(
         pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
         pystray.MenuItem("🎧  Identify by sound", _ident),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Opacity", opacity_menu),
+        pystray.MenuItem("Position", position_menu),
+        pystray.MenuItem("Scroll-in from", scroll_menu),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Sync  +0.3s  (lyrics earlier)", _n_plus),
         pystray.MenuItem("Sync  −0.3s  (lyrics later)", _n_minus),
