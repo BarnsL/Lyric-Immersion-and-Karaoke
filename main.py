@@ -312,7 +312,7 @@ class Overlay:
         s = _load_settings()
         self.opacity = float(s.get("opacity", 1.0))
         self.position = s.get("position", "bottom")   # 'top' | 'bottom'
-        self.scroll_dir = s.get("scroll", "bl")        # 'tl'|'tr'|'bl'|'br'
+        self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'
         self._anim_id = None
 
         self.root.overrideredirect(True)
@@ -604,20 +604,21 @@ class Overlay:
 
     def _animate_in(self):
         d = self.scroll_dir
-        ox = -460 if "l" in d else 460          # slide from left / right
-        oy = -50 if "t" in d else 50            # and from above / below
-        self.cv.move("cur", ox, oy)
-        self._anim_step(ox, oy, 0)
+        if d in ("none", "off", "stationary"):
+            return                               # appear in place, no motion
+        ox = 460 if "r" in d else -460           # horizontal only: from right / left
+        self.cv.move("cur", ox, 0)
+        self._anim_step(ox, 0)
 
-    def _anim_step(self, ox, oy, step):
+    def _anim_step(self, ox, step=0):
         steps = 20
         if step >= steps:
             self._anim_id = None
             return
         e0 = 1 - (1 - step / steps) ** 3
         e1 = 1 - (1 - (step + 1) / steps) ** 3
-        self.cv.move("cur", -(e1 - e0) * ox, -(e1 - e0) * oy)
-        self._anim_id = self.root.after(16, self._anim_step, ox, oy, step + 1)
+        self.cv.move("cur", -(e1 - e0) * ox, 0)
+        self._anim_id = self.root.after(16, self._anim_step, ox, step + 1)
 
     def _karaoke(self, pos):
         if not self._kara:
@@ -743,10 +744,9 @@ def main():
     LYRICS_DIR.mkdir(exist_ok=True)
     ov = Overlay(offset=offset)
 
-    def _n_plus(*_):  ov.root.after(0, lambda: ov.nudge(+0.3))
-    def _n_minus(*_): ov.root.after(0, lambda: ov.nudge(-0.3))
     def _reset(*_):   ov.root.after(0, ov.reset_offset)
     def _toggle(*_):  ov.root.after(0, ov.toggle)
+    def _nudge(d):    return lambda *_: ov.root.after(0, lambda: ov.nudge(d))
     def _refetch(*_): ov.root.after(0, ov.refetch)
     def _wrong(*_):   ov.root.after(0, ov.report_wrong)
     def _ident(*_):   ov.root.after(0, ov.identify_by_sound)
@@ -780,21 +780,27 @@ def main():
         _pos_item("Bottom of screen", "bottom"),
     )
     scroll_menu = pystray.Menu(
-        _scr_item("Top-left",  "tl"), _scr_item("Top-right",  "tr"),
-        _scr_item("Bottom-left", "bl"), _scr_item("Bottom-right", "br"),
+        _scr_item("Stationary (appear in place)", "none"),
+        _scr_item("Slide in from left", "left"),
+        _scr_item("Slide in from right", "right"),
+    )
+    sync_menu = pystray.Menu(
+        pystray.MenuItem("⏪  Lyrics earlier  +2.0s", _nudge(+2.0)),
+        pystray.MenuItem("⏪  Lyrics earlier  +0.5s", _nudge(+0.5)),
+        pystray.MenuItem("⏩  Lyrics later  −0.5s", _nudge(-0.5)),
+        pystray.MenuItem("⏩  Lyrics later  −2.0s", _nudge(-2.0)),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(lambda i: f"Reset  (now {ov.offset:+.1f}s)", _reset),
     )
 
     menu = pystray.Menu(
         pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
         pystray.MenuItem("🎧  Identify by sound", _ident),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),
         pystray.MenuItem("Opacity", opacity_menu),
         pystray.MenuItem("Position", position_menu),
-        pystray.MenuItem("Scroll-in from", scroll_menu),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Sync  +0.3s  (lyrics earlier)", _n_plus),
-        pystray.MenuItem("Sync  −0.3s  (lyrics later)", _n_minus),
-        pystray.MenuItem("Reset sync", _reset),
+        pystray.MenuItem("Scroll-in", scroll_menu),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Re-fetch lyrics", _refetch),
         pystray.MenuItem("Show / Hide", _toggle),
