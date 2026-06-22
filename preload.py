@@ -136,6 +136,17 @@ SONGS = [
     ("La Puerta Negra", "Los Tigres del Norte", True),
     ("Nieves de Enero", "Chalino Sánchez", True),
     ("El Rey", "Vicente Fernández", True),
+
+    # ── V.W.P (Virtual Witch Phenomenon / KAMITSUBAKI) — numbered MV set ──
+    ("電脳", "V.W.P", False), ("輪廻", "V.W.P", False), ("変身", "V.W.P", False),
+    ("言霊", "V.W.P", False), ("共鳴", "V.W.P", False), ("再会", "V.W.P", False),
+    ("魔女", "V.W.P", False), ("定命", "V.W.P", False), ("玩具", "V.W.P", False),
+    ("飛翔", "V.W.P", False), ("祭壇", "V.W.P", False), ("秘密", "V.W.P", False),
+    ("感情", "V.W.P", False), ("切札", "V.W.P", False), ("同盟", "V.W.P", False),
+    ("花束", "V.W.P", False), ("未遂", "V.W.P", False), ("強気", "V.W.P", False),
+    ("暁光", "V.W.P", False), ("真偽", "V.W.P", False), ("神話", "V.W.P", False),
+    ("愛詩", "V.W.P", False), ("追憶", "V.W.P", False), ("歌姫", "V.W.P", False),
+    ("欲望", "V.W.P", False), ("照射", "V.W.P", False), ("幻界", "V.W.P", False),
 ]
 
 
