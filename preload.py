@@ -175,6 +175,43 @@ SONGS = [
     ("ヒバナ", "DECO*27", False),
     ("愛言葉Ⅲ", "DECO*27", False),
     ("シンデレラ", "DECO*27", False),
+
+    # ── Hoshimachi Suisei (星街すいせい) ──
+    ("駆けろ", "Hoshimachi Suisei", False),
+    ("自己紹介", "Hoshimachi Suisei", False),
+    ("Bluerose", "Hoshimachi Suisei", False),
+    ("Andromeda", "Hoshimachi Suisei", False),
+    ("グラビティ", "Hoshimachi Suisei", False),
+    ("夜永唄", "Hoshimachi Suisei", False),
+    ("ノクターン", "Hoshimachi Suisei", False),
+    ("ミチヲユケ", "Hoshimachi Suisei", False),
+    ("七つの海よりキミの海", "Hoshimachi Suisei", False),
+    ("新星マーチ", "Hoshimachi Suisei", False),
+    ("王権神授説", "Hoshimachi Suisei", False),
+    ("天球、彗星は夜を跨いで", "Hoshimachi Suisei", False),
+    ("Awake", "Hoshimachi Suisei", False),
+    ("TELL ME", "Hoshimachi Suisei", False),
+
+    # ── Classic anime OPs / EDs ──
+    ("残酷な天使のテーゼ", "高橋洋子", False),
+    ("魂のルフラン", "高橋洋子", False),
+    ("創聖のアクエリオン", "AKINO", False),
+    ("God knows...", "平野綾", False),
+    ("ハレ晴レユカイ", "平野綾", False),
+    ("もってけ!セーラーふく", "泉こなた", False),
+    ("only my railgun", "fripSide", False),
+    ("そばかす", "JUDY AND MARY", False),
+    ("secret base ～君がくれたもの～", "ZONE", False),
+    ("again", "YUI", False),
+    ("ライオン", "May'n", False),
+    ("READY STEADY GO", "L'Arc-en-Ciel", False),
+    ("メリッサ", "Porno Graffitti", False),
+    ("1/3の純情な感情", "SIAM SHADE", False),
+    ("Don't say \"lazy\"", "桜高軽音部", False),
+    ("プラチナ", "坂本真綾", False),
+    ("鳥の詩", "Lia", False),
+    ("unravel", "TK from 凛として時雨", False),
+    ("紅蓮の弓矢", "Linked Horizon", False),
 ]
 
 

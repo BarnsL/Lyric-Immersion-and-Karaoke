@@ -17,6 +17,7 @@ import asyncio
 import ctypes
 from ctypes import wintypes
 import json
+import os
 import re
 import subprocess
 import sys
@@ -55,6 +56,46 @@ def _load_settings():
 def _save_settings(data):
     try:
         SETTINGS.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ── Start-with-Windows (Startup-folder shortcut) ─────────────────────
+
+def _startup_lnk():
+    return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
+            / "Start Menu" / "Programs" / "Startup" / "Desktop Karaoke.lnk")
+
+
+def startup_enabled():
+    return _startup_lnk().exists()
+
+
+def _psq(s):                       # quote a string for PowerShell
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def set_startup(enable):
+    lnk = _startup_lnk()
+    if not enable:
+        try:
+            lnk.unlink()
+        except Exception:
+            pass
+        return
+    if getattr(sys, "frozen", False):          # packaged .exe
+        target, args = sys.executable, ""
+    else:                                      # running from source
+        target = str(Path(sys.executable).with_name("pythonw.exe"))
+        args = f'"{BASE / "main.py"}"'
+    ps = (f"$W=New-Object -ComObject WScript.Shell;"
+          f"$S=$W.CreateShortcut({_psq(lnk)});"
+          f"$S.TargetPath={_psq(target)};$S.Arguments={_psq(args)};"
+          f"$S.WorkingDirectory={_psq(BASE)};$S.IconLocation={_psq(BASE / 'icon.ico')};"
+          f"$S.Save()")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, timeout=15)
     except Exception:
         pass
 
@@ -278,12 +319,9 @@ class LyricsIndex:
 # ── Rendering ────────────────────────────────────────────────────────
 
 def draw_text(cv, x, y, text, font, fill, anchor="center", tags="cur"):
-    """Crisp text with a thin outline + soft drop shadow. Returns fill id."""
-    for dx, dy in [(2, 3), (3, 2), (2, 2)]:                 # drop shadow
-        cv.create_text(x + dx, y + dy, text=text, font=font,
-                       fill=INK, anchor=anchor, tags=tags)
-    for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1),      # 1px outline
-                   (-1, 0), (1, 0), (0, -1), (0, 1)]:
+    """Outlined text, kept lightweight (5 items/char) so the slide animation
+    stays smooth. Returns the fill item id."""
+    for dx, dy in ((-2, -2), (2, -2), (-2, 2), (2, 2)):     # 4-corner outline
         cv.create_text(x + dx, y + dy, text=text, font=font,
                        fill=INK, anchor=anchor, tags=tags)
     return cv.create_text(x, y, text=text, font=font, fill=fill,
@@ -313,7 +351,9 @@ class Overlay:
         self.opacity = float(s.get("opacity", 1.0))
         self.position = s.get("position", "bottom")   # 'top' | 'bottom'
         self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'
+        self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
         self._anim_id = None
+        self._apply_scale()                            # sets fonts + layout + H
 
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
@@ -593,33 +633,32 @@ class Overlay:
         self._cancel_anim()
         self.cv.delete("all")
         self._kara = []   # list of per-line "tracks", each swept in sync
-        pad = 64
-        furi_y, main_y, romaji_y, en_y = 52, 102, 182, 242
+        pad = self.pad
 
         if ln.jp:
             chars, cx = [], pad
             for base, reading in split_furigana(ln.jp):
                 seg_start = cx
                 for ch in base:
-                    w = measure_text(self.cv, ch, JP_FONT)
+                    w = measure_text(self.cv, ch, self.JP_FONT)
                     if w <= 0:
                         continue
                     cxc = cx + w / 2
-                    fid = draw_text(self.cv, cxc, main_y, ch, JP_FONT, WHITE)
+                    fid = draw_text(self.cv, cxc, self.main_y, ch, self.JP_FONT, WHITE)
                     chars.append({"cx": cxc, "fill": fid, "last": WHITE})
                     cx += w
                 if reading:
-                    draw_text(self.cv, (seg_start + cx) / 2, furi_y,
-                              reading, FURI_FONT, FURI_C)
+                    draw_text(self.cv, (seg_start + cx) / 2, self.furi_y,
+                              reading, self.FURI_FONT, FURI_C)
                 cx += 6
             self._kara.append({"chars": chars, "left": pad, "right": cx,
                                "base": WHITE, "sung": SUNG})
 
         if ln.rm:
-            self._kara.append(self._char_track(ln.rm, romaji_y, ROMAJI_FONT,
+            self._kara.append(self._char_track(ln.rm, self.romaji_y, self.ROMAJI_FONT,
                                                ROMAJI_C, SUNG, pad))
         if ln.en:
-            self._kara.append(self._char_track(ln.en, en_y, EN_FONT,
+            self._kara.append(self._char_track(ln.en, self.en_y, self.EN_FONT,
                                                EN_C, SUNG, pad))
 
         self._animate_in()
@@ -688,7 +727,7 @@ class Overlay:
     def _hint(self, msg):
         self.cv.delete("all")
         self._kara = []
-        draw_text(self.cv, 64, self.H // 2, msg, HINT_FONT, DIM, anchor="w")
+        draw_text(self.cv, self.pad, self.H // 2, msg, self.HINT_FONT, DIM, anchor="w")
 
     # ── tray hooks ──
 
@@ -705,7 +744,7 @@ class Overlay:
 
     def _persist(self):
         _save_settings({"opacity": self.opacity, "position": self.position,
-                        "scroll": self.scroll_dir})
+                        "scroll": self.scroll_dir, "font_scale": self.font_scale})
 
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
@@ -725,6 +764,30 @@ class Overlay:
         self._cancel_anim()
         if self._kara:                # re-demo the entrance on the current line
             self._animate_in()
+        self._persist()
+
+    def _apply_scale(self):
+        s = self.font_scale
+        self.JP_FONT     = ("Yu Gothic UI", max(10, round(38 * s)), "bold")
+        self.FURI_FONT   = ("Yu Gothic UI", max(7,  round(17 * s)))
+        self.ROMAJI_FONT = ("Segoe UI Semibold", max(8, round(23 * s)))
+        self.EN_FONT     = ("Segoe UI", max(8, round(21 * s)))
+        self.HINT_FONT   = ("Segoe UI", max(8, round(15 * s)))
+        self.pad = 64
+        self.furi_y   = round(52 * s)
+        self.main_y   = round(102 * s)
+        self.romaji_y = round(182 * s)
+        self.en_y     = round(242 * s)
+        self.H = min(self.sh - 60, round(340 * s))
+
+    def set_font_scale(self, v):
+        self.font_scale = max(0.25, min(2.0, v))
+        self._apply_scale()
+        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.attributes("-topmost", True)
+        self.root.update_idletasks()
+        if self.idx >= 0 and self.lines:        # re-render current line at new size
+            self._render(self.lines[self.idx])
         self._persist()
 
     def toggle(self):
@@ -812,6 +875,8 @@ def main():
     def _set_op(v):  return lambda *_: ov.root.after(0, lambda: ov.set_opacity(v))
     def _set_pos(p): return lambda *_: ov.root.after(0, lambda: ov.set_position(p))
     def _set_scr(d): return lambda *_: ov.root.after(0, lambda: ov.set_scroll(d))
+    def _set_font(v): return lambda *_: ov.root.after(0, lambda: ov.set_font_scale(v))
+    def _toggle_startup(*_): set_startup(not startup_enabled())
 
     def _op_item(label, v):
         return pystray.MenuItem(label, _set_op(v), radio=True,
@@ -839,6 +904,12 @@ def main():
         _scr_item("Slide in from left", "left"),
         _scr_item("Slide in from right", "right"),
     )
+
+    def _font_item(pct):
+        v = pct / 100
+        return pystray.MenuItem(f"{pct}%", _set_font(v), radio=True,
+                                checked=lambda i, v=v: abs(ov.font_scale - v) < 0.01)
+    font_menu = pystray.Menu(*[_font_item(p) for p in range(25, 201, 25)])
     sync_menu = pystray.Menu(
         pystray.MenuItem("⏪  Lyrics earlier  +2.0s", _nudge(+2.0)),
         pystray.MenuItem("⏪  Lyrics earlier  +0.5s", _nudge(+0.5)),
@@ -854,8 +925,12 @@ def main():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),
         pystray.MenuItem("Opacity", opacity_menu),
+        pystray.MenuItem("Font size", font_menu),
         pystray.MenuItem("Position", position_menu),
         pystray.MenuItem("Scroll-in", scroll_menu),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Start with Windows", _toggle_startup,
+                         checked=lambda i: startup_enabled()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Re-fetch lyrics", _refetch),
         pystray.MenuItem("Show / Hide", _toggle),
