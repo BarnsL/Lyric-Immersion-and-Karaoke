@@ -874,7 +874,7 @@ class Overlay:
             rows.append({"chars": ec, "y": self.b_en, "font": fe, "base": EN_C})
             right = max(right, ex)
         return {"rows": rows, "furi": furi, "furi_font": ff, "furi_y": self.b_furi,
-                "w": int(right) + 8, "h": int(self.b_en + 28 * s) + 8}
+                "w": int(right) + 8, "h": self._block_h}
 
     def _paint_block(self, spec, frac):
         """Render the block to a PhotoImage with the sung portion highlighted."""
@@ -897,7 +897,7 @@ class Overlay:
         tag = f"blk{self._blk_seq}"
         spec = self._block_spec(i)
         photo = self._paint_block(spec, frac)
-        lane_y = (i % self._lanes) * self._lane_gap
+        lane_y = self._lane_top + (i % self._lanes) * self._lane_gap
         self.cv.create_image(0, lane_y, image=photo, anchor="nw", tags=(tag, "strm"))
         return {"idx": i, "tag": tag, "x": 0.0, "w": spec["w"], "img": True,
                 "spec": spec, "photo": photo, "sung_n": -1,
@@ -911,7 +911,7 @@ class Overlay:
         ln = self.lines[i]
         self._blk_seq += 1
         tag = f"blk{self._blk_seq}"
-        dy = (i % self._lanes) * self._lane_gap
+        dy = self._lane_top + (i % self._lanes) * self._lane_gap
         tracks, right = [], 0
         if ln.jp:
             chars, cx = [], 0
@@ -1177,17 +1177,21 @@ class Overlay:
         # Scroll-through: staggered vertical lanes so consecutive lines sit at
         # different heights instead of piling up at one level. The number of
         # lanes is whatever the font size allows — up to 3.
-        self.b_furi = round(22 * s)
-        self.b_main = round(64 * s)
-        self.b_rom  = round(128 * s)
-        self.b_en   = round(166 * s)
-        block_h = round(200 * s)
-        self._lane_gap = block_h + round(16 * s)
-        usable = self.sh - 80
-        fit = 1 + max(0, (usable - block_h) // self._lane_gap)
-        self._lanes = max(1, min(3, int(fit)))     # 3 lanes only if they fit
+        self.b_furi = round(26 * s)
+        self.b_main = round(70 * s)
+        self.b_rom  = round(132 * s)
+        self.b_en   = round(170 * s)
+        # _block_h is the full image height; spec uses the SAME value so a block
+        # never renders taller than its lane slot (was clipping at the bottom).
+        self._block_h = round(206 * s)
+        self._lane_top = round(8 * s)
+        self._lane_gap = self._block_h + round(14 * s)
+        usable = self.sh - 70
+        fit = 1 + max(0, (usable - self._lane_top - self._block_h) // self._lane_gap)
+        self._lanes = max(1, min(3, int(fit)))     # 3 lanes only if they fully fit
         if self.scroll_dir in ("lr", "rl"):
-            self.H = min(usable, block_h + self._lane_gap * (self._lanes - 1))
+            self.H = min(usable, self._lane_top + self._block_h
+                         + self._lane_gap * (self._lanes - 1) + round(14 * s))
         else:
             self.H = min(self.sh - 60, round(460 * s))   # room for wrapped lines
 
