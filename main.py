@@ -713,52 +713,79 @@ class Overlay:
     def _render(self, ln):
         self._cancel_anim()
         self.cv.delete("all")
-        self._kara = []   # list of per-line "tracks", each swept in sync
+        self._kara = []   # per-line "tracks" (index-based karaoke fill)
         pad = self.pad
+        max_w = self.W - 2 * pad
+        cur_y = 0.0
 
+        # ── Japanese (furigana over kanji); wrap at segment boundaries ──
         if ln.jp:
-            chars, cx = [], pad
+            jp_h, furi_h = self._text_h(self.JP_FONT), self._text_h(self.FURI_FONT)
+            line_h = jp_h + furi_h + 10
+            chars = []
+            cur_y += furi_h + jp_h / 2 + 6
+            cx = pad
             for base, reading in split_furigana(ln.jp):
+                seg_w = max(measure_text(self.cv, base, self.JP_FONT),
+                            measure_text(self.cv, reading, self.FURI_FONT) if reading else 0)
+                if cx + seg_w > pad + max_w and cx > pad:      # wrap underneath
+                    cx, cur_y = pad, cur_y + line_h
                 seg_start = cx
                 for ch in base:
                     w = measure_text(self.cv, ch, self.JP_FONT)
                     if w <= 0:
                         continue
-                    cxc = cx + w / 2
-                    fid = draw_text(self.cv, cxc, self.main_y, ch, self.JP_FONT, WHITE)
-                    chars.append({"cx": cxc, "fill": fid, "last": WHITE})
+                    fid = draw_text(self.cv, cx + w / 2, cur_y, ch, self.JP_FONT, WHITE)
+                    chars.append({"fill": fid, "last": WHITE})
                     cx += w
                 if reading:
-                    draw_text(self.cv, (seg_start + cx) / 2, self.furi_y,
+                    draw_text(self.cv, (seg_start + cx) / 2,
+                              cur_y - jp_h / 2 - furi_h / 2 - 2,
                               reading, self.FURI_FONT, FURI_C)
                 cx += 6
-            self._kara.append({"chars": chars, "left": pad, "right": cx,
-                               "base": WHITE, "sung": SUNG})
+            self._kara.append({"chars": chars, "base": WHITE, "sung": SUNG})
+            cur_y += jp_h / 2 + 14
 
         if ln.rm:
-            self._kara.append(self._char_track(ln.rm, self.romaji_y, self.ROMAJI_FONT,
-                                               ROMAJI_C, SUNG, pad))
+            chars, cur_y = self._wrap_row(ln.rm, cur_y, self.ROMAJI_FONT, ROMAJI_C, pad, max_w)
+            self._kara.append({"chars": chars, "base": ROMAJI_C, "sung": SUNG})
         if ln.en:
-            self._kara.append(self._char_track(ln.en, self.en_y, self.EN_FONT,
-                                               EN_C, SUNG, pad))
+            chars, cur_y = self._wrap_row(ln.en, cur_y, self.EN_FONT, EN_C, pad, max_w)
+            self._kara.append({"chars": chars, "base": EN_C, "sung": SUNG})
 
+        # anchor the whole block: near the top, or near the bottom of the window
+        dy = 28 if self.position == "top" else max(18, self.H - cur_y - 24)
+        self.cv.move("cur", 0, dy)
         self._animate_in()
 
-    def _char_track(self, text, y, font, base, sung, pad):
-        chars, cx = [], pad
-        sp = measure_text(self.cv, "n", font) * 0.5 or 6
-        for ch in text:
-            if ch == " ":
+    def _wrap_row(self, text, y, font, color, pad, max_w):
+        """Draw a text row, wrapping overflow onto lines underneath.
+        Returns (chars, next_y)."""
+        h = self._text_h(font)
+        line_h = h + 12
+        sp = measure_text(self.cv, " ", font) or h * 0.3
+        cy, cx, chars = y + h / 2 + 6, pad, []
+        latin = not _has_cjk(text)
+        for unit in (text.split(" ") if latin else list(text)):
+            uw = measure_text(self.cv, unit, font)
+            if cx + uw > pad + max_w and cx > pad:
+                cx, cy = pad, cy + line_h
+            for ch in unit:
+                w = measure_text(self.cv, ch, font)
+                if w <= 0:
+                    continue
+                fid = draw_text(self.cv, cx + w / 2, cy, ch, font, color)
+                chars.append({"fill": fid, "last": color})
+                cx += w
+            if latin:
                 cx += sp
-                continue
-            w = measure_text(self.cv, ch, font)
-            if w <= 0:
-                continue
-            cxc = cx + w / 2
-            fid = draw_text(self.cv, cxc, y, ch, font, base)
-            chars.append({"cx": cxc, "fill": fid, "last": base})
-            cx += w
-        return {"chars": chars, "left": pad, "right": cx, "base": base, "sung": sung}
+        return chars, cy + h / 2 + 14
+
+    def _text_h(self, font):
+        tid = self.cv.create_text(-9999, -9999, text="Aあ", font=font, anchor="nw")
+        bb = self.cv.bbox(tid)
+        self.cv.delete(tid)
+        return (bb[3] - bb[1]) if bb else 28
 
     # ── entrance animation (scroll-in from chosen corner) ──
 
