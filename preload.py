@@ -29,6 +29,17 @@ SONGS = [
     ("泡沫メイビー", "ReGLOSS", True),
     ("夢路らぶ", "ReGLOSS", True),
     ("シー・ユー・スーン", "ReGLOSS", True),
+    ("Flashpoint", "ReGLOSS", True),
+    ("シンメトリー", "ReGLOSS", True),
+    ("Midsummer Citrus", "ReGLOSS", False),
+
+    # ── FLOW GLOW (hololive DEV_IS 2nd gen) — group ──
+    ("MAKE IT, BREAK IT", "FLOW GLOW", True),
+    ("FG ROADSTER", "FLOW GLOW", True),
+    ("LOAD", "FLOW GLOW", True),
+    ("24K GOLD", "FLOW GLOW", True),
+    ("good enough", "FLOW GLOW", True),
+    ("stay by my side", "FLOW GLOW", True),
 
     # ── ReGLOSS — members (solo) ──
     ("DEAD-END", "火威青", True),

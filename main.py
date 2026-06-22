@@ -979,6 +979,8 @@ class Overlay:
             cx = center + d * v * ((ln.start + ln.end) / 2 - pos)
             if -1200 < cx < self.W + 1200:
                 want[i] = cx
+        if want:
+            self.cv.delete("hint")        # real lyrics showing → drop any stale hint
         have = {b["idx"] for b in self._stream}
         for i, cx in want.items():
             if i not in have:                       # spawn at absolute target
@@ -1050,7 +1052,8 @@ class Overlay:
         self.cv.delete("all")
         self._kara = []
         self._clear_stream()
-        draw_text(self.cv, self.pad, self.H // 2, msg, self.HINT_FONT, DIM, anchor="w")
+        draw_text(self.cv, self.pad, self.H // 2, msg, self.HINT_FONT, DIM,
+                  anchor="w", tags="hint")
 
     # ── tray hooks ──
 
@@ -1092,13 +1095,15 @@ class Overlay:
         self._persist()
 
     def git_backup(self):
-        """Commit + push the local library to git, if this folder is a repo
-        with a remote. Runs in the background; silently no-ops otherwise."""
+        """Commit + push ONLY the lyrics library, if this folder is a git repo
+        with a remote. Stages just lyrics/ (never code/settings), so in the
+        source repo (where lyrics are git-ignored) it harmlessly no-ops.
+        Runs in the background."""
         if not (_DATA / ".git").exists():
             return
 
         def work():
-            for args in (["add", "-A"],
+            for args in (["add", "--", "lyrics"],
                          ["commit", "-m", "Update lyric library"],
                          ["push"]):
                 try:
