@@ -256,29 +256,35 @@ _KATA_RUN = re.compile(r"[ァ-ヶ]{2,}ー?|[ァ-ヶ][ァ-ヶー]+")
 def _segment_katakana(text: str) -> str:
     """Insert spaces into run-together katakana English so the romanizer can
     resolve each loanword: ベイビーアイラブユー → 'ベイビー アイ ラブ ユー'.
-    Only splits at known gairaigo boundaries; unknown katakana (names,
-    onomatopoeia) is left alone for normal phonetic romaji."""
+
+    A run is split ONLY when it tiles ENTIRELY into known gairaigo words. That
+    safety rule is essential: ノー ("no") is a known word, but ノート ("note")
+    must NOT be broken into ノー+ト — and it isn't, because the leftover ト
+    leaves no full tiling, so ノート is left intact for cutlet ("note"). Same
+    for アイス (ice), アイドル (idol), etc."""
     from gairaigo import KATAKANA_EN
     keys = KATAKANA_EN
 
-    def split_run(run: str) -> str:
-        i, parts = 0, []
-        while i < len(run):
-            for j in range(min(len(run), i + 10), i, -1):
-                if run[i:j] in keys and (j - i) >= 2:
-                    parts.append(run[i:j])
-                    i = j
-                    break
-            else:
-                # accrete unknown chars onto the previous/next chunk
-                if parts and parts[-1] not in keys:
-                    parts[-1] += run[i]
-                else:
-                    parts.append(run[i])
-                i += 1
-        return " ".join(parts)
+    def full_tiling(run: str):
+        # DP: shortest sequence of dict words that covers the whole run, else None
+        n = len(run)
+        best = [None] * (n + 1)
+        best[0] = []
+        for i in range(n):
+            if best[i] is None:
+                continue
+            for j in range(i + 2, min(n, i + 10) + 1):
+                if run[i:j] in keys and (best[j] is None
+                                         or len(best[j]) > len(best[i]) + 1):
+                    best[j] = best[i] + [run[i:j]]
+        return best[n]
 
-    return _KATA_RUN.sub(lambda m: split_run(m.group(0)), text)
+    def repl(m):
+        run = m.group(0)
+        parts = full_tiling(run)
+        return " ".join(parts) if parts else run
+
+    return _KATA_RUN.sub(repl, text)
 
 
 def _kakasi():
