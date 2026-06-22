@@ -1,8 +1,8 @@
 # 🎤 Desktop Karaoke
 
 **A transparent, always-on-top karaoke overlay that floats synced, annotated
-lyrics over whatever you're playing — built for learning Japanese (and Chinese,
-Korean, and Spanish) by singing along.**
+lyrics over whatever you're playing — built for learning Japanese (plus Chinese,
+Korean, Spanish, German, and Russian) by singing along.**
 
 Play a song in **Spotify, YouTube, or any app** that talks to Windows' media
 controls, and Desktop Karaoke pulls the **real playback position** and streams
