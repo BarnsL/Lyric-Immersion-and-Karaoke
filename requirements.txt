@@ -4,3 +4,4 @@ pykakasi>=2.2
 winsdk>=1.0
 syncedlyrics>=1.0
 deep-translator>=1.11
+spotipy>=2.23

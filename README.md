@@ -67,6 +67,21 @@ python preload.py --translate-all   # also bake English into every song (slow)
 Re-running only fetches what's missing, so it doubles as a "top up my library"
 command.
 
+## Sync your Spotify playlists
+
+Pre-cache every track in all your playlists so nothing fetches mid-song:
+
+```bash
+# One-time: create an app at https://developer.spotify.com/dashboard
+# (redirect URI http://localhost:8888/callback), copy the Client ID, then:
+python sync_playlists.py --client-id YOUR_CLIENT_ID   # authorize once in browser
+python sync_playlists.py                              # later runs (token cached)
+python sync_playlists.py --liked                      # also include Liked Songs
+```
+
+Uses Spotify's official OAuth (PKCE) — the tool never sees your password, and
+your token/Client ID stay local (git-ignored).
+
 ---
 
 ## How it looks under the hood

@@ -10,6 +10,10 @@ env/
 *.log
 preload.log
 
+# Spotify auth — local secrets / tokens, never commit
+spotify_config.json
+.spotify_cache
+
 # Cached song lyrics are copyrighted third-party content — not redistributed.
 # Run `python preload.py` (or just play music) to build your own local library.
 lyrics/*.json
