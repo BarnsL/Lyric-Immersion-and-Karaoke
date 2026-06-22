@@ -396,6 +396,8 @@ class Overlay:
         self._scroll_x = self._scroll_start = self._scroll_end = 0
         self._stream = []          # scroll-through ticker: live line blocks
         self._blk_seq = 0
+        self._pil_fonts = {}       # cache of PIL fonts for image blocks
+        self._use_img = True       # render scroll blocks as images (fast); auto-off on failure
         self._apply_scale()                            # sets fonts + layout + H
 
         self.root.overrideredirect(True)
@@ -813,6 +815,94 @@ class Overlay:
         self.cv.move("cur", ox, 0)
         self._anim_step(ox, 0)
 
+    # ── image-based scroll blocks (fast: scroll one bitmap, not 100+ items) ──
+
+    def _pil_font(self, kind, size):
+        key = (kind, size)
+        f = self._pil_fonts.get(key)
+        if f is None:
+            for name in _PIL_FONTS[kind]:
+                try:
+                    f = ImageFont.truetype(name, size)
+                    break
+                except Exception:
+                    continue
+            f = f or ImageFont.load_default()
+            self._pil_fonts[key] = f
+        return f
+
+    def _img_row(self, text, font, x0):
+        """[(char, left_x), …] and the row's right edge, for a plain row."""
+        chars, cx = [], x0
+        latin = not _has_cjk(text)
+        sp = font.getlength(" ") or font.size * 0.3
+        for ch in text:
+            if ch == " ":
+                cx += sp
+                continue
+            chars.append((ch, cx))
+            cx += font.getlength(ch)
+        return chars, cx
+
+    def _block_spec(self, i):
+        """Lay out line i for image rendering (positions only, no drawing)."""
+        ln = self.lines[i]
+        s = self.font_scale
+        fj = self._pil_font("jp", max(10, round(38 * s)))
+        ff = self._pil_font("furi", max(7, round(17 * s)))
+        fr = self._pil_font("rm", max(8, round(23 * s)))
+        fe = self._pil_font("en", max(8, round(21 * s)))
+        x0, right, rows, furi = 8, 8, [], []
+        if ln.jp:
+            chars, cx = [], x0
+            for base, reading in split_furigana(ln.jp):
+                seg = cx
+                for ch in base:
+                    chars.append((ch, cx))
+                    cx += fj.getlength(ch)
+                if reading:
+                    furi.append((reading, (seg + cx) / 2))
+                cx += 6 * s
+            rows.append({"chars": chars, "y": self.b_main, "font": fj, "base": WHITE})
+            right = max(right, cx)
+        if ln.rm:
+            rc, rx = self._img_row(ln.rm, fr, x0)
+            rows.append({"chars": rc, "y": self.b_rom, "font": fr, "base": ROMAJI_C})
+            right = max(right, rx)
+        if ln.en:
+            ec, ex = self._img_row(ln.en, fe, x0)
+            rows.append({"chars": ec, "y": self.b_en, "font": fe, "base": EN_C})
+            right = max(right, ex)
+        return {"rows": rows, "furi": furi, "furi_font": ff, "furi_y": self.b_furi,
+                "w": int(right) + 8, "h": int(self.b_en + 28 * s) + 8}
+
+    def _paint_block(self, spec, frac):
+        """Render the block to a PhotoImage with the sung portion highlighted."""
+        img = Image.new("RGBA", (max(1, spec["w"]), max(1, spec["h"])), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        sw = max(1, round(2 * self.font_scale))
+        for text, cx in spec["furi"]:
+            d.text((cx, spec["furi_y"]), text, font=spec["furi_font"], fill=FURI_C,
+                   anchor="mm", stroke_width=1, stroke_fill=INK)
+        for row in spec["rows"]:
+            n = int(frac * len(row["chars"]) + 0.5)
+            for idx, (ch, cx) in enumerate(row["chars"]):
+                col = SUNG if idx < n else row["base"]
+                d.text((cx, row["y"]), ch, font=row["font"], fill=col, anchor="lm",
+                       stroke_width=sw, stroke_fill=INK)
+        return ImageTk.PhotoImage(img)
+
+    def _render_img_block(self, i, frac):
+        self._blk_seq += 1
+        tag = f"blk{self._blk_seq}"
+        spec = self._block_spec(i)
+        photo = self._paint_block(spec, frac)
+        lane_y = (i % self._lanes) * self._lane_gap
+        self.cv.create_image(0, lane_y, image=photo, anchor="nw", tags=(tag, "strm"))
+        return {"idx": i, "tag": tag, "x": 0.0, "w": spec["w"], "img": True,
+                "spec": spec, "photo": photo, "sung_n": -1,
+                "nchars": max((len(r["chars"]) for r in spec["rows"]), default=0)}
+
     # ── continuous scroll-through ticker (multiple lines on screen) ──
 
     def _render_block(self, i):
@@ -892,7 +982,10 @@ class Overlay:
         have = {b["idx"] for b in self._stream}
         for i, cx in want.items():
             if i not in have:                       # spawn at absolute target
-                b = self._render_block(i)
+                ln = self.lines[i]
+                dur = ln.end - ln.start
+                frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
+                b = self._spawn_block(i, frac)
                 self.cv.move(b["tag"], (cx - b["w"] / 2) - b["x"], 0)
                 self._stream.append(b)
         for b in self._stream[:]:
@@ -902,10 +995,24 @@ class Overlay:
                 continue
             ln = self.lines[b["idx"]]
             dur = ln.end - ln.start
-            if ln.start <= pos < ln.end and dur > 0:
-                self._highlight_block(b, (pos - ln.start) / dur)   # current fills
+            frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
+            if b.get("img"):
+                n = int(frac * b["nchars"] + 0.5)
+                if n != b["sung_n"]:                 # re-paint only when fill advances
+                    b["sung_n"] = n
+                    b["photo"] = self._paint_block(b["spec"], frac)
+                    self.cv.itemconfig(b["tag"], image=b["photo"])
             else:
-                self._highlight_block(b, 0.0)
+                self._highlight_block(b, frac)
+
+    def _spawn_block(self, i, frac):
+        """One image block (fast) if possible, else fall back to text items."""
+        if self._use_img:
+            try:
+                return self._render_img_block(i, frac)
+            except Exception:
+                self._use_img = False     # disable images if rendering fails
+        return self._render_block(i)
 
     def _clear_stream(self):
         for b in self._stream:
