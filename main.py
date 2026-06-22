@@ -923,10 +923,10 @@ class Overlay:
             return
         frac = max(0.0, min(1.0, (pos - ln.start) / dur))
         for tr in self._kara:                       # JP, romaji, English in lockstep
-            sweep = tr["left"] + frac * (tr["right"] - tr["left"])
+            n = int(frac * len(tr["chars"]) + 0.5)  # index-based: works across wraps
             base, sung = tr["base"], tr["sung"]
-            for k in tr["chars"]:
-                col = sung if k["cx"] <= sweep else base
+            for i, k in enumerate(tr["chars"]):
+                col = sung if i < n else base
                 if k["last"] != col:
                     self.cv.itemconfig(k["fill"], fill=col)
                     k["last"] = col
@@ -1074,7 +1074,7 @@ class Overlay:
         if self.scroll_dir in ("lr", "rl"):
             self.H = min(usable, block_h + self._lane_gap * (self._lanes - 1))
         else:
-            self.H = min(self.sh - 60, round(340 * s))
+            self.H = min(self.sh - 60, round(460 * s))   # room for wrapped lines
 
     def set_font_scale(self, v):
         self.font_scale = max(0.25, min(2.0, v))
