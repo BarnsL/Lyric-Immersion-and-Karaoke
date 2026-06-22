@@ -35,11 +35,19 @@ except Exception:
 
 try:
     import pystray
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pystray", "Pillow"])
     import pystray
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
+
+# Windows font files for PIL block rendering (first that loads wins).
+_PIL_FONTS = {
+    "jp":   ("YuGothB.ttc", "meiryob.ttc", "msgothic.ttc", "yugothb.ttf"),
+    "furi": ("YuGothR.ttc", "meiryo.ttc", "msgothic.ttc", "yugothr.ttf"),
+    "rm":   ("seguisb.ttf", "segoeui.ttf"),
+    "en":   ("segoeui.ttf",),
+}
 
 BASE = Path(__file__).parent
 # Portable: keep the library + settings right next to the .exe so the whole
