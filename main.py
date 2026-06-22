@@ -132,6 +132,11 @@ PLAYING = 4  # GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing
 SCROLL_SPEED = 220.0  # px/sec — constant, comfortable scroll-through pace
 
 BROWSER_HINTS = ("youtube", "brave", "chrome", "msedge", "edge", "firefox", "opera", "mozilla")
+_CJK_RE = re.compile(r"[一-鿿㐀-䶿ぁ-んァ-ヶー가-힣]")
+
+
+def _has_cjk(s):
+    return bool(_CJK_RE.search(s or ""))
 
 
 # ── Real playback position via Windows Media Transport Controls ───────
@@ -622,20 +627,30 @@ class Overlay:
                     if st and st.get("status") == PLAYING:
                         true_now = offset + (time.time() - t_cap)
                         corr = true_now - st["position"]
-                        if abs(corr - self.offset) > 1.5 and abs(corr) < 180:
-                            self.offset = round(corr, 2)
-                # Swap lyrics only when the HEARD song changes. Same song →
-                # timing-only. Different song → a new track inside this video
-                # (concert / DJ set / livestream) → load its lyrics.
+                        diff = corr - self.offset
+                        if abs(corr) < 180:
+                            if abs(diff) > 3:
+                                self.offset = round(corr, 2)            # snap (new song / intro)
+                            elif abs(diff) > 0.3:
+                                self.offset = round(self.offset + 0.6 * diff, 2)  # ease out drift
+                # Swap lyrics only when the HEARD song changes (concert / live).
                 if (title, artist) != self._sound_song:
                     self._sound_song = (title, artist)
-                    cached = self.index.match(artist, title, self._cur_duration)
+                    # Shazam often romanizes JP titles ("Kira" for 綺羅), which
+                    # fetches the wrong song. If the player's own title is CJK,
+                    # fetch with THAT original script instead.
+                    g_artist, g_title = (self._track or ("", ""))
+                    if _has_cjk(g_title) and not _has_cjk(title):
+                        f_artist, f_title = (g_artist or artist), g_title
+                    else:
+                        f_artist, f_title = artist, title
+                    cached = self.index.match(f_artist, f_title, self._cur_duration)
                     if cached and self._file_valid(cached, self._cur_duration):
                         if cached != self._lyrics_path:
                             self.load(cached)
                         self._maybe_translate()
                     else:
-                        self._start_fetch(artist, title, self._cur_duration)
+                        self._start_fetch(f_artist, f_title, self._cur_duration)
 
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
