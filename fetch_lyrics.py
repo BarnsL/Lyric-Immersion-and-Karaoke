@@ -158,9 +158,15 @@ def romanize(text: str, lang: str) -> str:
 
 def parse_lrc_text(lrc: str) -> list[dict]:
     raw = []
-    for m in re.finditer(r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)", lrc):
-        t = int(m.group(1)) * 60 + float(m.group(2))
-        raw.append({"time": round(t, 2), "text": m.group(3).strip()})
+    for line in lrc.splitlines():
+        tags = re.findall(r"\[(\d+):(\d+(?:\.\d+)?)\]", line)
+        if not tags:
+            continue
+        # strip ALL [mm:ss] line tags and <mm:ss> word tags from the text
+        text = re.sub(r"\[\d+:\d+(?:\.\d+)?\]", "", line)
+        text = re.sub(r"<\d+:\d+(?:\.\d+)?>", "", text).strip()
+        for mm, ss in tags:                       # a line may repeat at several times
+            raw.append({"time": round(int(mm) * 60 + float(ss), 2), "text": text})
     raw.sort(key=lambda x: x["time"])
 
     out = []

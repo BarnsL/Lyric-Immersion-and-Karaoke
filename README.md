@@ -27,6 +27,15 @@ the **actual song position** from the Windows `GlobalSystemMediaTransportControl
 session (the same data behind the media keys), so it tracks scrubbing, pausing,
 and song changes for *any* player — and freezes when the music does.
 
+## Identify by **sound**, not just the title
+
+Titles lie — covers, mislabeled uploads, and DJ mixes all defeat name-based
+matching. Desktop Karaoke can listen to the actual audio (WASAPI loopback) and
+ask Shazam what's really playing, then fetch *those* lyrics. It does this
+automatically when a match looks wrong, and on demand from the tray
+(**🎧 Identify by sound** / **⚑ Wrong lyrics**). Only raw audio is sent to
+Shazam — no title, account, or device info.
+
 ## Getting the *right* lyrics (error detection & correction)
 
 Common titles match the wrong song easily, and aggregators sometimes return
@@ -38,10 +47,12 @@ the wrong language entirely. Every fetch is **verified** before it's accepted:
 - **Language** — a CJK-titled song must come back in that script, so
   hallucinated / mistranslated lyrics are thrown out.
 
-At runtime the overlay re-checks the cached file against the playing song and
-re-fetches if it doesn't fit. Hit a bad match anyway? The tray menu's
-**"⚑ Wrong lyrics — fix this song"** bins it and fetches a correct one. You can
-also sweep the whole library with `python validate.py --purge`.
+At runtime the overlay runs a **periodic health-check**: if the lyrics stop
+fitting the song (wrong duration, lyrics ending too early, unverified match) it
+identifies the track by sound and self-corrects — so it lands on the right song
+eventually even if the first guess was wrong. The tray
+**"⚑ Wrong lyrics — fix this song"** forces that correction immediately, and
+`python validate.py --purge` sweeps the whole library.
 
 ## Lyrics coverage
 

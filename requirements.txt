@@ -7,3 +7,5 @@ deep-translator>=1.11
 spotipy>=2.23
 pypinyin>=0.49
 hangul-romanize>=0.1.0
+soundcard>=0.4.3
+shazamio>=0.4

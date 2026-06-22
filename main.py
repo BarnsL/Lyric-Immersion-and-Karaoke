@@ -178,12 +178,20 @@ class Line:
     en: str = ""
 
 
+_TS_RE = re.compile(r"\[\d+:\d+(?:\.\d+)?\]|<\d+:\d+(?:\.\d+)?>")
+
+
+def _clean(s):
+    return _TS_RE.sub("", s).strip()
+
+
 def load_lyrics(path):
     data = json.loads(Path(path).read_text("utf-8"))
     meta = data.get("meta", {})
     lines = [
         Line(start=e["t"][0], end=e["t"][1],
-             jp=e.get("jp", ""), rm=e.get("rm", ""), en=e.get("en", ""))
+             jp=_clean(e.get("jp", "")), rm=_clean(e.get("rm", "")),
+             en=_clean(e.get("en", "")))
         for e in data.get("lines", [])
     ]
     return meta, lines
@@ -314,11 +322,17 @@ class Overlay:
         self._translate_result = None
         self._translating = None
         self._cur_duration = None
+        self._verified = False
+        self._health_attempts = 0
+        self._identifying = False
+        self._identify_result = None
+        self._identified = None      # track tuple we've already sound-checked
 
         self.index = LyricsIndex()
         self.media = MediaWatcher()
         self._hint("Waiting for music…")
         self.root.after(300, self._tick)
+        self.root.after(7000, self._health_check)
 
     # ── per-track ──
 
@@ -328,6 +342,7 @@ class Overlay:
             a, t = title.split(" - ", 1)
             artist, title = a.strip(), t.strip()
         self._cur_duration = duration
+        self._health_attempts = 0
 
         path = self.index.match(artist, title, duration)
         if path and self._file_valid(path, duration):
@@ -338,8 +353,14 @@ class Overlay:
         # nothing valid cached → fetch (and overwrite a bad file if present)
         self.lines, self._lyrics_path, self.idx = [], None, -1
         self._kara = []
+        self._verified = False
         self._hint(f"♪ {title} — fetching lyrics…")
         self._start_fetch(artist, title, duration)
+
+    def _mark_verified(self):
+        md = self.meta.get("duration")
+        self._verified = bool(md and self._cur_duration
+                              and abs(md - self._cur_duration) <= 12)
 
     def _file_valid(self, path, duration):
         try:
@@ -381,6 +402,58 @@ class Overlay:
 
         threading.Thread(target=work, daemon=True).start()
 
+    # ── audio identification (detect by SOUND, not title) ──
+
+    def _start_identify(self):
+        if self._identifying:
+            return
+        self._identifying = True
+        self._identified = self._track
+
+        def work():
+            res = None
+            try:
+                from recognize import recognize_playing
+                t, a = recognize_playing()
+                if t:
+                    res = (t, a or "")
+            except Exception:
+                res = None
+            self._identify_result = ("done", res)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── periodic health check: notice a bad match mid-song and self-heal ──
+
+    def _health_check(self):
+        try:
+            st = self.media.get()
+            if (st and st.get("status") == PLAYING and self._track
+                    and not self._identifying and self._health_attempts < 4):
+                if self._suspect(st):
+                    self._health_attempts += 1
+                    # Identify by sound — the authoritative correction.
+                    self._start_identify()
+        finally:
+            self.root.after(9000, self._health_check)
+
+    def _suspect(self, st):
+        """Signs the current lyrics don't belong to what's actually playing."""
+        dur, pos = st.get("duration"), st.get("position", 0)
+        if not self.lines:
+            # browser/cover with no match yet, and we haven't sound-checked it
+            return self._identified != self._track
+        md = self.meta.get("duration")
+        last_end = self.lines[-1].end if self.lines else 0
+        if dur and md and abs(md - dur) > 12:
+            return True                                   # wrong version/song
+        if dur and last_end and last_end < dur * 0.6 and pos > last_end + 8 \
+                and pos < dur - 5:
+            return True                                   # lyrics don't cover song
+        if not self._verified and self._identified != self._track:
+            return True                                   # unverified → confirm by ear
+        return False
+
     def _consume_async(self):
         if self._fetch_result:
             key, p = self._fetch_result
@@ -397,10 +470,27 @@ class Overlay:
             self._translate_result = None
             if ok and Path(path) == Path(self._lyrics_path or ""):
                 self.load(path, keep_idx=True)
+        if self._identify_result:
+            _, res = self._identify_result
+            self._identify_result = None
+            self._identifying = False
+            if res:
+                title, artist = res
+                # Re-key the track to the sound-identified song and fetch it.
+                self._track = (artist, title)
+                self._fetch_key = None
+                cached = self.index.match(artist, title, self._cur_duration)
+                if cached and self._file_valid(cached, self._cur_duration):
+                    self.load(cached)
+                else:
+                    self.lines, self.idx, self._kara = [], -1, []
+                    self._hint(f"🎧 {title} — {artist}")
+                    self._start_fetch(artist, title, self._cur_duration)
 
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
         self._lyrics_path = Path(path)
+        self._mark_verified()
         if not keep_idx:
             self.idx = -1
             self._kara = []
@@ -519,7 +609,7 @@ class Overlay:
             self._on_track_change(self._track, self._cur_duration)
 
     def report_wrong(self):
-        """User-driven correction: bin the current (wrong) lyrics and re-fetch."""
+        """User-driven correction: bin the wrong lyrics and identify by SOUND."""
         if self._lyrics_path:
             try:
                 Path(self._lyrics_path).unlink(missing_ok=True)
@@ -529,9 +619,14 @@ class Overlay:
         self._fetch_key = None
         self._lyrics_path = None
         self.lines, self.idx, self._kara = [], -1, []
-        if self._track:
-            self._hint("Re-fetching correct lyrics…")
-            self._on_track_change(self._track, self._cur_duration)
+        self._identified = None
+        self._hint("🎧 Listening to identify the song…")
+        self._start_identify()
+
+    def identify_by_sound(self):
+        self._identified = None
+        self._hint("🎧 Listening to identify the song…")
+        self._start_identify()
 
     def quit(self):
         self.media.stop()
@@ -578,12 +673,14 @@ def main():
     def _toggle(*_):  ov.root.after(0, ov.toggle)
     def _refetch(*_): ov.root.after(0, ov.refetch)
     def _wrong(*_):   ov.root.after(0, ov.report_wrong)
+    def _ident(*_):   ov.root.after(0, ov.identify_by_sound)
     def _quit(icon, *_):
         icon.stop()
         ov.root.after(0, ov.quit)
 
     menu = pystray.Menu(
         pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
+        pystray.MenuItem("🎧  Identify by sound", _ident),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Sync  +0.3s  (lyrics earlier)", _n_plus),
         pystray.MenuItem("Sync  −0.3s  (lyrics later)", _n_minus),
