@@ -129,6 +129,7 @@ HINT_FONT   = ("Segoe UI", 15)
 
 _FURI_RE = re.compile(r"([一-鿿㐀-䶿々][一-鿿㐀-䶿々ぁ-ゖァ-ヺー]*)\(([ぁ-ゖァ-ヺー]+)\)")
 PLAYING = 4  # GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing
+SCROLL_SPEED = 220.0  # px/sec — constant, comfortable scroll-through pace
 
 BROWSER_HINTS = ("youtube", "brave", "chrome", "msedge", "edge", "firefox", "opera", "mozilla")
 
@@ -366,6 +367,8 @@ class Overlay:
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
         self._anim_id = None
         self._scroll_x = self._scroll_start = self._scroll_end = 0
+        self._stream = []          # scroll-through ticker: live line blocks
+        self._blk_seq = 0
         self._apply_scale()                            # sets fonts + layout + H
 
         self.root.overrideredirect(True)
@@ -601,6 +604,8 @@ class Overlay:
         if not keep_idx:
             self.idx = -1
             self._kara = []
+            self._clear_stream()
+            self.cv.delete("all")
 
     # ── main loop ──
 
@@ -625,12 +630,17 @@ class Overlay:
             return
 
         pos = state["position"] + self.offset
+
+        if self.scroll_dir in ("lr", "rl"):       # continuous scroll-through
+            self._ticker_update(pos)
+            self.root.after(16, self._tick)
+            return
+
         new = -1
         for i, ln in enumerate(self.lines):
             if ln.start <= pos < ln.end:
                 new = i
                 break
-
         if new != self.idx:
             self.idx = new
             if new >= 0:
@@ -639,10 +649,7 @@ class Overlay:
                 self.cv.delete("all")
                 self._kara = []
         elif new >= 0:
-            if self.scroll_dir in ("lr", "rl"):
-                self._scroll_update(pos)      # song-driven scroll-through
-            else:
-                self._karaoke(pos)
+            self._karaoke(pos)
 
         self.root.after(16, self._tick)   # ~60fps for tight, on-time sweeping
 
@@ -710,50 +717,98 @@ class Overlay:
 
     def _animate_in(self):
         d = self.scroll_dir
-        if d in ("lr", "rl"):
-            self._setup_scroll()                 # song-driven scroll-through
-            return
-        if d in ("none", "off", "stationary"):
-            return                               # appear in place, no motion
+        if d in ("lr", "rl", "none", "off", "stationary"):
+            return                               # scroll handled by the ticker
         ox = 460 if d == "right" else -460       # slide in from right / left, once
         self.cv.move("cur", ox, 0)
         self._anim_step(ox, 0)
 
-    def _setup_scroll(self):
-        """Place the line off the entry edge; _scroll_update drives it across
-        over the line's own time window (so it never despawns mid-scroll)."""
-        bbox = self.cv.bbox("cur")
-        if not bbox:
-            self._scroll_start = self._scroll_end = self._scroll_x = 0
-            return
-        gl, gr = bbox[0], bbox[2]
-        if self.scroll_dir == "rl":              # right → left
-            self._scroll_start = self.W - gl + 30
-            self._scroll_end = -gr - 30
-        else:                                    # lr, left → right
-            self._scroll_start = -gr - 30
-            self._scroll_end = self.W - gl + 30
-        self.cv.move("cur", self._scroll_start, 0)
-        self._scroll_x = self._scroll_start
+    # ── continuous scroll-through ticker (multiple lines on screen) ──
 
-    def _scroll_update(self, pos):
-        if not self._kara:
-            return
-        ln = self.lines[self.idx]
-        dur = ln.end - ln.start
-        if dur <= 0:
-            return
-        frac = max(0.0, min(1.0, (pos - ln.start) / dur))
-        target = self._scroll_start + frac * (self._scroll_end - self._scroll_start)
-        self.cv.move("cur", target - self._scroll_x, 0)
-        self._scroll_x = target
-        for tr in self._kara:                    # progressive highlight by frac
+    def _render_block(self, i):
+        """Draw line i's layers at x-origin 0 under a unique tag; return block."""
+        ln = self.lines[i]
+        self._blk_seq += 1
+        tag = f"blk{self._blk_seq}"
+        tracks, right = [], 0
+        if ln.jp:
+            chars, cx = [], 0
+            for base, reading in split_furigana(ln.jp):
+                seg = cx
+                for ch in base:
+                    w = measure_text(self.cv, ch, self.JP_FONT)
+                    if w <= 0:
+                        continue
+                    fid = draw_text(self.cv, cx + w / 2, self.main_y, ch,
+                                    self.JP_FONT, WHITE, tags=tag)
+                    chars.append({"fill": fid, "last": WHITE})
+                    cx += w
+                if reading:
+                    draw_text(self.cv, (seg + cx) / 2, self.furi_y, reading,
+                              self.FURI_FONT, FURI_C, tags=tag)
+                cx += 6
+            tracks.append({"chars": chars, "base": WHITE, "sung": SUNG})
+            right = max(right, cx)
+        for text, y, font, col in ((ln.rm, self.romaji_y, self.ROMAJI_FONT, ROMAJI_C),
+                                   (ln.en, self.en_y, self.EN_FONT, EN_C)):
+            if not text:
+                continue
+            chars, cx = [], 0
+            sp = measure_text(self.cv, "n", font) * 0.5 or 6
+            for ch in text:
+                if ch == " ":
+                    cx += sp
+                    continue
+                w = measure_text(self.cv, ch, font)
+                if w <= 0:
+                    continue
+                fid = draw_text(self.cv, cx + w / 2, y, ch, font, col, tags=tag)
+                chars.append({"fill": fid, "last": col})
+                cx += w
+            tracks.append({"chars": chars, "base": col, "sung": SUNG})
+            right = max(right, cx)
+        return {"idx": i, "tag": tag, "x": 0.0, "w": right, "tracks": tracks}
+
+    def _highlight_block(self, b, frac):
+        for tr in b["tracks"]:
             k = int(frac * len(tr["chars"]) + 0.5)
-            for i, c in enumerate(tr["chars"]):
-                col = tr["sung"] if i < k else tr["base"]
+            for j, c in enumerate(tr["chars"]):
+                col = tr["sung"] if j < k else tr["base"]
                 if c["last"] != col:
                     self.cv.itemconfig(c["fill"], fill=col)
                     c["last"] = col
+
+    def _ticker_update(self, pos):
+        center, v = self.W / 2, SCROLL_SPEED
+        d = 1 if self.scroll_dir == "rl" else -1
+        want = {}
+        for i, ln in enumerate(self.lines):
+            cx = center + d * v * ((ln.start + ln.end) / 2 - pos)
+            if -1500 < cx < self.W + 1500:
+                want[i] = cx
+        have = {b["idx"] for b in self._stream}
+        for i in want:
+            if i not in have:
+                self._stream.append(self._render_block(i))
+        for b in self._stream[:]:
+            if b["idx"] in want:
+                left = want[b["idx"]] - b["w"] / 2
+                self.cv.move(b["tag"], left - b["x"], 0)
+                b["x"] = left
+                ln = self.lines[b["idx"]]
+                dur = ln.end - ln.start
+                if ln.start <= pos < ln.end and dur > 0:
+                    self._highlight_block(b, (pos - ln.start) / dur)  # current line fills
+                else:
+                    self._highlight_block(b, 0.0)                      # others at base color
+            else:
+                self.cv.delete(b["tag"])
+                self._stream.remove(b)
+
+    def _clear_stream(self):
+        for b in self._stream:
+            self.cv.delete(b["tag"])
+        self._stream = []
 
     def _anim_step(self, ox, step=0):
         steps = 20
@@ -785,6 +840,7 @@ class Overlay:
     def _hint(self, msg):
         self.cv.delete("all")
         self._kara = []
+        self._clear_stream()
         draw_text(self.cv, self.pad, self.H // 2, msg, self.HINT_FONT, DIM, anchor="w")
 
     # ── tray hooks ──
@@ -820,8 +876,10 @@ class Overlay:
     def set_scroll(self, d):
         self.scroll_dir = d
         self._cancel_anim()
-        if self.idx >= 0 and self.lines:   # re-render to reset positions + mode
-            self._render(self.lines[self.idx])
+        self._clear_stream()
+        self.cv.delete("all")
+        self._kara = []
+        self.idx = -1                      # next tick repaints in the new mode
         self._persist()
 
     def _apply_scale(self):
