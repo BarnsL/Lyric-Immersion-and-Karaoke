@@ -23,10 +23,13 @@ while it runs.
   segmented correctly — 今生きてる → 今(いま)生き *"ima ikite"*, not *"konjou"*.
   Katakana English is recovered as English (ベイビーアイラブユー → *"baby I love
   you"*), not spelled out phonetically.
-- **Chinese → pinyin** and **Korean → romaja**, detected per song. Korean and
-  Chinese render with proper fonts, so nothing turns into □ boxes.
-- **English translation** for Japanese / Chinese / Korean / **Spanish** songs
-  (including corridos), translated in context for natural results.
+- **Chinese → pinyin**, **Korean → romaja**, and **Russian → Latin
+  transliteration**, detected per song. Every script renders with a font that
+  has its glyphs, so nothing turns into □ boxes — even mixed-language lines.
+- **English translation** for Japanese / Chinese / Korean / **Spanish /
+  German / Russian** songs (corridos, Rammstein, t.A.T.u. …), translated in
+  context for natural results. Songs are often multilingual — each part is
+  romanized and translated on its own.
 - **Karaoke fill** that sweeps each line at singing speed, kept in time by the
   **real song position** — not a guess from when the app launched.
 - **Identify by sound.** When a title is wrong (covers, mislabeled uploads, DJ
@@ -96,13 +99,18 @@ right after a song starts so the timing locks within ~25 seconds. That
 auto-corrects YouTube MV intros, catches drift, and follows **concert / live
 videos** that contain many songs back-to-back.
 
-### Gets the *right* lyrics
-Common titles match the wrong song easily, so every fetch is **verified** before
-it's accepted — by song **duration**, by **artist**, and by **language** (a
-CJK-titled song must come back in that script). A periodic health-check notices
-if the lyrics stop fitting and re-identifies by sound, so it lands on the right
-song even if the first guess was off. Force a correction any time with the tray's
-**⚑ Wrong lyrics**, or sweep the whole library with `python validate.py --purge`.
+### Gets the *right* lyrics (sound is the authority)
+Titles are unreliable — two songs by the same artist share a vibe, MV titles are
+messy, and covers lie. So matching is **paranoid and sound-led**: a cached title
+is accepted only if it's an exact or near-exact match (never a loose substring,
+so a *different* track by the same artist is never grabbed), and **every few
+seconds the song is re-checked by ear** — if what's heard doesn't match the
+loaded lyrics, they're corrected on the spot. Force a correction any time with
+the tray's **⚑ Wrong lyrics**, or sweep the whole library with
+`python validate.py --purge`.
+
+Every one of these decisions is written to a **log** (`karaoke.log`) you (or an
+agent) can read — see [Automation](#-automation--local-api) below.
 
 ### Never bare, never boxed
 Readings are added **per line by each line's own script**, so a Japanese line
@@ -173,6 +181,30 @@ your token / Client ID stay local (git-ignored).
 
 ---
 
+## 🤖 Automation & local API
+
+Desktop Karaoke runs a tiny HTTP server on **`127.0.0.1:8765`** (localhost only —
+never the network; toggle it in the tray) so an agent or script can see what it's
+doing and drive it:
+
+| Method & path | What it does |
+|---------------|--------------|
+| `GET /status` | now-playing, the matched song, sync offset, current line |
+| `GET /logs?n=200` | the last N log lines (every match/sound/swap decision) |
+| `GET /lyrics` | the full loaded, annotated lyric lines |
+| `POST /identify` | re-identify the song by **sound** now |
+| `POST /wrong` | mark the current lyrics wrong → re-identify + re-fetch |
+| `POST /reindex` | rescan the local library |
+
+```bash
+curl http://127.0.0.1:8765/status
+curl -X POST http://127.0.0.1:8765/identify   # "that's the wrong song — listen again"
+```
+
+It also writes a rolling log to **`karaoke.log`** (next to the app) recording
+every track change, title‑vs‑sound match, correction, and sync adjustment — so
+when something looks off you can see exactly *why* it chose what it chose.
+
 ## 📁 Project structure
 
 | File | Role |
@@ -180,6 +212,7 @@ your token / Client ID stay local (git-ignored).
 | `main.py` | The overlay: transparent click-through window, media watcher, renderer, tray menu |
 | `fetch_lyrics.py` | Multi-provider fetch + verification + furigana / romaji / translation |
 | `recognize.py` | Identify the playing song by **sound** (loopback capture → Shazam) |
+| `api.py` | The local HTTP API (status / logs / identify) for agents & scripts |
 | `gairaigo.py` | Katakana → English loanword table (so ベイビー → "baby") |
 | `character.py` | The optional dancing on-screen companion |
 | `preload.py` | Bulk-build the local lyric library from a curated list |

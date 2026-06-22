@@ -198,6 +198,10 @@ call; lanes + block height adapt per song.
 | Companion | Optional tray-toggled dancing character themed to the artist | `character.py`, `main.py` |
 | Spaces | `to_furigana` preserves whitespace (fugashi dropped it); cache re-spaced | `fetch_lyrics.py` `to_furigana` |
 | Perf | PhotoImage paste-in-place, 0.15s poll, measure_text cache, idle char fps | `main.py`, `character.py` |
+| Matching | Title match is strict + scored (no loose same-artist grabs); sound is the authority and re-checks every ~20s and self-corrects | `main.py` `LyricsIndex.match`, `_consume_async` |
+| Automation | Local HTTP API + rolling `karaoke.log` of every decision | `api.py`, `main.py` |
+| Languages | German + Russian (Cyrillic transliteration + translation); per-line CJK font on rm/en rows kills mixed-line □ boxes; whitespace-safe furigana | `fetch_lyrics.py`, `main.py` |
+| Polish | All subprocess calls windowless (no flashing terminals) | `main.py` |
 | Docs | Word-level finding, candidates, this file | `fetch_lyrics.py` header, `RESEARCH.md` |
 
 Everything else researched (word-level providers, GPU backend, event-driven

@@ -128,6 +128,7 @@ else:
 _HANGUL = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏]")
 _KANA   = re.compile(r"[぀-ゟ゠-ヿ]")
 _HAN    = re.compile(r"[一-鿿㐀-䶿々]")
+_CYRILLIC = re.compile(r"[а-яё]", re.I)
 _KANJI  = r"[一-鿿㐀-䶿々]"
 _JP_RE  = re.compile(r"[ぁ-んァ-ヶー一-鿿々]")
 _CREDIT_RE = re.compile(
@@ -173,11 +174,38 @@ def _is_spanish(text: str) -> bool:
     return len(words & _ES_WORDS) >= 2
 
 
+# German: umlauts / ß are a strong signal; otherwise common function words.
+_DE_DIA = re.compile(r"[äöüß]", re.I)
+_DE_WORDS = {
+    "und", "ich", "nicht", "das", "ist", "ein", "eine", "der", "die", "den",
+    "dem", "du", "wir", "ihr", "sie", "mit", "auf", "für", "von", "zu", "im",
+    "sich", "auch", "war", "sind", "haben", "wird", "werden", "kann", "mein",
+    "dein", "dich", "mich", "uns", "wenn", "aber", "doch", "noch", "schon",
+    "nur", "über", "ohne", "alles", "nichts", "immer", "wieder", "mehr", "ja",
+    "nein", "herz", "liebe", "nacht", "leben", "welt", "feuer", "engel",
+    "will", "wollen", "wollte", "kommt", "kommen", "geht", "gehen", "sehen",
+    "weiter", "warum", "deine", "meine", "keine", "wie", "wo", "was", "wer",
+    "hast", "habe", "bist", "weil", "dann", "hier", "sehr", "gut", "böse",
+    "sonne", "regen", "wasser", "blut", "tod", "angst", "schmerz", "weiß",
+}
+
+
+def _is_german(text: str) -> bool:
+    if _DE_DIA.search(text):
+        return True
+    words = set(re.findall(r"[a-zäöüß]+", text.lower()))
+    return len(words & _DE_WORDS) >= 2
+
+
 def detect_lang(text: str) -> str:
-    """Coarse language of a string/lyric by dominant script / markers."""
+    """Coarse language of a string/lyric by dominant script / markers →
+    ja|ko|zh|ru|es|de|other."""
     hang = len(_HANGUL.findall(text))
     kana = len(_KANA.findall(text))
     han = len(_HAN.findall(text))
+    cyr = len(_CYRILLIC.findall(text))
+    if cyr and cyr >= max(kana, han, hang):
+        return "ru"
     if hang and hang >= kana:
         return "ko"
     if kana:
@@ -186,6 +214,8 @@ def detect_lang(text: str) -> str:
         return "zh"
     if _is_spanish(text):
         return "es"
+    if _is_german(text):
+        return "de"
     return "other"
 
 
@@ -374,11 +404,36 @@ def to_furigana(text: str) -> str:
     return "".join(out)
 
 
+# Cyrillic → Latin (BGN/PCGN-ish) for a readable Russian transliteration.
+_RU_MAP = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def _translit_ru(text: str) -> str:
+    out = []
+    for ch in text:
+        low = ch.lower()
+        if low in _RU_MAP:
+            r = _RU_MAP[low]
+            out.append((r[0].upper() + r[1:]) if ch.isupper() and r else r)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def romanize(text: str, lang: str) -> str:
     """Romanize text for the given language: Japanese → Hepburn romaji (fugashi +
     cutlet, katakana English recovered as English), Chinese → pinyin, Korean →
-    romaja. Returns '' on failure or unsupported language."""
+    romaja, Russian → Latin transliteration. Returns '' on failure or an
+    unsupported language (German/Spanish/English are already Latin)."""
     try:
+        if lang == "ru":
+            return _translit_ru(text)
         if lang == "ja":
             if _jp_engine():
                 try:
@@ -631,7 +686,7 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
         tr = _make_translator()
     except ImportError:
         return 0
-    whole = song_lang in ("ja", "ko", "zh", "es")
+    whole = song_lang in ("ja", "ko", "zh", "es", "de", "ru")
 
     def want(ln):
         if only_missing and ln.get("en", "").strip():
@@ -640,9 +695,9 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
         if not raw.strip():
             return False
         ll = detect_lang(raw)
-        if ll in ("ja", "ko", "zh", "es"):
+        if ll in ("ja", "ko", "zh", "es", "de", "ru"):
             return True
-        return whole and ll == "other"     # Spanish line w/o accents, etc.
+        return whole and ll == "other"     # Spanish/German line w/o markers, etc.
 
     want_set = {i for i, ln in enumerate(lines) if want(ln)}
     if not want_set:
@@ -710,8 +765,10 @@ def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict
             else:
                 ln["jp"] = to_furigana(raw)
                 ln["rm"] = romanize(raw, "ja")
+        elif ll == "ru":
+            ln["rm"] = romanize(raw, "ru")          # Cyrillic → Latin reading
         else:
-            ln["rm"] = ""  # Spanish / English / other — shown as-is, no romaji
+            ln["rm"] = ""  # Spanish / German / English — shown as-is, no romaji
     if translate:
         _translate_lines(lines, lang)
     return lines

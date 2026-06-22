@@ -35,6 +35,7 @@ Both are just starting points — tweak anything afterward.
 | **Scroll-through speed** | Slow / Medium / Fast / Very fast (continuous mode only). |
 | **Performance** | *Smooth* (60fps, full outline) or *Performance* (30fps, light outline). |
 | **Dancing character** | On/off. A small companion themed to the current song's artist that dances while music plays. Drag to move it; click it to make it hop. Drop a `characters/<artist>.png` next to the app to use your own image for that artist. |
+| **Local API (agent control)** | On/off. A localhost-only HTTP server on `127.0.0.1:8765` so an agent or script can read what's playing and drive it (`/status`, `/logs`, `/identify`, `/wrong`). Never exposed to the network. See the README's *Automation* section. |
 | **Start with Windows** | Launch automatically at login. |
 | **Show / Hide**, **Re-fetch lyrics**, **Quit** | Self-explanatory. |
 

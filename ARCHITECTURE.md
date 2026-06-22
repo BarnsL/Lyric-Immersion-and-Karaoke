@@ -21,8 +21,14 @@ plus a `pystray` tray menu.
   `GlobalSystemMediaTransportControls` for `{title, artist, status, position,
   duration, source}`; extrapolates position between polls. `.get()` / `.stop()`.
 - **`clean_title(title, source)`** — strip "- YouTube", brackets, "Official MV"…
-- **`LyricsIndex`** — in-memory index of `lyrics/*.json` for instant matching.
-  `.match(artist, title, duration)` (duration-guarded), `.refresh()`, `.add()`.
+- **`LyricsIndex`** — in-memory index of `lyrics/*.json`. `.match(artist, title,
+  duration)` is **title-driven and paranoid**: a candidate is accepted only on an
+  exact or ≥60%-overlap title match (never a loose substring), so a different
+  song by the same artist is never grabbed; returns None when unsure → the caller
+  identifies by **sound**. `.refresh()`, `.add()`.
+- **Logging** — `log` (rotating `karaoke.log`) records every track change, the
+  title-vs-sound match, corrections, and sync adjustments. Readable via the API's
+  `/logs` so a human or agent can see *why* a song/lyric was chosen.
 - **`load_lyrics` / `split_furigana` / `draw_text` / `measure_text`** — IO &
   rendering helpers. `draw_text` honours the perf mode's outline weight.
 - **Fonts (`_PIL_FONTS`, `_TK_MAIN_FONT`, `_script_of`)** — per-script so text
@@ -36,6 +42,12 @@ plus a `pystray` tray menu.
   mid-song made it jump). Content is positioned *inside* via `_lane_y0`.
 - **`Character`** (`character.py`) — optional tray-toggled dancing companion
   themed to the detected artist (see that file's header).
+- **`api.py`** — optional localhost HTTP API (`127.0.0.1:8765`) exposing
+  `/status`, `/logs`, `/lyrics` and `POST /identify` · `/wrong` · `/reindex` so
+  an agent can observe and drive the app. Mutations are marshalled onto the Tk
+  thread via `root.after`.
+- All `subprocess` calls (git, PowerShell, pip) run with `CREATE_NO_WINDOW` so no
+  console window flashes.
 - **`Overlay`** — the window. Notable methods:
   - lifecycle: `__init__`, `run`, `quit`, `_tick` (the ~60fps loop)
   - matching/fetch: `_on_track_change`, `_start_fetch`, `_consume_async`,

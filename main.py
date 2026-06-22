@@ -30,6 +30,10 @@ from pathlib import Path
 
 from character import Character
 
+# Run every subprocess (git, PowerShell, pip) with NO console window — otherwise
+# Windows flashes a black cmd window each time the app shells out.
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0   # CREATE_NO_WINDOW
+
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(0)
 except Exception:
@@ -39,7 +43,8 @@ try:
     import pystray
     from PIL import Image, ImageDraw, ImageFont, ImageTk
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pystray", "Pillow"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pystray", "Pillow"],
+                          creationflags=_NO_WINDOW)
     import pystray
     from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -84,6 +89,26 @@ else:
 _DATA.mkdir(parents=True, exist_ok=True)
 LYRICS_DIR = _DATA / "lyrics"
 SETTINGS = _DATA / "settings.json"
+LOG_FILE = _DATA / "karaoke.log"
+
+# ── Logging ──────────────────────────────────────────────────────────
+# A rolling log of what the app is doing — track changes, title vs. sound
+# matches, swaps, sync corrections, errors — so a human OR an automated agent
+# can see WHY a given song/lyric was chosen (read it via the API's /logs, or the
+# file directly). Kept small (rotates at ~256 KB).
+import logging
+from logging.handlers import RotatingFileHandler
+
+log = logging.getLogger("karaoke")
+log.setLevel(logging.INFO)
+try:
+    _h = RotatingFileHandler(LOG_FILE, maxBytes=256_000, backupCount=1,
+                             encoding="utf-8")
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s",
+                                      "%H:%M:%S"))
+    log.addHandler(_h)
+except Exception:
+    pass
 
 
 def _resource(name):
@@ -146,7 +171,7 @@ def set_startup(enable):
           f"$S.Save()")
     try:
         subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                       capture_output=True, timeout=15)
+                       capture_output=True, timeout=15, creationflags=_NO_WINDOW)
     except Exception:
         pass
 
@@ -177,6 +202,15 @@ _CJK_RE = re.compile(r"[一-鿿㐀-䶿ぁ-んァ-ヶー가-힣]")
 def _has_cjk(s):
     """True if the string contains any CJK or Hangul character."""
     return bool(_CJK_RE.search(s or ""))
+
+
+_NORM_RE = re.compile(r"[^0-9a-z぀-ヿ一-鿿가-힣]+")
+
+
+def _norm_title(s):
+    """Normalize a title/artist for comparison: lowercase, keep only letters,
+    digits, and CJK/kana/Hangul (drops spaces, punctuation, feat. credits)."""
+    return _NORM_RE.sub("", (s or "").lower())
 
 
 # ── Real playback position via Windows Media Transport Controls ───────
@@ -365,6 +399,7 @@ class LyricsIndex:
                 "path": p,
                 "title": lt,
                 "core": re.sub(r"\s*[\(（].*?[\)）]", "", lt).strip(),
+                "artist": m.get("artist") or "",
                 "dur": m.get("duration"),
             })
         self.entries = entries
@@ -375,24 +410,45 @@ class LyricsIndex:
         self.refresh()
 
     def match(self, artist, title, duration=None):
-        query = f"{artist} {title}".lower()
-        tl = (title or "").lower()
-        fallback = None
+        """Find the cached song whose TITLE matches `title` confidently.
+
+        Matching is **title-driven, not artist-driven**, and paranoid: a
+        candidate is accepted only if its title equals the query, or one title
+        contains ≥60% of the other. So a *different* song by the same artist is
+        never grabbed (the bug where another ReGLOSS track matched). Duration
+        breaks ties and rejects wrong-length versions; artist is only a mild
+        tiebreaker. Returns None when nothing is confident — the caller then
+        identifies by **sound**."""
+        qt = _norm_title(title)
+        qa = _norm_title(artist)
+        if not qt:
+            return None
+        best, best_score = None, 0
         for e in self.entries:
-            lt, core = e["title"], e["core"]
-            hit = (
-                (lt and lt in query)
-                or (core and len(core) > 2 and core in query)
-                or (core and len(core) > 2 and core in tl)
-            )
-            if not hit:
+            ct = _norm_title(e["core"]) or _norm_title(e["title"])
+            if not ct:
                 continue
-            # duration guard: same title but clearly different length → skip
-            if duration and e["dur"] and abs(e["dur"] - duration) > 12:
-                fallback = fallback  # keep looking for a better-length match
+            if ct == qt:
+                score = 100
+            elif ct in qt or qt in ct:
+                short, lng = sorted((ct, qt), key=len)
+                cover = len(short) / max(1, len(lng))
+                if cover < 0.6:                  # weak substring → reject (paranoid)
+                    continue
+                score = 60 + int(30 * cover)
+            else:
                 continue
-            return e["path"]
-        return fallback
+            if duration and e["dur"]:
+                score += 8 if abs(e["dur"] - duration) <= 12 else -40
+            if qa and _norm_title(e["artist"]) == qa:
+                score += 5
+            if score > best_score:
+                best, best_score = e["path"], score
+        if best and best_score >= 60:
+            log.info("title-match %r -> %s (score %d)", title, best.name, best_score)
+            return best
+        log.info("no confident title-match for %r (best %d); will use sound", title, best_score)
+        return None
 
 
 # ── Rendering ────────────────────────────────────────────────────────
@@ -484,9 +540,11 @@ class Overlay:
         self.scroll_speed = float(s.get("scroll_speed", SCROLL_SPEED))
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
         self.perf = s.get("perf", "smooth")            # 'smooth' | 'fast'
-        self.recal_secs = int(s.get("recal_secs", 30))  # auto re-sync interval (0=off)
+        self.recal_secs = int(s.get("recal_secs", 20))  # re-check by sound often (0=off)
         self.git_sync = bool(s.get("git_sync", False))  # push new songs to git
         self.character_on = bool(s.get("character", False))  # dancing companion
+        self.api_on = bool(s.get("api", True))         # local agent-control API
+        self._api = None
         self._fps = 16
         self._last_pos = 0.0
         self._strm_rem = 0.0
@@ -545,6 +603,13 @@ class Overlay:
         self.character = Character(self.root, _DATA)
         if self.character_on:
             self.character.set_enabled(True)
+        if self.api_on:
+            try:
+                from api import start_api
+                self._api = start_api(self, LOG_FILE)
+            except Exception as e:
+                log.info("API failed to start: %s", e)
+        log.info("started (recal %ss, api %s)", self.recal_secs, self.api_on)
         self._hint("Waiting for music…")
         self.root.after(300, self._tick)
         self.root.after(7000, self._health_check)
@@ -563,6 +628,7 @@ class Overlay:
         self._health_attempts = 0
         self.offset = 0.0          # fresh baseline; sound calibration sets it
         self._sound_song = None    # new video → re-identify by ear
+        log.info("track change: %r / %r (dur %s)", title, artist, duration)
 
         # Provisional: show the title/artist match instantly (so there's no
         # dead air) — but AUDIO is primary and confirms/overrides it below.
@@ -608,6 +674,19 @@ class Overlay:
         except Exception:
             return True
 
+    @staticmethod
+    def _titles_match(a, b):
+        """True if two titles refer to the same song (exact, or one contains
+        ≥60% of the other after normalization). Used to check whether the loaded
+        lyrics match what was heard by sound."""
+        na, nb = _norm_title(a), _norm_title(b)
+        if not na or not nb:
+            return False
+        if na == nb:
+            return True
+        short, lng = sorted((na, nb), key=len)
+        return short in lng and len(short) / max(1, len(lng)) >= 0.6
+
     def _maybe_translate(self):
         # Self-heal a loaded song in the background: add romaji to any
         # Japanese/CJK line missing it, and translate any line that should have
@@ -618,7 +697,10 @@ class Overlay:
             return
         cjk = [ln for ln in self.lines if ln.jp.strip() and _has_cjk(ln.jp)]
         need_rm = any(not ln.rm.strip() for ln in cjk)
-        want_en = (self.lines if self.meta.get("lang") == "es" else cjk)
+        # non-English Latin/Cyrillic songs (Spanish, German, Russian) should have
+        # every line translated; CJK songs only their CJK lines.
+        whole = self.meta.get("lang") in ("es", "de", "ru")
+        want_en = (self.lines if whole else cjk)
         want_en = [ln for ln in want_en if ln.jp.strip()]
         have_en = sum(1 for ln in want_en if ln.en.strip())
         if need_rm or (want_en and have_en < len(want_en) * 0.5):
@@ -801,26 +883,37 @@ class Overlay:
                                 self.offset = round(corr, 2)            # snap to a clearly real offset (intro / new song)
                             elif abs(diff) > 0.15:
                                 self.offset = round(self.offset + 0.8 * diff, 2)  # converge fast, smooth Shazam noise
-                # Swap lyrics only when the HEARD song changes (concert / live).
-                if (title, artist) != self._sound_song:
-                    self._sound_song = (title, artist)
-                    self._fast_calib = max(self._fast_calib, 2)  # new song → re-lock fast
+                # SOUND IS THE AUTHORITY. Shazam often romanizes JP titles
+                # ("Kira" for 綺羅), so when the player's own title is CJK keep
+                # that original script for fetching/matching.
+                g_artist, g_title = (self._track or ("", ""))
+                if _has_cjk(g_title) and not _has_cjk(title):
+                    f_artist, f_title = (g_artist or artist), g_title
+                else:
+                    f_artist, f_title = artist, title
+                heard = (f_title, f_artist)
+                # Paranoid self-correction: if the loaded lyrics don't match the
+                # song we just HEARD, they're wrong — fix them (this is what
+                # catches a wrong same-artist title match).
+                loaded_ok = bool(self.lines) and self._titles_match(
+                    self.meta.get("title", ""), f_title)
+                log.info("heard %r / %r | loaded %r | match=%s",
+                         f_title, f_artist, self.meta.get("title", ""), loaded_ok)
+                if not loaded_ok:
+                    self._sound_song = heard
+                    self._fast_calib = max(self._fast_calib, 2)
                     self._arm_recal(7)
-                    # Shazam often romanizes JP titles ("Kira" for 綺羅), which
-                    # fetches the wrong song. If the player's own title is CJK,
-                    # fetch with THAT original script instead.
-                    g_artist, g_title = (self._track or ("", ""))
-                    if _has_cjk(g_title) and not _has_cjk(title):
-                        f_artist, f_title = (g_artist or artist), g_title
-                    else:
-                        f_artist, f_title = artist, title
                     cached = self.index.match(f_artist, f_title, self._cur_duration)
                     if cached and self._file_valid(cached, self._cur_duration):
                         if cached != self._lyrics_path:
+                            log.info("correcting -> cached %s", cached.name)
                             self.load(cached)
                         self._maybe_translate()
                     else:
+                        log.info("correcting -> fetching %r / %r", f_title, f_artist)
                         self._start_fetch(f_artist, f_title, self._cur_duration)
+                elif heard != self._sound_song:
+                    self._sound_song = heard
 
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
@@ -1034,12 +1127,18 @@ class Overlay:
             rows.append({"chars": chars, "y": self.b_main, "font": fj, "base": WHITE})
             right = max(right, cx)
         if ln.rm:
-            rc, rx = self._img_row(ln.rm, fr, x0)
-            rows.append({"chars": rc, "y": self.b_rom, "font": fr, "base": ROMAJI_C})
+            # if a romaji/translation row contains CJK (a mixed-language line),
+            # use a CJK-capable font so it doesn't render as □ boxes
+            frow = (self._pil_font(_script_of(ln.rm, self.meta.get("lang")),
+                                   max(8, round(23 * s))) if _has_cjk(ln.rm) else fr)
+            rc, rx = self._img_row(ln.rm, frow, x0)
+            rows.append({"chars": rc, "y": self.b_rom, "font": frow, "base": ROMAJI_C})
             right = max(right, rx)
         if ln.en:
-            ec, ex = self._img_row(ln.en, fe, x0)
-            rows.append({"chars": ec, "y": self.b_en, "font": fe, "base": EN_C})
+            erow = (self._pil_font(_script_of(ln.en, self.meta.get("lang")),
+                                   max(8, round(21 * s))) if _has_cjk(ln.en) else fe)
+            ec, ex = self._img_row(ln.en, erow, x0)
+            rows.append({"chars": ec, "y": self.b_en, "font": erow, "base": EN_C})
             right = max(right, ex)
         return {"rows": rows, "furi": furi, "furi_font": ff, "furi_y": self.b_furi,
                 "w": int(right) + 8, "h": self._block_h}
@@ -1317,6 +1416,24 @@ class Overlay:
         self.character.set_enabled(self.character_on)
         self._persist()
 
+    def set_api(self, on):
+        """Start/stop the local agent-control API (127.0.0.1:8765)."""
+        self.api_on = bool(on)
+        if self.api_on and not self._api:
+            try:
+                from api import start_api
+                self._api = start_api(self, LOG_FILE)
+                log.info("API on http://127.0.0.1:8765")
+            except Exception as e:
+                log.info("API failed to start: %s", e)
+        elif not self.api_on and self._api:
+            try:
+                self._api.shutdown()
+            except Exception:
+                pass
+            self._api = None
+        self._persist()
+
     def git_backup(self):
         """Commit + push ONLY the lyrics library, if this folder is a git repo
         with a remote. Stages just lyrics/ (never code/settings), so in the
@@ -1334,7 +1451,8 @@ class Overlay:
                          ["push"]):
                 try:
                     subprocess.run(["git", "-C", str(_DATA), *args],
-                                   capture_output=True, timeout=90)
+                                   capture_output=True, timeout=90,
+                                   creationflags=_NO_WINDOW)
                 except Exception:
                     return
         threading.Thread(target=work, daemon=True).start()
@@ -1344,7 +1462,7 @@ class Overlay:
                         "scroll": self.scroll_dir, "font_scale": self.font_scale,
                         "scroll_speed": self.scroll_speed, "perf": self.perf,
                         "recal_secs": self.recal_secs, "git_sync": self.git_sync,
-                        "character": self.character_on})
+                        "character": self.character_on, "api": self.api_on})
 
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
@@ -1623,6 +1741,7 @@ def main():
     def _toggle_git(*_):   ov.root.after(0, lambda: ov.set_git_sync(not ov.git_sync))
     def _backup_now(*_):   ov.root.after(0, ov.git_backup)
     def _toggle_char(*_):  ov.root.after(0, lambda: ov.set_character(not ov.character_on))
+    def _toggle_api(*_):   ov.root.after(0, lambda: ov.set_api(not ov.api_on))
     git_menu = pystray.Menu(
         pystray.MenuItem("Auto-push new songs", _toggle_git,
                          checked=lambda i: ov.git_sync),
@@ -1660,6 +1779,8 @@ def main():
         pystray.MenuItem("Performance", perf_menu),
         pystray.MenuItem("Dancing character", _toggle_char,
                          checked=lambda i: ov.character_on),
+        pystray.MenuItem("Local API (agent control)", _toggle_api,
+                         checked=lambda i: ov.api_on),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Start with Windows", _toggle_startup,
                          checked=lambda i: startup_enabled()),
