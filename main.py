@@ -52,15 +52,19 @@ except ImportError:
 # so non-Japanese text doesn't render as boxes (□): Yu Gothic has no Hangul,
 # so Korean needs Malgun Gothic; Chinese gets Microsoft YaHei for full coverage.
 _PIL_FONTS = {
-    "jp":   ("YuGothB.ttc", "meiryob.ttc", "msgothic.ttc", "yugothb.ttf"),
-    "ko":   ("malgunbd.ttf", "malgun.ttf", "gulim.ttc", "batang.ttc"),
-    "zh":   ("msyhbd.ttc", "msyh.ttc", "simhei.ttf", "simsun.ttc"),
-    "furi": ("YuGothR.ttc", "meiryo.ttc", "msgothic.ttc", "yugothr.ttf"),
-    "rm":   ("seguisb.ttf", "segoeui.ttf"),
-    "en":   ("segoeui.ttf",),
+    "jp":    ("YuGothB.ttc", "meiryob.ttc", "msgothic.ttc", "yugothb.ttf"),
+    "ko":    ("malgunbd.ttf", "malgun.ttf", "gulim.ttc", "batang.ttc"),
+    "zh":    ("msyhbd.ttc", "msyh.ttc", "simhei.ttf", "simsun.ttc"),
+    # Latin/Cyrillic main text: Segoe UI renders it tightly — Yu Gothic gives
+    # Cyrillic/Latin huge full-width spacing, so Russian/German/English use this.
+    "latin": ("segoeuib.ttf", "seguisb.ttf", "segoeui.ttf"),
+    "furi":  ("YuGothR.ttc", "meiryo.ttc", "msgothic.ttc", "yugothr.ttf"),
+    "rm":    ("seguisb.ttf", "segoeui.ttf"),
+    "en":    ("segoeui.ttf",),
 }
 # tkinter font families per script (fallback path when PIL blocks are off).
-_TK_MAIN_FONT = {"jp": "Yu Gothic UI", "ko": "Malgun Gothic", "zh": "Microsoft YaHei"}
+_TK_MAIN_FONT = {"jp": "Yu Gothic UI", "ko": "Malgun Gothic",
+                 "zh": "Microsoft YaHei", "latin": "Segoe UI"}
 
 _HANGUL_RE = re.compile(r"[가-힣ㄱ-ㆎ]")
 _KANA_RE = re.compile(r"[ぁ-ゖァ-ヺ]")
@@ -68,16 +72,17 @@ _HAN_RE = re.compile(r"[一-鿿㐀-䶿々]")
 
 
 def _script_of(text, song_lang=None):
-    """Dominant CJK script of a line → which font to use. Korean (Hangul) and
-    Japanese (kana) are unambiguous; bare kanji is read as Japanese unless the
-    whole song is Chinese."""
+    """Pick the font for a line by its script. Korean (Hangul) and Japanese
+    (kana) are unambiguous; bare kanji reads as Japanese unless the whole song
+    is Chinese; anything else (Latin, Cyrillic) uses the tight Segoe UI 'latin'
+    font rather than the wide-spaced Japanese font."""
     if _HANGUL_RE.search(text or ""):
         return "ko"
     if _KANA_RE.search(text or ""):
         return "jp"
     if _HAN_RE.search(text or ""):
         return "zh" if song_lang == "zh" else "jp"
-    return "jp"
+    return "latin"
 
 BASE = Path(__file__).parent
 # Portable: keep the library + settings right next to the .exe so the whole
@@ -211,6 +216,19 @@ def _norm_title(s):
     """Normalize a title/artist for comparison: lowercase, keep only letters,
     digits, and CJK/kana/Hangul (drops spaces, punctuation, feat. credits)."""
     return _NORM_RE.sub("", (s or "").lower())
+
+
+# Cyrillic → Latin, so a romanized video title ("Nas Ne Dogonyat") can match a
+# Cyrillic cached title ("Нас не догонят").
+_CYR_LAT = {"а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+            "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+            "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+            "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+            "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya"}
+
+
+def _translit_cyr(s):
+    return "".join(_CYR_LAT.get(c.lower(), c) for c in (s or ""))
 
 
 # ── Real playback position via Windows Media Transport Controls ───────
@@ -400,10 +418,17 @@ class LyricsIndex:
             except Exception:
                 continue
             lt = (m.get("title") or "").lower()
+            core = re.sub(r"\s*[\(（].*?[\)）]", "", lt).strip()
+            cn = _norm_title(core) or _norm_title(lt)
+            # also a Latin form of a Cyrillic title, so "Nas Ne Dogonyat" matches
+            forms = {cn}
+            if any("а" <= c <= "я" or c == "ё" for c in core.lower()):
+                forms.add(_norm_title(_translit_cyr(core)))
             entries.append({
                 "path": p,
                 "title": lt,
-                "core": re.sub(r"\s*[\(（].*?[\)）]", "", lt).strip(),
+                "core": core,
+                "forms": {f for f in forms if f},
                 "artist": m.get("artist") or "",
                 "dur": m.get("duration"),
             })
@@ -428,20 +453,25 @@ class LyricsIndex:
         qa = _norm_title(artist)
         if not qt:
             return None
+        # also try the romanized query against a transliterated Cyrillic title
+        q_forms = {qt, _norm_title(_translit_cyr(title))}
         best, best_score = None, 0
         for e in self.entries:
-            ct = _norm_title(e["core"]) or _norm_title(e["title"])
-            if not ct:
-                continue
-            if ct == qt:
-                score = 100
-            elif ct in qt or qt in ct:
-                short, lng = sorted((ct, qt), key=len)
-                cover = len(short) / max(1, len(lng))
-                if cover < 0.6:                  # weak substring → reject (paranoid)
-                    continue
-                score = 60 + int(30 * cover)
-            else:
+            score = 0
+            for ct in e.get("forms") or {_norm_title(e["core"])}:
+                for q in q_forms:
+                    if not ct or not q:
+                        continue
+                    if ct == q:
+                        s = 100
+                    elif ct in q or q in ct:
+                        short, lng = sorted((ct, q), key=len)
+                        cover = len(short) / max(1, len(lng))
+                        s = 60 + int(30 * cover) if cover >= 0.6 else 0
+                    else:
+                        s = 0
+                    score = max(score, s)
+            if not score:
                 continue
             if duration and e["dur"]:
                 score += 8 if abs(e["dur"] - duration) <= 12 else -40
