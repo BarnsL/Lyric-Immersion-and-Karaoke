@@ -5,10 +5,13 @@ watches whatever you're playing — Spotify, YouTube in any browser, anything th
 talks to Windows' media controls — pulls the **real playback position**, and
 floats synced lyrics over your screen with:
 
-- **Furigana** above every kanji (漢字 → かんじ)
-- **Romaji** reading
+- **Furigana** above every kanji (漢字 → かんじ), **romaji** reading
+- **Chinese → pinyin** and **Korean → romaja** readings too
 - **English** translation
 - a **karaoke fill** that sweeps across each line *at singing speed*
+
+Japanese, Chinese, and Korean are detected per song and romanized
+appropriately; English (and other) songs just show the synced line.
 
 No window, no panel — just clean outlined text over whatever's on screen. It
 never steals focus, so you can keep working / watching while it runs.
@@ -23,6 +26,22 @@ Most lyric overlays guess timing from when they launched. Desktop Karaoke reads
 the **actual song position** from the Windows `GlobalSystemMediaTransportControls`
 session (the same data behind the media keys), so it tracks scrubbing, pausing,
 and song changes for *any* player — and freezes when the music does.
+
+## Getting the *right* lyrics (error detection & correction)
+
+Common titles match the wrong song easily, and aggregators sometimes return
+the wrong language entirely. Every fetch is **verified** before it's accepted:
+
+- **Duration** — preferred matches come from LRCLIB's duration-exact endpoint;
+  the real song length (from the OS) rejects same-titled wrong versions.
+- **Artist** — search candidates are scored on artist + title match.
+- **Language** — a CJK-titled song must come back in that script, so
+  hallucinated / mistranslated lyrics are thrown out.
+
+At runtime the overlay re-checks the cached file against the playing song and
+re-fetches if it doesn't fit. Hit a bad match anyway? The tray menu's
+**"⚑ Wrong lyrics — fix this song"** bins it and fetches a correct one. You can
+also sweep the whole library with `python validate.py --purge`.
 
 ## Lyrics coverage
 

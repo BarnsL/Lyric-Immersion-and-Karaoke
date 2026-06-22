@@ -119,7 +119,7 @@ class MediaWatcher:
                         self._state = None
             except Exception:
                 pass
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.15)
 
     @staticmethod
     def _pick(mgr):
@@ -201,30 +201,55 @@ def split_furigana(text):
     return parts
 
 
-def find_lyrics_for_track(artist, title):
-    LYRICS_DIR.mkdir(exist_ok=True)
-    query = f"{artist} {title}".lower()
-    best = None
-    for path in LYRICS_DIR.glob("*.json"):
-        try:
-            data = json.loads(path.read_text("utf-8"))
-            meta = data.get("meta", {})
-            lt = meta.get("title", "").lower()
-            la = meta.get("artist", "").lower()
-            core = re.sub(r"\s*[\(（].*?[\)）]", "", lt).strip()
-            if lt and lt in query:
-                return path
-            if core and len(core) > 2 and core in query:
-                return path
-            if title and core and core in title.lower():
-                best = best or path
-            if la and la in query and any(
-                w in query for w in re.findall(r"[\w぀-鿿]{2,}", core)
-            ):
-                best = best or path
-        except Exception:
-            continue
-    return best
+class LyricsIndex:
+    """In-memory index of cached lyrics → millisecond matching, with
+    duration-based rejection so a same-titled wrong file isn't used."""
+
+    def __init__(self):
+        self.entries = []
+        self.refresh()
+
+    def refresh(self):
+        LYRICS_DIR.mkdir(exist_ok=True)
+        entries = []
+        for p in LYRICS_DIR.glob("*.json"):
+            try:
+                m = json.loads(p.read_text("utf-8")).get("meta", {})
+            except Exception:
+                continue
+            lt = (m.get("title") or "").lower()
+            entries.append({
+                "path": p,
+                "title": lt,
+                "core": re.sub(r"\s*[\(（].*?[\)）]", "", lt).strip(),
+                "dur": m.get("duration"),
+            })
+        self.entries = entries
+
+    def add(self, path):
+        path = Path(path)
+        self.entries = [e for e in self.entries if e["path"] != path]
+        self.refresh()
+
+    def match(self, artist, title, duration=None):
+        query = f"{artist} {title}".lower()
+        tl = (title or "").lower()
+        fallback = None
+        for e in self.entries:
+            lt, core = e["title"], e["core"]
+            hit = (
+                (lt and lt in query)
+                or (core and len(core) > 2 and core in query)
+                or (core and len(core) > 2 and core in tl)
+            )
+            if not hit:
+                continue
+            # duration guard: same title but clearly different length → skip
+            if duration and e["dur"] and abs(e["dur"] - duration) > 12:
+                fallback = fallback  # keep looking for a better-length match
+                continue
+            return e["path"]
+        return fallback
 
 
 # ── Rendering ────────────────────────────────────────────────────────
@@ -288,31 +313,43 @@ class Overlay:
         self._fetch_result = None
         self._translate_result = None
         self._translating = None
+        self._cur_duration = None
 
+        self.index = LyricsIndex()
         self.media = MediaWatcher()
         self._hint("Waiting for music…")
         self.root.after(300, self._tick)
 
     # ── per-track ──
 
-    def _on_track_change(self, track):
+    def _on_track_change(self, track, duration=None):
         artist, title = track
         if not artist and " - " in title:
             a, t = title.split(" - ", 1)
             artist, title = a.strip(), t.strip()
+        self._cur_duration = duration
 
-        path = find_lyrics_for_track(artist, title)
-        if path:
+        path = self.index.match(artist, title, duration)
+        if path and self._file_valid(path, duration):
             if path != self._lyrics_path:
                 self.load(path)
             return
 
+        # nothing valid cached → fetch (and overwrite a bad file if present)
         self.lines, self._lyrics_path, self.idx = [], None, -1
         self._kara = []
         self._hint(f"♪ {title} — fetching lyrics…")
-        self._start_fetch(artist, title)
+        self._start_fetch(artist, title, duration)
 
-    def _start_fetch(self, artist, title):
+    def _file_valid(self, path, duration):
+        try:
+            from fetch_lyrics import validate_file
+            ok, _ = validate_file(path, duration)
+            return ok
+        except Exception:
+            return True
+
+    def _start_fetch(self, artist, title, duration=None):
         key = (artist, title)
         if self._fetch_key == key:
             return
@@ -321,7 +358,7 @@ class Overlay:
         def work():
             try:
                 from fetch_lyrics import fetch_and_save
-                p = fetch_and_save(title, artist, translate=False, interactive=False)
+                p = fetch_and_save(title, artist, translate=False, duration=duration)
             except Exception:
                 p = None
             self._fetch_result = (key, p)
@@ -350,10 +387,11 @@ class Overlay:
             self._fetch_result = None
             if key == self._fetch_key:
                 if p:
+                    self.index.add(p)
                     self.load(Path(p))
                     self._start_translate(Path(p))
                 else:
-                    self._hint("No synced lyrics found for this song")
+                    self._hint("No verified lyrics found for this song")
         if self._translate_result:
             path, ok = self._translate_result
             self._translate_result = None
@@ -383,7 +421,7 @@ class Overlay:
         track = (state["artist"], clean_title(state["title"], state["source"]))
         if track != self._track:
             self._track = track
-            self._on_track_change(track)
+            self._on_track_change(track, state.get("duration"))
 
         if state["status"] != PLAYING or not self.lines:
             self.root.after(80, self._tick)   # frozen while paused — no advancing
@@ -478,7 +516,22 @@ class Overlay:
         self._fetch_key = None
         self._lyrics_path = None
         if self._track:
-            self._on_track_change(self._track)
+            self._on_track_change(self._track, self._cur_duration)
+
+    def report_wrong(self):
+        """User-driven correction: bin the current (wrong) lyrics and re-fetch."""
+        if self._lyrics_path:
+            try:
+                Path(self._lyrics_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.index.refresh()
+        self._fetch_key = None
+        self._lyrics_path = None
+        self.lines, self.idx, self._kara = [], -1, []
+        if self._track:
+            self._hint("Re-fetching correct lyrics…")
+            self._on_track_change(self._track, self._cur_duration)
 
     def quit(self):
         self.media.stop()
@@ -524,11 +577,14 @@ def main():
     def _reset(*_):   ov.root.after(0, ov.reset_offset)
     def _toggle(*_):  ov.root.after(0, ov.toggle)
     def _refetch(*_): ov.root.after(0, ov.refetch)
+    def _wrong(*_):   ov.root.after(0, ov.report_wrong)
     def _quit(icon, *_):
         icon.stop()
         ov.root.after(0, ov.quit)
 
     menu = pystray.Menu(
+        pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Sync  +0.3s  (lyrics earlier)", _n_plus),
         pystray.MenuItem("Sync  −0.3s  (lyrics later)", _n_minus),
         pystray.MenuItem("Reset sync", _reset),

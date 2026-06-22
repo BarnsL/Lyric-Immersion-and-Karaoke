@@ -1,15 +1,49 @@
 """
-Fetch synced lyrics from LRCLIB, auto-generate furigana + romaji,
-and (best-effort) English translation.
+Desktop Karaoke — lyric fetching, annotation, and verification.
 
-Usage:
+═══════════════════════════════════════════════════════════════════════
+SOURCES USED
+  • LRCLIB        (https://lrclib.net)  — clean, open, returns track /
+                  artist / duration metadata so matches can be VERIFIED.
+                  Used first via /api/get (duration-exact) then /api/search.
+  • syncedlyrics  (PyPI) — aggregates Musixmatch / NetEase / Megalobiz /
+                  Genius. Great coverage for VTuber / anime / CJK songs
+                  that LRCLIB lacks, but returns only an LRC string with
+                  no metadata, so results MUST be verified heuristically.
+  • pykakasi      — Japanese → furigana + romaji (hepburn).
+  • pypinyin      — Chinese → pinyin.
+  • hangul-romanize — Korean → romaja.
+  • deep-translator (Google) — line translation to English ('auto' source
+                  so it covers ja / zh / ko alike).
+
+PROBLEMS OVERCOME
+  1. WRONG-SONG MATCHES. A bare title like "Lucky Star" matched a totally
+     different song. Fix: prefer LRCLIB's duration-exact /api/get, score
+     /api/search candidates on artist+title+duration, and for the opaque
+     syncedlyrics fallback verify the result by song DURATION and LANGUAGE
+     before accepting. Title-only queries are a last resort and still
+     verified.
+  2. WRONG-LANGUAGE / HALLUCINATED LYRICS. A Japanese song came back with
+     Albanian text. Fix: detect_lang() on title + lyrics; if the title is
+     CJK the lyrics must be the same script, else the result is rejected.
+  3. CREDIT-LINE NOISE. Providers prefix "作词:" / "作曲:" etc. Filtered out.
+  4. NetEase's public /api/search returns hot-charts garbage for foreign
+     queries, so we do NOT call it directly — syncedlyrics handles it with
+     its own signing, and we verify whatever it returns.
+  5. NO PERSONAL DATA. Nothing here logs, stores, or transmits anything
+     about the user, their account, or their machine — only public song
+     title/artist strings are sent to public lyric APIs.
+═══════════════════════════════════════════════════════════════════════
+
+Public API:
+    fetch_and_save(title, artist, translate=False, duration=None) -> Path|None
+    translate_file(path) -> bool
+    validate_file(path, duration=None) -> (ok: bool, reason: str)
+    detect_lang(text) -> 'ja'|'ko'|'zh'|'other'
+
+CLI:
     python fetch_lyrics.py "Title" "Artist"
-    python fetch_lyrics.py --lrc path/to/file.lrc "Title" "Artist"
-    python fetch_lyrics.py --no-en "Title" "Artist"     # skip translation
-
-Importable:
-    from fetch_lyrics import fetch_and_save
-    path = fetch_and_save("フィーリングラデーション", "ReGLOSS")
+    python fetch_lyrics.py --lrc file.lrc "Title" "Artist"
 """
 
 import json
@@ -22,8 +56,8 @@ import urllib.request
 from pathlib import Path
 
 # syncedlyrics logs noisy provider warnings (e.g. Musixmatch 401) — quiet them
-logging.getLogger("syncedlyrics").setLevel(logging.CRITICAL)
-logging.getLogger("syncedlyrics.providers").setLevel(logging.CRITICAL)
+for _n in ("syncedlyrics", "syncedlyrics.providers"):
+    logging.getLogger(_n).setLevel(logging.CRITICAL)
 
 if sys.platform == "win32":
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -34,8 +68,13 @@ if sys.platform == "win32":
         pass
 
 LYRICS_DIR = Path(__file__).parent / "lyrics"
-_KANJI = r"[一-鿿㐀-䶿々]"
-_JP_RE = re.compile(r"[ぁ-んァ-ヶー一-鿿々]")
+
+# Script ranges
+_HANGUL = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏]")
+_KANA   = re.compile(r"[぀-ゟ゠-ヿ]")
+_HAN    = re.compile(r"[一-鿿㐀-䶿々]")
+_KANJI  = r"[一-鿿㐀-䶿々]"
+_JP_RE  = re.compile(r"[ぁ-んァ-ヶー一-鿿々]")
 _CREDIT_RE = re.compile(
     r"^\s*(作词|作詞|作曲|编曲|編曲|制作|製作|制作人|製作人|监制|監製|混音|母带|母帶|"
     r"和声|和聲|录音|錄音|出品|发行|發行|策划|策劃|"
@@ -44,11 +83,33 @@ _CREDIT_RE = re.compile(
     re.I,
 )
 
-_kks = None
-
 
 def is_japanese(text: str) -> bool:
     return bool(_JP_RE.search(text))
+
+
+def detect_lang(text: str) -> str:
+    """Coarse language of a string/lyric by dominant script."""
+    hang = len(_HANGUL.findall(text))
+    kana = len(_KANA.findall(text))
+    han = len(_HAN.findall(text))
+    if hang and hang >= kana:
+        return "ko"
+    if kana:
+        return "ja"
+    if han:
+        return "zh"
+    return "other"
+
+
+def slugify(title: str) -> str:
+    return re.sub(r"[^\w぀-ヿ가-힣一-鿿]+", "_", title.lower()).strip("_")
+
+
+# ── Romanization ─────────────────────────────────────────────────────
+
+_kks = None
+_translit = None
 
 
 def _kakasi():
@@ -59,130 +120,16 @@ def _kakasi():
     return _kks
 
 
-def slugify(title: str) -> str:
-    return re.sub(r"[^\w぀-ヿ一-鿿]+", "_", title.lower()).strip("_")
+def _korean():
+    global _translit
+    if _translit is None:
+        from hangul_romanize import Transliter
+        from hangul_romanize.rule import academic
+        _translit = Transliter(academic)
+    return _translit
 
-
-# ── Multi-provider fetch (Musixmatch / NetEase / LRCLIB / …) ─────────
-
-def fetch_lrc(title: str, artist: str = "") -> str | None:
-    """Best synced LRC from any provider. syncedlyrics covers Musixmatch,
-    NetEase, LRCLIB, Megalobiz, Genius — huge VTuber/anime/JP coverage."""
-    queries = []
-    t, a = title.strip(), artist.strip()
-    if t and a:
-        queries += [f"{t} {a}", f"{a} {t}"]
-    if t:
-        queries.append(t)
-
-    try:
-        import syncedlyrics
-        for q in queries:
-            try:
-                lrc = syncedlyrics.search(q, synced_only=True)
-            except Exception:
-                lrc = None
-            if lrc and "[" in lrc:
-                return lrc
-    except ImportError:
-        pass
-
-    # Fallback: LRCLIB direct
-    c = search_lrclib(title, artist, interactive=False)
-    return c.get("syncedLyrics") if c else None
-
-
-# ── LRCLIB search ────────────────────────────────────────────────────
-
-def search_lrclib(title: str, artist: str, interactive: bool = True) -> dict | None:
-    queries = [
-        f"{title} {artist}",
-        title,
-        f"{title} {artist} hololive",
-        f"{title} hololive",
-    ]
-    candidates: list[dict] = []
-    seen_ids: set = set()
-
-    for q in queries:
-        url = f"https://lrclib.net/api/search?q={urllib.parse.quote(q)}"
-        req = urllib.request.Request(url, headers={"User-Agent": "nihongo-lyrics/1.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                results = json.loads(resp.read())
-            for r in results:
-                rid = r.get("id", id(r))
-                if r.get("syncedLyrics") and rid not in seen_ids:
-                    seen_ids.add(rid)
-                    candidates.append(r)
-        except Exception:
-            continue
-
-    if not candidates:
-        return None
-
-    # Prefer exact-ish title + artist match
-    tl = title.lower()
-    al = artist.lower()
-
-    def score(c):
-        ct = c.get("trackName", "").lower()
-        ca = c.get("artistName", "").lower()
-        s = 0
-        if tl and (tl in ct or ct in tl):
-            s += 3
-        if al and (al in ca or ca in al):
-            s += 2
-        return s
-
-    candidates.sort(key=score, reverse=True)
-    if score(candidates[0]) >= 2:
-        return candidates[0]
-
-    if not interactive:
-        return candidates[0]
-
-    if len(candidates) == 1:
-        return candidates[0]
-
-    print(f"\n  Found {len(candidates)} results — pick one:\n")
-    for i, c in enumerate(candidates[:8]):
-        dur = c.get("duration", 0)
-        m, s = divmod(int(dur), 60)
-        print(f"    [{i + 1}] {c.get('trackName', '?')} — {c.get('artistName', '?')} ({m}:{s:02d})")
-    print("    [0] None of these\n")
-    try:
-        choice = int(input("  Choice: "))
-    except (ValueError, EOFError):
-        choice = 0
-    if 1 <= choice <= len(candidates):
-        return candidates[choice - 1]
-    return None
-
-
-def parse_lrc_text(lrc: str) -> list[dict]:
-    lines = []
-    for m in re.finditer(r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)", lrc):
-        mins, secs, text = int(m.group(1)), float(m.group(2)), m.group(3).strip()
-        lines.append({"time": round(mins * 60 + secs, 2), "text": text})
-    lines.sort(key=lambda x: x["time"])
-
-    result = []
-    for i, ln in enumerate(lines):
-        end = lines[i + 1]["time"] if i + 1 < len(lines) else ln["time"] + 5.0
-        if not ln["text"] or _CREDIT_RE.search(ln["text"]):
-            continue
-        result.append({
-            "t": [ln["time"], round(end, 2)],
-            "jp": ln["text"], "rm": "", "en": "",
-        })
-    return result
-
-
-# ── Annotation ───────────────────────────────────────────────────────
 
 def to_furigana(text: str) -> str:
-    """Wrap kanji words with their hiragana reading: 静けさ(しずけさ)."""
     out = []
     for item in _kakasi().convert(text):
         orig, hira = item["orig"], item["hira"]
@@ -193,26 +140,190 @@ def to_furigana(text: str) -> str:
     return "".join(out)
 
 
-def to_romaji(text: str) -> str:
-    return " ".join(it["hepburn"] for it in _kakasi().convert(text)).strip()
+def romanize(text: str, lang: str) -> str:
+    try:
+        if lang == "ja":
+            return " ".join(it["hepburn"] for it in _kakasi().convert(text)).strip()
+        if lang == "zh":
+            from pypinyin import lazy_pinyin
+            return " ".join(lazy_pinyin(text)).strip()
+        if lang == "ko":
+            return _korean().translit(text).replace("-", "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+# ── LRC parsing ──────────────────────────────────────────────────────
+
+def parse_lrc_text(lrc: str) -> list[dict]:
+    raw = []
+    for m in re.finditer(r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)", lrc):
+        t = int(m.group(1)) * 60 + float(m.group(2))
+        raw.append({"time": round(t, 2), "text": m.group(3).strip()})
+    raw.sort(key=lambda x: x["time"])
+
+    out = []
+    for i, ln in enumerate(raw):
+        if not ln["text"] or _CREDIT_RE.search(ln["text"]):
+            continue
+        end = raw[i + 1]["time"] if i + 1 < len(raw) else ln["time"] + 5.0
+        out.append({"t": [ln["time"], round(end, 2)], "jp": ln["text"], "rm": "", "en": ""})
+    return out
+
+
+def _lrc_last_time(lrc: str) -> float:
+    times = [int(m.group(1)) * 60 + float(m.group(2))
+             for m in re.finditer(r"\[(\d+):(\d+(?:\.\d+)?)\]", lrc)]
+    return max(times) if times else 0.0
+
+
+# ── Verification (error detection) ───────────────────────────────────
+
+def verify_lrc(lrc: str, title: str, duration: float | None) -> bool:
+    """Reject lyrics that clearly don't belong to the requested song."""
+    body = re.sub(r"\[[^\]]*\]", "", lrc)
+    if len(body.strip()) < 10:
+        return False
+    # Language: if the title is CJK, the lyrics must share that script
+    tl = detect_lang(title)
+    if tl in ("ja", "ko", "zh"):
+        ll = detect_lang(body)
+        if ll != tl and not (tl == "zh" and ll == "ja"):
+            return False
+    # Duration: last timestamp should land within the song, not way past it
+    if duration and duration > 30:
+        last = _lrc_last_time(lrc)
+        if last and (last < duration * 0.35 or last > duration + 45):
+            return False
+    return True
+
+
+# ── LRCLIB (verifiable) ──────────────────────────────────────────────
+
+def _http_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Desktop-Karaoke/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def _lrclib_get(title, artist, duration):
+    if not (artist and duration):
+        return None
+    q = urllib.parse.urlencode({
+        "track_name": title, "artist_name": artist, "duration": int(duration),
+    })
+    try:
+        d = _http_json(f"https://lrclib.net/api/get?{q}")
+        if d.get("syncedLyrics"):
+            return {"lrc": d["syncedLyrics"], "artist": d.get("artistName", artist),
+                    "duration": d.get("duration", duration)}
+    except Exception:
+        pass
+    return None
+
+
+def _lrclib_candidates(title, artist):
+    cands, seen = [], set()
+    urls = [
+        f"https://lrclib.net/api/search?{urllib.parse.urlencode({'track_name': title, 'artist_name': artist})}",
+        f"https://lrclib.net/api/search?{urllib.parse.urlencode({'q': f'{title} {artist}'.strip()})}",
+    ]
+    for u in urls:
+        try:
+            for r in _http_json(u):
+                rid = r.get("id")
+                if rid in seen or not r.get("syncedLyrics"):
+                    continue
+                seen.add(rid)
+                cands.append(r)
+        except Exception:
+            continue
+    return cands
+
+
+def _norm(s):
+    return re.sub(r"[^\w가-힣一-鿿ぁ-ヶ]+", "", (s or "").lower())
+
+
+def _pick_lrclib(title, artist, duration):
+    best, best_score = None, 0
+    nt, na = _norm(title), _norm(artist)
+    for c in _lrclib_candidates(title, artist):
+        ct, ca = _norm(c.get("trackName")), _norm(c.get("artistName"))
+        score = 0
+        if nt and (nt in ct or ct in nt):
+            score += 2
+        if na and (na in ca or ca in na):
+            score += 3
+        if duration and c.get("duration"):
+            if abs(c["duration"] - duration) <= 8:
+                score += 3
+            elif abs(c["duration"] - duration) > 25:
+                score -= 3
+        if score > best_score:
+            best, best_score = c, score
+    if best and best_score >= 4:
+        return {"lrc": best["syncedLyrics"], "artist": best.get("artistName", artist),
+                "duration": best.get("duration")}
+    return None
+
+
+# ── Multi-provider fetch with verification ───────────────────────────
+
+def fetch_lrc(title: str, artist: str = "", duration: float | None = None):
+    """Return (lrc_string, meta) of a VERIFIED match, or (None, None).
+    meta = {source, artist, duration}."""
+    t, a = title.strip(), artist.strip()
+
+    hit = _lrclib_get(t, a, duration)
+    if hit and verify_lrc(hit["lrc"], t, duration):
+        return hit["lrc"], {"source": "lrclib/get", "artist": hit["artist"],
+                            "duration": hit.get("duration")}
+
+    hit = _pick_lrclib(t, a, duration)
+    if hit and verify_lrc(hit["lrc"], t, duration):
+        return hit["lrc"], {"source": "lrclib/search", "artist": hit["artist"],
+                            "duration": hit.get("duration")}
+
+    queries = [f"{t} {a}".strip()]
+    if a:
+        queries.append(f"{a} {t}")
+    queries.append(t)  # last resort, still verified below
+    try:
+        import syncedlyrics
+        for q in queries:
+            try:
+                lrc = syncedlyrics.search(q, synced_only=True)
+            except Exception:
+                lrc = None
+            if lrc and "[" in lrc and verify_lrc(lrc, t, duration):
+                return lrc, {"source": "syncedlyrics", "artist": a or None,
+                             "duration": duration}
+    except ImportError:
+        pass
+
+    return None, None
+
+
+# ── Annotation ───────────────────────────────────────────────────────
+
+def _song_lang(lines: list[dict]) -> str:
+    return detect_lang(" ".join(ln["jp"] for ln in lines[:40]))
 
 
 def _translate_lines(lines: list[dict]) -> int:
-    """Fill the 'en' field of each Japanese line in place. Returns count."""
     try:
         from deep_translator import GoogleTranslator
     except ImportError:
-        print("  [info] deep-translator not installed — skipping English")
         return 0
-    tr = GoogleTranslator(source="ja", target="en")
-    # Only translate Japanese lines; leave non-JP (e.g. English songs) as-is
+    tr = GoogleTranslator(source="auto", target="en")
     idx = [i for i, ln in enumerate(lines)
-           if is_japanese(re.sub(r"\(.*?\)", "", ln["jp"]))]
+           if detect_lang(re.sub(r"\(.*?\)", "", ln["jp"])) in ("ja", "ko", "zh")]
     raws = [re.sub(r"\(.*?\)", "", lines[i]["jp"]) for i in idx]
     done = 0
     for k in range(0, len(raws), 20):
-        sl = idx[k:k + 20]
-        chunk = raws[k:k + 20]
+        sl, chunk = idx[k:k + 20], raws[k:k + 20]
         joined = "\n".join(c if c.strip() else "　" for c in chunk)
         try:
             parts = tr.translate(joined).split("\n")
@@ -232,51 +343,80 @@ def _translate_lines(lines: list[dict]) -> int:
     return done
 
 
-def add_annotations(lines: list[dict], translate: bool = True) -> list[dict]:
+def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict]:
     for ln in lines:
         raw = ln["jp"]
-        if is_japanese(raw):
+        ll = detect_lang(raw)
+        if lang == "ja" and ll == "ja":
             ln["jp"] = to_furigana(raw)
-            ln["rm"] = to_romaji(raw)
+            ln["rm"] = romanize(raw, "ja")
+        elif lang in ("zh", "ko") and ll == lang:
+            ln["rm"] = romanize(raw, lang)
         else:
-            ln["jp"] = raw          # English/other: show as-is, no romaji
-            ln["rm"] = ""
-    print(f"  [ok] Furigana + romaji for {len(lines)} lines")
+            ln["rm"] = ""  # English / other lines shown as-is
     if translate:
-        n = _translate_lines(lines)
-        if n:
-            print(f"  [ok] English translation for {n} lines")
+        _translate_lines(lines)
     return lines
 
 
 def translate_file(path) -> bool:
-    """Load a saved lyrics JSON, fill in English, save back."""
     path = Path(path)
     try:
         data = json.loads(path.read_text("utf-8"))
         n = _translate_lines(data["lines"])
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        if n:
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return n > 0
     except Exception:
         return False
 
 
-# ── Public API ───────────────────────────────────────────────────────
+# ── Library validation (error detection over cached files) ───────────
 
-def fetch_and_save(title: str, artist: str = "", translate: bool = True,
-                   interactive: bool = False) -> Path | None:
-    lrc = fetch_lrc(title, artist)
+def validate_file(path, duration: float | None = None) -> tuple[bool, str]:
+    """True if the cached file looks like a real, correct match."""
+    try:
+        data = json.loads(Path(path).read_text("utf-8"))
+    except Exception as e:
+        return False, f"unreadable ({e})"
+    lines = data.get("lines", [])
+    if len(lines) < 4:
+        return False, "too few lines"
+    meta = data.get("meta", {})
+    title = meta.get("title", "")
+    body = " ".join(ln.get("jp", "") for ln in lines)
+    tl, ll = detect_lang(title), detect_lang(body)
+    if tl in ("ja", "ko", "zh") and ll != tl and not (tl == "zh" and ll == "ja"):
+        return False, f"language mismatch (title {tl} / lyrics {ll})"
+    md = meta.get("duration")
+    if duration and md and abs(md - duration) > 12:
+        return False, f"duration mismatch ({md}s vs {duration}s)"
+    return True, "ok"
+
+
+# ── Save ─────────────────────────────────────────────────────────────
+
+def fetch_and_save(title: str, artist: str = "", translate: bool = False,
+                   duration: float | None = None, interactive: bool = False) -> Path | None:
+    lrc, meta = fetch_lrc(title, artist, duration)
     if not lrc:
         return None
     lines = parse_lrc_text(lrc)
-    if not lines:
+    if len(lines) < 4:
         return None
-    lines = add_annotations(lines, translate=translate)
+    lang = _song_lang(lines)
+    lines = annotate(lines, lang, translate=translate)
 
     LYRICS_DIR.mkdir(exist_ok=True)
     out = LYRICS_DIR / f"{slugify(title)}.json"
     data = {
-        "meta": {"title": title, "artist": artist},
+        "meta": {
+            "title": title,
+            "artist": artist,
+            "lang": lang,
+            "duration": (meta or {}).get("duration") or (round(duration, 1) if duration else None),
+            "source": (meta or {}).get("source", "unknown"),
+        },
         "lines": lines,
     }
     out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -286,48 +426,41 @@ def fetch_and_save(title: str, artist: str = "", translate: bool = True,
 # ── CLI ──────────────────────────────────────────────────────────────
 
 def main():
-    lrc_path = None
-    translate = True
-    positional = []
+    lrc_path, positional = None, []
+    translate = "--no-en" not in sys.argv
     args = sys.argv[1:]
     i = 0
     while i < len(args):
         if args[i] == "--lrc" and i + 1 < len(args):
             lrc_path = Path(args[i + 1]); i += 2
-        elif args[i] == "--no-en":
-            translate = False; i += 1
-        elif not args[i].startswith("-"):
-            positional.append(args[i]); i += 1
-        else:
+        elif args[i].startswith("-"):
             i += 1
+        else:
+            positional.append(args[i]); i += 1
 
-    if len(positional) < 1:
-        print(__doc__.strip())
+    if not positional:
+        print(__doc__.split("Public API:")[0])
         sys.exit(1)
-
     title = positional[0]
     artist = positional[1] if len(positional) > 1 else ""
 
     if lrc_path:
-        print(f"Importing LRC from {lrc_path} ...")
         lines = parse_lrc_text(lrc_path.read_text(encoding="utf-8"))
-        print(f"  [ok] Parsed {len(lines)} timed lines")
-        lines = add_annotations(lines, translate=translate)
+        lang = _song_lang(lines)
+        print(f"Parsed {len(lines)} lines (lang={lang})")
+        lines = annotate(lines, lang, translate=translate)
         LYRICS_DIR.mkdir(exist_ok=True)
         out = LYRICS_DIR / f"{slugify(title)}.json"
-        data = {"meta": {"title": title, "artist": artist}, "lines": lines}
-        out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"  [ok] Saved to {out}")
+        out.write_text(json.dumps(
+            {"meta": {"title": title, "artist": artist, "lang": lang,
+                      "duration": None, "source": "lrc-import"}, "lines": lines},
+            ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Saved {out}")
         return
 
-    print(f"Searching LRCLIB for: {title}" + (f" by {artist}" if artist else "") + " ...")
-    out = fetch_and_save(title, artist, translate=translate, interactive=True)
-    if not out:
-        print("\nNot found on LRCLIB. Try an .lrc import:")
-        print(f'  python fetch_lyrics.py --lrc file.lrc "{title}" "{artist}"')
-        sys.exit(1)
-    print(f"  [ok] Saved to {out}")
-    print("\nRun the overlay:  python main.py")
+    print(f"Fetching: {title} — {artist}")
+    out = fetch_and_save(title, artist, translate=translate)
+    print(f"Saved {out}" if out else "No verified lyrics found.")
 
 
 if __name__ == "__main__":

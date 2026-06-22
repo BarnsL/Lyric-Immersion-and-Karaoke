@@ -99,6 +99,27 @@ SONGS = [
     ("SPECIALZ", "King Gnu", False),
     ("夜咄ディセイブ", "じん", False),
     ("ロキ", "みきとP", False),
+
+    # ── Korean (romaja support) ──
+    ("Ditto", "NewJeans", False),
+    ("Super Shy", "NewJeans", False),
+    ("Hype Boy", "NewJeans", False),
+    ("How Sweet", "NewJeans", False),
+    ("LALALALA", "Stray Kids", False),
+    ("God's Menu", "Stray Kids", False),
+    ("How You Like That", "BLACKPINK", False),
+    ("뱅뱅뱅", "BIGBANG", False),
+    ("Spring Day", "BTS", False),
+    ("Antifragile", "LE SSERAFIM", False),
+
+    # ── Chinese / Mandarin (pinyin support) ──
+    ("月亮代表我的心", "邓丽君", False),
+    ("晴天", "周杰伦", False),
+    ("七里香", "周杰伦", False),
+    ("告白气球", "周杰伦", False),
+    ("稻香", "周杰伦", False),
+    ("起风了", "买辣椒也用券", False),
+    ("孤勇者", "陈奕迅", False),
 ]
 
 
