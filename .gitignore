@@ -32,3 +32,5 @@ build/
 dist/
 *.exe
 *.spec.bak
+lyrics/*.tmp
+lyrics/*.json.tmp

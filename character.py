@@ -158,7 +158,8 @@ class Character:
         if not self.enabled:
             return
         self._draw()
-        self.root.after(33, self._loop)     # ~30 fps
+        # ~30fps while dancing, ~10fps idle (saves CPU when paused/stopped)
+        self.root.after(33 if self.playing else 100, self._loop)
 
     def _draw(self):
         cv = self.cv

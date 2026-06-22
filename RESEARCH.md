@@ -21,7 +21,9 @@ These were reported repeatedly, so the **root causes** are documented here.
   window) only reduced it. **Fix:** make the window a **fixed, full-work-area,
   click-through** surface (`WS_EX_TRANSPARENT`) that never moves or resizes;
   position content inside it with `_lane_y0` (bottom-anchored content stays
-  pinned and grows upward). The watchdog no longer moves anything.
+  pinned and grows upward). The watchdog no longer moves anything. Bottom-anchored
+  lyrics also keep a `_bottom_clear` gap (~10% of height) so they sit **above** a
+  media player's now-playing bar instead of hugging the screen edge.
 - ✅ **Boxes (□) instead of letters — ROOT CAUSE.** Korean (Hangul) and some
   Chinese glyphs aren't in Yu Gothic, so they rendered as tofu. **Fix:**
   per-script fonts (`_script_of` → Malgun Gothic for Korean, Microsoft YaHei for
@@ -37,6 +39,36 @@ These were reported repeatedly, so the **root causes** are documented here.
   and get English.
 - ✅ **Responsive to display size.** `_auto_scale` scales text to the work-area
   height so a big TV / 4K screen gets larger lyrics automatically.
+
+## 0b. Performance (CPU / RAM) — kept every feature
+
+A pass to lower idle and active cost without removing anything:
+
+- ✅ **No PhotoImage churn in scroll mode.** The karaoke fill used to allocate a
+  brand-new `ImageTk.PhotoImage` every time the sung-character count advanced
+  (many times per line, per lane). Now `_paint_block_img` returns a PIL image
+  and the ticker **pastes it into the existing PhotoImage** in place — no
+  allocation, no GC pressure, and it drops the per-step `itemconfig` call too.
+- ✅ **Cheaper media polling.** `MediaWatcher` polled GSMTC every 0.1 s; position
+  is extrapolated between polls, so 0.15 s keeps timing accuracy while cutting
+  that thread's CPU ~33%.
+- ✅ **`measure_text` cache.** Width depends only on (text, font); the non-scroll
+  renderer measured every character by creating/deleting a throwaway canvas
+  item. Now cached.
+- ✅ **Character idles cheap.** The companion animates at ~30 fps while dancing
+  but drops to ~10 fps when paused/stopped.
+- 📝 Already-good: image blocks scroll one bitmap (not 100s of items), repaint is
+  throttled to fill changes, the GSMTC session manager is reused, per-song lane
+  count is minimized, and the render fps is user-selectable (Smooth/Performance).
+
+## 0c. English spaces squished — ROOT CAUSE
+
+- ✅ English phrases lost their spaces ("Summer sun" → "Summersun"). Cause:
+  `to_furigana` runs text through fugashi, which **drops whitespace** between
+  tokens, and the squished line then poisoned the romaji derived from it. **Fix:**
+  `to_furigana` now processes each whitespace-separated chunk and rejoins with
+  the original spaces. Already-squished cache lines were re-spaced once with
+  `wordninja` (a migration only — not a runtime dependency).
 
 ## 1. Lyric sources
 
@@ -164,6 +196,8 @@ call; lanes + block height adapt per song.
 | Coverage | Per-line furigana/romaji + runtime self-heal (no more bare Japanese) | `fetch_lyrics.py` `annotate`/`backfill_file`, `main.py` `_maybe_translate`, `reannotate.py` |
 | Display | Fixed click-through window (no drift), per-script fonts (no boxes), kana⇒ja, Spanish detection, responsive scaling | `main.py` `_relayout_song`/`_script_of`/`_auto_scale`, `fetch_lyrics.py` `_song_lang`/`_ES_WORDS` |
 | Companion | Optional tray-toggled dancing character themed to the artist | `character.py`, `main.py` |
+| Spaces | `to_furigana` preserves whitespace (fugashi dropped it); cache re-spaced | `fetch_lyrics.py` `to_furigana` |
+| Perf | PhotoImage paste-in-place, 0.15s poll, measure_text cache, idle char fps | `main.py`, `character.py` |
 | Docs | Word-level finding, candidates, this file | `fetch_lyrics.py` header, `RESEARCH.md` |
 
 Everything else researched (word-level providers, GPU backend, event-driven

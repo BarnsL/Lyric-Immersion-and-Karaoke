@@ -237,7 +237,8 @@ class MediaWatcher:
                         self._state = None
             except Exception:
                 mgr = None                      # drop a stale manager; re-request next poll
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.15)   # position is extrapolated, so 0.15s polling
+            #                              keeps accuracy while cutting CPU ~33%
 
     @staticmethod
     def _pick(mgr):
@@ -396,11 +397,22 @@ def draw_text(cv, x, y, text, font, fill, anchor="center", tags="cur"):
                           anchor=anchor, tags=tags)
 
 
+_MEASURE_CACHE = {}
+
+
 def measure_text(cv, text, font):
-    tid = cv.create_text(-9999, -9999, text=text, font=font, anchor="nw")
-    bbox = cv.bbox(tid)
-    cv.delete(tid)
-    return (bbox[2] - bbox[0]) if bbox else 0
+    """Pixel width of `text` in `font`, cached. Width depends only on (text,
+    font), so caching avoids creating/deleting a throwaway canvas item on every
+    call (the non-scroll renderer measures every character per line)."""
+    key = (text, font)
+    w = _MEASURE_CACHE.get(key)
+    if w is None:
+        tid = cv.create_text(-9999, -9999, text=text, font=font, anchor="nw")
+        bbox = cv.bbox(tid)
+        cv.delete(tid)
+        w = (bbox[2] - bbox[0]) if bbox else 0
+        _MEASURE_CACHE[key] = w
+    return w
 
 
 def _work_area():
@@ -433,7 +445,11 @@ class Overlay:
         wa = _work_area()
         self.work_left, self.work_top, _wr, self.work_bottom = wa or (0, 0, sw, sh - 48)
         self.work_h = self.work_bottom - self.work_top
-        self._win_margin = 28          # gap from the work-area edge
+        self._win_margin = 28          # gap from the work-area edge (top)
+        # Bottom-anchored lyrics sit this far above the work-area bottom so they
+        # clear a media player's now-playing bar (YouTube ~60px, Spotify ~90px)
+        # and stay readable instead of hugging the screen edge.
+        self._bottom_clear = max(56, round(self.work_h * 0.10))
         self._lane_y0 = self._win_margin
         # Responsive sizing: scale text to the display so a big TV / 4K screen
         # gets proportionally larger lyrics automatically (≈1.0 on 1080p). The
@@ -898,9 +914,9 @@ class Overlay:
             self._kara.append({"chars": chars, "base": EN_C, "sung": SUNG})
 
         # anchor the whole block: near the top, or near the bottom of the window
-        # anchor within the FIXED window: near the top, or pinned to the bottom
+        # anchor within the FIXED window: near the top, or above the media bar
         dy = (self._win_margin if self.position == "top"
-              else max(self._win_margin, self.work_h - cur_y - self._win_margin))
+              else max(self._win_margin, self.work_h - cur_y - self._bottom_clear))
         self.cv.move("cur", 0, dy)
         self._animate_in()
 
@@ -1012,8 +1028,10 @@ class Overlay:
         return {"rows": rows, "furi": furi, "furi_font": ff, "furi_y": self.b_furi,
                 "w": int(right) + 8, "h": self._block_h}
 
-    def _paint_block(self, spec, frac):
-        """Render the block to a PhotoImage with the sung portion highlighted."""
+    def _paint_block_img(self, spec, frac):
+        """Render the block to a PIL image with the sung portion highlighted.
+        Returns the PIL image (not a PhotoImage) so the caller can paste it into
+        an existing PhotoImage — avoiding a fresh allocation every fill-step."""
         img = Image.new("RGBA", (max(1, spec["w"]), max(1, spec["h"])), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         sw = max(1, round(2 * self.font_scale * self._auto_scale))
@@ -1026,13 +1044,13 @@ class Overlay:
                 col = SUNG if idx < n else row["base"]
                 d.text((cx, row["y"]), ch, font=row["font"], fill=col, anchor="lm",
                        stroke_width=sw, stroke_fill=INK)
-        return ImageTk.PhotoImage(img)
+        return img
 
     def _render_img_block(self, i, frac):
         self._blk_seq += 1
         tag = f"blk{self._blk_seq}"
         spec = self._block_spec(i)
-        photo = self._paint_block(spec, frac)
+        photo = ImageTk.PhotoImage(self._paint_block_img(spec, frac))
         lane_y = self._lane_y0 + (i % self._lanes) * self._lane_gap
         self.cv.create_image(0, lane_y, image=photo, anchor="nw", tags=(tag, "strm"))
         return {"idx": i, "tag": tag, "x": 0.0, "w": spec["w"], "img": True,
@@ -1182,8 +1200,9 @@ class Overlay:
                 n = int(frac * b["nchars"] + 0.5)
                 if n != b["sung_n"]:                 # re-paint only when fill advances
                     b["sung_n"] = n
-                    b["photo"] = self._paint_block(b["spec"], frac)
-                    self.cv.itemconfig(b["tag"], image=b["photo"])
+                    # paste into the existing PhotoImage (no new allocation) —
+                    # the canvas reflects it without an itemconfig call
+                    b["photo"].paste(self._paint_block_img(b["spec"], frac))
             else:
                 self._highlight_block(b, frac)
 
@@ -1291,8 +1310,11 @@ class Overlay:
             return
 
         def work():
+            # Commit ONLY the lyrics pathspec — `git commit -- lyrics` ignores
+            # anything else that happens to be staged in the index, so a manual
+            # `git add` of code can never be swept into an auto-backup commit.
             for args in (["add", "--", "lyrics"],
-                         ["commit", "-m", "Update lyric library"],
+                         ["commit", "-m", "Update lyric library", "--", "lyrics"],
                          ["push"]):
                 try:
                     subprocess.run(["git", "-C", str(_DATA), *args],
@@ -1419,7 +1441,7 @@ class Overlay:
             self._lane_y0 = self._win_margin + self._lane_top
         else:
             self._lane_y0 = max(self._win_margin,
-                                self.work_h - self._win_margin - stack)
+                                self.work_h - self._bottom_clear - stack)
         self._compute_scroll_floor()
 
     def set_font_scale(self, v):

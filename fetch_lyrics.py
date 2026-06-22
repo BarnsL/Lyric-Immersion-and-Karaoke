@@ -347,13 +347,18 @@ def _furi_pair(surf: str, kana: str) -> str:
 def to_furigana(text: str) -> str:
     if _jp_engine():
         try:
+            # fugashi DROPS whitespace between tokens, which squished English
+            # phrases ("Summer sun" → "Summersun"). Process each whitespace-
+            # separated chunk and rejoin with the original spaces preserved.
             out = []
-            for w in _jp_tagger(text):
-                surf = w.surface
-                if re.search(_KANJI, surf):
-                    out.append(_furi_pair(surf, _tok_reading(w)))
-                else:
-                    out.append(surf)
+            for chunk in re.split(r"(\s+)", text):
+                if not chunk or chunk.isspace():
+                    out.append(chunk)
+                    continue
+                for w in _jp_tagger(chunk):
+                    surf = w.surface
+                    out.append(_furi_pair(surf, _tok_reading(w))
+                               if re.search(_KANJI, surf) else surf)
             return "".join(out)
         except Exception:
             pass
