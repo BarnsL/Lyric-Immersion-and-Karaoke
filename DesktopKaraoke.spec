@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import collect_all
 datas = [("icon.ico", ".")]
 binaries = []
 hiddenimports = [
-    "pystray._win32", "PIL._tkinter_finder",
+    "pystray._win32", "PIL._tkinter_finder", "PIL.ImageTk",
     "winsdk.windows.media.control", "winsdk.windows.foundation",
     "winsdk.windows.storage.streams",
 ]
