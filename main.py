@@ -398,6 +398,7 @@ class Overlay:
         self._blk_seq = 0
         self._pil_fonts = {}       # cache of PIL fonts for image blocks
         self._use_img = True       # render scroll blocks as images (fast); auto-off on failure
+        self._v_floor = 0.0        # min scroll speed for THIS song (anti-overlap)
         self._apply_scale()                            # sets fonts + layout + H
 
         self.root.overrideredirect(True)
@@ -666,6 +667,9 @@ class Overlay:
         self.meta, self.lines = load_lyrics(path)
         self._lyrics_path = Path(path)
         self._mark_verified()
+        self._relayout_song()           # size lanes/blocks to this song's rows
+        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.attributes("-topmost", True)
         if not keep_idx:
             self.idx = -1
             self._kara = []
@@ -960,8 +964,51 @@ class Overlay:
                     self.cv.itemconfig(c["fill"], fill=col)
                     c["last"] = col
 
+    def _compute_scroll_floor(self):
+        """Pick the minimum scroll speed that keeps THIS song's lines from
+        overlapping. Two blocks in the same lane sit a constant distance apart
+        ( = speed × Δtimestamp ), and same-lane lines are `lanes` apart, so a
+        dense/fast song needs a faster belt to space them out. Slow songs keep
+        the user's comfortable pace; only crowded ones speed up, just enough.
+        Computed once per song (and on font/lane change) — the ticker itself
+        stays a single-move loop."""
+        self._v_floor = 0.0
+        lines = getattr(self, "lines", None) or []
+        n, L = len(lines), max(1, self._lanes)
+        if n <= L:
+            return
+        s = self.font_scale
+        fj = self._pil_font("jp", max(10, round(38 * s)))
+        fr = self._pil_font("rm", max(8, round(23 * s)))
+        fe = self._pil_font("en", max(8, round(21 * s)))
+
+        def width(ln):
+            w = 0.0
+            if ln.jp:
+                base = "".join(b for b, _ in split_furigana(ln.jp))
+                w = max(w, fj.getlength(base))
+            if ln.rm:
+                w = max(w, fr.getlength(ln.rm))
+            if ln.en:
+                w = max(w, fe.getlength(ln.en))
+            return w
+
+        mids = [(ln.start + ln.end) / 2 for ln in lines]
+        ws = [width(ln) for ln in lines]
+        margin = 46 * s
+        reqs = []
+        for i in range(n - L):                       # same-lane neighbour = i, i+L
+            dt = mids[i + L] - mids[i]
+            if dt > 0.05:
+                reqs.append(((ws[i] + ws[i + L]) / 2 + margin) / dt)
+        if reqs:
+            reqs.sort()
+            # 92nd percentile: cover all but the very tightest couplets (a brief
+            # rapid-fire burst may still touch) without over-speeding the song.
+            self._v_floor = min(700.0, max(0.0, reqs[int(0.92 * (len(reqs) - 1))]))
+
     def _ticker_update(self, pos):
-        center, v = self.W / 2, self.scroll_speed
+        center, v = self.W / 2, max(self.scroll_speed, self._v_floor)
         d = 1 if self.scroll_dir == "rl" else -1
 
         # All blocks share the same per-frame motion, so move the whole stream
@@ -1180,25 +1227,44 @@ class Overlay:
         self.romaji_y = round(182 * s)
         self.en_y     = round(242 * s)
         # Scroll-through: staggered vertical lanes so consecutive lines sit at
-        # different heights instead of piling up at one level. The number of
-        # lanes is whatever the font size allows — up to 3.
+        # different heights instead of piling up at one level. Per-row baselines
+        # within a block; the block's *height* adapts to which rows the current
+        # song actually uses (English-only songs are one row → shorter blocks →
+        # more lanes → far less overlap), set in _relayout_song().
         self.b_furi = round(26 * s)
         self.b_main = round(70 * s)
         self.b_rom  = round(132 * s)
         self.b_en   = round(170 * s)
-        # _block_h is the full image height; spec uses the SAME value so a block
-        # never renders taller than its lane slot (was clipping at the bottom).
-        self._block_h = round(206 * s)
         self._lane_top = round(8 * s)
+        self._relayout_song()              # sets _block_h, _lane_gap, _lanes, H
+
+    def _relayout_song(self):
+        """Size blocks + lanes to the CURRENT song's rows. A 1-row Latin song
+        gets short blocks and more lanes; a furigana+romaji+English song gets
+        tall blocks. Also refreshes the anti-overlap speed floor."""
+        s = self.font_scale
+        has_rm = has_en = False
+        for ln in getattr(self, "lines", None) or []:
+            has_rm = has_rm or bool(ln.rm.strip())
+            has_en = has_en or bool(ln.en.strip())
+            if has_rm and has_en:
+                break
+        if has_en:
+            self._block_h = self.b_en + round(36 * s)     # ≈ full 4-row height
+        elif has_rm:
+            self._block_h = self.b_rom + round(34 * s)
+        else:
+            self._block_h = self.b_main + round(46 * s)    # single main row
         self._lane_gap = self._block_h + round(14 * s)
         usable = self.sh - 70
         fit = 1 + max(0, (usable - self._lane_top - self._block_h) // self._lane_gap)
-        self._lanes = max(1, min(3, int(fit)))     # 3 lanes only if they fully fit
+        self._lanes = max(1, min(4, int(fit)))     # up to 4 when blocks are short
         if self.scroll_dir in ("lr", "rl"):
             self.H = min(usable, self._lane_top + self._block_h
                          + self._lane_gap * (self._lanes - 1) + round(14 * s))
         else:
             self.H = min(self.sh - 60, round(460 * s))   # room for wrapped lines
+        self._compute_scroll_floor()
 
     def set_font_scale(self, v):
         self.font_scale = max(0.25, min(2.0, v))

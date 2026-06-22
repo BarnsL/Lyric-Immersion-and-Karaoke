@@ -33,6 +33,12 @@ plus a `pystray` tray menu.
     re-lock **and** concert song-change), `_health_check`, `_suspect`
   - rendering: `_render`, `_karaoke`, `_render_block`/`_ticker_update`
     (scroll-through ticker), `_animate_in`/`_anim_step`, `_hint`
+  - **scroll layout**: `_relayout_song` sizes blocks + lane count to the rows
+    the current song uses (a 1-row Latin song → short blocks → up to 4 lanes;
+    a furigana+romaji+English song → tall blocks → fewer). `_compute_scroll_floor`
+    picks a per-song minimum scroll speed so dense/fast songs don't overlap
+    (same-lane lines sit `speed × Δtime` apart) while slow songs keep the
+    user's comfortable pace.
   - settings (all persisted via `_persist`): `set_opacity`, `set_position`,
     `set_scroll`, `set_scroll_speed`, `set_font_scale`, `set_quality`,
     `set_recal`, `apply_preset`, `set_git_sync`, `git_backup`, `set_startup`
@@ -50,8 +56,12 @@ dir), holding `lyrics/` and `settings.json`.
   duration-exact first, then scored search, then `syncedlyrics` (Musixmatch/
   NetEase/…) with a guarded title-only last resort. `verify_lrc` rejects
   wrong-language / wrong-duration matches.
+- **Romanization**: `to_furigana` + `romanize(text, lang)` use **fugashi +
+  UniDic** (via **cutlet** for romaji) for Japanese — a real morphological
+  analyzer that segments correctly (今生きて → 今(いま)生き), with **pykakasi** as
+  an automatic fallback. Chinese uses `pypinyin`, Korean `hangul-romanize`.
 - **`split_artists`**, `parse_lrc_text` (strips stacked `[mm:ss]`/`<..>` tags &
-  credit lines), `to_furigana`, `romanize(text, lang)`, `annotate`,
+  credit lines), `annotate`,
   `_translate_lines`/`translate_file`, **`fetch_and_save(...)`** (writes JSON
   with provenance: `lang/duration/source`), **`validate_file`**.
 
@@ -65,6 +75,8 @@ dir), holding `lyrics/` and `settings.json`.
 ## Tools (run from a terminal)
 
 - **`preload.py`** — bulk-fetch a curated `SONGS` list into the library.
+- **`reannotate.py`** — rebuild furigana/romaji for cached Japanese files with
+  the current analyzer (use after a romanizer change; `--dry` to preview).
 - **`sync_playlists.py`** — Spotify OAuth-PKCE → all playlists → fetch.
 - **`youtube_music.py`** — YouTube Music playlists via yt-dlp cookies → CSV + fetch.
 - **`validate.py`** — scan the cache for bad/mismatched files (`--purge`).

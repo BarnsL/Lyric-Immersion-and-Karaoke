@@ -10,7 +10,11 @@ SOURCES USED
                   Genius. Great coverage for VTuber / anime / CJK songs
                   that LRCLIB lacks, but returns only an LRC string with
                   no metadata, so results MUST be verified heuristically.
-  • pykakasi      — Japanese → furigana + romaji (hepburn).
+  • fugashi + unidic-lite + cutlet — Japanese → furigana + romaji via a real
+                  morphological analyzer. Segments correctly (今生きて →
+                  今/生きて "ima ikite", not 今生 "konjou"), which is the single
+                  biggest accuracy win for furigana/romaji. pykakasi is kept as
+                  an automatic fallback when the analyzer isn't installed.
   • pypinyin      — Chinese → pinyin.
   • hangul-romanize — Korean → romaja.
   • deep-translator (Google) — line translation to English ('auto' source
@@ -48,6 +52,12 @@ PROBLEMS OVERCOME
   5. NO PERSONAL DATA. Nothing here logs, stores, or transmits anything
      about the user, their account, or their machine — only public song
      title/artist strings are sent to public lyric APIs.
+  6. WRONG FURIGANA / ROMAJI FROM NAIVE SEGMENTATION. pykakasi's longest-match
+     read 今生きて as 今生(こんじょう) "konjou" instead of 今(いま)生き "ima ikite".
+     Fix: use the fugashi + UniDic morphological analyzer (cutlet for romaji),
+     place furigana only over the kanji, and nudge a few literary readings to
+     their colloquial form (今日→きょう, 私→わたし). Older cache files are
+     upgraded in place by `reannotate.py`.
 ═══════════════════════════════════════════════════════════════════════
 
 Public API:
@@ -160,6 +170,50 @@ def split_artists(artist: str) -> list[str]:
 
 _kks = None
 _translit = None
+_jp_tagger = None
+_jp_katsu = None
+_JP_READY = None       # tri-state: None=untried, True=analyzer up, False=fallback
+
+# UniDic occasionally prefers a literary reading over the everyday one heard in
+# song lyrics. Nudge the most frequent offenders back to the colloquial form so
+# furigana and romaji agree and read naturally.
+_READING_FIX = {
+    "今日": "きょう", "私": "わたし", "明日": "あした", "昨日": "きのう",
+    "貴方": "あなた", "何故": "なぜ", "一人": "ひとり", "二人": "ふたり",
+}
+_ROMAJI_FIX = {
+    "今日": "kyou", "私": "watashi", "明日": "ashita", "昨日": "kinou",
+    "貴方": "anata", "何故": "naze", "一人": "hitori", "二人": "futari",
+}
+
+
+def _is_hira(c: str) -> bool:
+    return "ぁ" <= c <= "ゟ"
+
+
+def _jp_engine():
+    """Lazy-init fugashi (morphological analyzer) + cutlet (romaji). Returns
+    True when the real analyzer is available; False means pykakasi fallback.
+    The analyzer segments correctly (今生きて → 今/生きて, not 今生), which is
+    the single biggest accuracy win for Japanese furigana + romaji."""
+    global _jp_tagger, _jp_katsu, _JP_READY
+    if _JP_READY is not None:
+        return _JP_READY
+    try:
+        import fugashi
+        import cutlet
+        _jp_tagger = fugashi.Tagger()
+        _jp_katsu = cutlet.Cutlet()
+        _jp_katsu.use_foreign_spelling = False
+        for surf, rom in _ROMAJI_FIX.items():
+            try:
+                _jp_katsu.add_exception(surf, rom)
+            except Exception:
+                pass
+        _JP_READY = True
+    except Exception:
+        _JP_READY = False
+    return _JP_READY
 
 
 def _kakasi():
@@ -179,8 +233,47 @@ def _korean():
     return _translit
 
 
+def _tok_reading(w) -> str:
+    """Hiragana reading for a fugashi token (or '' when it has none)."""
+    import jaconv
+    f = w.feature
+    for attr in ("kana", "pron"):
+        v = getattr(f, attr, None)
+        if v and v != "*":
+            return jaconv.kata2hira(v)
+    return ""
+
+
+def _furi_pair(surf: str, kana: str) -> str:
+    """Format one token as furigana, placing the reading only over the kanji by
+    trimming shared kana on either side (e.g. 生き/いき → 生(い)き)."""
+    if surf in _READING_FIX:
+        kana = _READING_FIX[surf]
+    head = tail = ""
+    s, k = surf, kana
+    while s and k and _is_hira(s[-1]) and s[-1] == k[-1]:
+        tail, s, k = s[-1] + tail, s[:-1], k[:-1]
+    while s and k and _is_hira(s[0]) and s[0] == k[0]:
+        head, s, k = head + s[0], s[1:], k[1:]
+    if s and k and re.search(_KANJI, s):
+        return f"{head}{s}({k}){tail}"
+    return surf
+
+
 def to_furigana(text: str) -> str:
-    out = []
+    if _jp_engine():
+        try:
+            out = []
+            for w in _jp_tagger(text):
+                surf = w.surface
+                if re.search(_KANJI, surf):
+                    out.append(_furi_pair(surf, _tok_reading(w)))
+                else:
+                    out.append(surf)
+            return "".join(out)
+        except Exception:
+            pass
+    out = []                                    # pykakasi fallback
     for item in _kakasi().convert(text):
         orig, hira = item["orig"], item["hira"]
         if orig != hira and re.search(_KANJI, orig):
@@ -193,6 +286,13 @@ def to_furigana(text: str) -> str:
 def romanize(text: str, lang: str) -> str:
     try:
         if lang == "ja":
+            if _jp_engine():
+                try:
+                    r = _jp_katsu.romaji(text).strip()
+                    if r:
+                        return r[0].lower() + r[1:]   # match the lowercase style
+                except Exception:
+                    pass
             return " ".join(it["hepburn"] for it in _kakasi().convert(text)).strip()
         if lang == "zh":
             from pypinyin import lazy_pinyin

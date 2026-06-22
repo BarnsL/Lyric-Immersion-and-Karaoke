@@ -12,7 +12,10 @@ hiddenimports = [
 ]
 
 # Packages that ship data files / dynamically-imported submodules.
+# NOTE: unidic_lite bundles the ~50 MB dictionary fugashi/cutlet need at runtime
+# — collect_all is what pulls those data files into the exe.
 for pkg in ("winsdk", "soundcard", "shazamio", "pykakasi", "jaconv",
+            "fugashi", "unidic_lite", "cutlet", "mojimoji",
             "pypinyin", "hangul_romanize", "deep_translator", "syncedlyrics",
             "pystray", "spotipy", "aiohttp", "aiosignal", "pydub", "numpy"):
     try:

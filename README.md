@@ -5,7 +5,9 @@ watches whatever you're playing — Spotify, YouTube in any browser, anything th
 talks to Windows' media controls — pulls the **real playback position**, and
 floats synced lyrics over your screen with:
 
-- **Furigana** above every kanji (漢字 → かんじ), **romaji** reading
+- **Furigana** above every kanji (漢字 → かんじ), **romaji** reading — from a
+  real Japanese morphological analyzer (fugashi + UniDic), so compounds are
+  segmented correctly (今生きてる → 今(いま)生き "ima ikite", not "konjou")
 - **Chinese → pinyin** and **Korean → romaja** readings too
 - **English** translation (incl. **Spanish** songs & corridos)
 - a **karaoke fill** that sweeps across each line *at singing speed*
@@ -40,9 +42,12 @@ Big, bold, flowing lyrics everyone can read and sing from across the room. The
 > Opacity **100%**, Position **bottom**, **Scroll-through ←**, Font **150%**,
 > **Smooth** 60fps, **Auto re-sync by sound** on.
 
-Lines stream across in staggered lanes (up to 3, depending on font), the current
-line fills as it's sung, and the audio re-sync keeps it glued to the music — even
-across a **concert / live video** with many songs back-to-back.
+Lines stream across in staggered lanes (up to 4, sized automatically to the
+song — short for English, taller for furigana+romaji+English), the current line
+fills as it's sung, and the audio re-sync keeps it glued to the music — even
+across a **concert / live video** with many songs back-to-back. Dense, fast
+songs automatically scroll just fast enough that lines never pile up on top of
+each other, while slow songs keep a relaxed pace.
 
 You can of course mix your own from the tray menu; both presets are starting
 points.

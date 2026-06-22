@@ -35,6 +35,20 @@ python preload.py            # skips songs already cached
 python sync_playlists.py --client-id <id>   # see sync_playlists.py header
 ```
 
+## Upgrade existing Japanese furigana/romaji
+
+Japanese readings use the fugashi + UniDic morphological analyzer (cutlet for
+romaji), which segments correctly where the old pykakasi path failed (今生きて →
+今(いま)生き "ima ikite", not 今生 "konjou"). After changing the romanizer, or to
+fix files annotated by an older version, rewrite the cache in place:
+
+```bash
+python reannotate.py          # rebuild jp/rm for every lang=="ja" file
+python reannotate.py --dry    # preview, write nothing
+```
+
+It only touches `jp`/`rm`; timestamps and `en` are preserved. Idempotent.
+
 ## The lyrics JSON schema
 
 ```json
