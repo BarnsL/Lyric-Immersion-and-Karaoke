@@ -29,8 +29,13 @@ plus a `pystray` tray menu.
   - lifecycle: `__init__`, `run`, `quit`, `_tick` (the ~60fps loop)
   - matching/fetch: `_on_track_change`, `_start_fetch`, `_consume_async`,
     `_file_valid`, `_maybe_translate`, `load`
-  - **audio**: `_start_identify`, `_recalibrate_loop` (periodic listen → timing
-    re-lock **and** concert song-change), `_health_check`, `_suspect`
+  - **audio**: `_start_identify(seconds, attempts)` (short captures re-sync
+    fast, long ones detect reliably), `_recalibrate_loop` + `_arm_recal`
+    (adaptive cadence — a 3-shot fast burst ~8s apart right after a song starts
+    so the offset locks in ~25s, then relaxes to `recal_secs`; also catches
+    concert song-changes), `_health_check`, `_suspect`. Correction snaps to a
+    clearly-real offset (>2s, e.g. an MV intro) and otherwise eases 0.8× toward
+    it, smoothing Shazam's sub-second noise.
   - rendering: `_render`, `_karaoke`, `_render_block`/`_ticker_update`
     (scroll-through ticker), `_animate_in`/`_anim_step`, `_hint`
   - **scroll layout**: `_relayout_song` sizes blocks + lane count to the rows

@@ -435,13 +435,15 @@ class Overlay:
         self._identifying = False
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
+        self._fast_calib = 0          # remaining quick re-locks after a song change
+        self._recal_after = None      # pending recalibrate timer id
 
         self.index = LyricsIndex()
         self.media = MediaWatcher()
         self._hint("Waiting for music…")
         self.root.after(300, self._tick)
         self.root.after(7000, self._health_check)
-        self.root.after(self.recal_secs * 1000, self._recalibrate_loop)
+        self._arm_recal(max(8, self.recal_secs or 30))
 
     # ── per-track ──
 
@@ -470,7 +472,11 @@ class Overlay:
             self._start_fetch(artist, title, duration)
 
         # PRIMARY signal: identify by sound and let it decide the real song.
-        self._start_identify()
+        self._start_identify(seconds=6, attempts=2)
+        # Lock the timing fast: a short burst of quick re-checks right after the
+        # song starts, then the loop relaxes to the normal cadence.
+        self._fast_calib = 3
+        self._arm_recal(7)
 
     def _trusted_duration(self, state):
         # YouTube/browser report the VIDEO length (intro/outro) which differs
@@ -542,7 +548,10 @@ class Overlay:
 
     # ── audio identification (detect by SOUND, not title) ──
 
-    def _start_identify(self):
+    def _start_identify(self, seconds=6, attempts=2):
+        """Listen and identify by sound. Short captures (re-sync of a known
+        song) finish faster; longer ones (first detection) recognize more
+        reliably."""
         if self._identifying:
             return
         self._identifying = True
@@ -551,7 +560,7 @@ class Overlay:
             res = None
             try:
                 from recognize import recognize_playing
-                t, a, off, t_cap = recognize_playing()
+                t, a, off, t_cap = recognize_playing(seconds, attempts)
                 if t:
                     res = (t, a or "", off, t_cap)
             except Exception:
@@ -570,21 +579,40 @@ class Overlay:
                 if self._suspect(st):
                     self._health_attempts += 1
                     # Identify by sound — the authoritative correction.
-                    self._start_identify()
+                    self._start_identify(seconds=6, attempts=2)
         finally:
             self.root.after(9000, self._health_check)
 
+    def _arm_recal(self, delay):
+        """(Re)schedule the recalibrate loop, cancelling any pending fire so a
+        song change can pull the next listen in close."""
+        if self._recal_after:
+            try:
+                self.root.after_cancel(self._recal_after)
+            except Exception:
+                pass
+        self._recal_after = self.root.after(int(max(1, delay) * 1000),
+                                            self._recalibrate_loop)
+
     def _recalibrate_loop(self):
-        """Every recal_secs while playing, listen again: re-lock the timing AND
-        catch a new song within the same video (concert / DJ set / livestream)."""
+        """Listen again to re-lock timing AND catch a new song within one long
+        video (concert / DJ set / livestream). Cadence is fast right after a
+        song starts (3 quick re-locks ~8s apart) so the offset settles within
+        ~25s, then relaxes to recal_secs. Re-syncs use a short 5s capture so
+        each pass finishes quickly."""
+        nxt = max(10, self.recal_secs or 30)
         try:
             st = self.media.get()
-            if (self.recal_secs and st and st.get("status") == PLAYING
-                    and not self._identifying):
-                self._start_identify()
+            if st and st.get("status") == PLAYING and not self._identifying:
+                if self._fast_calib > 0:
+                    self._fast_calib -= 1
+                    self._start_identify(seconds=5, attempts=1)
+                    nxt = 8
+                elif self.recal_secs:
+                    self._start_identify(seconds=5, attempts=1)
+                    nxt = max(10, self.recal_secs)
         finally:
-            self.root.after(max(10, self.recal_secs or 30) * 1000,
-                            self._recalibrate_loop)
+            self._arm_recal(nxt)
 
     def _suspect(self, st):
         """Signs the current lyrics don't belong to what's actually playing."""
@@ -640,13 +668,15 @@ class Overlay:
                         corr = true_now - st["position"]
                         diff = corr - self.offset
                         if abs(corr) < 180:
-                            if abs(diff) > 3:
-                                self.offset = round(corr, 2)            # snap (new song / intro)
-                            elif abs(diff) > 0.3:
-                                self.offset = round(self.offset + 0.6 * diff, 2)  # ease out drift
+                            if abs(diff) > 2.0:
+                                self.offset = round(corr, 2)            # snap to a clearly real offset (intro / new song)
+                            elif abs(diff) > 0.15:
+                                self.offset = round(self.offset + 0.8 * diff, 2)  # converge fast, smooth Shazam noise
                 # Swap lyrics only when the HEARD song changes (concert / live).
                 if (title, artist) != self._sound_song:
                     self._sound_song = (title, artist)
+                    self._fast_calib = max(self._fast_calib, 2)  # new song → re-lock fast
+                    self._arm_recal(7)
                     # Shazam often romanizes JP titles ("Kira" for 綺羅), which
                     # fetches the wrong song. If the player's own title is CJK,
                     # fetch with THAT original script instead.
@@ -1117,6 +1147,7 @@ class Overlay:
 
     def set_recal(self, secs):
         self.recal_secs = int(secs)
+        self._arm_recal(2 if self.recal_secs else 30)   # apply the new cadence now
         self._persist()
 
     def apply_preset(self, name):

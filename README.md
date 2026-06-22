@@ -62,9 +62,11 @@ session (the same data behind the media keys), so it tracks scrubbing, pausing,
 and song changes for *any* player — and freezes when the music does.
 
 On top of that it **listens**: it identifies the song with Shazam and aligns the
-clock to the true offset, re-checking on an interval. That means **YouTube MV
-intros** are auto-corrected, drift is caught, and **concert/live videos** that
-contain many songs get the *right* lyrics for whatever is playing *right now*.
+clock to the true offset. Right after a song starts it does a quick **burst of
+short re-checks (~8s apart)** so the timing locks within ~25 seconds, then
+relaxes to the normal interval. That means **YouTube MV intros** are
+auto-corrected almost immediately, drift is caught, and **concert/live videos**
+that contain many songs lock onto whatever is playing *right now* fast.
 
 ## Identify by **sound**, not just the title
 
