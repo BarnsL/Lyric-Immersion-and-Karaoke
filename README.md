@@ -1,209 +1,217 @@
 # 🎤 Desktop Karaoke
 
-A transparent, always-on-top **karaoke overlay for Japanese learners**. It
-watches whatever you're playing — Spotify, YouTube in any browser, anything that
-talks to Windows' media controls — pulls the **real playback position**, and
-floats synced lyrics over your screen with:
+**A transparent, always-on-top karaoke overlay that floats synced, annotated
+lyrics over whatever you're playing — built for learning Japanese (and Chinese,
+Korean, and Spanish) by singing along.**
 
-- **Furigana** above every kanji (漢字 → かんじ), **romaji** reading — from a
-  real Japanese morphological analyzer (fugashi + UniDic), so compounds are
-  segmented correctly (今生きてる → 今(いま)生き "ima ikite", not "konjou")
-- **Chinese → pinyin** and **Korean → romaja** readings too
-- **English** translation (incl. **Spanish** songs & corridos)
-- a **karaoke fill** that sweeps across each line *at singing speed*
-
-Japanese, Chinese, and Korean are detected per song and romanized
-appropriately. Spanish songs (and corridos) show the line plus an English
-translation; English songs just show the synced line.
-
-No window, no panel — just clean outlined text over whatever's on screen. It
-never steals focus, so you can keep working / watching while it runs.
+Play a song in **Spotify, YouTube, or any app** that talks to Windows' media
+controls, and Desktop Karaoke pulls the **real playback position** and streams
+the lyrics across your screen — with furigana over every kanji, a reading you can
+pronounce, an English translation, and a karaoke fill that sweeps in time with
+the singing. There's no window and no panel: just clean, outlined text over your
+screen that never steals focus, so you can keep working, watching, or gaming
+while it runs.
 
 ![overlay](docs/preview.png)
 
 ---
 
-## Use cases (try a preset)
+## ✨ What it does
 
-Right-click the tray icon → **Presets** for one-click setups:
-
-### 🎮 Learn a language while you game
-Keep a language ticking over in your peripheral vision while you play. The
-**Gaming** preset sets a faint top overlay that never gets in the way:
-> Opacity **45%**, Position **top**, Slide-in **from left**, Font **100%**,
-> **Performance** mode (30fps / light outline so it costs your game nothing).
-
-Put on a Japanese (or Chinese/Korean/Spanish) playlist, glance up between
-fights, and you'll absorb furigana + readings + meaning passively.
-
-### 🎤 Karaoke night for a room of people
-Big, bold, flowing lyrics everyone can read and sing from across the room. The
-**Karaoke** preset:
-> Opacity **100%**, Position **bottom**, **Scroll-through ←**, Font **150%**,
-> **Smooth** 60fps, **Auto re-sync by sound** on.
-
-Lines stream across in staggered lanes (up to 4, sized automatically to the
-song — short for English, taller for furigana+romaji+English), the current line
-fills as it's sung, and the audio re-sync keeps it glued to the music — even
-across a **concert / live video** with many songs back-to-back. Dense, fast
-songs automatically scroll just fast enough that lines never pile up on top of
-each other, while slow songs keep a relaxed pace.
-
-You can of course mix your own from the tray menu; both presets are starting
-points.
+- **Furigana + romaji for Japanese.** Readings come from a real morphological
+  analyzer (**fugashi + UniDic**, with **cutlet** for romaji), so compounds are
+  segmented correctly — 今生きてる → 今(いま)生き *"ima ikite"*, not *"konjou"*.
+  Katakana English is recovered as English (ベイビーアイラブユー → *"baby I love
+  you"*), not spelled out phonetically.
+- **Chinese → pinyin** and **Korean → romaja**, detected per song. Korean and
+  Chinese render with proper fonts, so nothing turns into □ boxes.
+- **English translation** for Japanese / Chinese / Korean / **Spanish** songs
+  (including corridos), translated in context for natural results.
+- **Karaoke fill** that sweeps each line at singing speed, kept in time by the
+  **real song position** — not a guess from when the app launched.
+- **Identify by sound.** When a title is wrong (covers, mislabeled uploads, DJ
+  mixes), it listens with Shazam and fetches the lyrics for what's *actually*
+  playing.
+- **Scroll-through mode** with staggered lanes for a flowing, room-filling
+  karaoke look — or a clean fixed-line mode.
+- **Responsive sizing.** Text scales to your display automatically, so it looks
+  right on a laptop or a big TV.
+- **Optional dancing character.** A little companion, themed to the current
+  song's artist, that bobs along to the music. Toggle it from the tray.
+- **Portable & private.** No account, no telemetry. The whole app is one folder
+  you can copy anywhere.
 
 ---
 
-## Why it stays in sync
+## ⬇️ Install (one click, no Python needed)
 
+1. Download **`DesktopKaraoke-Setup.exe`** from the
+   [**Releases**](https://github.com/BarnsL/Desktop-Karaoke/releases) page.
+2. Double-click it and click **Next → Install** (no admin rights required — it
+   installs just for you).
+3. Optionally tick **desktop shortcut** and **Start with Windows**.
+
+That's it. The app launches into your **system tray** (look for the あ icon) and
+adds a **Desktop Karaoke** entry to your **Start menu**. Play any song and the
+lyrics appear automatically.
+
+> **Prefer portable?** Download `DesktopKaraoke.exe` instead and just
+> double-click it — nothing to install. It keeps its lyric library and settings
+> in the same folder, so you can run it from a USB stick.
+
+Everything is controlled from the tray icon: presets, opacity, font size,
+position, scroll style, the dancing character, and more. See **[USAGE.md](USAGE.md)**
+for the full menu reference.
+
+---
+
+## 🎛️ Two presets to start from
+
+Right-click the tray icon → **Presets**:
+
+### 🎮 Learn a language while you game
+A faint overlay at the top that stays out of the way. Glance up between fights
+and you'll passively absorb furigana, readings, and meaning.
+> Opacity **45%** · top · slide-in from left · font **100%** · Performance mode.
+
+### 🎤 Karaoke night for a room
+Big, bold, flowing lyrics everyone can read and sing from across the room.
+> Opacity **100%** · bottom · scroll-through ← · font **150%** · Smooth 60 fps ·
+> auto re-sync by sound.
+
+Both are just starting points — mix your own from the tray menu.
+
+---
+
+## 🔎 How it works
+
+### Stays in sync
 Most lyric overlays guess timing from when they launched. Desktop Karaoke reads
-the **actual song position** from the Windows `GlobalSystemMediaTransportControls`
-session (the same data behind the media keys), so it tracks scrubbing, pausing,
-and song changes for *any* player — and freezes when the music does.
+the **actual song position** from Windows'
+`GlobalSystemMediaTransportControls` session (the data behind your media keys),
+so it follows scrubbing, pausing, and track changes for *any* player — and
+freezes when the music does. It also **listens**: it identifies the song with
+Shazam and aligns the clock to the true offset, with a quick burst of re-checks
+right after a song starts so the timing locks within ~25 seconds. That
+auto-corrects YouTube MV intros, catches drift, and follows **concert / live
+videos** that contain many songs back-to-back.
 
-On top of that it **listens**: it identifies the song with Shazam and aligns the
-clock to the true offset. Right after a song starts it does a quick **burst of
-short re-checks (~8s apart)** so the timing locks within ~25 seconds, then
-relaxes to the normal interval. That means **YouTube MV intros** are
-auto-corrected almost immediately, drift is caught, and **concert/live videos**
-that contain many songs lock onto whatever is playing *right now* fast.
+### Gets the *right* lyrics
+Common titles match the wrong song easily, so every fetch is **verified** before
+it's accepted — by song **duration**, by **artist**, and by **language** (a
+CJK-titled song must come back in that script). A periodic health-check notices
+if the lyrics stop fitting and re-identifies by sound, so it lands on the right
+song even if the first guess was off. Force a correction any time with the tray's
+**⚑ Wrong lyrics**, or sweep the whole library with `python validate.py --purge`.
 
-## Identify by **sound**, not just the title
+### Never bare, never boxed
+Readings are added **per line by each line's own script**, so a Japanese line
+inside a mostly-English song still gets furigana, and Korean/Chinese render with
+fonts that have the right glyphs (no □ boxes). Songs are cached to
+`lyrics/*.json` on first play and never fetched again — the local library only
+grows.
 
-Titles lie — covers, mislabeled uploads, and DJ mixes all defeat name-based
-matching. Desktop Karaoke can listen to the actual audio (WASAPI loopback) and
-ask Shazam what's really playing, then fetch *those* lyrics. It does this
-automatically when a match looks wrong, and on demand from the tray
-(**🎧 Identify by sound** / **⚑ Wrong lyrics**). Only raw audio is sent to
-Shazam — no title, account, or device info.
+---
 
-## Getting the *right* lyrics (error detection & correction)
+## 🌐 Lyric sources
 
-Common titles match the wrong song easily, and aggregators sometimes return
-the wrong language entirely. Every fetch is **verified** before it's accepted:
+Lyrics are fetched on demand. The search tries the full credit, then each
+featured artist, then a guarded title-only pass; if the title still misses, it
+identifies the song by **sound** and fetches under the canonical name.
 
-- **Duration** — preferred matches come from LRCLIB's duration-exact endpoint;
-  the real song length (from the OS) rejects same-titled wrong versions.
-- **Artist** — search candidates are scored on artist + title match.
-- **Language** — a CJK-titled song must come back in that script, so
-  hallucinated / mistranslated lyrics are thrown out.
-
-At runtime the overlay runs a **periodic health-check**: if the lyrics stop
-fitting the song (wrong duration, lyrics ending too early, unverified match) it
-identifies the track by sound and self-corrects — so it lands on the right song
-eventually even if the first guess was wrong. The tray
-**"⚑ Wrong lyrics — fix this song"** forces that correction immediately, and
-`python validate.py --purge` sweeps the whole library.
-
-## Lyrics coverage & sources
-
-Lyrics are fetched on demand and the widened search tries the full credit, then
-each individual / featured artist, then a guarded title-only pass — and if the
-title/artist still miss (e.g. a name written as "Ikuta Rira" but filed under
-"Lilas Ikuta"), it **identifies the song by sound** and fetches under the
-canonical name.
-
-**Sources used**
 - [`syncedlyrics`](https://github.com/moehmeni/syncedlyrics) — aggregates
   **Musixmatch, NetEase, LRCLIB, Megalobiz, Genius** (strong VTuber / hololive /
   anime / J-pop coverage)
 - [LRCLIB](https://lrclib.net) directly — duration-exact, verifiable matches
-- [`shazamio`](https://github.com/shazamio/ShazamIO) + [`soundcard`](https://github.com/bastibe/SoundCard) — identify by **audio**
-- [`pykakasi`](https://github.com/miurahr/pykakasi) (JP furigana/romaji),
-  [`pypinyin`](https://github.com/mozillazg/python-pinyin) (ZH),
-  [`hangul-romanize`](https://github.com/youknowone/hangul-romanize) (KO)
+- [`shazamio`](https://github.com/shazamio/ShazamIO) +
+  [`soundcard`](https://github.com/bastibe/SoundCard) — identify by **audio**
+- **fugashi + UniDic + [`cutlet`](https://github.com/polm/cutlet)** (Japanese),
+  [`pypinyin`](https://github.com/mozillazg/python-pinyin) (Chinese),
+  [`hangul-romanize`](https://github.com/youknowone/hangul-romanize) (Korean) —
+  readings; `pykakasi` is the automatic fallback
 - [`deep-translator`](https://github.com/nidhaloff/deep-translator) — English
+  (Google by default; DeepL if a `DEEPL_API_KEY` is set)
 
-**Candidate future sources** (for songs the above still miss — see the header of
-`fetch_lyrics.py` for how to wire one in): **PetitLyrics (プチリリ)** for JP/anime/
-VTuber, **QQ Music / Kugou** for Chinese, **Apple Music** time-synced lyrics, and
-Genius/Uta-Net/J-Lyric as unsynced last-resort fallbacks.
-
-Songs are cached to `lyrics/*.json` on first play (lyrics + readings +
-translation) and **never fetched again** — the local library only grows.
-Japanese / Chinese / Korean / Spanish are detected per song; English and other
-languages just show the synced line.
+See the header of `fetch_lyrics.py` and [RESEARCH.md](RESEARCH.md) for candidate
+future sources (PetitLyrics, QQ Music / Kugou, Apple Music) and the research
+behind each design choice.
 
 ---
 
-## Install
-
-**Easiest (no Python, no terminal):** download **`DesktopKaraoke-Setup.exe`**
-from [Releases](https://github.com/BarnsL/Desktop-Karaoke/releases), double-click,
-click through Next → Install. Tick **Start with Windows** if you want it always
-on. It launches to the system tray (あ) — play any song and lyrics appear. You
-can also toggle Start-with-Windows from the tray menu any time.
-
-> Prefer portable? Grab `DesktopKaraoke.exe` and just double-click it.
-
-**From source (developers):**
+## 🛠️ From source (developers)
 
 ```bash
 git clone https://github.com/BarnsL/Desktop-Karaoke.git
 cd Desktop-Karaoke
 pip install -r requirements.txt
+pythonw main.py                  # start the overlay (no console window)
+python  main.py --offset -1.5    # nudge sync earlier for an intro-heavy video
 ```
 
-To build the installer yourself, see [BUILD.md](BUILD.md) (`build.bat`).
-
-## Run
+**Build the one-click installer yourself** — see [BUILD.md](BUILD.md):
 
 ```bash
-pythonw main.py            # start the overlay (no console window)
-python  main.py --offset -1.5   # nudge sync earlier for videos with an intro
+build.bat        # → dist\DesktopKaraoke.exe  (+ DesktopKaraoke-Setup.exe if Inno Setup is installed)
 ```
 
-Everything is controlled from the tray icon (あ): presets, opacity, font,
-position, scroll style, sound re-sync, performance, library backup, and more —
-**see [USAGE.md](USAGE.md) for the full reference.** Play a song and the matching
-lyrics appear automatically; unknown songs are fetched and cached on the fly.
-
-**Portable & self-contained:** the packaged app keeps its library (`lyrics/`)
-and `settings.json` **right next to the .exe**, so the whole thing is one folder
-you can copy to a USB stick or back up wherever you like.
-
-## Build a starter library
-
+### Build a starter library
 ```bash
-python preload.py          # fetch a curated ReGLOSS / hololive / J-pop set
-python preload.py --translate-all   # also bake English into every song (slow)
+python preload.py                  # fetch a curated ReGLOSS / hololive / J-pop set
+python preload.py --translate-all  # also bake English into every song (slow)
 ```
 
-Re-running only fetches what's missing, so it doubles as a "top up my library"
-command.
-
-## Sync your Spotify playlists
-
-Pre-cache every track in all your playlists so nothing fetches mid-song:
-
+### Pre-cache your Spotify playlists
 ```bash
 # One-time: create an app at https://developer.spotify.com/dashboard
 # (redirect URI http://localhost:8888/callback), copy the Client ID, then:
-python sync_playlists.py --client-id YOUR_CLIENT_ID   # authorize once in browser
-python sync_playlists.py                              # later runs (token cached)
+python sync_playlists.py --client-id YOUR_CLIENT_ID   # authorize once in the browser
+python sync_playlists.py                              # later runs reuse the cached token
 python sync_playlists.py --liked                      # also include Liked Songs
 ```
-
 Uses Spotify's official OAuth (PKCE) — the tool never sees your password, and
-your token/Client ID stay local (git-ignored).
+your token / Client ID stay local (git-ignored).
 
 ---
 
-## How it looks under the hood
+## 📁 Project structure
 
 | File | Role |
 |------|------|
-| `main.py` | Overlay window, GSMTC media watcher, karaoke renderer |
-| `fetch_lyrics.py` | Multi-provider fetch + furigana/romaji/English annotation |
-| `preload.py` | Bulk-build the local lyrics library |
-| `lyrics/*.json` | Cached, annotated, timed lyrics (git-ignored) |
+| `main.py` | The overlay: transparent click-through window, media watcher, renderer, tray menu |
+| `fetch_lyrics.py` | Multi-provider fetch + verification + furigana / romaji / translation |
+| `recognize.py` | Identify the playing song by **sound** (loopback capture → Shazam) |
+| `gairaigo.py` | Katakana → English loanword table (so ベイビー → "baby") |
+| `character.py` | The optional dancing on-screen companion |
+| `preload.py` | Bulk-build the local lyric library from a curated list |
+| `reannotate.py` | Re-generate furigana / romaji for the cache after a romanizer change |
+| `sync_playlists.py` | Pre-cache every track in your Spotify playlists |
+| `validate.py` | Scan the cache for bad / mismatched files (`--purge`) |
+| `lyrics/*.json` | Cached, annotated, timed lyrics (git-ignored — not redistributed) |
 
-## A note on lyrics & copyright
+### Documentation
+- **[USAGE.md](USAGE.md)** — every tray menu option, explained.
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — module-by-module design, every public function.
+- **[BUILD.md](BUILD.md)** — how the one-click installer is produced.
+- **[AGENTS.md](AGENTS.md)** — how to add songs, languages, and katakana data.
+- **[RESEARCH.md](RESEARCH.md)** — the investigation and root-cause notes behind each design choice.
+- **[SECURITY.md](SECURITY.md)** — exactly what data leaves the machine (almost nothing).
 
-Song lyrics are owned by their rights-holders. This tool **fetches them at
-runtime for personal study** and caches them locally — the cache is *not*
-committed or redistributed (see `.gitignore`). Please support the artists. 💜
+---
 
-## License
+## 🔒 Privacy
 
-MIT (the code). Lyrics belong to their respective owners.
+No account, no telemetry, no analytics. The only things that ever leave your
+machine are public song **title/artist** strings (to lyric providers) and a few
+seconds of **audio** (to Shazam, for identify-by-sound). Nothing about you, your
+library, or your device is sent anywhere. Full details in [SECURITY.md](SECURITY.md).
+
+## 🎵 A note on lyrics & copyright
+
+Song lyrics belong to their rights-holders. This tool **fetches them at runtime
+for personal study** and caches them locally — the cache is *not* committed or
+redistributed (see `.gitignore`). The optional dancing character is a simple
+drawn avatar, not any artist's actual model. Please support the artists. 💜
+
+## 📄 License
+
+MIT for the code. Lyrics and any artwork belong to their respective owners.

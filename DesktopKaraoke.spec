@@ -35,24 +35,38 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter.test", "test", "pytest"],
+    # Trim heavy libraries the app never imports (they can get pulled in
+    # transitively and bloat the build). Safe to drop — none are used.
+    excludes=["tkinter.test", "test", "pytest", "matplotlib", "scipy",
+              "IPython", "notebook", "pandas", "PyQt5", "PyQt6", "PySide2",
+              "PySide6", "wx", "sphinx", "setuptools._vendor", "wordninja"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
 
+# ONEDIR build: the .exe lives in a folder next to its dependencies. This starts
+# instantly (a one-file build re-extracts ~100 MB — including the 50 MB UniDic
+# dictionary — to a temp folder on EVERY launch, which is slow and brittle). The
+# Inno Setup installer wraps this folder into the one-click DesktopKaraoke-Setup.exe.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,    # onedir — binaries live alongside, not inside
     name="DesktopKaraoke",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    runtime_tmpdir=None,
     console=False,            # no console window — clean GUI app
     disable_windowed_traceback=False,
     icon="icon.ico",
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="DesktopKaraoke",
 )

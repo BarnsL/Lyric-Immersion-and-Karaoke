@@ -345,6 +345,8 @@ def _furi_pair(surf: str, kana: str) -> str:
 
 
 def to_furigana(text: str) -> str:
+    """Annotate Japanese text with furigana as ``漢字(かな)`` (readings sit only
+    over the kanji). Uses the fugashi analyzer when available, else pykakasi."""
     if _jp_engine():
         try:
             # fugashi DROPS whitespace between tokens, which squished English
@@ -373,6 +375,9 @@ def to_furigana(text: str) -> str:
 
 
 def romanize(text: str, lang: str) -> str:
+    """Romanize text for the given language: Japanese → Hepburn romaji (fugashi +
+    cutlet, katakana English recovered as English), Chinese → pinyin, Korean →
+    romaja. Returns '' on failure or unsupported language."""
     try:
         if lang == "ja":
             if _jp_engine():

@@ -25,6 +25,8 @@ _SR = 44100
 
 
 def _capture(seconds=_DUR):
+    """Record `seconds` of the system's audio output (WASAPI loopback) and return
+    it as in-memory WAV bytes, or None if no loopback device is found."""
     import numpy as np
     import soundcard as sc
 
@@ -49,6 +51,9 @@ def _capture(seconds=_DUR):
 
 
 async def _shazam(wav_bytes):
+    """Fingerprint the WAV clip and ask Shazam to identify it. Returns
+    (title, artist, offset) — offset = seconds into the matched song — or
+    (None, None, None) if nothing matched."""
     from shazamio import Shazam
     out = await Shazam().recognize(wav_bytes)
     track = (out or {}).get("track") or {}

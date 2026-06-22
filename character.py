@@ -97,6 +97,7 @@ class Character:
 
     # ── public API ──
     def set_enabled(self, on: bool):
+        """Show or hide the companion. When shown, starts its animation loop."""
         self.enabled = bool(on)
         if self.enabled:
             self.win.deiconify()
@@ -106,15 +107,20 @@ class Character:
             self.win.withdraw()
 
     def set_artist(self, name: str):
+        """Theme the companion to a new artist (re-derives colors and looks for a
+        user-supplied characters/<artist>.png to use instead of the drawing)."""
         if name == self.artist:
             return
         self.artist = name or ""
         self._img = self._load_model(self.artist)
 
     def set_playing(self, playing: bool):
+        """Tell the companion whether music is playing (drives the dance vs idle
+        animation). Called every frame by the overlay."""
         self.playing = bool(playing)
 
     def destroy(self):
+        """Tear down the companion window (ignored if already gone)."""
         try:
             self.win.destroy()
         except Exception:
@@ -122,10 +128,13 @@ class Character:
 
     # ── interaction ──
     def _press(self, e):
+        """Start a drag: record the pointer + window origin so _move can follow."""
         self._drag = (e.x_root, e.y_root, self.win.winfo_x(), self.win.winfo_y())
         self._moved = False
 
     def _move(self, e):
+        """Drag the window with the pointer (and remember that it moved, so a
+        release isn't treated as a click)."""
         if not self._drag:
             return
         dx, dy = e.x_root - self._drag[0], e.y_root - self._drag[1]
@@ -134,12 +143,15 @@ class Character:
         self.win.geometry(f"+{self._drag[2] + dx}+{self._drag[3] + dy}")
 
     def _release(self, e):
+        """End a drag; a release with no movement counts as a click → hop."""
         if self._drag and not self._moved:
             self._jump = 1.0            # a click (not a drag) makes it hop
         self._drag = None
 
     # ── optional user-supplied model image ──
     def _load_model(self, artist: str):
+        """Return a PhotoImage for characters/<artist>.png|.gif if the user has
+        supplied one, else None (fall back to the drawn avatar)."""
         folder = self.data_dir / "characters"
         for ext in (".png", ".gif"):
             p = folder / f"{_slug(artist)}{ext}"

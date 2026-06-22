@@ -92,6 +92,7 @@ def _resource(name):
 
 
 def _load_settings():
+    """Read settings.json (returns {} if missing or unreadable)."""
     try:
         return json.loads(SETTINGS.read_text("utf-8"))
     except Exception:
@@ -99,6 +100,7 @@ def _load_settings():
 
 
 def _save_settings(data):
+    """Write the settings dict to settings.json (best-effort)."""
     try:
         SETTINGS.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
@@ -108,15 +110,19 @@ def _save_settings(data):
 # ── Start-with-Windows (Startup-folder shortcut) ─────────────────────
 
 def _startup_lnk():
+    """Path to the .lnk in the user's Startup folder used for 'Start with
+    Windows'."""
     return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
             / "Start Menu" / "Programs" / "Startup" / "Desktop Karaoke.lnk")
 
 
 def startup_enabled():
+    """True if the Start-with-Windows shortcut currently exists."""
     return _startup_lnk().exists()
 
 
-def _psq(s):                       # quote a string for PowerShell
+def _psq(s):
+    """Quote a string as a single-quoted PowerShell literal (doubles any ')."""
     return "'" + str(s).replace("'", "''") + "'"
 
 
@@ -169,6 +175,7 @@ _CJK_RE = re.compile(r"[一-鿿㐀-䶿ぁ-んァ-ヶー가-힣]")
 
 
 def _has_cjk(s):
+    """True if the string contains any CJK or Hangul character."""
     return bool(_CJK_RE.search(s or ""))
 
 
@@ -274,6 +281,10 @@ class MediaWatcher:
 
 
 def clean_title(title, source=""):
+    """Strip noise from a media title so it matches lyric metadata — removes a
+    trailing '- YouTube', bracketed notes, and tags like 'Official MV' / 'Lyric
+    Video' / 'HD'. `source` is the player app id (browser titles get extra
+    cleanup)."""
     t = title
     if any(h in source for h in BROWSER_HINTS):
         t = re.sub(r"\s*[-–—|]\s*YouTube\s*$", "", t, flags=re.I)
@@ -301,10 +312,13 @@ _TS_RE = re.compile(r"\[\d+:\d+(?:\.\d+)?\]|<\d+:\d+(?:\.\d+)?>")
 
 
 def _clean(s):
+    """Strip any stray inline LRC timestamp tags ([mm:ss], <mm:ss>) from text."""
     return _TS_RE.sub("", s).strip()
 
 
 def load_lyrics(path):
+    """Load a cached lyrics JSON file → (meta dict, list[Line]) with timestamps,
+    furigana/main text, romaji, and English, tags stripped."""
     data = json.loads(Path(path).read_text("utf-8"))
     meta = data.get("meta", {})
     lines = [
@@ -317,6 +331,8 @@ def load_lyrics(path):
 
 
 def split_furigana(text):
+    """Parse 'kanji(かな)' furigana markup into [(base, reading), …] segments;
+    plain runs come back as (text, '')."""
     parts, last = [], 0
     for m in _FURI_RE.finditer(text):
         if m.start() > last:
@@ -1498,6 +1514,8 @@ class Overlay:
 # ── Tray icon ────────────────────────────────────────────────────────
 
 def make_icon():
+    """Load the tray icon image (bundled icon.ico), falling back to a drawn 'あ'
+    glyph if the file can't be read."""
     ico = _resource("icon.ico")
     if ico.exists():
         return Image.open(ico)
