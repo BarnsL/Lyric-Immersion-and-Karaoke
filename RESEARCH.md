@@ -30,7 +30,18 @@ every result verified by duration + language. See `fetch_lyrics.py`.
   of those providers is wired. The renderer interpolates the fill across each
   line in the meantime (looks good for the vast majority of songs).
 - 📝 **Candidate providers** (now noted in `fetch_lyrics.py` header): PetitLyrics
-  (JP), QQ/Kugou (CJK word-level), Apple Music (token), BetterLyrics (TTML).
+  (JP), QQ/Kugou (CJK word-level), Apple Music (token), BetterLyrics (TTML),
+  animelyrics.com / Miraikyun (anime/Vocaloid with ready-made romaji + English,
+  but plain text only — no karaoke timing).
+- ✅ **"Bare Japanese" fix.** Some songs displayed Japanese with no romaji /
+  translation. Cause: `annotate()` only romanized when the *whole song's*
+  language was `ja`, so a Japanese line inside a mostly-English (or
+  mis-detected) song stayed bare. Fixed by romanizing **per line** by each
+  line's own script. This is better than pulling a foreign romaji/translation
+  source: the local analyzer + translator cover *every* song, not just charted
+  anime, and stay consistent with the rest of the library. Three layers now
+  guarantee it: `annotate()` (fetch), `reannotate.py` (cache — found 5 mixed
+  files), and `backfill_file()` + `_maybe_translate` (runtime self-heal).
 
 **Net:** the free stack is already near-optimal; the only real upgrade (word
 timing) isn't available for free. No code change beyond documentation.
@@ -96,6 +107,7 @@ call; lanes + block height adapt per song.
 | Sync | PlaybackRate-aware position + calibration | `main.py` `MediaWatcher`, `_consume_async` |
 | Perf | Reuse GSMTC session manager across polls | `main.py` `MediaWatcher._loop` |
 | Translation | Use DeepL when `DEEPL_API_KEY` is set | `fetch_lyrics.py` `_make_translator` |
+| Coverage | Per-line furigana/romaji + runtime self-heal (no more bare Japanese) | `fetch_lyrics.py` `annotate`/`backfill_file`, `main.py` `_maybe_translate`, `reannotate.py` |
 | Docs | Word-level finding, candidates, this file | `fetch_lyrics.py` header, `RESEARCH.md` |
 
 Everything else researched (word-level providers, GPU backend, event-driven
@@ -111,3 +123,5 @@ GSMTC, pitch accent) is intentionally deferred for the reasons above.
 - [Tk Canvas performance (Tcl wiki)](https://wiki.tcl-lang.org/page/Tk+Performance) ·
   [Tk Canvas limitations](https://www.ancisoft.com/blog/understanding-performance-limitations-of-the-tkinter-canvas/)
 - [deep-translator (DeepL/Google)](https://pypi.org/project/deep-translator/)
+- [animelyrics (PyPI)](https://pypi.org/project/animelyrics/) ·
+  [Miraikyun](https://miraikyun.com/) — anime/Vocaloid romaji + English (plain text)

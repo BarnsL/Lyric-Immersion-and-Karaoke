@@ -38,6 +38,13 @@ FUTURE / CANDIDATE SOURCES  (researched 2026-06; not yet wired — add here as
                   renderer interpolates the fill across each line.
   • PetitLyrics (プチリリ) — large synced catalog for JP anime / VTuber /
                   doujin; best next addition for songs the aggregators miss.
+  • animelyrics.com (via the `animelyrics` PyPI pkg) / Miraikyun — anime &
+                  Vocaloid lyrics that ALREADY ship romaji + English, but only
+                  PLAIN text (no per-line timing). Useful as a translation/romaji
+                  cross-check, not for karaoke timing. NOTE: we don't actually
+                  need these for romaji/EN — the analyzer + translator generate
+                  them locally per line (see annotate / backfill_file), which
+                  covers every song, not just charted anime.
   • QQ Music / Kugou — synced (incl. word-level) lyrics for Chinese + Asian pop.
   • Apple Music time-synced lyrics (needs an Apple Music API token).
   • BetterLyrics — TTML (word-level) provider seen in newer lyric tools.
@@ -533,15 +540,18 @@ def _make_translator():
     return GoogleTranslator(source="auto", target="en")
 
 
-def _translate_lines(lines: list[dict], song_lang: str | None = None) -> int:
+def _translate_lines(lines: list[dict], song_lang: str | None = None,
+                     only_missing: bool = False) -> int:
     try:
         tr = _make_translator()
     except ImportError:
         return 0
     whole = song_lang in ("ja", "ko", "zh", "es")
 
-    def want(jp):
-        raw = re.sub(r"\(.*?\)", "", jp)
+    def want(ln):
+        if only_missing and ln.get("en", "").strip():
+            return False                   # keep an existing translation
+        raw = re.sub(r"\(.*?\)", "", ln["jp"])
         if not raw.strip():
             return False
         ll = detect_lang(raw)
@@ -549,7 +559,7 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None) -> int:
             return True
         return whole and ll == "other"     # Spanish line w/o accents, etc.
 
-    idx = [i for i, ln in enumerate(lines) if want(ln["jp"])]
+    idx = [i for i, ln in enumerate(lines) if want(lines[i])]
     raws = [re.sub(r"\(.*?\)", "", lines[i]["jp"]) for i in idx]
     done = 0
     for k in range(0, len(raws), 20):
@@ -574,19 +584,66 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None) -> int:
 
 
 def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict]:
+    """Add furigana + romaji to each line by ITS OWN script — not the song's
+    overall language. This way a Japanese line inside a mostly-English song (or
+    one whose language was mis-detected) still gets furigana/romaji instead of
+    coming out as bare kanji. `lang` only disambiguates kanji-only lines
+    (Japanese vs Chinese)."""
     for ln in lines:
         raw = ln["jp"]
         ll = detect_lang(raw)
-        if lang == "ja" and ll == "ja":
+        if ll == "ja":
             ln["jp"] = to_furigana(raw)
             ln["rm"] = romanize(raw, "ja")
-        elif lang in ("zh", "ko") and ll == lang:
-            ln["rm"] = romanize(raw, lang)
+        elif ll == "ko":
+            ln["rm"] = romanize(raw, "ko")
+        elif ll == "zh":
+            # kanji-only: read as Japanese unless the whole song is Chinese
+            if lang == "zh":
+                ln["rm"] = romanize(raw, "zh")
+            else:
+                ln["jp"] = to_furigana(raw)
+                ln["rm"] = romanize(raw, "ja")
         else:
             ln["rm"] = ""  # Spanish / English / other — shown as-is, no romaji
     if translate:
         _translate_lines(lines, lang)
     return lines
+
+
+def backfill_file(path) -> bool:
+    """Self-heal a cached file: add furigana/romaji to any Japanese/CJK line
+    that's missing it, and translate any non-English line with no English yet.
+    Returns True if anything changed. Used at runtime so a song that came out as
+    bare Japanese gets fixed in place the first time it plays."""
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except Exception:
+        return False
+    lines = data.get("lines", [])
+    lang = data.get("meta", {}).get("lang")
+    changed = False
+    for ln in lines:
+        raw = re.sub(r"[(（][ぁ-ゟ゛゜ー]+[)）]", "", ln.get("jp", ""))  # strip existing furigana
+        if not raw.strip() or ln.get("rm", "").strip():
+            continue
+        ll = detect_lang(raw)
+        if ll == "ja" or (ll == "zh" and lang != "zh"):
+            ln["jp"] = to_furigana(raw)
+            ln["rm"] = romanize(raw, "ja")
+            changed = True
+        elif ll in ("zh", "ko"):
+            ln["rm"] = romanize(raw, ll)
+            changed = True
+    n = _translate_lines(lines, lang, only_missing=True)   # fills lines missing 'en'
+    if n:
+        changed = True
+    if changed:
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+        tmp.replace(path)
+    return changed
 
 
 def translate_file(path) -> bool:

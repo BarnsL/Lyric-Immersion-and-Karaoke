@@ -47,7 +47,22 @@ python reannotate.py          # rebuild jp/rm for every lang=="ja" file
 python reannotate.py --dry    # preview, write nothing
 ```
 
-It only touches `jp`/`rm`; timestamps and `en` are preserved. Idempotent.
+It only touches `jp`/`rm`; timestamps and `en` are preserved. Idempotent. It
+processes **any** file containing CJK — including songs whose overall language
+was detected as English/other — so Japanese lines inside a mixed song still get
+furigana + romaji (`annotate()` romanizes **per line** by each line's own
+script, not the song's overall language).
+
+## Why lyrics never come out as "bare Japanese"
+
+Three layers make sure a Japanese line always gets furigana/romaji (and a
+translation):
+
+1. **`annotate()`** romanizes each line by its own script at fetch time.
+2. **`reannotate.py`** fixes the existing cache.
+3. **`backfill_file()`** + the overlay's `_maybe_translate` self-heal a song at
+   runtime: the first time it plays, any CJK line missing romaji gets it, and
+   any untranslated line gets English — then the file is re-saved.
 
 ## The lyrics JSON schema
 

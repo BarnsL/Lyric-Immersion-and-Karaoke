@@ -32,18 +32,24 @@ def base_text(jp: str) -> str:
 
 
 def reannotate_file(path, dry=False) -> bool:
-    """Rewrite jp/rm for one file. Returns True if it changed."""
+    """Rewrite jp/rm per LINE by the line's own script (not the song's overall
+    language), so Japanese lines inside a mixed / mis-detected song also get
+    furigana + romaji instead of staying bare kanji. Returns True if changed."""
+    from fetch_lyrics import detect_lang
     data = json.loads(path.read_text("utf-8"))
-    if data.get("meta", {}).get("lang") != "ja":
-        return False
+    lang = data.get("meta", {}).get("lang")
     changed = False
     for ln in data.get("lines", []):
         jp = ln.get("jp", "")
         base = base_text(jp)
         if not base.strip():
             continue
-        new_jp = to_furigana(base)
-        new_rm = romanize(base, "ja")
+        ll = detect_lang(base)
+        new_jp, new_rm = jp, ln.get("rm", "")
+        if ll == "ja" or (ll == "zh" and lang != "zh"):     # read kanji-only as JP
+            new_jp, new_rm = to_furigana(base), romanize(base, "ja")
+        elif ll in ("zh", "ko"):
+            new_jp, new_rm = base, romanize(base, ll)
         if new_jp != jp or new_rm != ln.get("rm", ""):
             changed = True
             if not dry:
@@ -62,20 +68,22 @@ def main():
               "the same pykakasi output).")
         return
     files = sorted(LYRICS_DIR.glob("*.json"))
-    ja = changed = 0
+    seen = changed = 0
     for p in files:
         try:
             data = json.loads(p.read_text("utf-8"))
         except Exception:
             continue
-        if data.get("meta", {}).get("lang") != "ja":
+        # process any file that contains Japanese/CJK text, whatever its lang tag
+        if not any(re.search(r"[぀-ヿ一-鿿]", ln.get("jp", ""))
+                   for ln in data.get("lines", [])):
             continue
-        ja += 1
+        seen += 1
         if reannotate_file(p, dry):
             changed += 1
             print(("would update " if dry else "updated ") + p.name)
     verb = "would change" if dry else "changed"
-    print(f"\n{ja} Japanese files, {verb} {changed}.")
+    print(f"\n{seen} files with CJK, {verb} {changed}.")
 
 
 if __name__ == "__main__":

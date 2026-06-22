@@ -534,16 +534,19 @@ class Overlay:
             return True
 
     def _maybe_translate(self):
-        # A cached non-English song with no translation yet (e.g. preloaded
-        # with English off) gets it filled now and saved — so the local cache
-        # is complete and the song is never fetched again.
+        # Self-heal a loaded song in the background: add romaji to any
+        # Japanese/CJK line missing it, and translate any line that should have
+        # English but doesn't — whatever the song's overall detected language.
+        # So a song that came out as bare Japanese (e.g. mixed-language, or a
+        # mis-detected song) gets furigana/romaji + English filled and re-saved.
         if not self.lines or not self._lyrics_path:
             return
-        if self.meta.get("lang") not in ("ja", "zh", "ko", "es"):
-            return
-        have = sum(1 for ln in self.lines if ln.en.strip())
-        need = sum(1 for ln in self.lines if ln.jp.strip())
-        if need and have < need * 0.5:
+        cjk = [ln for ln in self.lines if ln.jp.strip() and _has_cjk(ln.jp)]
+        need_rm = any(not ln.rm.strip() for ln in cjk)
+        want_en = (self.lines if self.meta.get("lang") == "es" else cjk)
+        want_en = [ln for ln in want_en if ln.jp.strip()]
+        have_en = sum(1 for ln in want_en if ln.en.strip())
+        if need_rm or (want_en and have_en < len(want_en) * 0.5):
             self._start_translate(self._lyrics_path)
 
     def _start_fetch(self, artist, title, duration=None):
@@ -570,8 +573,8 @@ class Overlay:
         def work():
             ok = False
             try:
-                from fetch_lyrics import translate_file
-                ok = translate_file(path)
+                from fetch_lyrics import backfill_file   # romaji + translation
+                ok = backfill_file(path)
             except Exception:
                 ok = False
             self._translate_result = (path, ok)
