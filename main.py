@@ -331,10 +331,16 @@ class LyricsIndex:
 
 # ── Rendering ────────────────────────────────────────────────────────
 
+# Outline offsets per glyph — fewer = faster (less rasterization per frame).
+_OUTLINE_FULL = ((-2, -2), (2, -2), (-2, 2), (2, 2))   # 5 items/char
+_OUTLINE_LITE = ((2, 2),)                              # 2 items/char (perf mode)
+_OUTLINE = _OUTLINE_FULL
+
+
 def draw_text(cv, x, y, text, font, fill, anchor="center", tags="cur"):
-    """Outlined text, kept lightweight (5 items/char) so the slide animation
-    stays smooth. Returns the fill item id."""
-    for dx, dy in ((-2, -2), (2, -2), (-2, 2), (2, 2)):     # 4-corner outline
+    """Outlined text. Returns the fill item id. Outline weight follows the
+    current performance mode (_OUTLINE)."""
+    for dx, dy in _OUTLINE:
         cv.create_text(x + dx, y + dy, text=text, font=font,
                        fill=INK, anchor=anchor, tags=tags)
     return cv.create_text(x, y, text=text, font=font, fill=fill,
@@ -366,6 +372,11 @@ class Overlay:
         self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'|'lr'|'rl'
         self.scroll_speed = float(s.get("scroll_speed", SCROLL_SPEED))
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
+        self.perf = s.get("perf", "smooth")            # 'smooth' | 'fast'
+        self._fps = 16
+        self._last_pos = 0.0
+        self._strm_rem = 0.0
+        self._apply_perf()
         self._anim_id = None
         self._scroll_x = self._scroll_start = self._scroll_end = 0
         self._stream = []          # scroll-through ticker: live line blocks
@@ -634,7 +645,7 @@ class Overlay:
 
         if self.scroll_dir in ("lr", "rl"):       # continuous scroll-through
             self._ticker_update(pos)
-            self.root.after(16, self._tick)
+            self.root.after(self._fps, self._tick)
             return
 
         new = -1
@@ -652,7 +663,7 @@ class Overlay:
         elif new >= 0:
             self._karaoke(pos)
 
-        self.root.after(16, self._tick)   # ~60fps for tight, on-time sweeping
+        self.root.after(self._fps, self._tick)
 
     # ── drawing ──
 
@@ -743,12 +754,12 @@ class Overlay:
                     if w <= 0:
                         continue
                     fid = draw_text(self.cv, cx + w / 2, self.b_main + dy, ch,
-                                    self.JP_FONT, WHITE, tags=tag)
+                                    self.JP_FONT, WHITE, tags=(tag, "strm"))
                     chars.append({"fill": fid, "last": WHITE})
                     cx += w
                 if reading:
                     draw_text(self.cv, (seg + cx) / 2, self.b_furi + dy, reading,
-                              self.FURI_FONT, FURI_C, tags=tag)
+                              self.FURI_FONT, FURI_C, tags=(tag, "strm"))
                 cx += 6
             tracks.append({"chars": chars, "base": WHITE, "sung": SUNG})
             right = max(right, cx)
@@ -765,7 +776,7 @@ class Overlay:
                 w = measure_text(self.cv, ch, font)
                 if w <= 0:
                     continue
-                fid = draw_text(self.cv, cx + w / 2, y, ch, font, col, tags=tag)
+                fid = draw_text(self.cv, cx + w / 2, y, ch, font, col, tags=(tag, "strm"))
                 chars.append({"fill": fid, "last": col})
                 cx += w
             tracks.append({"chars": chars, "base": col, "sung": SUNG})
@@ -784,29 +795,39 @@ class Overlay:
     def _ticker_update(self, pos):
         center, v = self.W / 2, self.scroll_speed
         d = 1 if self.scroll_dir == "rl" else -1
+
+        # All blocks share the same per-frame motion, so move the whole stream
+        # in ONE call (keeps a sub-pixel remainder so it doesn't drift).
+        if self._stream:
+            dx_f = -d * v * (pos - self._last_pos) + self._strm_rem
+            dx = round(dx_f)
+            self._strm_rem = dx_f - dx
+            if dx:
+                self.cv.move("strm", dx, 0)
+        self._last_pos = pos
+
         want = {}
         for i, ln in enumerate(self.lines):
             cx = center + d * v * ((ln.start + ln.end) / 2 - pos)
-            if -1500 < cx < self.W + 1500:
+            if -1200 < cx < self.W + 1200:
                 want[i] = cx
         have = {b["idx"] for b in self._stream}
-        for i in want:
-            if i not in have:
-                self._stream.append(self._render_block(i))
+        for i, cx in want.items():
+            if i not in have:                       # spawn at absolute target
+                b = self._render_block(i)
+                self.cv.move(b["tag"], (cx - b["w"] / 2) - b["x"], 0)
+                self._stream.append(b)
         for b in self._stream[:]:
-            if b["idx"] in want:
-                left = want[b["idx"]] - b["w"] / 2
-                self.cv.move(b["tag"], left - b["x"], 0)
-                b["x"] = left
-                ln = self.lines[b["idx"]]
-                dur = ln.end - ln.start
-                if ln.start <= pos < ln.end and dur > 0:
-                    self._highlight_block(b, (pos - ln.start) / dur)  # current line fills
-                else:
-                    self._highlight_block(b, 0.0)                      # others at base color
-            else:
+            if b["idx"] not in want:
                 self.cv.delete(b["tag"])
                 self._stream.remove(b)
+                continue
+            ln = self.lines[b["idx"]]
+            dur = ln.end - ln.start
+            if ln.start <= pos < ln.end and dur > 0:
+                self._highlight_block(b, (pos - ln.start) / dur)   # current fills
+            else:
+                self._highlight_block(b, 0.0)
 
     def _clear_stream(self):
         for b in self._stream:
@@ -862,7 +883,7 @@ class Overlay:
     def _persist(self):
         _save_settings({"opacity": self.opacity, "position": self.position,
                         "scroll": self.scroll_dir, "font_scale": self.font_scale,
-                        "scroll_speed": self.scroll_speed})
+                        "scroll_speed": self.scroll_speed, "perf": self.perf})
 
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
@@ -892,6 +913,24 @@ class Overlay:
 
     def set_scroll_speed(self, v):
         self.scroll_speed = float(v)
+        self._persist()
+
+    def _apply_perf(self):
+        global _OUTLINE
+        if self.perf == "fast":
+            _OUTLINE = _OUTLINE_LITE     # 2 items/char, 30fps → much less to draw
+            self._fps = 33
+        else:
+            _OUTLINE = _OUTLINE_FULL     # 5 items/char, 60fps
+            self._fps = 16
+
+    def set_quality(self, mode):
+        self.perf = mode
+        self._apply_perf()
+        self._clear_stream()
+        self.cv.delete("all")
+        self._kara = []
+        self.idx = -1
         self._persist()
 
     def _apply_scale(self):
@@ -1055,6 +1094,14 @@ def main():
         _spd_item("Fast", 340), _spd_item("Very fast", 480),
     )
 
+    def _q_item(label, mode):
+        return pystray.MenuItem(label, lambda *_: ov.root.after(0, lambda: ov.set_quality(mode)),
+                                radio=True, checked=lambda i, mode=mode: ov.perf == mode)
+    perf_menu = pystray.Menu(
+        _q_item("Smooth  (best quality · 60fps)", "smooth"),
+        _q_item("Performance  (lighter · 30fps)", "fast"),
+    )
+
     def _font_item(pct):
         v = pct / 100
         return pystray.MenuItem(f"{pct}%", _set_font(v), radio=True,
@@ -1079,6 +1126,7 @@ def main():
         pystray.MenuItem("Position", position_menu),
         pystray.MenuItem("Scroll-in", scroll_menu),
         pystray.MenuItem("Scroll-through speed", speed_menu),
+        pystray.MenuItem("Performance", perf_menu),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Start with Windows", _toggle_startup,
                          checked=lambda i: startup_enabled()),
