@@ -55,17 +55,34 @@ eventually even if the first guess was wrong. The tray
 **"⚑ Wrong lyrics — fix this song"** forces that correction immediately, and
 `python validate.py --purge` sweeps the whole library.
 
-## Lyrics coverage
+## Lyrics coverage & sources
 
-Lyrics are fetched on demand via [`syncedlyrics`](https://github.com/moehmeni/syncedlyrics),
-which aggregates **Musixmatch, NetEase, LRCLIB, Megalobiz and Genius** — strong
-coverage for VTuber / hololive / anime / J-pop that single sources miss.
-Japanese lines are annotated locally with [`pykakasi`](https://github.com/miurahr/pykakasi)
-(furigana + romaji) and translated with
-[`deep-translator`](https://github.com/nidhaloff/deep-translator).
+Lyrics are fetched on demand and the widened search tries the full credit, then
+each individual / featured artist, then a guarded title-only pass — and if the
+title/artist still miss (e.g. a name written as "Ikuta Rira" but filed under
+"Lilas Ikuta"), it **identifies the song by sound** and fetches under the
+canonical name.
 
-Non-Japanese songs (English, etc.) work too — they just show the synced line
-with the karaoke sweep, no furigana.
+**Sources used**
+- [`syncedlyrics`](https://github.com/moehmeni/syncedlyrics) — aggregates
+  **Musixmatch, NetEase, LRCLIB, Megalobiz, Genius** (strong VTuber / hololive /
+  anime / J-pop coverage)
+- [LRCLIB](https://lrclib.net) directly — duration-exact, verifiable matches
+- [`shazamio`](https://github.com/shazamio/ShazamIO) + [`soundcard`](https://github.com/bastibe/SoundCard) — identify by **audio**
+- [`pykakasi`](https://github.com/miurahr/pykakasi) (JP furigana/romaji),
+  [`pypinyin`](https://github.com/mozillazg/python-pinyin) (ZH),
+  [`hangul-romanize`](https://github.com/youknowone/hangul-romanize) (KO)
+- [`deep-translator`](https://github.com/nidhaloff/deep-translator) — English
+
+**Candidate future sources** (for songs the above still miss — see the header of
+`fetch_lyrics.py` for how to wire one in): **PetitLyrics (プチリリ)** for JP/anime/
+VTuber, **QQ Music / Kugou** for Chinese, **Apple Music** time-synced lyrics, and
+Genius/Uta-Net/J-Lyric as unsynced last-resort fallbacks.
+
+Songs are cached to `lyrics/*.json` on first play (lyrics + readings +
+translation) and **never fetched again** — the local library only grows.
+Japanese / Chinese / Korean / Spanish are detected per song; English and other
+languages just show the synced line.
 
 ---
 

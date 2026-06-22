@@ -20,7 +20,7 @@ import asyncio
 import io
 import wave
 
-_DUR = 6  # seconds to sample
+_DUR = 8  # seconds to sample (longer = better recognition)
 _SR = 44100
 
 
@@ -57,15 +57,24 @@ async def _shazam(wav_bytes):
     return (title, artist) if title else (None, None)
 
 
-def recognize_playing(seconds=_DUR):
-    """Return (title, artist) of the currently playing audio, or (None, None)."""
-    try:
-        wav = _capture(seconds)
-        if not wav:
-            return (None, None)
-        return asyncio.run(_shazam(wav))
-    except Exception as e:
-        return (None, None)
+def recognize_playing(seconds=_DUR, attempts=2):
+    """Return (title, artist) of the currently playing audio, or (None, None).
+
+    Samples a fresh clip on each attempt — the second pass catches a quiet
+    intro / instrumental break the first one may have hit, improving the hit
+    rate without raising false positives (Shazam only returns a confident
+    match)."""
+    for _ in range(max(1, attempts)):
+        try:
+            wav = _capture(seconds)
+            if not wav:
+                return (None, None)
+            t, a = asyncio.run(_shazam(wav))
+            if t:
+                return (t, a)
+        except Exception:
+            pass
+    return (None, None)
 
 
 if __name__ == "__main__":

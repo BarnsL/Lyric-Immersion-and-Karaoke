@@ -370,6 +370,7 @@ class Overlay:
         if path and self._file_valid(path, duration):
             if path != self._lyrics_path:
                 self.load(path)
+            self._maybe_translate()   # fill English once, then it's cached forever
             return
 
         # nothing valid cached → fetch (and overwrite a bad file if present)
@@ -401,6 +402,19 @@ class Overlay:
             return ok
         except Exception:
             return True
+
+    def _maybe_translate(self):
+        # A cached non-English song with no translation yet (e.g. preloaded
+        # with English off) gets it filled now and saved — so the local cache
+        # is complete and the song is never fetched again.
+        if not self.lines or not self._lyrics_path:
+            return
+        if self.meta.get("lang") not in ("ja", "zh", "ko", "es"):
+            return
+        have = sum(1 for ln in self.lines if ln.en.strip())
+        need = sum(1 for ln in self.lines if ln.jp.strip())
+        if need and have < need * 0.5:
+            self._start_translate(self._lyrics_path)
 
     def _start_fetch(self, artist, title, duration=None):
         key = (artist, title)
@@ -495,8 +509,13 @@ class Overlay:
                     self.index.add(p)
                     self.load(Path(p))
                     self._start_translate(Path(p))
+                elif not self._identifying and self._identified != self._track:
+                    # title/artist missed (e.g. name-variant) — Shazam returns
+                    # the canonical name, which usually fetches fine.
+                    self._hint("🎧 Finding the song by sound…")
+                    self._start_identify()
                 else:
-                    self._hint("No verified lyrics found for this song")
+                    self._hint("No lyrics found for this song")
         if self._translate_result:
             path, ok = self._translate_result
             self._translate_result = None
@@ -691,16 +710,21 @@ class Overlay:
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
         self.root.attributes("-alpha", self.opacity)
+        self.root.update_idletasks()
         self._persist()
 
     def set_position(self, p):
         self.position = p
         self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
         self.root.attributes("-topmost", True)
+        self.root.update_idletasks()   # apply the move immediately
         self._persist()
 
     def set_scroll(self, d):
         self.scroll_dir = d
+        self._cancel_anim()
+        if self._kara:                # re-demo the entrance on the current line
+            self._animate_in()
         self._persist()
 
     def toggle(self):

@@ -14,7 +14,22 @@ SOURCES USED
   • pypinyin      — Chinese → pinyin.
   • hangul-romanize — Korean → romaja.
   • deep-translator (Google) — line translation to English ('auto' source
-                  so it covers ja / zh / ko alike).
+                  so it covers ja / zh / ko / es alike).
+  • Audio identification (recognize.py): soundcard (WASAPI loopback) +
+                  shazamio (Shazam) — identifies the song by SOUND for covers
+                  / mislabeled uploads. See recognize.py for details.
+
+FUTURE / CANDIDATE SOURCES  (not yet wired — add here as providers for
+  hard-to-find VTuber / indie / regional tracks)
+  • PetitLyrics (プチリリ) — large synced catalog for JP anime / VTuber /
+                  doujin; best next addition for songs the aggregators miss.
+  • QQ Music / Kugou — synced lyrics for Chinese + much Asian pop.
+  • Apple Music time-synced lyrics (needs an Apple Music API token).
+  • Genius / AZLyrics / Uta-Net / J-Lyric — UNSYNCED only; usable as a
+                  last-resort plain-text fallback (no karaoke timing).
+  To add one: implement `def _provider(title, artist, duration) -> lrc|None`
+  returning timed LRC, call it inside fetch_lrc() before returning None, and
+  list it here.
 
 PROBLEMS OVERCOME
   1. WRONG-SONG MATCHES. A bare title like "Lucky Star" matched a totally
@@ -123,6 +138,19 @@ def detect_lang(text: str) -> str:
 
 def slugify(title: str) -> str:
     return re.sub(r"[^\w぀-ヿ가-힣一-鿿]+", "_", title.lower()).strip("_")
+
+
+def split_artists(artist: str) -> list[str]:
+    """Break 'PeanutsKun, Ikuta Rira feat. X' → ['PeanutsKun','Ikuta Rira','X']."""
+    parts = re.split(r"\s*[,/&、，]\s*|\s+(?:feat|ft|featuring|with|×|x)\.?\s+",
+                     artist or "", flags=re.I)
+    out, seen = [], set()
+    for p in parts:
+        p = p.strip()
+        if p and p.lower() not in seen:
+            seen.add(p.lower())
+            out.append(p)
+    return out
 
 
 # ── Romanization ─────────────────────────────────────────────────────
@@ -250,10 +278,11 @@ def _lrclib_get(title, artist, duration):
 
 def _lrclib_candidates(title, artist):
     cands, seen = [], set()
-    urls = [
-        f"https://lrclib.net/api/search?{urllib.parse.urlencode({'track_name': title, 'artist_name': artist})}",
-        f"https://lrclib.net/api/search?{urllib.parse.urlencode({'q': f'{title} {artist}'.strip()})}",
-    ]
+    urls = [f"https://lrclib.net/api/search?{urllib.parse.urlencode({'q': f'{title} {artist}'.strip()})}"]
+    for ar in ([artist] + split_artists(artist))[:3]:
+        if ar:
+            urls.append("https://lrclib.net/api/search?"
+                        + urllib.parse.urlencode({"track_name": title, "artist_name": ar}))
     for u in urls:
         try:
             for r in _http_json(u):
@@ -273,13 +302,14 @@ def _norm(s):
 
 def _pick_lrclib(title, artist, duration):
     best, best_score = None, 0
-    nt, na = _norm(title), _norm(artist)
+    nt = _norm(title)
+    nas = [_norm(x) for x in split_artists(artist)] or [_norm(artist)]
     for c in _lrclib_candidates(title, artist):
         ct, ca = _norm(c.get("trackName")), _norm(c.get("artistName"))
         score = 0
         if nt and (nt in ct or ct in nt):
             score += 2
-        if na and (na in ca or ca in na):
+        if any(na and (na in ca or ca in na) for na in nas):
             score += 3
         if duration and c.get("duration"):
             if abs(c["duration"] - duration) <= 8:
@@ -296,37 +326,72 @@ def _pick_lrclib(title, artist, duration):
 
 # ── Multi-provider fetch with verification ───────────────────────────
 
+def _strict_ok(lrc: str, title: str, duration: float | None) -> bool:
+    """Extra guard for low-confidence (title-only) matches to cut false
+    positives: only trust them when language gating or duration can confirm."""
+    if detect_lang(title) in ("ja", "ko", "zh"):
+        return True                        # language gate already applied
+    if duration:
+        last = _lrc_last_time(lrc)
+        return bool(last and abs(last - duration) <= max(20, duration * 0.15))
+    return False                           # Latin title, no duration → don't risk it
+
+
 def fetch_lrc(title: str, artist: str = "", duration: float | None = None):
     """Return (lrc_string, meta) of a VERIFIED match, or (None, None).
-    meta = {source, artist, duration}."""
+    Widens the search across artist variants while guarding false positives."""
     t, a = title.strip(), artist.strip()
+    arts = split_artists(a)
 
-    hit = _lrclib_get(t, a, duration)
-    if hit and verify_lrc(hit["lrc"], t, duration):
-        return hit["lrc"], {"source": "lrclib/get", "artist": hit["artist"],
-                            "duration": hit.get("duration")}
+    # 1. LRCLIB duration-exact, trying the full credit then each artist
+    for ca in ([a] + arts if a else []):
+        hit = _lrclib_get(t, ca, duration)
+        if hit and verify_lrc(hit["lrc"], t, duration):
+            return hit["lrc"], {"source": "lrclib/get", "artist": hit["artist"],
+                                "duration": hit.get("duration")}
 
+    # 2. LRCLIB scored search (artist/title/duration)
     hit = _pick_lrclib(t, a, duration)
     if hit and verify_lrc(hit["lrc"], t, duration):
         return hit["lrc"], {"source": "lrclib/search", "artist": hit["artist"],
                             "duration": hit.get("duration")}
 
-    queries = [f"{t} {a}".strip()]
-    if a:
-        queries.append(f"{a} {t}")
-    queries.append(t)  # last resort, still verified below
+    # 3. syncedlyrics — title+artist queries (high confidence) first
     try:
         import syncedlyrics
-        for q in queries:
-            try:
-                lrc = syncedlyrics.search(q, synced_only=True)
-            except Exception:
-                lrc = None
-            if lrc and "[" in lrc and verify_lrc(lrc, t, duration):
-                return lrc, {"source": "syncedlyrics", "artist": a or None,
-                             "duration": duration}
     except ImportError:
-        pass
+        return None, None
+
+    def _try(q):
+        try:
+            lrc = syncedlyrics.search(q, synced_only=True)
+        except Exception:
+            return None
+        return lrc if (lrc and "[" in lrc) else None
+
+    hi_q, seen = [], set()
+    if t and arts:
+        hi_q.append(f"{t} {a}")
+        for ar in arts:
+            hi_q += [f"{t} {ar}", f"{ar} {t}"]
+    elif t and a:
+        hi_q.append(f"{t} {a}")
+    for q in hi_q:
+        k = q.lower().strip()
+        if k in seen:
+            continue
+        seen.add(k)
+        lrc = _try(q)
+        if lrc and verify_lrc(lrc, t, duration):
+            return lrc, {"source": "syncedlyrics", "artist": a or None,
+                         "duration": duration}
+
+    # 4. title-only — last resort, strict guard against same-title wrong songs
+    if t:
+        lrc = _try(t)
+        if lrc and verify_lrc(lrc, t, duration) and _strict_ok(lrc, t, duration):
+            return lrc, {"source": "syncedlyrics/title", "artist": a or None,
+                         "duration": duration}
 
     return None, None
 
