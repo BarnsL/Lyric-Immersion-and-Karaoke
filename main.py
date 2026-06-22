@@ -373,6 +373,7 @@ class Overlay:
         self.scroll_speed = float(s.get("scroll_speed", SCROLL_SPEED))
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
         self.perf = s.get("perf", "smooth")            # 'smooth' | 'fast'
+        self.recal_secs = int(s.get("recal_secs", 30))  # auto re-sync interval (0=off)
         self._fps = 16
         self._last_pos = 0.0
         self._strm_rem = 0.0
@@ -417,12 +418,14 @@ class Overlay:
         self._identifying = False
         self._identify_result = None
         self._identified = None      # track tuple we've already sound-checked
+        self._calibrate_only = False
 
         self.index = LyricsIndex()
         self.media = MediaWatcher()
         self._hint("Waiting for music…")
         self.root.after(300, self._tick)
         self.root.after(7000, self._health_check)
+        self.root.after(self.recal_secs * 1000, self._recalibrate_loop)
 
     # ── per-track ──
 
@@ -522,11 +525,15 @@ class Overlay:
 
     # ── audio identification (detect by SOUND, not title) ──
 
-    def _start_identify(self):
-        if self._identifying or self._identified == self._track:
-            return                       # one sound-check per track
+    def _start_identify(self, calibrate_only=False):
+        if self._identifying:
+            return
+        if not calibrate_only and self._identified == self._track:
+            return                       # song already identified this track
         self._identifying = True
-        self._identified = self._track
+        self._calibrate_only = calibrate_only   # timing-only re-lock vs full ID
+        if not calibrate_only:
+            self._identified = self._track
 
         def work():
             res = None
@@ -554,6 +561,18 @@ class Overlay:
                     self._start_identify()
         finally:
             self.root.after(9000, self._health_check)
+
+    def _recalibrate_loop(self):
+        """Every recal_secs while playing, re-lock the timing to the song by
+        ear (timing only — lyrics stay put)."""
+        try:
+            st = self.media.get()
+            if (self.recal_secs and st and st.get("status") == PLAYING
+                    and self.lines and not self._identifying):
+                self._start_identify(calibrate_only=True)
+        finally:
+            self.root.after(max(10, self.recal_secs or 30) * 1000,
+                            self._recalibrate_loop)
 
     def _suspect(self, st):
         """Signs the current lyrics don't belong to what's actually playing."""
@@ -609,17 +628,19 @@ class Overlay:
                     if st and st.get("status") == PLAYING:
                         true_now = offset + (time.time() - t_cap)
                         corr = true_now - st["position"]
-                        # only correct a real offset (e.g. MV intro); leave
-                        # already-accurate songs alone to avoid adding error
-                        if 1.2 < abs(corr) < 180:
+                        # re-lock only when it differs from the current offset
+                        # by more than Shazam's noise floor (avoids jitter, but
+                        # tracks real drift / seeks / MV intros)
+                        if abs(corr - self.offset) > 1.5 and abs(corr) < 180:
                             self.offset = round(corr, 2)
-                cached = self.index.match(artist, title, self._cur_duration)
-                if cached and self._file_valid(cached, self._cur_duration):
-                    if cached != self._lyrics_path:
-                        self.load(cached)
-                    self._maybe_translate()
-                else:
-                    self._start_fetch(artist, title, self._cur_duration)
+                if not self._calibrate_only:        # timing-only pass: keep lyrics
+                    cached = self.index.match(artist, title, self._cur_duration)
+                    if cached and self._file_valid(cached, self._cur_duration):
+                        if cached != self._lyrics_path:
+                            self.load(cached)
+                        self._maybe_translate()
+                    else:
+                        self._start_fetch(artist, title, self._cur_duration)
 
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
@@ -892,10 +913,15 @@ class Overlay:
     def _geom_y(self):
         return 40 if self.position == "top" else self.sh - self.H - 40
 
+    def set_recal(self, secs):
+        self.recal_secs = int(secs)
+        self._persist()
+
     def _persist(self):
         _save_settings({"opacity": self.opacity, "position": self.position,
                         "scroll": self.scroll_dir, "font_scale": self.font_scale,
-                        "scroll_speed": self.scroll_speed, "perf": self.perf})
+                        "scroll_speed": self.scroll_speed, "perf": self.perf,
+                        "recal_secs": self.recal_secs})
 
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
@@ -1118,6 +1144,14 @@ def main():
         _q_item("Performance  (lighter · 30fps)", "fast"),
     )
 
+    def _recal_item(label, secs):
+        return pystray.MenuItem(label, lambda *_: ov.root.after(0, lambda: ov.set_recal(secs)),
+                                radio=True, checked=lambda i, secs=secs: ov.recal_secs == secs)
+    recal_menu = pystray.Menu(
+        _recal_item("Off", 0), _recal_item("Every 20s", 20),
+        _recal_item("Every 30s", 30), _recal_item("Every 60s", 60),
+    )
+
     def _font_item(pct):
         v = pct / 100
         return pystray.MenuItem(f"{pct}%", _set_font(v), radio=True,
@@ -1135,6 +1169,7 @@ def main():
     menu = pystray.Menu(
         pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
         pystray.MenuItem("🎧  Identify by sound", _ident),
+        pystray.MenuItem("Auto re-sync by sound", recal_menu),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),
         pystray.MenuItem("Opacity", opacity_menu),
