@@ -17,18 +17,30 @@ SOURCES USED
                   an automatic fallback when the analyzer isn't installed.
   • pypinyin      — Chinese → pinyin.
   • hangul-romanize — Korean → romaja.
-  • deep-translator (Google) — line translation to English ('auto' source
-                  so it covers ja / zh / ko / es alike).
+  • deep-translator — line translation to English ('auto' source so it covers
+                  ja / zh / ko / es alike). Uses the free Google endpoint by
+                  default; if a DEEPL_API_KEY env var is set it uses DeepL
+                  instead (noticeably better JP/CJK→EN). No key required to run.
   • Audio identification (recognize.py): soundcard (WASAPI loopback) +
                   shazamio (Shazam) — identifies the song by SOUND for covers
                   / mislabeled uploads. See recognize.py for details.
 
-FUTURE / CANDIDATE SOURCES  (not yet wired — add here as providers for
-  hard-to-find VTuber / indie / regional tracks)
+FUTURE / CANDIDATE SOURCES  (researched 2026-06; not yet wired — add here as
+  providers for hard-to-find VTuber / indie / regional tracks). See
+  docs/RESEARCH.md for the full investigation.
+  • WORD-LEVEL (karaoke) timing. syncedlyrics accepts enhanced=True for
+                  word-by-word <mm:ss.xx> tags, but the FREE providers
+                  (LRCLIB/NetEase/Musixmatch-free) do NOT return it — tested on
+                  JP + Western titles, all came back line-level. Real word-level
+                  lives in QQ Music (qrc), Kugou (krc), NetEase (yrc) and Apple
+                  Music, each needing a reverse-engineered/token endpoint. Wire
+                  one of those to enable true per-word fill; until then the
+                  renderer interpolates the fill across each line.
   • PetitLyrics (プチリリ) — large synced catalog for JP anime / VTuber /
                   doujin; best next addition for songs the aggregators miss.
-  • QQ Music / Kugou — synced lyrics for Chinese + much Asian pop.
+  • QQ Music / Kugou — synced (incl. word-level) lyrics for Chinese + Asian pop.
   • Apple Music time-synced lyrics (needs an Apple Music API token).
+  • BetterLyrics — TTML (word-level) provider seen in newer lyric tools.
   • Genius / AZLyrics / Uta-Net / J-Lyric — UNSYNCED only; usable as a
                   last-resort plain-text fallback (no karaoke timing).
   To add one: implement `def _provider(title, artist, duration) -> lrc|None`
@@ -505,12 +517,27 @@ def _song_lang(lines: list[dict]) -> str:
     return detect_lang(" ".join(ln["jp"] for ln in lines[:40]))
 
 
+def _make_translator():
+    """Prefer DeepL (noticeably better JP/CJK→EN) when a DEEPL_API_KEY is set in
+    the environment; otherwise fall back to the free Google endpoint. Either way
+    no key is required to use the app."""
+    key = os.environ.get("DEEPL_API_KEY")
+    if key:
+        try:
+            from deep_translator import DeeplTranslator
+            return DeeplTranslator(api_key=key, source="auto", target="en",
+                                   use_free_api=True)
+        except Exception:
+            pass
+    from deep_translator import GoogleTranslator
+    return GoogleTranslator(source="auto", target="en")
+
+
 def _translate_lines(lines: list[dict], song_lang: str | None = None) -> int:
     try:
-        from deep_translator import GoogleTranslator
+        tr = _make_translator()
     except ImportError:
         return 0
-    tr = GoogleTranslator(source="auto", target="en")
     whole = song_lang in ("ja", "ko", "zh", "es")
 
     def want(jp):

@@ -169,20 +169,30 @@ class MediaWatcher:
         from winsdk.windows.media.control import (
             GlobalSystemMediaTransportControlsSessionManager as MM,
         )
+        mgr = None
         while not self._stop:
             try:
-                mgr = await MM.request_async()
+                if mgr is None:                 # reuse the manager across polls —
+                    mgr = await MM.request_async()  # re-requesting it each 0.1s was wasteful
                 sess = self._pick(mgr)
                 if sess:
                     info = await sess.try_get_media_properties_async()
                     tl = sess.get_timeline_properties()
                     pb = sess.get_playback_info()
                     status = pb.playback_status
+                    # Playback rate (≠1.0 when the user speeds up / slows down,
+                    # very common on YouTube) — the clock must advance by it.
+                    try:
+                        rate = float(pb.playback_rate) if pb.playback_rate else 1.0
+                    except Exception:
+                        rate = 1.0
+                    if rate <= 0:
+                        rate = 1.0
                     pos = tl.position.total_seconds()
                     try:
                         lu = tl.last_updated_time
                         if status == PLAYING and lu.year > 1:
-                            pos += (datetime.now(timezone.utc) - lu).total_seconds()
+                            pos += (datetime.now(timezone.utc) - lu).total_seconds() * rate
                     except Exception:
                         pass
                     st = {
@@ -191,6 +201,7 @@ class MediaWatcher:
                         "status": status,
                         "position": max(0.0, pos),
                         "duration": tl.end_time.total_seconds(),
+                        "rate": rate,
                         "source": (sess.source_app_user_model_id or "").lower(),
                         "ts": time.time(),
                     }
@@ -200,7 +211,7 @@ class MediaWatcher:
                     with self._lock:
                         self._state = None
             except Exception:
-                pass
+                mgr = None                      # drop a stale manager; re-request next poll
             await asyncio.sleep(0.1)
 
     @staticmethod
@@ -229,7 +240,7 @@ class MediaWatcher:
                 return None
             s = dict(self._state)
         if s["status"] == PLAYING:
-            s["position"] += time.time() - s["ts"]
+            s["position"] += (time.time() - s["ts"]) * s.get("rate", 1.0)
         return s
 
     def stop(self):
@@ -664,7 +675,8 @@ class Overlay:
                 if offset is not None and t_cap is not None:
                     st = self.media.get()
                     if st and st.get("status") == PLAYING:
-                        true_now = offset + (time.time() - t_cap)
+                        # at non-1x the song advanced by elapsed×rate since capture
+                        true_now = offset + (time.time() - t_cap) * st.get("rate", 1.0)
                         corr = true_now - st["position"]
                         diff = corr - self.offset
                         if abs(corr) < 180:

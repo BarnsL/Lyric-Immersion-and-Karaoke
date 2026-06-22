@@ -93,5 +93,7 @@ dir), holding `lyrics/` and `settings.json`.
   "lines": [ {"t":[start,end], "jp":"漢字(かな)…", "rm":"reading", "en":"english"} ] }
 ```
 
-See **[AGENTS.md](AGENTS.md)** to add songs/sources and **[USAGE.md](USAGE.md)**
-for the tray/settings reference.
+See **[AGENTS.md](AGENTS.md)** to add songs/sources, **[USAGE.md](USAGE.md)** for
+the tray/settings reference, and **[RESEARCH.md](RESEARCH.md)** for the
+subsystem-by-subsystem investigation behind recent changes (lyric sources,
+word-level timing, sync, performance, translation).
