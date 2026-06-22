@@ -212,10 +212,13 @@ def detect_lang(text: str) -> str:
         return "ja"
     if han:
         return "zh"
-    if _is_spanish(text):
-        return "es"
-    if _is_german(text):
-        return "de"
+    # Spanish vs German share short function words, so score both (diacritics
+    # count double) and pick the stronger rather than first-match.
+    if _is_spanish(text) or _is_german(text):
+        words = set(re.findall(r"[a-zñáéíóúüäöüß]+", text.lower()))
+        es = (2 if _ES_DIA.search(text) else 0) + len(words & _ES_WORDS)
+        de = (2 if _DE_DIA.search(text) else 0) + len(words & _DE_WORDS)
+        return "de" if de > es else "es"
     return "other"
 
 
