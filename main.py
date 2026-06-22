@@ -42,8 +42,20 @@ except ImportError:
     from PIL import Image, ImageDraw, ImageFont
 
 BASE = Path(__file__).parent
-LYRICS_DIR = BASE / "lyrics"
-SETTINGS = BASE / "settings.json"
+# When packaged as an .exe, keep the writable library/settings in the user's
+# AppData (the exe's own folder may be read-only / a temp extract dir).
+if getattr(sys, "frozen", False):
+    _DATA = Path(os.environ.get("APPDATA", str(Path.home()))) / "Desktop Karaoke"
+else:
+    _DATA = BASE
+_DATA.mkdir(parents=True, exist_ok=True)
+LYRICS_DIR = _DATA / "lyrics"
+SETTINGS = _DATA / "settings.json"
+
+
+def _resource(name):
+    """Path to a bundled read-only resource (icon), frozen or not."""
+    return Path(getattr(sys, "_MEIPASS", BASE)) / name
 
 
 def _load_settings():
@@ -834,7 +846,7 @@ class Overlay:
 # ── Tray icon ────────────────────────────────────────────────────────
 
 def make_icon():
-    ico = BASE / "icon.ico"
+    ico = _resource("icon.ico")
     if ico.exists():
         return Image.open(ico)
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))

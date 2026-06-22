@@ -82,7 +82,10 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-LYRICS_DIR = Path(__file__).parent / "lyrics"
+if getattr(sys, "frozen", False):
+    LYRICS_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "Desktop Karaoke" / "lyrics"
+else:
+    LYRICS_DIR = Path(__file__).parent / "lyrics"
 
 # Script ranges
 _HANGUL = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏]")

@@ -88,11 +88,23 @@ languages just show the synced line.
 
 ## Install
 
+**Easiest (no Python, no terminal):** download **`DesktopKaraoke-Setup.exe`**
+from [Releases](https://github.com/BarnsL/Desktop-Karaoke/releases), double-click,
+click through Next → Install. Tick **Start with Windows** if you want it always
+on. It launches to the system tray (あ) — play any song and lyrics appear. You
+can also toggle Start-with-Windows from the tray menu any time.
+
+> Prefer portable? Grab `DesktopKaraoke.exe` and just double-click it.
+
+**From source (developers):**
+
 ```bash
 git clone https://github.com/BarnsL/Desktop-Karaoke.git
 cd Desktop-Karaoke
 pip install -r requirements.txt
 ```
+
+To build the installer yourself, see [BUILD.md](BUILD.md) (`build.bat`).
 
 ## Run
 

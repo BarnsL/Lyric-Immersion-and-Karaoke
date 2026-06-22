@@ -26,3 +26,9 @@ desktop.ini
 
 # Local UI preferences
 settings.json
+
+# Build artifacts
+build/
+dist/
+*.exe
+*.spec.bak
