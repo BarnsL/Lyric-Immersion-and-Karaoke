@@ -365,6 +365,7 @@ class Overlay:
         self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
         self._anim_id = None
+        self._scroll_x = self._scroll_start = self._scroll_end = 0
         self._apply_scale()                            # sets fonts + layout + H
 
         self.root.overrideredirect(True)
@@ -637,8 +638,11 @@ class Overlay:
             else:
                 self.cv.delete("all")
                 self._kara = []
-        elif new >= 0 and self.scroll_dir not in ("lr", "rl"):
-            self._karaoke(pos)
+        elif new >= 0:
+            if self.scroll_dir in ("lr", "rl"):
+                self._scroll_update(pos)      # song-driven scroll-through
+            else:
+                self._karaoke(pos)
 
         self.root.after(16, self._tick)   # ~60fps for tight, on-time sweeping
 
@@ -707,7 +711,7 @@ class Overlay:
     def _animate_in(self):
         d = self.scroll_dir
         if d in ("lr", "rl"):
-            self._marquee()                      # continuous scroll-through
+            self._setup_scroll()                 # song-driven scroll-through
             return
         if d in ("none", "off", "stationary"):
             return                               # appear in place, no motion
@@ -715,28 +719,41 @@ class Overlay:
         self.cv.move("cur", ox, 0)
         self._anim_step(ox, 0)
 
-    def _marquee(self):
+    def _setup_scroll(self):
+        """Place the line off the entry edge; _scroll_update drives it across
+        over the line's own time window (so it never despawns mid-scroll)."""
         bbox = self.cv.bbox("cur")
         if not bbox:
+            self._scroll_start = self._scroll_end = self._scroll_x = 0
             return
-        if self.scroll_dir == "lr":              # start off the left edge
-            self.cv.move("cur", -bbox[2] - 20, 0)
-        else:                                    # start off the right edge
-            self.cv.move("cur", self.W - bbox[0] + 20, 0)
-        self._marquee_step()
+        gl, gr = bbox[0], bbox[2]
+        if self.scroll_dir == "rl":              # right → left
+            self._scroll_start = self.W - gl + 30
+            self._scroll_end = -gr - 30
+        else:                                    # lr, left → right
+            self._scroll_start = -gr - 30
+            self._scroll_end = self.W - gl + 30
+        self.cv.move("cur", self._scroll_start, 0)
+        self._scroll_x = self._scroll_start
 
-    def _marquee_step(self):
-        if self.scroll_dir not in ("lr", "rl") or not self._kara:
-            self._anim_id = None
+    def _scroll_update(self, pos):
+        if not self._kara:
             return
-        self.cv.move("cur", 3 if self.scroll_dir == "lr" else -3, 0)
-        bbox = self.cv.bbox("cur")
-        if bbox:
-            if self.scroll_dir == "lr" and bbox[0] > self.W:
-                self.cv.move("cur", -(bbox[2] + 20), 0)      # wrap back to left
-            elif self.scroll_dir == "rl" and bbox[2] < 0:
-                self.cv.move("cur", self.W - bbox[0] + 20, 0)  # wrap back to right
-        self._anim_id = self.root.after(16, self._marquee_step)
+        ln = self.lines[self.idx]
+        dur = ln.end - ln.start
+        if dur <= 0:
+            return
+        frac = max(0.0, min(1.0, (pos - ln.start) / dur))
+        target = self._scroll_start + frac * (self._scroll_end - self._scroll_start)
+        self.cv.move("cur", target - self._scroll_x, 0)
+        self._scroll_x = target
+        for tr in self._kara:                    # progressive highlight by frac
+            k = int(frac * len(tr["chars"]) + 0.5)
+            for i, c in enumerate(tr["chars"]):
+                col = tr["sung"] if i < k else tr["base"]
+                if c["last"] != col:
+                    self.cv.itemconfig(c["fill"], fill=col)
+                    c["last"] = col
 
     def _anim_step(self, ox, step=0):
         steps = 20
