@@ -108,6 +108,25 @@ every result verified by duration + language. See `fetch_lyrics.py`.
 **Net:** the free stack is already near-optimal; the only real upgrade (word
 timing) isn't available for free. No code change beyond documentation.
 
+- 📝 **Coverage reality check (2026-06).** Re-tested when a niche VTuber B-side
+  (ピーナッツくん — TIME TO LUV) returned nothing. Findings:
+  - **Musixmatch is currently 401-ing for ALL queries** inside syncedlyrics
+    (even 紅蓮華/LiSA) — an upstream token breakage that quietly removes one of
+    the biggest providers. syncedlyrics 1.0.1 (latest) doesn't fix it. LRCLIB +
+    NetEase still work (the ~300-song cache proves it), so coverage is still
+    good, just not as good as it should be. Worth periodically retrying or
+    pinning a syncedlyrics version where Musixmatch works.
+  - Truly niche VTuber/indie songs (a B-side like TIME TO LUV) have **no
+    lyrics — synced OR plain — on any accessible provider**. That's a content
+    gap, not a bug.
+  - ⏭️ **PetitLyrics** (best JP catalog) is a **commercial SyncPower API** with
+    no open docs/keys — not a clean drop-in. QQ Music / Kugou need
+    reverse-engineered, signed endpoints and are Chinese-catalog anyway.
+  - 💡 **Best next step for "no lyrics" songs: a manual-LRC path** — let a user
+    drop a `.lrc`/`.json` next to the app for any song the providers miss; the
+    annotator already turns raw lyrics into furigana/romaji/translation. This
+    solves the niche-song gap deterministically without a fragile new scraper.
+
 ## 2. Romanization (Japanese furigana + romaji)
 
 - ✅ Already upgraded this session to **fugashi + UniDic + cutlet** (a real

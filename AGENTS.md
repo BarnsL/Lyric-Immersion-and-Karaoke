@@ -18,7 +18,15 @@ python fetch_lyrics.py "Song Title" "Artist Name"
 
 This fetches the best **verified** synced lyrics, annotates them by language,
 and writes `lyrics/<slug>.json`. If it prints "No verified lyrics found", the
-song genuinely isn't on any provider — do not fake it.
+song genuinely isn't on any provider — do not fake it. For those, add a local
+`.lrc` instead:
+
+```bash
+python add_lrc.py "Song.lrc" --title "Song" --artist "Artist"   # or --folder manual
+```
+
+It parses the timing and annotates (furigana/romaji/translation) exactly like a
+fetched song, saving it with `source: "manual"`.
 
 ## Add many songs
 

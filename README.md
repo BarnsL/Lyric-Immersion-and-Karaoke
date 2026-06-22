@@ -144,6 +144,19 @@ See the header of `fetch_lyrics.py` and [RESEARCH.md](RESEARCH.md) for candidate
 future sources (PetitLyrics, QQ Music / Kugou, Apple Music) and the research
 behind each design choice.
 
+### When a song isn't found
+Niche VTuber / indie tracks (a B-side that isn't on LRCLIB, Musixmatch, or
+NetEase) sometimes have **no lyrics on any provider** — that's a content gap, not
+a bug. For those, find or make a timed `.lrc` (a fan wiki, the video description,
+or a tool like QuickLRC) and add it yourself — it gets the same furigana / romaji
+/ translation as a fetched song:
+
+```bash
+python add_lrc.py "TIME TO LUV.lrc" --title "TIME TO LUV" --artist "ピーナッツくん"
+# or drop "Artist - Title.lrc" files into a folder:
+python add_lrc.py --folder manual
+```
+
 ---
 
 ## 🛠️ From source (developers)
@@ -216,6 +229,7 @@ when something looks off you can see exactly *why* it chose what it chose.
 | `gairaigo.py` | Katakana → English loanword table (so ベイビー → "baby") |
 | `character.py` | The optional dancing on-screen companion |
 | `preload.py` | Bulk-build the local lyric library from a curated list |
+| `add_lrc.py` | Add **any** song from a local `.lrc` file (for tracks no provider has) |
 | `reannotate.py` | Re-generate furigana / romaji for the cache after a romanizer change |
 | `sync_playlists.py` | Pre-cache every track in your Spotify playlists |
 | `validate.py` | Scan the cache for bad / mismatched files (`--purge`) |
