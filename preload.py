@@ -147,6 +147,34 @@ SONGS = [
     ("暁光", "V.W.P", False), ("真偽", "V.W.P", False), ("神話", "V.W.P", False),
     ("愛詩", "V.W.P", False), ("追憶", "V.W.P", False), ("歌姫", "V.W.P", False),
     ("欲望", "V.W.P", False), ("照射", "V.W.P", False), ("幻界", "V.W.P", False),
+
+    # ── Bakemonogatari / Monogatari series (OP + iconic ED) ──
+    ("staple stable", "戦場ヶ原ひたぎ", False),
+    ("帰り道", "八九寺真宵", False),
+    ("ambivalent world", "神原駿河", False),
+    ("恋愛サーキュレーション", "千石撫子", False),
+    ("sugar sweet nightmare", "羽川翼", False),
+    ("白金ディスコ", "阿良々木月火", False),
+    ("君の知らない物語", "supercell", False),
+
+    # ── kz (livetune) ──
+    ("Tell Your World", "kz(livetune)", False),
+    ("Packaged", "livetune", False),
+    ("Last Night, Good Night", "livetune", False),
+    ("ファインダー", "livetune", False),
+    ("Redial", "livetune", False),
+    ("Decorator", "livetune", False),
+
+    # ── DECO*27 ──
+    ("ヴァンパイア", "DECO*27", False),
+    ("ゴーストルール", "DECO*27", False),
+    ("アンドロイドガール", "DECO*27", False),
+    ("乙女解剖", "DECO*27", False),
+    ("モザイクロール", "DECO*27", False),
+    ("妄想税", "DECO*27", False),
+    ("ヒバナ", "DECO*27", False),
+    ("愛言葉Ⅲ", "DECO*27", False),
+    ("シンデレラ", "DECO*27", False),
 ]
 
 

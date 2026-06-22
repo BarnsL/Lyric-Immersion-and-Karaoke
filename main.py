@@ -134,7 +134,7 @@ class MediaWatcher:
                         self._state = None
             except Exception:
                 pass
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.1)
 
     @staticmethod
     def _pick(mgr):
@@ -379,10 +379,20 @@ class Overlay:
         self._hint(f"♪ {title} — fetching lyrics…")
         self._start_fetch(artist, title, duration)
 
+    def _trusted_duration(self, state):
+        # YouTube/browser report the VIDEO length (intro/outro) which differs
+        # from the audio track — using it to match/verify rejects correct
+        # lyrics. Only trust duration from real audio players (Spotify, etc.).
+        if any(h in state.get("source", "") for h in BROWSER_HINTS):
+            return None
+        return state.get("duration")
+
     def _mark_verified(self):
         md = self.meta.get("duration")
-        self._verified = bool(md and self._cur_duration
-                              and abs(md - self._cur_duration) <= 12)
+        if self._cur_duration:
+            self._verified = bool(md and abs(md - self._cur_duration) <= 12)
+        else:
+            self._verified = True   # title+language match is the best signal here
 
     def _file_valid(self, path, duration):
         try:
@@ -533,7 +543,7 @@ class Overlay:
         track = (state["artist"], clean_title(state["title"], state["source"]))
         if track != self._track:
             self._track = track
-            self._on_track_change(track, state.get("duration"))
+            self._on_track_change(track, self._trusted_duration(state))
 
         if state["status"] != PLAYING or not self.lines:
             self.root.after(80, self._tick)   # frozen while paused — no advancing
@@ -556,19 +566,19 @@ class Overlay:
         elif new >= 0:
             self._karaoke(pos)
 
-        self.root.after(33, self._tick)
+        self.root.after(16, self._tick)   # ~60fps for tight, on-time sweeping
 
     # ── drawing ──
 
     def _render(self, ln):
         self._cancel_anim()
         self.cv.delete("all")
-        self._kara = []
+        self._kara = []   # list of per-line "tracks", each swept in sync
         pad = 64
         furi_y, main_y, romaji_y, en_y = 52, 102, 182, 242
 
         if ln.jp:
-            cx = pad
+            chars, cx = [], pad
             for base, reading in split_furigana(ln.jp):
                 seg_start = cx
                 for ch in base:
@@ -577,20 +587,39 @@ class Overlay:
                         continue
                     cxc = cx + w / 2
                     fid = draw_text(self.cv, cxc, main_y, ch, JP_FONT, WHITE)
-                    self._kara.append({"cx": cxc, "fill": fid, "last": WHITE})
+                    chars.append({"cx": cxc, "fill": fid, "last": WHITE})
                     cx += w
                 if reading:
                     draw_text(self.cv, (seg_start + cx) / 2, furi_y,
                               reading, FURI_FONT, FURI_C)
                 cx += 6
-            self._line_left, self._line_right = pad, cx
+            self._kara.append({"chars": chars, "left": pad, "right": cx,
+                               "base": WHITE, "sung": SUNG})
 
         if ln.rm:
-            draw_text(self.cv, pad, romaji_y, ln.rm, ROMAJI_FONT, ROMAJI_C, anchor="w")
+            self._kara.append(self._char_track(ln.rm, romaji_y, ROMAJI_FONT,
+                                               ROMAJI_C, SUNG, pad))
         if ln.en:
-            draw_text(self.cv, pad, en_y, ln.en, EN_FONT, EN_C, anchor="w")
+            self._kara.append(self._char_track(ln.en, en_y, EN_FONT,
+                                               EN_C, SUNG, pad))
 
         self._animate_in()
+
+    def _char_track(self, text, y, font, base, sung, pad):
+        chars, cx = [], pad
+        sp = measure_text(self.cv, "n", font) * 0.5 or 6
+        for ch in text:
+            if ch == " ":
+                cx += sp
+                continue
+            w = measure_text(self.cv, ch, font)
+            if w <= 0:
+                continue
+            cxc = cx + w / 2
+            fid = draw_text(self.cv, cxc, y, ch, font, base)
+            chars.append({"cx": cxc, "fill": fid, "last": base})
+            cx += w
+        return {"chars": chars, "left": pad, "right": cx, "base": base, "sung": sung}
 
     # ── entrance animation (scroll-in from chosen corner) ──
 
@@ -628,12 +657,14 @@ class Overlay:
         if dur <= 0:
             return
         frac = max(0.0, min(1.0, (pos - ln.start) / dur))
-        sweep = self._line_left + frac * (self._line_right - self._line_left)
-        for k in self._kara:
-            col = SUNG if k["cx"] <= sweep else WHITE
-            if k["last"] != col:
-                self.cv.itemconfig(k["fill"], fill=col)
-                k["last"] = col
+        for tr in self._kara:                       # JP, romaji, English in lockstep
+            sweep = tr["left"] + frac * (tr["right"] - tr["left"])
+            base, sung = tr["base"], tr["sung"]
+            for k in tr["chars"]:
+                col = sung if k["cx"] <= sweep else base
+                if k["last"] != col:
+                    self.cv.itemconfig(k["fill"], fill=col)
+                    k["last"] = col
 
     def _hint(self, msg):
         self.cv.delete("all")
