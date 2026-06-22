@@ -316,15 +316,20 @@ class MediaWatcher:
 
 def clean_title(title, source=""):
     """Strip noise from a media title so it matches lyric metadata — removes a
-    trailing '- YouTube', bracketed notes, and tags like 'Official MV' / 'Lyric
-    Video' / 'HD'. `source` is the player app id (browser titles get extra
-    cleanup)."""
+    trailing '- YouTube', bracketed notes, 'Official MV / Lyric Video / HD' tags,
+    and **cover credits** ('天誅 / covered by 幸祜' → '天誅'). A cover's lyrics are
+    the original song's, so we search the real song title, not the cover credit.
+    `source` is the player app id (browser titles get extra cleanup)."""
     t = title
     if any(h in source for h in BROWSER_HINTS):
         t = re.sub(r"\s*[-–—|]\s*YouTube\s*$", "", t, flags=re.I)
-    t = re.sub(r"\s*[\[(【「『].*?[\])】」』]", "", t)
+    t = re.sub(r"\s*[\[(【「『].*?[\])】」』]", "", t)            # (Official MV) etc.
+    # cover / "tried singing" credits → keep only the song title
+    t = re.sub(r"\s*([/／]\s*)?\bcover(ed)?\s+by\b.*$", "", t, flags=re.I)
+    t = re.sub(r"\s*[/／]\s*cover\b.*$", "", t, flags=re.I)
+    t = re.sub(r"\s*[/／]?\s*(歌ってみた|歌わせて|アコギ|acoustic\s*ver).*$", "", t, flags=re.I)
     t = re.sub(
-        r"\b(Official\s*(Music\s*)?(Video|Audio)|Music\s*Video|MV|PV|"
+        r"\b(Official\s*(Music\s*)?(Video|Audio)|Official|Music\s*Video|MV|PV|"
         r"Lyric\s*Video|Audio|HD|4K|FULL|Full\s*Ver\.?)\b",
         "", t, flags=re.I,
     )
@@ -833,6 +838,8 @@ class Overlay:
         last_end = self.lines[-1].end if self.lines else 0
         if dur and md and abs(md - dur) > 12:
             return True                                   # wrong version/song
+        if dur and last_end and last_end > dur + 15:
+            return True              # lyrics run PAST the song's end = wrong/longer version
         if dur and last_end and last_end < dur * 0.6 and pos > last_end + 8 \
                 and pos < dur - 5:
             return True                                   # lyrics don't cover song
