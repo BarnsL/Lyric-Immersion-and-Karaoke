@@ -363,7 +363,8 @@ class Overlay:
         s = _load_settings()
         self.opacity = float(s.get("opacity", 1.0))
         self.position = s.get("position", "bottom")   # 'top' | 'bottom'
-        self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'
+        self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'|'lr'|'rl'
+        self.scroll_speed = float(s.get("scroll_speed", SCROLL_SPEED))
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
         self._anim_id = None
         self._scroll_x = self._scroll_start = self._scroll_end = 0
@@ -726,10 +727,12 @@ class Overlay:
     # ── continuous scroll-through ticker (multiple lines on screen) ──
 
     def _render_block(self, i):
-        """Draw line i's layers at x-origin 0 under a unique tag; return block."""
+        """Draw line i's compact block at x-origin 0, offset into its vertical
+        lane so staggered lines don't overlap. Returns the block."""
         ln = self.lines[i]
         self._blk_seq += 1
         tag = f"blk{self._blk_seq}"
+        dy = (i % self._lanes) * self._lane_gap
         tracks, right = [], 0
         if ln.jp:
             chars, cx = [], 0
@@ -739,18 +742,18 @@ class Overlay:
                     w = measure_text(self.cv, ch, self.JP_FONT)
                     if w <= 0:
                         continue
-                    fid = draw_text(self.cv, cx + w / 2, self.main_y, ch,
+                    fid = draw_text(self.cv, cx + w / 2, self.b_main + dy, ch,
                                     self.JP_FONT, WHITE, tags=tag)
                     chars.append({"fill": fid, "last": WHITE})
                     cx += w
                 if reading:
-                    draw_text(self.cv, (seg + cx) / 2, self.furi_y, reading,
+                    draw_text(self.cv, (seg + cx) / 2, self.b_furi + dy, reading,
                               self.FURI_FONT, FURI_C, tags=tag)
                 cx += 6
             tracks.append({"chars": chars, "base": WHITE, "sung": SUNG})
             right = max(right, cx)
-        for text, y, font, col in ((ln.rm, self.romaji_y, self.ROMAJI_FONT, ROMAJI_C),
-                                   (ln.en, self.en_y, self.EN_FONT, EN_C)):
+        for text, y, font, col in ((ln.rm, self.b_rom + dy, self.ROMAJI_FONT, ROMAJI_C),
+                                   (ln.en, self.b_en + dy, self.EN_FONT, EN_C)):
             if not text:
                 continue
             chars, cx = [], 0
@@ -779,7 +782,7 @@ class Overlay:
                     c["last"] = col
 
     def _ticker_update(self, pos):
-        center, v = self.W / 2, SCROLL_SPEED
+        center, v = self.W / 2, self.scroll_speed
         d = 1 if self.scroll_dir == "rl" else -1
         want = {}
         for i, ln in enumerate(self.lines):
@@ -858,7 +861,8 @@ class Overlay:
 
     def _persist(self):
         _save_settings({"opacity": self.opacity, "position": self.position,
-                        "scroll": self.scroll_dir, "font_scale": self.font_scale})
+                        "scroll": self.scroll_dir, "font_scale": self.font_scale,
+                        "scroll_speed": self.scroll_speed})
 
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
@@ -875,11 +879,19 @@ class Overlay:
 
     def set_scroll(self, d):
         self.scroll_dir = d
+        self._apply_scale()                # scroll mode is a taller, laned window
+        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.attributes("-topmost", True)
         self._cancel_anim()
         self._clear_stream()
         self.cv.delete("all")
         self._kara = []
         self.idx = -1                      # next tick repaints in the new mode
+        self.root.update_idletasks()
+        self._persist()
+
+    def set_scroll_speed(self, v):
+        self.scroll_speed = float(v)
         self._persist()
 
     def _apply_scale(self):
@@ -894,7 +906,18 @@ class Overlay:
         self.main_y   = round(102 * s)
         self.romaji_y = round(182 * s)
         self.en_y     = round(242 * s)
-        self.H = min(self.sh - 60, round(340 * s))
+        # Scroll-through: staggered vertical lanes so consecutive lines sit at
+        # different heights instead of piling up at one level. Compact block.
+        self.b_furi = round(22 * s)
+        self.b_main = round(64 * s)
+        self.b_rom  = round(128 * s)
+        self.b_en   = round(166 * s)
+        self._lanes = 2
+        self._lane_gap = round(200 * s)
+        if self.scroll_dir in ("lr", "rl"):
+            self.H = min(self.sh - 50, round(210 * s) + self._lane_gap * (self._lanes - 1))
+        else:
+            self.H = min(self.sh - 60, round(340 * s))
 
     def set_font_scale(self, v):
         self.font_scale = max(0.25, min(2.0, v))
@@ -1024,6 +1047,14 @@ def main():
         _scr_item("Scroll through  ←  (right to left)", "rl"),
     )
 
+    def _spd_item(label, v):
+        return pystray.MenuItem(label, lambda *_: ov.root.after(0, lambda: ov.set_scroll_speed(v)),
+                                radio=True, checked=lambda i, v=v: abs(ov.scroll_speed - v) < 1)
+    speed_menu = pystray.Menu(
+        _spd_item("Slow", 130), _spd_item("Medium", 220),
+        _spd_item("Fast", 340), _spd_item("Very fast", 480),
+    )
+
     def _font_item(pct):
         v = pct / 100
         return pystray.MenuItem(f"{pct}%", _set_font(v), radio=True,
@@ -1047,6 +1078,7 @@ def main():
         pystray.MenuItem("Font size", font_menu),
         pystray.MenuItem("Position", position_menu),
         pystray.MenuItem("Scroll-in", scroll_menu),
+        pystray.MenuItem("Scroll-through speed", speed_menu),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Start with Windows", _toggle_startup,
                          checked=lambda i: startup_enabled()),
