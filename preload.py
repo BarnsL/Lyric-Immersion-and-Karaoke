@@ -1,0 +1,144 @@
+"""
+Preload the Desktop Karaoke lyrics library.
+
+Fetches synced lyrics (furigana + romaji, English on priority tracks) for a
+curated list of ReGLOSS / hololive / VTuber / popular-JP songs and caches
+them under lyrics/. Safe to re-run — existing songs are skipped.
+
+    python preload.py                 # build / top up the library
+    python preload.py --translate-all # also bake English into every song (slow)
+    python preload.py --force         # re-fetch even if already cached
+    python preload.py --no-en         # skip English entirely (fastest)
+"""
+
+import sys
+import time
+from pathlib import Path
+
+from fetch_lyrics import fetch_and_save, slugify, LYRICS_DIR
+
+# (title, artist, bake_english)  — English baked only on priority tracks by
+# default so bulk loads stay fast and don't trip translation rate limits.
+SONGS = [
+    # ── ReGLOSS (hololive DEV_IS) — group ──
+    ("瞬間ハートビート", "ReGLOSS", True),
+    ("フィーリングラデーション", "ReGLOSS", True),
+    ("アワータイムイエロー", "ReGLOSS", True),
+    ("Lucky Loud", "ReGLOSS", True),
+    ("サクラミラージュ", "ReGLOSS", True),
+    ("泡沫メイビー", "ReGLOSS", True),
+    ("夢路らぶ", "ReGLOSS", True),
+    ("シー・ユー・スーン", "ReGLOSS", True),
+
+    # ── ReGLOSS — members (solo) ──
+    ("DEAD-END", "火威青", True),
+    ("Bad Dance Holic", "火威青", False),
+    ("レディメイド", "音乃瀬奏", False),
+    ("EGO!!ST", "一条莉々華", False),
+    ("ペルソナ", "儒烏風亭らでん", False),
+    ("JUMP!!", "轟はじめ", False),
+
+    # ── hololive — Hoshimachi Suisei ──
+    ("Stellar Stellar", "Hoshimachi Suisei", False),
+    ("ビビデバ", "Hoshimachi Suisei", False),
+    ("Bibbidiba", "Hoshimachi Suisei", False),
+    ("comet", "Hoshimachi Suisei", False),
+    ("GHOST", "Hoshimachi Suisei", False),
+    ("NEXT COLOR PLANET", "Hoshimachi Suisei", False),
+    ("みちづれ", "Hoshimachi Suisei", False),
+
+    # ── hololive — others ──
+    ("Unison", "Houshou Marine", False),
+    ("I'm Your Treasure Box", "Houshou Marine", False),
+    ("美少女無罪♡パイレーツ", "宝鐘マリン", False),
+    ("Journey", "IRyS", False),
+    ("REFLECT", "Gawr Gura", False),
+    ("Excuse my Rudeness, but Could You Please RIP?", "Mori Calliope", False),
+    ("Off with Their Heads", "Mori Calliope", False),
+    ("いのち", "AZKi", False),
+    ("DAILY DIARY", "hololive", False),
+    ("Shiny Smily Story", "hololive", False),
+    ("キラメキライダー", "hololive", False),
+    ("Capture the Moment", "hololive", False),
+
+    # ── VTuber the user follows ──
+    ("Hello, Morning", "Kizuna AI", False),
+    ("AIAIAI", "Kizuna AI", False),
+    ("future base", "Kizuna AI", False),
+    ("Acid Rain", "Phase Invaders WISH", False),
+
+    # ── Popular JP / anime (great for learning, guaranteed synced) ──
+    ("アイドル", "YOASOBI", False),
+    ("夜に駆ける", "YOASOBI", False),
+    ("群青", "YOASOBI", False),
+    ("怪物", "YOASOBI", False),
+    ("勇者", "YOASOBI", False),
+    ("ハルジオン", "YOASOBI", False),
+    ("うっせぇわ", "Ado", False),
+    ("新時代", "Ado", False),
+    ("阿修羅ちゃん", "Ado", False),
+    ("踊", "Ado", False),
+    ("唱", "Ado", False),
+    ("KICK BACK", "Kenshi Yonezu", False),
+    ("Lemon", "Kenshi Yonezu", False),
+    ("感電", "Kenshi Yonezu", False),
+    ("M八七", "Kenshi Yonezu", False),
+    ("廻廻奇譚", "Eve", False),
+    ("心予報", "Eve", False),
+    ("ドライフラワー", "Yuuri", False),
+    ("ベテルギウス", "Yuuri", False),
+    ("Subtitle", "Official HIGE DANdism", False),
+    ("Pretender", "Official HIGE DANdism", False),
+    ("ミックスナッツ", "Official HIGE DANdism", False),
+    ("怪獣の花唄", "Vaundy", False),
+    ("踊り子", "Vaundy", False),
+    ("紅蓮華", "LiSA", False),
+    ("炎", "LiSA", False),
+    ("残響散歌", "Aimer", False),
+    ("白日", "King Gnu", False),
+    ("SPECIALZ", "King Gnu", False),
+    ("夜咄ディセイブ", "じん", False),
+    ("ロキ", "みきとP", False),
+]
+
+
+def main():
+    args = sys.argv[1:]
+    force = "--force" in args
+    no_en = "--no-en" in args
+    translate_all = "--translate-all" in args
+
+    LYRICS_DIR.mkdir(exist_ok=True)
+    ok = miss = skip = 0
+    total = len(SONGS)
+
+    for i, (title, artist, prio) in enumerate(SONGS, 1):
+        tag = f"[{i:>2}/{total}]"
+        out = LYRICS_DIR / f"{slugify(title)}.json"
+        if out.exists() and not force:
+            print(f"{tag} skip {title} — {artist}")
+            skip += 1
+            continue
+
+        translate = not no_en and (translate_all or prio)
+        try:
+            p = fetch_and_save(title, artist, translate=translate)
+            if p:
+                ok += 1
+                en = " +en" if translate else ""
+                print(f"{tag} OK   {title} — {artist}{en}")
+            else:
+                miss += 1
+                print(f"{tag} MISS {title} — {artist}")
+        except Exception as e:
+            miss += 1
+            print(f"{tag} ERR  {title} — {artist}: {e}")
+        time.sleep(0.4)
+
+    have = len(list(LYRICS_DIR.glob("*.json")))
+    print(f"\nDone — {ok} fetched, {skip} already cached, {miss} missed.")
+    print(f"Library now holds {have} songs.")
+
+
+if __name__ == "__main__":
+    main()

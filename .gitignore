@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Build / logs
+*.log
+preload.log
+
+# Cached song lyrics are copyrighted third-party content — not redistributed.
+# Run `python preload.py` (or just play music) to build your own local library.
+lyrics/*.json
+!lyrics/.gitkeep
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
