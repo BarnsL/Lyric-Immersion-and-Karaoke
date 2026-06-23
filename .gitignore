@@ -27,8 +27,7 @@ desktop.ini
 # Local UI preferences
 settings.json
 
-# Local agent handoff notes (not for the public repo)
-AGENT_HANDOFF.md
+# Icon-generation scratch / previews
 _icon_preview.png
 _preview_cur.png
 _exe_icon.png
