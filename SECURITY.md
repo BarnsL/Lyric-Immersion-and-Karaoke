@@ -18,10 +18,26 @@ crash-reporting service.
 
 ## Secrets
 
-* The only secret the app reads is the optional **`DEEPL_API_KEY`** environment
-  variable. It is read at translate time and used solely to construct the DeepL
-  client — never logged, written to disk, or committed. No key is required to
-  run the app (it falls back to the free Google endpoint).
+* The only secrets the app reads are optional **environment variables** —
+  `DEEPL_API_KEY` (better translations) and `KARAOKE_API_TOKEN` (locks the local
+  API, below). Both are read from the environment only, used in memory, and
+  **never logged, written to disk, or committed**. Neither is required to run.
+
+## Local API (`api.py`)
+
+The optional agent-control API is built to be safe to leave on:
+
+* **Localhost only.** It binds to `127.0.0.1`, so it is **never reachable from
+  the network** — only processes on this machine can talk to it.
+* **Optional token.** If `KARAOKE_API_TOKEN` is set, every request must present
+  it (`X-API-Token` header or `?token=`); otherwise localhost is trusted.
+* **Bounded + total.** POST bodies are size-capped (64 KB) and discarded; every
+  handler is wrapped so a malformed request returns a clean JSON error (never a
+  stack trace) and can never crash the overlay. Mutating calls are marshalled
+  onto the UI thread.
+* **No data exfiltration.** It only exposes the public now-playing/lyrics state
+  and the local log; it cannot read files outside the app or run shell commands.
+* Toggle it off entirely from the tray ("Local API") if you don't want it.
 
 ## Process / command execution
 

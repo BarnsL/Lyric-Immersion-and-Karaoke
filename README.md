@@ -200,19 +200,31 @@ Desktop Karaoke runs a tiny HTTP server on **`127.0.0.1:8765`** (localhost only 
 never the network; toggle it in the tray) so an agent or script can see what it's
 doing and drive it:
 
+Every response is JSON with a consistent `{"ok": …}` shape, bad input returns a
+clean error (never a stack trace), and `GET /` returns the machine-readable
+route schema — so it's safe and predictable to drive from an agent.
+
 | Method & path | What it does |
 |---------------|--------------|
+| `GET /health` | liveness + version + uptime |
 | `GET /status` | now-playing, the matched song, sync offset, current line |
 | `GET /logs?n=200` | the last N log lines (every match/sound/swap decision) |
 | `GET /lyrics` | the full loaded, annotated lyric lines |
 | `POST /identify` | re-identify the song by **sound** now |
 | `POST /wrong` | mark the current lyrics wrong → re-identify + re-fetch |
+| `POST /nudge?s=2.5` | shift sync by *s* seconds (for songs Shazam can't hear) |
+| `POST /reset` | reset the sync offset to 0 |
 | `POST /reindex` | rescan the local library |
 
 ```bash
 curl http://127.0.0.1:8765/status
-curl -X POST http://127.0.0.1:8765/identify   # "that's the wrong song — listen again"
+curl -X POST http://127.0.0.1:8765/identify        # "that's the wrong song — listen again"
+curl -X POST "http://127.0.0.1:8765/nudge?s=2.5"   # nudge the timing
 ```
+
+**Security:** it binds to `127.0.0.1` only (never the network). To require auth,
+set `KARAOKE_API_TOKEN` and pass it as `X-API-Token` (or `?token=`). Toggle the
+whole API off from the tray.
 
 It also writes a rolling log to **`karaoke.log`** (next to the app) recording
 every track change, title‑vs‑sound match, correction, and sync adjustment — so

@@ -42,10 +42,13 @@ plus a `pystray` tray menu.
   mid-song made it jump). Content is positioned *inside* via `_lane_y0`.
 - **`Character`** (`character.py`) — optional tray-toggled dancing companion
   themed to the detected artist (see that file's header).
-- **`api.py`** — optional localhost HTTP API (`127.0.0.1:8765`) exposing
-  `/status`, `/logs`, `/lyrics` and `POST /identify` · `/wrong` · `/reindex` so
-  an agent can observe and drive the app. Mutations are marshalled onto the Tk
-  thread via `root.after`.
+- **`api.py`** — optional localhost HTTP API (`127.0.0.1:8765`) for agents:
+  `GET /health` · `/status` · `/logs` · `/lyrics`, `POST /identify` · `/wrong` ·
+  `/nudge` · `/reset` · `/reindex`. Hardened for unattended driving — every
+  handler is wrapped (a bad request returns clean JSON, never crashes the app),
+  responses share an `{"ok": …}` shape, bodies are size-capped, mutations are
+  marshalled onto the Tk thread, it binds 127.0.0.1 only, and an optional
+  `KARAOKE_API_TOKEN` gates access.
 - All `subprocess` calls (git, PowerShell, pip) run with `CREATE_NO_WINDOW` so no
   console window flashes.
 - **`Overlay`** — the window. Notable methods:
