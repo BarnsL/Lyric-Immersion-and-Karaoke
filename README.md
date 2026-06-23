@@ -73,12 +73,20 @@ menu**. Play any song and the lyrics appear automatically.
 > outright, and SmartScreen warns on them. The Store ships a Microsoft-trusted
 > signature, so it just works — that's the true one-click path.
 
-### Portable build (no install, runs from a folder or USB stick)
+### Portable build (no install, no Python — just download and run)
 
-No Python needed to *run* it — build the self-contained folder once (see
-[BUILD.md](BUILD.md)), then double-click `DesktopKaraoke.exe` inside
-`dist\DesktopKaraoke\`. It keeps its lyric library and settings next to itself,
-so you can copy the whole folder anywhere.
+The easy path for everyone: open the **[latest release](https://github.com/BarnsL/Desktop-Karaoke/releases/latest)**,
+download **`DesktopKaraoke-portable.zip`**, right-click → **Extract All**, and
+double-click **`DesktopKaraoke.exe`** inside. That's it — **every feature works out
+of the box** (lyrics, sync, furigana/romaji/translation, AI generate-by-ear, and
+sync-by-listening all run on the CPU; the small speech model downloads itself the
+first time it's needed). It keeps its lyric library and settings next to itself, so
+you can copy the whole folder anywhere — or run it off a USB stick. To self-build it
+instead, see [BUILD.md](BUILD.md).
+
+> Optional, NVIDIA only: the tray's **⚡ Enable GPU acceleration** fetches the CUDA
+> libraries on demand (~1.5 GB) — they're not bundled, so the download above stays
+> small (~200 MB). Everything already works without it.
 
 ### ⚙️ Where are the settings? — the tray icon
 
