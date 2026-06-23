@@ -196,9 +196,11 @@ def transcribe_for_generation(pos_cap, lang="ja", seconds=16, size=_GEN_MODEL):
     position `pos_cap` at capture start), or ``[]`` on silence/failure.
 
     Uses a **bigger model** than sync-by-listening (this text is *shown*, not just
-    matched) with **VAD** (skip the instrumental gaps) and in-chunk context for the
-    best transcription quality feasible on CPU. Still imperfect — the caller marks
-    every generated line so the user knows it's machine-made, not official."""
+    matched) and in-chunk context for the best transcription quality feasible. VAD
+    is OFF on purpose: Silero VAD treats SUNG vocals as non-speech and would drop
+    whole clips (no lyrics generated); Whisper's own no_speech_threshold still skips
+    the instrumental gaps. Still imperfect — the caller marks every generated line
+    so the user knows it's machine-made, not official."""
     _ensure_deps_path()
     lang = {"ja-romaji": "ja"}.get(lang, lang)
     hint = lang if lang in ("ja", "ko", "zh", "es", "de", "ru", "en",
@@ -211,8 +213,11 @@ def transcribe_for_generation(pos_cap, lang="ja", seconds=16, size=_GEN_MODEL):
         return []                                    # essentially silence
     try:
         model = _get_model(size)
+        # vad_filter=False: Silero VAD classifies SUNG vocals as non-speech and drops
+        # the whole clip → 0 generated lines for most music (verified live: VAD on
+        # gave 0 segments on the same audio where VAD off transcribed real lyrics).
         segs, _info = model.transcribe(
-            audio, language=hint, beam_size=5, vad_filter=True,
+            audio, language=hint, beam_size=5, vad_filter=False,
             condition_on_previous_text=True)
     except Exception:
         return []
