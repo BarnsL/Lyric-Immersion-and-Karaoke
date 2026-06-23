@@ -1169,6 +1169,12 @@ class Overlay:
                     # (feelingradation heard as SKAVLA). Trust the title; ignore it.
                     log.info("ignoring sound %r — title-locked to %r",
                              f_title, self.meta.get("title", ""))
+                elif heard == self._sound_song:
+                    # Already switched to this heard song and its lyrics are still
+                    # pending or simply don't exist (generation handles that). Don't
+                    # re-reset the offset / re-fetch on every repeat hearing — that
+                    # churned the sync and restarted generation. Just leave it be.
+                    pass
                 else:
                     # heard a DIFFERENT song → switch to it; start its timing fresh
                     # rather than carrying over the previous song's offset.

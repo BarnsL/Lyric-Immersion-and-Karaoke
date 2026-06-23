@@ -53,3 +53,10 @@ lyrics/*.json.tmp
 # against running make_assets.py from the repo root)
 /Assets/
 priconfig.xml
+
+# Local 3h-watch + release packaging artifacts
+_monitor.py
+_monitor.jsonl
+_zip_release.py
+DesktopKaraoke-portable.zip
+DesktopKaraoke-portable.zip.sha256
