@@ -724,7 +724,8 @@ class Overlay:
         self.boundary_on = bool(s.get("boundary", True))  # fast song-change detect
         self.generate_on = bool(s.get("generate", True))  # generate lyrics by ear
         self._generating = False      # Whisper lyric-generation in progress
-        self._gen_token = 0           # bumped on track change to cancel generation
+        self._gen_token = 0           # bumped on track change / real-lyric load to stop generation
+        self._track_seq = 0           # bumped per track change (gates the generation deadline)
         self._gen_lines = []          # accumulated generated line dicts
         self._gen_title = self._gen_artist = ""
         self._title_locked = False    # exact clean-title match → sound can't override
@@ -844,6 +845,7 @@ class Overlay:
         self.offset = 0.0          # fresh baseline; sound calibration sets it
         self._sound_song = None    # new video → re-identify by ear
         self._gen_token += 1       # cancel any in-flight lyric generation
+        self._track_seq += 1
         self._generating = False
         log.info("track change: %r / %r (dur %s)", title, artist, duration)
 
@@ -897,6 +899,22 @@ class Overlay:
         # song starts, then the loop relaxes to the normal cadence.
         self._fast_calib = 3
         self._arm_recal(7)
+        # Bound the "deliberation": if no real lyrics have loaded within ~11 s
+        # (title fetch + sound-ID have had their chance), start generating by ear
+        # — instead of waiting out the whole title→sound→re-fetch chain (~30 s).
+        # If real lyrics arrive late, `load()` cancels the generation.
+        if self.generate_on and not self._live_mode:
+            self.root.after(11000,
+                            lambda t=self._track_seq: self._maybe_generate(t))
+
+    def _maybe_generate(self, track_seq):
+        """Deadline fallback: still no lyrics for this track → generate by ear."""
+        if track_seq != self._track_seq or self.lines or self._generating:
+            return
+        st = self.media.get()
+        if st and st.get("status") == PLAYING:
+            log.info("no lyrics after the grace window → generating by ear")
+            self._begin_generation()
 
     def _trusted_duration(self, state):
         # YouTube/browser report the VIDEO length (intro/outro) which differs
@@ -1247,7 +1265,7 @@ class Overlay:
         Cancels the moment the track changes (token bump)."""
         import align
         from fetch_lyrics import annotate
-        CHUNK, last_end, idle = 16, 0.0, 0
+        CHUNK, last_end, idle, first = 16, 0.0, 0, True
         while token == self._gen_token:
             st = self.media.get()
             if not (st and st.get("status") == PLAYING):
@@ -1258,7 +1276,9 @@ class Overlay:
                 continue
             idle = 0
             pos = float(st.get("position") or 0.0)
-            chunk = align.transcribe_for_generation(pos, lang="ja", seconds=CHUNK)
+            secs = 8 if first else CHUNK      # short FIRST chunk → lyrics appear sooner
+            first = False
+            chunk = align.transcribe_for_generation(pos, lang="ja", seconds=secs)
             if token != self._gen_token:
                 return
             new = [d for d in chunk if d["t"][0] >= last_end - 1.0 and d["jp"].strip()]
@@ -1310,6 +1330,9 @@ class Overlay:
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
         self._lyrics_path = Path(path)
+        if self.meta.get("source") != "generated":
+            self._gen_token += 1       # real lyrics arrived → stop any generation
+            self._generating = False
         self._mark_verified()
         self._relayout_song()           # size lanes/blocks to this song's rows
         self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
