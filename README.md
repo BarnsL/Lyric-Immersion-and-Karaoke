@@ -54,20 +54,26 @@ while it runs.
 
 ## ⬇️ Install (one click, no Python needed)
 
-1. Download **`DesktopKaraoke-Setup.exe`** from the
-   [**Releases**](https://github.com/BarnsL/Desktop-Karaoke/releases) page.
-2. Double-click it and click **Next → Install** (no admin rights required — it
-   installs just for you).
-3. Optionally tick **desktop shortcut** and **Start with Windows**.
+### Microsoft Store — recommended
 
-That's it. The app launches into your **system tray** (look for the purple
-microphone icon) and
-adds a **Desktop Karaoke** entry to your **Start menu**. Play any song and the
-lyrics appear automatically.
+<!-- STORE LINK --> _Store listing pending — see [STORE_SUBMISSION.md](STORE_SUBMISSION.md)._
 
-> **Prefer portable?** Download `DesktopKaraoke.exe` instead and just
-> double-click it — nothing to install. It keeps its lyric library and settings
-> in the same folder, so you can run it from a USB stick.
+Open the **Microsoft Store**, search **Desktop Karaoke**, and click **Get**. It
+installs with no Python and **no security warnings** (the Store signs it), and
+keeps itself up to date. The app launches into your **system tray** (look for the
+purple microphone icon) and adds a **Desktop Karaoke** entry to your **Start
+menu**. Play any song and the lyrics appear automatically.
+
+> Why the Store? Windows **Smart App Control** blocks unsigned installers
+> outright, and SmartScreen warns on them. The Store ships a Microsoft-trusted
+> signature, so it just works — that's the true one-click path.
+
+### Portable build (no install, runs from a folder or USB stick)
+
+No Python needed to *run* it — build the self-contained folder once (see
+[BUILD.md](BUILD.md)), then double-click `DesktopKaraoke.exe` inside
+`dist\DesktopKaraoke\`. It keeps its lyric library and settings next to itself,
+so you can copy the whole folder anywhere.
 
 Everything is controlled from the tray icon: presets, opacity, font size,
 position, scroll style, the dancing character, and more. See **[USAGE.md](USAGE.md)**

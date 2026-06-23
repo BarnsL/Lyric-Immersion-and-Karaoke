@@ -36,6 +36,13 @@ _exe_icon.png
 build/
 dist/
 *.exe
+*.msix
+*.msixupload
 *.spec.bak
 lyrics/*.tmp
 lyrics/*.json.tmp
+
+# MSIX packaging outputs (build_msix.ps1 writes these under dist/, but guard
+# against running make_assets.py from the repo root)
+/Assets/
+priconfig.xml

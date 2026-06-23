@@ -1,10 +1,28 @@
 # Building the Desktop Karaoke installer
 
-End users don't need any of this — they just run the released
-`DesktopKaraoke-Setup.exe` (or the portable folder). This page is for producing
-those files.
+End users don't need any of this — they install from the **Microsoft Store**
+(one click, auto-updating, no security warnings). This page is for producing the
+packages.
 
-## One command
+## Microsoft Store package (the recommended distribution)
+
+```powershell
+.\packaging\build_msix.ps1 -CertThumbprint <yourDevCertThumbprint>   # local test build
+```
+
+Produces **`dist\DesktopKaraoke.msix`** — the PyInstaller app wrapped as a
+full-trust MSIX with branded tiles. To actually publish it (reserve the name,
+fill identity, upload), follow **[STORE_SUBMISSION.md](STORE_SUBMISSION.md)**.
+The Store signs the package, which is what gets it past SmartScreen and Smart App
+Control — the thing that blocks plain unsigned `.exe` installers.
+
+> Why MSIX and not the `.exe` installer below? An unsigned `Setup.exe` is blocked
+> by Smart App Control and warned-on by SmartScreen. Store-signed MSIX is the only
+> way to a genuine zero-warning, one-click install for non-technical users.
+
+## Portable / Inno `.exe` build (for sideloading or non-Store distribution)
+
+### One command
 
 ```bat
 build.bat

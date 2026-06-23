@@ -85,13 +85,11 @@ def _script_of(text, song_lang=None):
     return "latin"
 
 BASE = Path(__file__).parent
-# Portable: keep the library + settings right next to the .exe so the whole
-# app is one self-contained folder you can copy anywhere.
-if getattr(sys, "frozen", False):
-    _DATA = Path(sys.executable).parent
-else:
-    _DATA = BASE
-_DATA.mkdir(parents=True, exist_ok=True)
+# Writable data (settings, lyric cache, log) lives next to the .exe for the
+# portable build, but in %LOCALAPPDATA% when installed via MSIX (its install
+# dir is read-only). appdata.data_dir() resolves that — see appdata.py.
+from appdata import data_dir
+_DATA = data_dir()
 LYRICS_DIR = _DATA / "lyrics"
 SETTINGS = _DATA / "settings.json"
 LOG_FILE = _DATA / "karaoke.log"

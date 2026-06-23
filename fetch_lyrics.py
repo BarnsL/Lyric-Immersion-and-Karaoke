@@ -130,10 +130,10 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-if getattr(sys, "frozen", False):
-    LYRICS_DIR = Path(sys.executable).parent / "lyrics"   # portable: next to the .exe
-else:
-    LYRICS_DIR = Path(__file__).parent / "lyrics"
+# Same writable location the overlay uses (next to the .exe when portable,
+# %LOCALAPPDATA%\DesktopKaraoke when installed via MSIX). See appdata.py.
+from appdata import data_dir
+LYRICS_DIR = data_dir() / "lyrics"
 
 # Script ranges
 _HANGUL = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏]")

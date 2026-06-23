@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX manifest for Desktop Karaoke (a full-trust Win32/PyInstaller desktop app).
+  Tokens in {{...}} are filled in by build_msix.ps1. For a Microsoft Store
+  submission the Identity Name / Publisher / PublisherDisplayName come from
+  Partner Center (Product > Product identity) - see STORE_SUBMISSION.md.
+-->
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    IgnorableNamespaces="uap rescap">
+
+  <Identity Name="{{IDENTITY_NAME}}"
+            Publisher="{{PUBLISHER}}"
+            Version="{{VERSION}}"
+            ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Desktop Karaoke</DisplayName>
+    <PublisherDisplayName>{{PUBLISHER_DISPLAY}}</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="DesktopKaraoke"
+                 Executable="DesktopKaraoke.exe"
+                 EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+          DisplayName="Desktop Karaoke"
+          Description="A transparent, always-on-top karaoke overlay that floats synced furigana, romaji, and English translation over Spotify, YouTube, or any player - learn Japanese, Chinese, Korean, Spanish, German, and Russian by singing along."
+          BackgroundColor="#541CB2"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png"
+                         Square71x71Logo="Assets\Square71x71Logo.png"
+                         Square310x310Logo="Assets\Square310x310Logo.png">
+          <uap:ShowNameOnTiles>
+            <uap:ShowOn Tile="square150x150Logo" />
+            <uap:ShowOn Tile="wide310x150Logo" />
+          </uap:ShowNameOnTiles>
+        </uap:DefaultTile>
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- Full-trust Win32 app (Python + native deps). Required; the Store flags
+         this as a restricted capability and asks for a one-line justification. -->
+    <rescap:Capability Name="runFullTrust" />
+    <!-- Fetching lyrics + identify-by-sound (Shazam) need outbound network. -->
+    <Capability Name="internetClient" />
+    <!-- NOTE: identify-by-sound captures the SYSTEM OUTPUT (WASAPI render
+         loopback), not the microphone, so no <DeviceCapability Name="microphone"/>
+         is declared. If loopback capture is ever blocked on a target machine,
+         add it here. -->
+  </Capabilities>
+</Package>
