@@ -615,3 +615,25 @@ LOVE GAME (57), AWAKE (50), BANZAI (48) all found REAL lyrics via cover/title-va
 generation), sync-by-listening corrected BANZAI by −4.35s and tracked, furigana rendering,
 GPU engaged, 0 desync flags. NOTE: the defer fix (part-6 #2) + device-log landed AFTER the
 v1.0.4 build — they're committed but ride in the NEXT release (v1.0.5) once watched/validated.
+
+### GPU transcription fix — vendored CUDA libs need PATH (not just add_dll_directory)
+(Completes part-6 #3 above: the model LOADED a cuda context — hence visible in
+nvidia-smi and the "loaded on cuda" log — but the first ENCODE crashed, so that log
+alone did NOT prove transcription ran. This makes the encode actually run on GPU.)
+The v1.0.4 on-demand GPU path (gpu_setup downloads cuBLAS/cuDNN/nvRTC into
+<data_dir>/deps/nvidia/...) loaded the Whisper model on "cuda" but CRASHED on the
+first encode: "Library cublas64_12.dll is not found or cannot be loaded" — even though
+the DLL is on disk (caught on the first real-GPU test, RTX 3060). Two bugs in
+align._ensure_deps_path, both fixed:
+  1. os.add_dll_directory's return handle was DISCARDED -> CPython GC-removes the dir
+     from the search path immediately, so nothing stayed registered. Now kept alive in
+     a module list (_dll_dir_handles), deduped via _dll_dirs_added.
+  2. The REAL fix: CTranslate2 loads cuBLAS/cuDNN by BARE name (LoadLibraryW), which
+     does NOT search add_dll_directory dirs at all. So each vendored dir is ALSO
+     prepended to os.environ["PATH"] (the legacy DLL search order includes PATH). This
+     resolves cublas64_12 AND the cuDNN-9 dispatcher's bare-name sub-libs
+     (cudnn_ops64_9.dll, cudnn_graph64_9.dll, ...).
+Verified on RTX 3060 (CTranslate2 4.8.0 / cuDNN 9.23): model loads on cuda + a real
+transcribe forward pass runs on GPU (encode ~0.3-0.4s). Clean CPU fallback when the
+libs/GPU are absent. For the GPU-feature owner: gpu_setup + the tray download are
+correct; this was purely the DLL-load path in align.

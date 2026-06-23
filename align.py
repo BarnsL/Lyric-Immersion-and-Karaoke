@@ -40,6 +40,14 @@ _PUNCT = re.compile(r"[\s,.!?;:'\"…、。！？「」『』（）()・，．]+
 
 _last_error = None      # why available() last returned False (for logging)
 
+# Keep the os.add_dll_directory handles alive: the returned handle REMOVES the dir
+# from the DLL search path when garbage-collected, so a discarded handle registers
+# nothing. The set dedupes repeated _ensure_deps_path calls. (The CUDA libraries
+# ALSO need the dir on PATH — see _ensure_deps_path — because CTranslate2 loads
+# cuBLAS/cuDNN by BARE name, a load that does not consult add_dll_directory dirs.)
+_dll_dir_handles = []
+_dll_dirs_added = set()
+
 
 def _ensure_deps_path():
     """faster-whisper is heavy and NOT bundled in the lean app. If the user has
@@ -70,8 +78,16 @@ def _ensure_deps_path():
                         "nvidia/cuda_nvrtc/bin"):
                 d = cand / sub if sub else cand
                 try:
-                    if d.is_dir():
-                        os.add_dll_directory(str(d))
+                    ds = str(d)
+                    if d.is_dir() and ds not in _dll_dirs_added:
+                        _dll_dir_handles.append(os.add_dll_directory(ds))
+                        # CTranslate2 loads cuBLAS/cuDNN by BARE name (LoadLibraryW),
+                        # which does NOT search add_dll_directory dirs — so also put the
+                        # dir on PATH (the legacy DLL search order DOES include PATH).
+                        # Without this the GPU model loads but the first encode raises
+                        # "Library cublas64_12.dll is not found or cannot be loaded".
+                        os.environ["PATH"] = ds + os.pathsep + os.environ.get("PATH", "")
+                        _dll_dirs_added.add(ds)
                 except Exception:
                     pass
 
