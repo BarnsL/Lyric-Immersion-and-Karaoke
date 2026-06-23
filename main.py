@@ -230,6 +230,24 @@ def _translit_cyr(s):
     return "".join(_CYR_LAT.get(c.lower(), c) for c in (s or ""))
 
 
+def _title_forms(title):
+    """Normalized forms a title may be matched by: the whole thing, and — for a
+    JP-style 'Artist / Song' upload — the **song** part (the segment after the last
+    '/'), plus a Cyrillic→Latin transliteration of each. Only the last segment is
+    tried (the song; the leading parts are the artist), and segments shorter than
+    4 chars are dropped, so the artist name can't cause a false match."""
+    forms = set()
+    for base in (title or "", _translit_cyr(title or "")):
+        forms.add(_norm_title(base))
+        segs = re.split(r"\s*[/／]\s*", base)
+        if len(segs) > 1:
+            nf = _norm_title(segs[-1])          # 'Artist / Song' → the Song
+            if len(nf) >= 4:
+                forms.add(nf)
+    forms.discard("")
+    return forms
+
+
 # ── Real playback position via Windows Media Transport Controls ───────
 
 class MediaWatcher:
@@ -350,6 +368,14 @@ def clean_title(title, source=""):
         r"Lyric\s*Video|Audio|HD|4K|FULL|Full\s*Ver\.?)\b",
         "", t, flags=re.I,
     )
+    # Trailing dash-delimited version/edit subtitle, common on JP MV uploads:
+    # "Into Starlight -anniversary special ver.-", "曲名 -Remix-", "- Acoustic ver -".
+    t = re.sub(
+        r"\s*[-–—]\s*[^-–—]*\b(ver\.?|version|edit|remix|remaster(?:ed)?|acoustic|"
+        r"instrumental|off\s*vocal|anniversary|special|tv\s*size|short\s*ver|"
+        r"long\s*ver|self\s*cover|live)\b[^-–—]*[-–—]?\s*$",
+        "", t, flags=re.I,
+    )
     return t.strip(" -–—|/　").strip()
 
 
@@ -452,8 +478,9 @@ class LyricsIndex:
         qa = _norm_title(artist)
         if not qt:
             return None
-        # also try the romanized query against a transliterated Cyrillic title
-        q_forms = {qt, _norm_title(_translit_cyr(title))}
+        # whole title + each 'Artist / Song' segment + Cyrillic transliteration,
+        # so a wrapped MV title ("IA & ОИЕ / Into Starlight -ver-") still matches.
+        q_forms = _title_forms(title)
         best, best_score = None, 0
         for e in self.entries:
             score = 0

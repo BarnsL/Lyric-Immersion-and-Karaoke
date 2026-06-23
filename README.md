@@ -127,9 +127,11 @@ messy, and covers lie. So matching is **paranoid and sound-led**: a cached title
 is accepted only if it's an exact or near-exact match (never a loose substring,
 so a *different* track by the same artist is never grabbed), and **every few
 seconds the song is re-checked by ear** — if what's heard doesn't match the
-loaded lyrics, they're corrected on the spot. Force a correction any time with
-the tray's **⚑ Wrong lyrics**, or sweep the whole library with
-`python validate.py --purge`.
+loaded lyrics, they're corrected on the spot. It also unwraps the common
+Japanese-MV title format — `Artist / Song -anniversary special ver.- (MUSIC
+VIDEO)` is matched on the **song** part, so wrapped uploads still find their
+cached lyrics. Force a correction any time with the tray's **⚑ Wrong lyrics**, or
+sweep the whole library with `python validate.py --purge`.
 
 Every one of these decisions is written to a **log** (`karaoke.log`) you (or an
 agent) can read — see [Automation](#-automation--local-api) below.

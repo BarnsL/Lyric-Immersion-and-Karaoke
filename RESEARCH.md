@@ -227,6 +227,45 @@ post-fire debounce) keep a quiet musical passage from false-triggering.
   spectral-novelty detector would catch those too but costs real CPU, so it's
   deferred. Tray-toggleable ("Fast song-change detect").
 
+### 3c. "Artist / Song -ver-" MV titles didn't match cached lyrics — ROOT CAUSE + fix
+
+**Symptom.** *IA & ОИЕ / Into Starlight -anniversary special ver.- (MUSIC VIDEO)*
+showed **"No lyrics found"** even though the song was cached (correctly, with
+kanji+romaji+English) and the title is on every provider.
+
+**Root cause.** Two compounding things:
+1. **Title wrapping.** JP music videos title themselves `Artist / Song -version-
+   (TAGS)`. `clean_title` stripped `(TAGS)` but not the `Artist /` prefix or the
+   `-anniversary special ver.-` subtitle, so the query normalised to
+   `iaoieintostarlightanniversaryspecialver`. The cached `intostarlight` is only
+   **34 %** of that string — below the matcher's deliberate **≥60 %** paranoia
+   threshold (which exists to stop different-songs-same-artist false matches) — so
+   it scored 0. Shazam couldn't fingerprint this "anniversary special ver." cut
+   either (`heard_by_sound: null`), so there was no sound fallback.
+2. **Corrupt landmine files.** Two cache files had **title == artist**
+   (`yoasobi.json`/`YOASOBI`, `lyolite.json`/`Lyolite`) — bad earlier saves where a
+   mangled YouTube title was the channel name. These false-match *every* video by
+   that artist (the artist substring clears 60 %).
+
+**Fix.**
+- `clean_title` now also strips a trailing dash-delimited **version/edit subtitle**
+  (`-… ver.-`, `-Remix-`, `-Acoustic-`, `-anniversary special ver.-`, …).
+- `_title_forms()` adds, for an `Artist / Song` title, the **song part only** (the
+  segment after the last `/`, ≥4 norm chars) as a match form — so the wrapped MV
+  title matches the cached song. The leading artist segment is deliberately *not*
+  tried (it would match an artist-named file), and `LyricsIndex.match` uses these
+  forms. Result: *Into Starlight* → `into_starlight.json`; *YOASOBI / Idol* →
+  `idol.json` (the song), not the artist.
+- Deleted the 2 corrupt files and added a guard in `fetch_and_save`: never cache a
+  song whose **title == artist** (it indexes garbage that false-matches everything).
+- 📝 **Honest limit (sync).** This MV is 5:50 vs the single's 5:36; the cached LRC
+  is timed to the single and Shazam can't ID the special-ver cut, so the lyrics
+  show but the **timing needs a manual nudge** (tray *Sync timing* / `POST /nudge`).
+  No automatic fix without a fingerprint of that exact cut.
+- 📝 **Still-open formats (pre-existing, not regressions):** `Artist "Song"`
+  (song in quotes) and `Artist MV「Song」` (song in 「」, which the bracket-strip
+  removes) don't yet extract the song; candidates for a later `clean_title` pass.
+
 ## 4. Rendering & performance
 
 **Current:** a transparent, click-through Tk canvas. Scroll-through renders each
@@ -266,6 +305,7 @@ call; lanes + block height adapt per song.
 | Spaces | `to_furigana` preserves whitespace (fugashi dropped it); cache re-spaced | `fetch_lyrics.py` `to_furigana` |
 | Perf | PhotoImage paste-in-place, 0.15s poll, measure_text cache, idle char fps | `main.py`, `character.py` |
 | Matching | Title match is strict + scored (no loose same-artist grabs); sound is the authority and re-checks every ~20s and self-corrects | `main.py` `LyricsIndex.match`, `_consume_async` |
+| Matching | Handle `Artist / Song -ver-` MV titles: strip dash-version subtitles, match the song segment after the last `/`; drop + block corrupt `title==artist` cache files | `main.py` `clean_title`/`_title_forms`/`match`, `fetch_lyrics.py` `fetch_and_save` |
 | Automation | Local HTTP API (hardened: total error-wrapping, `{ok}` shape, `/health`, auth token) + rolling `karaoke.log` of every decision | `api.py`, `main.py` |
 | Switching | Energy-gated **song-change detector** for seamless switching in compilations; blind Shazam poll relaxes to a slow heartbeat once confirmed (lower CPU) | `songchange.py`, `main.py` `_on_boundary`/`_recalibrate_loop` |
 | Languages | German + Russian (Cyrillic transliteration + translation); per-line CJK font on rm/en rows kills mixed-line □ boxes; whitespace-safe furigana | `fetch_lyrics.py`, `main.py` |

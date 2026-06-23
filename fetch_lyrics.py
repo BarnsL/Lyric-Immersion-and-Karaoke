@@ -987,6 +987,11 @@ def validate_file(path, duration: float | None = None) -> tuple[bool, str]:
 
 def fetch_and_save(title: str, artist: str = "", translate: bool = False,
                    duration: float | None = None, interactive: bool = False) -> Path | None:
+    # Don't cache a song under a "title" that's just the artist/channel name
+    # (e.g. a mangled YouTube title) — it indexes garbage that then false-matches
+    # every other video by that artist. Sound ID will find the real song instead.
+    if artist and _norm(title) and _norm(title) == _norm(artist):
+        return None
     lrc, meta = fetch_lrc(title, artist, duration)
     if not lrc:
         return None
