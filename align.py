@@ -32,7 +32,8 @@ _CAP = 9             # seconds of audio to listen to
 _MODEL = "base"      # tiny=fastest/weakest … base is a good CPU balance for anchoring
 _MIN_RATIO = 0.42    # reject a match this unsure (avoid setting a bogus offset)
 
-_model = None        # cached WhisperModel singleton
+_GEN_MODEL = "small"  # generation transcribes for DISPLAY → bigger model = better JP
+_models = {}          # cached WhisperModel per size
 _FURI = re.compile(r"\(([ぁ-ゖァ-ヺ゛゜ーゝゞ]+)\)")     # half-width furigana readings
 _PUNCT = re.compile(r"[\s,.!?;:'\"…、。！？「」『』（）()・，．]+")
 
@@ -100,18 +101,17 @@ def _data_models_dir():
         return None
 
 
-def _get_model():
-    global _model
-    if _model is None:
+def _get_model(size=_MODEL):
+    if size not in _models:
         import os
         md = _data_models_dir()
         if md:                                       # keep all model cache off C:
             os.environ.setdefault("HF_HOME", md)
             os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         from faster_whisper import WhisperModel
-        _model = WhisperModel(_MODEL, device="cpu", compute_type="int8",
-                              download_root=md)
-    return _model
+        _models[size] = WhisperModel(size, device="cpu", compute_type="int8",
+                                     download_root=md)
+    return _models[size]
 
 
 def _capture(seconds=_CAP):
@@ -143,6 +143,43 @@ def _transcribe(audio, lang):
         audio, language=lang, beam_size=1, vad_filter=False,
         condition_on_previous_text=False)
     return [(seg.start, seg.text) for seg in segments if seg.text.strip()]
+
+
+def transcribe_for_generation(pos_cap, lang="ja", seconds=16, size=_GEN_MODEL):
+    """LAST-RESORT lyric generation: capture `seconds` of the live audio and
+    transcribe it into timed lyric lines (for songs no provider has). Returns
+    ``[{"t":[start,end], "jp": text}, …]`` on the SONG clock (offset by the player
+    position `pos_cap` at capture start), or ``[]`` on silence/failure.
+
+    Uses a **bigger model** than sync-by-listening (this text is *shown*, not just
+    matched) with **VAD** (skip the instrumental gaps) and in-chunk context for the
+    best transcription quality feasible on CPU. Still imperfect — the caller marks
+    every generated line so the user knows it's machine-made, not official."""
+    _ensure_deps_path()
+    lang = {"ja-romaji": "ja"}.get(lang, lang)
+    hint = lang if lang in ("ja", "ko", "zh", "es", "de", "ru", "en",
+                            "fr", "it", "pt") else None
+    audio = _capture(seconds)
+    if audio is None:
+        return []
+    import numpy as np
+    if float(np.sqrt(np.mean(np.square(audio)) + 1e-12)) < 4.0e-3:
+        return []                                    # essentially silence
+    try:
+        model = _get_model(size)
+        segs, _info = model.transcribe(
+            audio, language=hint, beam_size=5, vad_filter=True,
+            condition_on_previous_text=True)
+    except Exception:
+        return []
+    out = []
+    for s in segs:
+        t = (s.text or "").strip()
+        if len(t) < 2:
+            continue
+        out.append({"t": [round(pos_cap + float(s.start), 2),
+                          round(pos_cap + float(s.end), 2)], "jp": t})
+    return out
 
 
 def _best_anchor(segments, lines):

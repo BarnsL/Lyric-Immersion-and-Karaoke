@@ -366,6 +366,18 @@ the ctranslate2/av DLLs correctly. From source it auto-loads from `.deps`
 (`_ensure_deps_path`); either way it degrades gracefully (`available()` False →
 hint) when absent. Phase 0/2 remain future work.
 
+✅ **Generate-by-ear (built, v1.0.2)** — the same Whisper stack, pushed further:
+when **no provider has the song at all**, transcribe the audio itself into the
+lyrics. `align.transcribe_for_generation` captures the song in ~16 s chunks and
+runs the **bigger `small` model with `vad_filter=True`** (skip the instrumental
+gaps → cleaner Japanese) and in-chunk context; `main._generate_loop` offsets the
+segment times onto the song clock, annotates each chunk (furigana/romaji/
+translate), appends **`***`** to every translation as an honesty marker, and
+accumulates + **saves** the file so a replay is instant and perfectly synced.
+Honest limits: sung-ASR is imperfect and the first pass lags ~20 s (chunked); it's
+a genuine last resort, gated behind `generate_on` + faster-whisper. A future
+quality lever is **Demucs vocal isolation** before ASR (heavy; deferred).
+
 ---
 
 ## What changed in code (this pass)
@@ -385,6 +397,7 @@ hint) when absent. Phase 0/2 remain future work.
 | Automation | Local HTTP API (hardened: total error-wrapping, `{ok}` shape, `/health`, auth token) + rolling `karaoke.log` of every decision | `api.py`, `main.py` |
 | Switching | Energy-gated **song-change detector** for seamless switching in compilations; blind Shazam poll relaxes to a slow heartbeat once confirmed (lower CPU) | `songchange.py`, `main.py` `_on_boundary`/`_recalibrate_loop` |
 | Sync | **Sync by listening** — opt-in faster-whisper transcribes live vocals + fuzzy-matches the cached lines to set the offset when Shazam can't ID the cut; not bundled, auto-loaded from `deps/` | `align.py`, `main.py` `align_by_listening`, `api.py` `/align` |
+| Lyrics | **Generate by ear (last resort)** — when no provider has the song, transcribe the audio in chunks with Whisper `small` (VAD-filtered) → timed JP → furigana/romaji/translate, each line marked `***`; accumulates + saves so a replay is synced | `align.py` `transcribe_for_generation`, `main.py` `_begin_generation`/`_generate_loop`/`_apply_generated` |
 | Languages | German + Russian (Cyrillic transliteration + translation); per-line CJK font on rm/en rows kills mixed-line □ boxes; whitespace-safe furigana | `fetch_lyrics.py`, `main.py` |
 | Polish | All subprocess calls windowless (no flashing terminals) | `main.py` |
 | Docs | Word-level finding, candidates, this file | `fetch_lyrics.py` header, `RESEARCH.md` |

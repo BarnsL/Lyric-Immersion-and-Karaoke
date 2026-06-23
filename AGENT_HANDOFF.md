@@ -404,6 +404,17 @@ lyrics you already have. (Background + research recommendation in `RESEARCH.md �
   (`Into Starlight` → score 100).
 - **requirements.txt:** faster-whisper listed but **commented out** (optional).
 
+### B2. Generate lyrics by ear (v1.0.2) — same Whisper stack
+When **no provider has the song**, `main._begin_generation` → `_generate_loop`
+transcribes the audio in ~16 s chunks via `align.transcribe_for_generation`
+(model **`small`**, `vad_filter=True`), offsets segment times onto the song clock,
+`annotate()`s each chunk (furigana/romaji/translate), appends **`***`** to each
+translation (AI-made marker), accumulates + **saves** the file (`source:
+"generated"`) so replays are synced. Triggered from `_consume_async`'s
+no-lyrics branch; gated by `generate_on` (tray toggle, default on) + faster-whisper;
+cancelled on track change via `_gen_token`. The `small` model (~244 MB) downloads
+to `<data>/models` on first use.
+
 ### C. Library — YOASOBI discography added
 Fetched YOASOBI's tracks into the cache (`_yfetch.py`, a one-off; `YOASOBI` block
 also added to `preload.py`). Lyrics stay gitignored; the curated list in

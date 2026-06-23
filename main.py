@@ -710,6 +710,11 @@ class Overlay:
         self.character_on = bool(s.get("character", False))  # dancing companion
         self.api_on = bool(s.get("api", True))         # local agent-control API
         self.boundary_on = bool(s.get("boundary", True))  # fast song-change detect
+        self.generate_on = bool(s.get("generate", True))  # generate lyrics by ear
+        self._generating = False      # Whisper lyric-generation in progress
+        self._gen_token = 0           # bumped on track change to cancel generation
+        self._gen_lines = []          # accumulated generated line dicts
+        self._gen_title = self._gen_artist = ""
         self._api = None
         self._boundary = None         # song-change detector thread
         self._last_boundary = 0.0     # throttle: last boundary-triggered identify
@@ -825,6 +830,8 @@ class Overlay:
         self._health_attempts = 0
         self.offset = 0.0          # fresh baseline; sound calibration sets it
         self._sound_song = None    # new video → re-identify by ear
+        self._gen_token += 1       # cancel any in-flight lyric generation
+        self._generating = False
         log.info("track change: %r / %r (dur %s)", title, artist, duration)
 
         self._live_mode = is_live_or_compilation(title, duration)
@@ -1095,7 +1102,7 @@ class Overlay:
                     self._hint("🎧 Finding the song by sound…")
                     self._start_identify()
                 else:
-                    self._hint("No lyrics found for this song")
+                    self._begin_generation()   # LAST RESORT: generate by ear
         if self._translate_result:
             path, ok = self._translate_result
             self._translate_result = None
@@ -1155,6 +1162,109 @@ class Overlay:
                     else:
                         log.info("correcting -> fetching %r / %r", f_title, f_artist)
                         self._start_fetch(f_artist, f_title, self._cur_duration)
+
+    # ── last-resort lyric GENERATION (transcribe the audio) ──
+    def _begin_generation(self):
+        """No provider had this song — generate lyrics by ear: transcribe the live
+        audio with Whisper into timed JP, add furigana + romaji + a *likely*
+        translation (every line marked ``***`` so it's clearly AI-made, not
+        official). Opt-in (`generate_on`), needs faster-whisper, runs in the
+        background, accumulating + saving so the next play is instant and synced."""
+        if not getattr(self, "generate_on", True):
+            self._hint("No lyrics found for this song")
+            return
+        try:
+            import align
+            ok = align.available()
+        except Exception:
+            ok = False
+        if not ok:
+            self._hint("No lyrics found (install faster-whisper to auto-generate)")
+            return
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING) or self._generating:
+            if not self._generating:
+                self._hint("No lyrics found for this song")
+            return
+        artist, title = (self._track or ("", ""))
+        self._generating = True
+        self._gen_token += 1
+        self._gen_title, self._gen_artist = (title or "song"), (artist or "")
+        self._gen_lines = []
+        self.lines, self.idx, self._kara = [], -1, []
+        self._lyrics_path = None
+        self._verified = False
+        self.meta = {"title": self._gen_title, "artist": self._gen_artist,
+                     "lang": "ja", "duration": self._cur_duration, "source": "generated"}
+        self._hint("✨ Generating lyrics by ear… (AI — marked ***)")
+        log.info("generating lyrics by Whisper for %r", self._gen_title)
+        threading.Thread(target=self._generate_loop,
+                         args=(self._gen_token,), daemon=True).start()
+
+    def _generate_loop(self, token):
+        """Capture the song in chunks, transcribe each, annotate, accumulate.
+        Cancels the moment the track changes (token bump)."""
+        import align
+        from fetch_lyrics import annotate
+        CHUNK, last_end, idle = 16, 0.0, 0
+        while token == self._gen_token:
+            st = self.media.get()
+            if not (st and st.get("status") == PLAYING):
+                time.sleep(1.0)
+                idle += 1
+                if idle > 25:
+                    break                                # gave up (paused/stopped)
+                continue
+            idle = 0
+            pos = float(st.get("position") or 0.0)
+            chunk = align.transcribe_for_generation(pos, lang="ja", seconds=CHUNK)
+            if token != self._gen_token:
+                return
+            new = [d for d in chunk if d["t"][0] >= last_end - 1.0 and d["jp"].strip()]
+            if new:
+                try:
+                    annotate(new, "ja", translate=True)   # furigana + romaji + EN
+                except Exception:
+                    pass
+                for d in new:
+                    if d.get("en", "").strip():
+                        d["en"] = d["en"].strip() + " ***"   # mark as AI-generated
+                    last_end = max(last_end, d["t"][1])
+                self._gen_lines += new
+                self.root.after(0, lambda t=token: self._apply_generated(t))
+            if self._cur_duration and pos >= self._cur_duration - CHUNK:
+                break
+        if token == self._gen_token:
+            self._generating = False
+
+    def _apply_generated(self, token):
+        """(Tk thread) sort/dedup the accumulated lines, show them, and save the
+        generated file so a replay loads instantly and perfectly in sync."""
+        if token != self._gen_token:
+            return
+        seen, merged = set(), []
+        for d in sorted(self._gen_lines, key=lambda x: x["t"][0]):
+            k = (round(d["t"][0], 1), d["jp"][:8])
+            if k in seen:
+                continue
+            seen.add(k)
+            merged.append(d)
+        self.lines = [Line(start=d["t"][0], end=d["t"][1], jp=d.get("jp", ""),
+                           rm=d.get("rm", ""), en=d.get("en", "")) for d in merged]
+        self._relayout_song()
+        try:
+            from fetch_lyrics import slugify
+            out = LYRICS_DIR / f"{slugify(self._gen_title)}.json"
+            data = {"meta": {"title": self._gen_title, "artist": self._gen_artist,
+                             "lang": "ja", "duration": self._cur_duration,
+                             "source": "generated"},
+                    "lines": [{"t": d["t"], "jp": d.get("jp", ""), "rm": d.get("rm", ""),
+                               "en": d.get("en", "")} for d in merged]}
+            out.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+            self._lyrics_path = out
+            self.index.add(out)
+        except Exception as e:
+            log.info("saving generated lyrics failed: %s", e)
 
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
@@ -1845,7 +1955,12 @@ class Overlay:
                         "scroll_speed": self.scroll_speed, "perf": self.perf,
                         "recal_secs": self.recal_secs, "git_sync": self.git_sync,
                         "character": self.character_on, "api": self.api_on,
-                        "boundary": self.boundary_on})
+                        "boundary": self.boundary_on, "generate": self.generate_on})
+
+    def set_generate(self, on):
+        """Toggle the last-resort Whisper lyric generation."""
+        self.generate_on = bool(on)
+        self._persist()
 
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
@@ -2183,6 +2298,7 @@ def main():
     def _toggle_char(*_):  ov.root.after(0, lambda: ov.set_character(not ov.character_on))
     def _toggle_api(*_):   ov.root.after(0, lambda: ov.set_api(not ov.api_on))
     def _toggle_bound(*_): ov.root.after(0, lambda: ov.set_boundary(not ov.boundary_on))
+    def _toggle_gen(*_):   ov.root.after(0, lambda: ov.set_generate(not ov.generate_on))
     git_menu = pystray.Menu(
         pystray.MenuItem("Auto-push new songs", _toggle_git,
                          checked=lambda i: ov.git_sync),
@@ -2250,6 +2366,8 @@ def main():
         pystray.MenuItem("🎤  Sync by listening  (match lyrics to the audio)", _align),
         pystray.MenuItem("Fast song-change detect (compilations)", _toggle_bound,
                          checked=lambda i: ov.boundary_on),
+        pystray.MenuItem("Generate lyrics by ear when none found (AI, ***)", _toggle_gen,
+                         checked=lambda i: ov.generate_on),
         pystray.MenuItem("Auto re-sync by sound", recal_menu),
         pystray.MenuItem("Library backup (Git)", git_menu),
         pystray.Menu.SEPARATOR,

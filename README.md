@@ -41,6 +41,11 @@ while it runs.
   hears the moment one track ends and the next begins, and re-identifies *right
   then* instead of on a slow timer. Switches are quick, and because changes are
   now event-driven the heavy recognizer can idle between songs (**lower CPU**).
+- **Generate lyrics by ear (last resort).** For a track *no* lyric site has, the
+  app can **transcribe the audio itself** with Whisper into timed Japanese, then
+  add furigana, romaji, and a likely English translation — every generated line
+  marked with `***` so you know it's AI-made, not official. (Optional; needs
+  faster-whisper, which the portable build includes.)
 - **Scroll-through mode** with staggered lanes for a flowing, room-filling
   karaoke look — or a clean fixed-line mode.
 - **Responsive sizing.** Text scales to your display automatically, so it looks
@@ -208,9 +213,22 @@ behind each design choice.
 ### When a song isn't found
 Niche VTuber / indie tracks (a B-side that isn't on LRCLIB, Musixmatch, or
 NetEase) sometimes have **no lyrics on any provider** — that's a content gap, not
-a bug. For those, find or make a timed `.lrc` (a fan wiki, the video description,
-or a tool like QuickLRC) and add it yourself — it gets the same furigana / romaji
-/ translation as a fetched song:
+a bug.
+
+**As a last resort the app generates them by ear.** When every provider comes up
+empty, it transcribes the playing audio with Whisper (the bigger `small` model,
+with voice-activity filtering for quality) into **timed Japanese**, then adds
+furigana, romaji, and a likely translation — **each line marked `***`** so it's
+clearly machine-made. It builds up over the song and **saves the result**, so a
+replay is instant and perfectly in sync. The first pass lags ~20 s behind the
+audio (it's transcribing in chunks) and the transcription is imperfect — it's a
+genuine best-effort fallback for songs that simply have no lyrics anywhere. Toggle
+it from the tray (**Generate lyrics by ear…**); it needs faster-whisper, which the
+portable build bundles.
+
+For a *known* missing song you'd rather supply exactly, find or make a timed
+`.lrc` (a fan wiki, the video description, or a tool like QuickLRC) and add it —
+it gets the same furigana / romaji / translation as a fetched song:
 
 ```bash
 python add_lrc.py "TIME TO LUV.lrc" --title "TIME TO LUV" --artist "ピーナッツくん"
