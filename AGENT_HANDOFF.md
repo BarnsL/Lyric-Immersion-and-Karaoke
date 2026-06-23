@@ -417,3 +417,63 @@ PY="%LOCALAPPDATA%/Programs/Python/Python312/python.exe"   # call explicitly
 "$PY" -c "import align; print(align.available())"
 curl -X POST http://127.0.0.1:8765/align          # trigger sync-by-listening
 ```
+
+---
+
+## Work done in the 2026-06-22 session (part 4): MV / cinematic dead-space intro
+
+### The problem
+A music video often opens with a cinematic/instrumental **dead-space** before the
+song proper (e.g. ~25 s of ambience over the title card, then the track starts).
+LRC timestamps are relative to the SONG (time 0 = song start), so a lyric clock
+running from video t=0 is **ahead by the intro length**. Shazam normally fixes
+this — it hears the cut and reports the offset INTO the song. The gap is **niche
+tracks Shazam can't ID** (small indie/VTuber uploads): no Shazam offset → lyrics
+run ahead through the whole intro.
+
+### What was added
+1. **`is_mv_version(title)`** (`main.py`) — heuristic: Official (Music) Video /
+   Music Video / MV / PV / Lyric Video / Visualizer (EN + JP forms).
+2. **An audio ONSET signal** in `songchange.py` — the RMS meter now also fires
+   `on_onset()` when **sustained music begins after a quiet stretch** (`min_quiet`
+   1.5 s near-silence, then `min_sustain` 0.6 s music). The song-boundary
+   `on_change` needs music→silence→music; the onset needs only quiet→music, so it
+   catches a *leading* intro that no music preceded.
+3. **Dead-space compensation** in the Overlay:
+   - Track change: `_mv_mode = is_mv_version(title) and not _live_mode`,
+     `_intro_anchored = False`, `_track_t0 = now`.
+   - **Hold** (`_tick`): while `_mv_mode and not _intro_anchored and _sound_song is
+     None`, show "Cinematic intro — waiting for the song..." and don't run lyrics.
+     Released by a ~50 s timeout if no dead-space appears.
+   - **Anchor** (`_on_song_onset`): for any not-yet-aligned track, when the onset
+     lands in the first ~50 s (after a real gap from 0), set `offset = -video_pos`
+     so **video time of the onset = lyric time 0**; the first line then shows at
+     onset + its own LRC time.
+   - Shazam always wins: any `/identify` result sets `_intro_anchored = True`, so
+     the guess never fights a real measured offset.
+
+### Why this shape (design notes)
+- **Near-silence gate, not just title.** The onset only fires after genuine
+  near-silence (abs floor 3e-3), so a song with an *audible* soft intro (that IS
+  the song) does NOT trip it — only a true dead-space does. That's what makes the
+  anchor safe for normal tracks (tested: no onset when music starts immediately).
+- **Hold is MV-title-gated; anchor is universal.** Holding (blank + hint) is only
+  for MV-titled videos so normal songs are never blanked. The onset *anchor* still
+  corrects any unaligned track with a real dead-space (covers "or similar"
+  non-MV cinematic uploads — they just aren't pre-held).
+- **Fail-safe:** no onset + no Shazam => the timeout releases and lyrics run from
+  t=0 (old behaviour, no regression).
+
+### Limitations (honest)
+- Only **near-silent** dead-space is detected; a LOUD cinematic intro (dialogue/
+  SFX above the floor) won't trip the onset → falls back to timeout.
+- The anchor assumes LRC time 0 ~= the song's audio start; Shazam is more precise,
+  this is the fallback for when Shazam is blind.
+- Tuning: `SongChangeDetector(min_quiet=, min_sustain=)`, and the 50 s window /
+  1 s floor in `_on_song_onset` and `_tick`.
+
+### Also: YouTube channel-suffix artist cleaning — `clean_artist()` (`main.py`)
+`Kaneko Lumi - Topic` / `LMFAOVEVO` / `... - Official Artist Channel` blocked the
+lyric-provider + Shazam-name search. `clean_artist()` strips those; wired into the
+`_tick` track build (cached alongside `clean_title`). Helps every Topic/VEVO upload
+find lyrics, not just one song.

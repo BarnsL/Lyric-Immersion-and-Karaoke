@@ -39,11 +39,18 @@ class SongChangeDetector(threading.Thread):
     must be *preceded by music*; after firing, it stays quiet for `debounce`
     seconds (no song flips twice in a breath)."""
 
-    def __init__(self, on_change, *, block=0.2, samplerate=16000,
+    def __init__(self, on_change, *, on_onset=None, block=0.2, samplerate=16000,
                  min_gap=0.30, min_music=1.2, debounce=5.0,
-                 abs_silence=3.0e-3, rel_silence=0.10):
+                 abs_silence=3.0e-3, rel_silence=0.10,
+                 min_quiet=1.5, min_sustain=0.6):
         super().__init__(daemon=True)
         self.on_change = on_change
+        # on_onset(): fired when sustained music BEGINS after a quiet stretch — the
+        # tell-tale of a cinematic/MV dead-space intro ending and the song kicking
+        # in. Unlike on_change (which needs music→silence→music), this needs only
+        # quiet→music, so it catches a *leading* intro that no music preceded. The
+        # overlay uses it to anchor lyric timing for songs Shazam can't ID.
+        self.on_onset = on_onset
         self.block = block
         self.sr = int(samplerate)
         self.min_gap = min_gap
@@ -51,6 +58,8 @@ class SongChangeDetector(threading.Thread):
         self.debounce = debounce
         self.abs_silence = abs_silence
         self.rel_silence = rel_silence
+        self.min_quiet = min_quiet        # leading quiet (s) needed to call it an intro
+        self.min_sustain = min_sustain    # music must hold this long (s) to be an onset
 
         self._enabled = True
         self._stop_evt = threading.Event()
@@ -61,6 +70,8 @@ class SongChangeDetector(threading.Thread):
         self._had_music = False    # saw a real music run before the current gap
         self._in_gap = False       # currently inside a qualifying silent gap
         self._last_fire = 0.0
+        self._pre_quiet = 0.0      # length of the quiet stretch the current music followed
+        self._onset_fired = False  # onset already fired for the current music run
 
     # ── control ──
     def set_enabled(self, on: bool):
@@ -76,6 +87,8 @@ class SongChangeDetector(threading.Thread):
         self._music_for = self._silent_for = 0.0
         self._had_music = False
         self._in_gap = False
+        self._pre_quiet = 0.0
+        self._onset_fired = False
 
     # ── the loop ──
     def run(self):
@@ -142,6 +155,7 @@ class SongChangeDetector(threading.Thread):
         if is_silent:
             self._silent_for += dt
             self._music_for = 0.0
+            self._onset_fired = False       # arm the next quiet→music onset
             # A qualifying gap = enough silence, and it followed real music.
             # `had_music` is latched while music played, so this still holds even
             # though music_for was just zeroed on the first silent block.
@@ -154,8 +168,18 @@ class SongChangeDetector(threading.Thread):
             if self._in_gap:
                 self._fire()
             self._in_gap = False
+            if self._silent_for > 0.0:
+                self._pre_quiet = self._silent_for   # remember the quiet we just left
             self._silent_for = 0.0
             self._music_for += dt
+            # Onset: sustained music after a real quiet stretch (a dead-space /
+            # cinematic intro ending). Fires once per quiet→music transition; the
+            # overlay only acts on the FIRST one of a track (the leading intro).
+            if (self.on_onset and not self._onset_fired
+                    and self._music_for >= self.min_sustain
+                    and self._pre_quiet >= self.min_quiet):
+                self._onset_fired = True
+                self._fire_onset()
             if self._music_for >= self.min_music:
                 self._had_music = True
 
@@ -166,5 +190,13 @@ class SongChangeDetector(threading.Thread):
         self._last_fire = now
         try:
             self.on_change()
+        except Exception:
+            pass
+
+    def _fire_onset(self):
+        """Music just started after a quiet stretch — likely a cinematic/MV intro
+        ending. Best-effort; the overlay decides whether it matters."""
+        try:
+            self.on_onset()
         except Exception:
             pass

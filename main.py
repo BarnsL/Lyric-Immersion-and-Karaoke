@@ -440,6 +440,38 @@ def is_live_or_compilation(title, duration=None):
     return bool(_LIVE_RE.search(title or ""))
 
 
+# Music-video / MV uploads — these often open with a cinematic or instrumental
+# "dead-space" intro BEFORE the song proper, so the lyrics' time 0 lands partway
+# into the video. (See the MV-intro dead-space handling in the Overlay: hold the
+# lyrics through the intro, then anchor them to the detected audio onset.)
+_MV_RE = re.compile(
+    r"\b(?:official\s*(?:music\s*)?video|music\s*video|m\s*/?\s*v|p\s*/?\s*v|"
+    r"official\s*audio|lyric\s*video|visuali[sz]er)\b"
+    r"|ミュージックビデオ|ＭＶ|【\s*mv\s*】|「\s*mv\s*」",
+    re.I,
+)
+
+
+def is_mv_version(title):
+    """True for an official-MV / music-video style upload. These frequently start
+    with a cinematic/instrumental intro before the song — when Shazam can measure
+    the real offset we use it; when it can't (niche tracks), the overlay holds the
+    lyrics through that dead-space and anchors them to the detected audio onset."""
+    return bool(_MV_RE.search(title or ""))
+
+
+def clean_artist(artist):
+    """Strip YouTube channel cruft so the artist matches lyric providers:
+    'Kaneko Lumi - Topic' → 'Kaneko Lumi', 'LMFAOVEVO' → 'LMFAO'. Auto-generated
+    '… - Topic' / VEVO / 'Official Artist Channel' uploads are real tracks; the
+    suffix just blocks the provider/Shazam-name search."""
+    a = (artist or "").strip()
+    a = re.sub(r"\s*[-–—]\s*Topic$", "", a, flags=re.I)
+    a = re.sub(r"\s*[-–—]\s*Official(\s+(Artist|Music))?\s+Channel$", "", a, flags=re.I)
+    a = re.sub(r"\s*VEVO$", "", a)
+    return a.strip() or (artist or "")
+
+
 # ── Lyrics data ──────────────────────────────────────────────────────
 
 @dataclass
@@ -675,9 +707,11 @@ class Overlay:
         self._strm_rem = 0.0
         self._tick_n = 0           # frame counter for throttling the heavy ticker work
         self._fill_skip = 3        # spawn/despawn/fill every Nth frame (set by _apply_perf)
-        self._last_raw_title = None  # cache so clean_title() isn't re-run every frame
-        self._last_src = None
+        self._last_raw_title = None  # cache so clean_title()/clean_artist() aren't
+        self._last_src = None        # re-run every frame
+        self._last_artist = None
         self._clean_title_cache = ""
+        self._clean_artist_cache = ""
         self._frame_ms = 0.0         # EWMA of render-frame interval (ms) → /status render_fps
         self._last_tick_t = None
         self._render_frame = False
@@ -743,6 +777,9 @@ class Overlay:
         self._fast_calib = 0          # remaining quick re-locks after a song change
         self._recal_after = None      # pending recalibrate timer id
         self._live_mode = False       # concert/compilation → sound-only, no title-match
+        self._mv_mode = False         # MV/cinematic title → expect a dead-space intro
+        self._intro_anchored = True   # have we anchored past this track's intro yet?
+        self._track_t0 = 0.0          # wall-clock when the current track started
 
         self.index = LyricsIndex()
         self.media = MediaWatcher()
@@ -804,6 +841,14 @@ class Overlay:
                 self._verified = False
                 self._hint(f"♪ {title} — identifying…")
                 self._start_fetch(artist, title, duration)
+
+        # MV / cinematic dead-space intro: for an MV-titled video, hold the lyrics
+        # through the leading intro (see _tick); for ANY unaligned track, anchor
+        # lyric time 0 to the detected audio onset (see _on_song_onset). Shazam
+        # overrides both the moment it can measure the real offset.
+        self._mv_mode = is_mv_version(title) and not self._live_mode
+        self._intro_anchored = False
+        self._track_t0 = time.time()
 
         # PRIMARY signal: identify by sound and let it decide the real song.
         self._start_identify(seconds=6, attempts=2)
@@ -1051,6 +1096,7 @@ class Overlay:
             self._identifying = False
             if res:
                 title, artist, offset, t_cap = res
+                self._intro_anchored = True   # Shazam can align this → drop the MV dead-space guess
                 # SOUND IS THE AUTHORITY. Shazam often romanizes JP titles
                 # ("Kira" for 綺羅), so when the player's own title is CJK keep
                 # that original script for fetching/matching.
@@ -1139,11 +1185,13 @@ class Overlay:
 
         # clean_title() runs several regexes; the raw title rarely changes, so
         # only recompute it when it does (this loop runs every frame).
-        rawt, src = state["title"], state["source"]
-        if rawt != self._last_raw_title or src != self._last_src:
-            self._last_raw_title, self._last_src = rawt, src
+        rawt, src, rawa = state["title"], state["source"], state.get("artist", "")
+        if (rawt != self._last_raw_title or src != self._last_src
+                or rawa != self._last_artist):
+            self._last_raw_title, self._last_src, self._last_artist = rawt, src, rawa
             self._clean_title_cache = clean_title(rawt, src)
-        track = (state["artist"], self._clean_title_cache)
+            self._clean_artist_cache = clean_artist(rawa)
+        track = (self._clean_artist_cache, self._clean_title_cache)
         if track != self._track:
             self._track = track
             self._on_track_change(track, self._trusted_duration(state))
@@ -1153,6 +1201,20 @@ class Overlay:
         if state["status"] != PLAYING or not self.lines:
             self.root.after(80, self._tick)   # frozen while paused — no advancing
             return
+
+        # MV / cinematic dead-space: for an MV-titled, not-yet-aligned song, hold
+        # the lyrics through the leading intro so they don't run ahead of the song.
+        # _on_song_onset clears _intro_anchored at the real onset; a ~50s timeout
+        # releases it if no clear dead-space turns up (then lyrics run normally).
+        if (self._mv_mode and not self._intro_anchored
+                and self._sound_song is None):
+            if state["position"] > 50.0 or (time.time() - self._track_t0) > 50.0:
+                self._intro_anchored = True
+            else:
+                self._hint("🎬 Cinematic intro — waiting for the song…")
+                self.idx = -1
+                self.root.after(90, self._tick)
+                return
 
         pos = state["position"] + self.offset
 
@@ -1664,7 +1726,8 @@ class Overlay:
         track change it pulls a re-identify in immediately — see _on_boundary."""
         try:
             from songchange import SongChangeDetector
-            self._boundary = SongChangeDetector(self._fire_boundary)
+            self._boundary = SongChangeDetector(self._fire_boundary,
+                                                on_onset=self._fire_onset_event)
             self._boundary.set_enabled(self.boundary_on)
             self._boundary.start()
             log.info("song-change detector on")
@@ -1694,6 +1757,35 @@ class Overlay:
         self._fast_calib = max(self._fast_calib, 2)
         self._start_identify(seconds=5, attempts=1)
         self._arm_recal(6)
+
+    def _fire_onset_event(self):
+        """Detector thread heard the song start after a quiet intro → Tk thread."""
+        try:
+            self.root.after(0, self._on_song_onset)
+        except Exception:
+            pass
+
+    def _on_song_onset(self):
+        """The audio just kicked in after a leading quiet stretch — the end of an
+        MV's cinematic / instrumental DEAD-SPACE intro. When Shazam can't ID the
+        song (so it can't supply the real offset), anchor the lyric clock to THIS
+        moment: the song's start = lyric time 0, so the lyrics stop running ahead
+        through the intro. Only for a not-yet-aligned track still near its start;
+        Shazam overrides later if it succeeds (see _consume_async)."""
+        if self._intro_anchored or self._sound_song is not None or not self.lines:
+            return
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING):
+            return
+        vpos = st.get("position", 0.0)
+        # Only a *leading* intro: the onset must land in the first ~50s, and after a
+        # real gap from t=0 (skip near-zero — that's a song that simply starts).
+        if not (1.0 < vpos < 50.0):
+            return
+        self._intro_anchored = True
+        self.offset = round(-vpos, 2)        # video time `vpos` → lyric time 0
+        self.idx = -1
+        log.info("MV intro dead-space ~%.1fs → anchored lyrics to the song onset", vpos)
 
     def set_api(self, on):
         """Start/stop the local agent-control API (127.0.0.1:8765)."""
