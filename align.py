@@ -272,7 +272,15 @@ def capture_and_align(lines, lang="ja", get_pos=None, seconds=_CAP):
     # The heard line's real song-time is line.start; in the clip it occurred at
     # pos_cap + seg_t. The offset makes displayed (position+offset) == song time.
     offset = round(line.start - (pos_cap + seg_t), 2)
-    if abs(offset) > 600:                            # sanity guard
+    if abs(offset) > 600:                            # absolute sanity guard
+        return None
+    # A LARGER correction must clear a HIGHER confidence bar. A weak ASR match just
+    # over the floor that implies a big jump is almost always a mis-anchor on a
+    # noisy transcript (observed live: a 0.44 match yanking the offset to -95s),
+    # not a real long intro — so scale the required ratio with the jump size. A
+    # genuinely large offset (a cinematic intro) still passes if the match is
+    # strong; a small drift correction keeps the lenient floor.
+    if ratio < _MIN_RATIO + min(0.30, abs(offset) / 200.0):
         return None
     return offset, round(ratio, 2), line.start
 
