@@ -1741,20 +1741,18 @@ class Overlay:
 # ── Tray icon ────────────────────────────────────────────────────────
 
 def make_icon():
-    """Load the tray icon image (bundled icon.ico), falling back to a drawn 'あ'
-    glyph if the file can't be read."""
+    """Load the tray icon image (bundled icon.ico), falling back to a simple drawn
+    microphone (matching the real icon) if the file can't be read."""
     ico = _resource("icon.ico")
     if ico.exists():
         return Image.open(ico)
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([2, 2, 62, 62], radius=14, fill="#7c3aed")
-    try:
-        f = ImageFont.truetype("segoeui.ttf", 22)
-    except OSError:
-        f = ImageFont.load_default()
-    bbox = d.textbbox((0, 0), "あ", font=f)
-    d.text(((64 - (bbox[2] - bbox[0])) // 2, 16), "あ", fill="white", font=f)
+    d.rounded_rectangle([2, 2, 62, 62], radius=14, fill="#6d28d9")
+    # minimal microphone: capsule head + band + handle
+    d.rounded_rectangle([25, 13, 39, 39], radius=7, fill="white")     # head
+    d.rounded_rectangle([27, 38, 37, 43], radius=2, fill="white")     # band
+    d.rounded_rectangle([29, 42, 35, 53], radius=3, fill="white")     # handle
     return img
 
 

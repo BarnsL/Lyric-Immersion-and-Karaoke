@@ -60,7 +60,8 @@ while it runs.
    installs just for you).
 3. Optionally tick **desktop shortcut** and **Start with Windows**.
 
-That's it. The app launches into your **system tray** (look for the あ icon) and
+That's it. The app launches into your **system tray** (look for the purple
+microphone icon) and
 adds a **Desktop Karaoke** entry to your **Start menu**. Play any song and the
 lyrics appear automatically.
 

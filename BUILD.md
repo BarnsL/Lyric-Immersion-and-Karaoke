@@ -39,7 +39,7 @@ end-user experience is still a single download.
    rights needed — installs per-user).
 2. Two optional checkboxes: **desktop shortcut** and **Start with Windows**.
 3. Done. It adds a **Start menu** entry, launches, and lives in the system tray
-   (あ). Play any song.
+   (the purple microphone). Play any song.
 
 The packaged app is **portable**: it keeps its lyric library (`lyrics/`) and
 `settings.json` right next to `DesktopKaraoke.exe`, so the whole folder is
@@ -56,6 +56,22 @@ $W=New-Object -ComObject WScript.Shell
 $S=$W.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Programs')) 'Desktop Karaoke.lnk'))
 $S.TargetPath="$PWD\dist\DesktopKaraoke\DesktopKaraoke.exe"; $S.IconLocation="$PWD\icon.ico"; $S.Save()
 ```
+
+## The app icon
+
+`icon.ico` is generated reproducibly by **`make_icon.py`** (a karaoke microphone
+with sound waves on a purple gradient). To tweak it, edit the colours/geometry
+constants at the top of that file and regenerate:
+
+```bat
+python make_icon.py --preview     :: rewrites icon.ico + a _icon_preview.png contact sheet
+```
+
+It writes a multi-size `.ico` (16–256 px); the small tray sizes use a bolder,
+simplified master so the mic stays legible at 16 px. The icon is embedded into
+the `.exe` and bundled as a data file by `DesktopKaraoke.spec`, so **rebuild the
+app after changing it** for the new icon to show in the tray, taskbar, and Start
+menu.
 
 ## Notes
 

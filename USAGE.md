@@ -1,6 +1,6 @@
 # Desktop Karaoke — Usage & Settings
 
-Everything lives in the **system-tray icon (あ)** — right-click it. Settings save
+Everything lives in the **system-tray icon (a purple microphone)** — right-click it. Settings save
 instantly to `settings.json` (next to the app) and persist across restarts.
 
 ## Quick start
