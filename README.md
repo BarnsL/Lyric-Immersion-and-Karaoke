@@ -283,14 +283,55 @@ python preload.py                  # fetch a curated ReGLOSS / hololive / J-pop 
 python preload.py --translate-all  # also bake English into every song (slow)
 ```
 
-### Pre-cache your Spotify playlists
+### Pre-cache your playlists
+
+**Tray menu (GUI — easiest):** right-click the purple microphone → **📥 Import playlist**.
+A window opens with three tabs:
+
+| Tab | What it does | Auth needed |
+|-----|-------------|-------------|
+| **Exportify CSV** | Import a CSV exported from [exportify.net](https://exportify.net) — no Spotify auth required | none |
+| **Spotify OAuth** | Live fetch every track in all your playlists via the Spotify Web API | free [Spotify Developer App](https://developer.spotify.com/dashboard) (Client ID only) |
+| **YouTube Music** | Fetch any YouTube Music playlist via yt-dlp (close the browser first, or supply a cookies.txt) | browser login |
+
+Select a source, fill in the details, click **Import**. A scrolling log shows each
+track in real time (OK / SKIP / MISS). Hit **Cancel** to abort after the current track.
+Already-cached songs are skipped automatically; tick **Force re-fetch** to overwrite them.
+
+**CLI equivalents (for scripting or large imports):**
 ```bash
-# One-time: create an app at https://developer.spotify.com/dashboard
-# (redirect URI http://localhost:8888/callback), copy the Client ID, then:
+# Spotify (OAuth-PKCE) — works from source or a running overlay:
 python sync_playlists.py --client-id YOUR_CLIENT_ID   # authorize once in the browser
 python sync_playlists.py                              # later runs reuse the cached token
-python sync_playlists.py --liked                      # also include Liked Songs
+python sync_playlists.py --liked                      # include Liked Songs too
+
+# Exportify CSV — import one or more CSVs exported from exportify.net:
+# (same format as BarnsL/music-migrator's spotify_exporter.py)
+python -c "
+from playlist_import import ImportJob, import_from_csv
+import_from_csv('MyPlaylist.csv', ImportJob())
+"
+
+# YouTube Music — close the browser first:
+python youtube_music.py LM                     # Liked Music
+python youtube_music.py https://music.youtube.com/playlist?list=PL...  # any playlist
+python youtube_music.py --browser chrome LM    # different browser
+python youtube_music.py --cookies cookies.txt LM  # or a cookies.txt file
 ```
+
+**Required env vars for Spotify OAuth:**
+- `SPOTIFY_CLIENT_ID` — pre-fills the Client ID (optional; can also be entered in the GUI or passed via `--client-id`)
+- Redirect URI for your Spotify Developer App must be exactly: `http://localhost:8888/callback`
+
+**Optional translation env var:**
+- `DEEPL_API_KEY` — if set, the GUI's "Translate to English" option uses DeepL instead of Google (noticeably better for Japanese/Korean/Chinese)
+
+**API endpoint (for agent use):**
+```bash
+curl -X POST "http://127.0.0.1:8765/import/csv?path=C:\\path\\to\\playlist.csv"
+curl http://127.0.0.1:8765/import/status   # → {state, done, total, ok, skipped, failed_count}
+```
+
 Uses Spotify's official OAuth (PKCE) — the tool never sees your password, and
 your token / Client ID stay local (git-ignored).
 
@@ -318,6 +359,8 @@ route schema — so it's safe and predictable to drive from an agent.
 | `POST /reset` | reset the sync offset to 0 |
 | `POST /align` | **sync by listening** — transcribe the live audio + match it to the lyrics (needs faster-whisper) |
 | `POST /reindex` | rescan the local library |
+| `POST /import/csv?path=…` | start a background CSV import from an Exportify file at `path` |
+| `GET /import/status` | current import job state: `state`, `done`, `total`, `ok`, `skipped`, `failed_count` |
 
 ```bash
 curl http://127.0.0.1:8765/status
@@ -347,7 +390,10 @@ when something looks off you can see exactly *why* it chose what it chose.
 | `preload.py` | Bulk-build the local lyric library from a curated list |
 | `add_lrc.py` | Add **any** song from a local `.lrc` file (for tracks no provider has) |
 | `reannotate.py` | Re-generate furigana / romaji for the cache after a romanizer change |
-| `sync_playlists.py` | Pre-cache every track in your Spotify playlists |
+| `playlist_import.py` | Core import logic — Exportify CSV parser, `ImportJob`, all three import paths |
+| `playlist_import_gui.py` | Tkinter Import Playlist window (opened from the tray) |
+| `sync_playlists.py` | Pre-cache every track in your Spotify playlists (CLI; used by playlist_import) |
+| `youtube_music.py` | Pre-cache YouTube Music playlists via yt-dlp (CLI; used by playlist_import) |
 | `validate.py` | Scan the cache for bad / mismatched files (`--purge`) |
 | `lyrics/*.json` | Cached, annotated, timed lyrics (git-ignored — not redistributed) |
 

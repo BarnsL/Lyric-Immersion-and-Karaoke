@@ -39,7 +39,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from version import __version__ as API_VERSION
+import threading as _threading
+
 PLAYING = 4
+
+# Active playlist import job (set when POST /import/csv is called).
+_import_job = None
+_import_lock = _threading.Lock()
 _MAX_BODY = 64 * 1024          # cap POST bodies — we don't need a payload anyway
 _START = time.time()
 
@@ -50,6 +56,7 @@ _ROUTES = {
         "/status": "now-playing + matched song + sync + current line",
         "/logs": "recent log lines (?n=200) — the matching decisions",
         "/lyrics": "the full loaded lyric lines",
+        "/import/status": "current playlist import state: state, done, total, ok, skipped, failed_count",
     },
     "POST": {
         "/identify": "re-identify by sound now",
@@ -58,6 +65,7 @@ _ROUTES = {
         "/reset": "reset the sync offset to 0",
         "/align": "sync by listening — transcribe the audio + match to lyrics (needs faster-whisper)",
         "/reindex": "rescan the local library",
+        "/import/csv": "start a playlist CSV import: ?path=C:\\path\\to\\file.csv [&translate=1] [&force=1]",
     },
 }
 
@@ -180,6 +188,8 @@ def make_handler(app, log_file, token):
                     except Exception:
                         lines = []
                     self._send(200, {"ok": True, "lines": lines[-n:]})
+                elif path == "/import/status":
+                    self._send(200, {"ok": True, **_import_status()})
                 elif path == "/":
                     self._send(200, {"ok": True, "app": "Desktop Karaoke",
                                      "version": API_VERSION, "routes": _ROUTES})
@@ -218,12 +228,65 @@ def make_handler(app, log_file, token):
                 elif path == "/reindex":
                     self._run(app.index.refresh)
                     self._send(200, {"ok": True, "action": "library rescanned"})
+                elif path == "/import/csv":
+                    csv_path = q.get("path", [""])[0].strip()
+                    if not csv_path:
+                        return self._err(400, "path query param required, e.g. ?path=C:\\my.csv")
+                    translate = q.get("translate", ["0"])[0] in ("1", "true", "yes")
+                    force     = q.get("force",     ["0"])[0] in ("1", "true", "yes")
+                    result = _start_csv_import(csv_path, translate=translate, force=force)
+                    self._send(200 if result["ok"] else 409, result)
                 else:
                     self._err(404, f"no POST {path}")
             except Exception as e:
                 self._err(500, f"{type(e).__name__}: {e}")
 
     return Handler
+
+
+def _import_status() -> dict:
+    """Return a serialisable summary of the current (or last) import job."""
+    global _import_job
+    job = _import_job
+    if job is None:
+        return {"state": "idle"}
+    if job.cancelled:
+        state = "cancelled"
+    elif job.done >= job.total > 0:
+        state = "done"
+    else:
+        state = "running"
+    return {
+        "state": state,
+        "total": job.total,
+        "done": job.done,
+        "ok": job.ok,
+        "skipped": job.skipped,
+        "failed_count": len(job.failed),
+        "pct": round(job.pct, 1),
+        "last_track": list(job.last_track),
+    }
+
+
+def _start_csv_import(path: str, *, translate: bool = False, force: bool = False) -> dict:
+    """Start a background CSV import. Returns {ok, action} or {ok, error}."""
+    global _import_job
+    with _import_lock:
+        job = _import_job
+        if job and not job.cancelled and job.done < job.total:
+            return {"ok": False, "error": "import already running — cancel it first via /import/status"}
+        from playlist_import import ImportJob, import_from_csv
+        new_job = ImportJob()
+        _import_job = new_job
+
+    def _run():
+        try:
+            import_from_csv(path, new_job, translate=translate, force=force)
+        except Exception:
+            new_job.cancel()
+
+    _threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "action": f"importing {path}"}
 
 
 def start_api(app, log_file, port=8765):

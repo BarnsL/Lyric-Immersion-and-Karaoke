@@ -2565,6 +2565,10 @@ def main():
     def _wrong(*_):   ov.root.after(0, ov.report_wrong)
     def _ident(*_):   ov.root.after(0, ov.identify_by_sound)
     def _align(*_):   ov.root.after(0, ov.align_by_listening)
+
+    def _open_import(*_):
+        from playlist_import_gui import show_import_window
+        show_import_window(ov.root)
     def _quit(icon, *_):
         icon.stop()
         ov.root.after(0, ov.quit)
@@ -2766,6 +2770,7 @@ def main():
                          visible=lambda i: gpu_setup.nvidia_gpu_present()),
         pystray.MenuItem("Auto re-sync by sound", recal_menu),
         pystray.MenuItem("Library backup (Git)", git_menu),
+        pystray.MenuItem("📥  Import playlist (Spotify / YouTube)", _open_import),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),
         pystray.MenuItem("Opacity", opacity_menu),
