@@ -944,7 +944,12 @@ class Overlay:
         hung fetch can't postpone generation forever."""
         if track_seq != self._track_seq or self.lines or self._generating:
             return
-        if self._fetching and self._gen_defers < 4:      # ~16s extra at most
+        # Niche/Vocaloid/VTuber lookups can take 25-35s (provider search is serial);
+        # live watching showed real lyrics — which DO exist and always won — only
+        # arriving after a brief AI flash. Wait out a realistic fetch (≈35s total
+        # with the 11s deadline) before generating, so generation stays a genuine
+        # last resort. Still bounded, so a hung fetch can't postpone it forever.
+        if self._fetching and self._gen_defers < 6:      # ~24s extra at most
             self._gen_defers += 1
             self.root.after(4000, lambda t=track_seq: self._maybe_generate(t))
             return
