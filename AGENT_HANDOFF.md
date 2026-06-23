@@ -5,7 +5,7 @@ A cheat-sheet so another agent (or contributor) can pick this project up cold. T
 `USAGE.md`, `BUILD.md`, `SECURITY.md`, `AGENTS.md`. This file is the
 session/state + build-process summary.
 
-Last updated: 2026-06-22.
+Last updated: 2026-06-23.
 
 ---
 
@@ -571,3 +571,47 @@ REUSES it. Remaining ~20s syncedlyrics latency (still loses to the 11s generate 
 so a brief AI flash can still precede the real lyrics) is a syncedlyrics-speed issue, not
 a correctness one; a future win is deferring generate-by-ear while a fetch is in flight
 (don't touch the generate timing here — it was just retuned in dc4b6a2).
+
+---
+
+## Work done in the 2026-06-23 session (part 6): faster generation, on-demand GPU, generate-defer, v1.0.4
+
+### 1. Faster generate-by-ear — translation off the capture loop (commit dc4b6a2)
+`_generate_loop` used to `annotate(..., translate=True)` inline, which BLOCKED the capture
+loop on the network translation — both delaying the lyrics and making the next capture miss
+several seconds of audio. Now: `annotate(translate=False)` shows **JP + romaji immediately**,
+and a daemon thread (`_translate_generated`) fills the `***` English a beat later. The
+`_generating` flag is cleared when the LOOP ends (not per-chunk). Net: lyrics appear ~5s
+sooner and no inter-chunk audio gaps.
+
+### 2. Generate-defer while a fetch is in flight (commit 71fdc2c) — closes the part-5 "future win"
+Exactly the deferral the cover note above predicted. `_start_fetch` sets `self._fetching`
+(cleared when the lookup resolves). `_maybe_generate`, when its 11s deadline fires with a
+fetch still running, **re-checks every 4s (≤4×) instead of pre-empting it**, and only
+generates once the lookup has actually come up empty (or hung past the bound). Killed the
+"AI flash before the real lyrics" on covers + niche bilingual titles. The OTHER generate
+trigger (`_consume_async`, sound-ID found the song but no provider has lyrics) already runs
+post-fetch and is guarded by `_begin_generation`'s `_generating` re-entry check, so no
+double-start. `_gen_defers` reset per track in `_on_track_change`.
+
+### 3. Optional GPU — opt-in, fetched on demand, NOT bundled (`gpu_setup.py` NEW, commit 5c7deb5→1474fc7)
+The CUDA libs are **1.9 GB unpacked** — absurd to ship to everyone (most machines can't use
+them). So the clean one-click install stays CPU-only (all features work; a 16s clip
+transcribes in ~2s — benchmarked, transcription is NOT the bottleneck), and an NVIDIA-only
+tray item **"⚡ Enable GPU acceleration"** downloads the official cuBLAS/cuDNN/nvRTC wheels
+**straight from PyPI** (we host nothing) at the versions matching the bundled CTranslate2
+4.8.0, verifies PyPI's SHA-256 fail-closed, extracts zip-slip-safe into `<data_dir>/deps`,
+and writes a `.gpu_ready` marker only on full success. `align._get_model` already prefers
+CUDA→CPU and `_ensure_deps_path` registers `nvidia/{cublas,cudnn,cuda_nvrtc}/bin`.
+- **VERIFIED in the frozen app**: pre-seeding `deps/nvidia` from `.deps` + relaunch →
+  `DesktopKaraoke.exe` shows in `nvidia-smi --query-compute-apps` and stays resident; the
+  device is now logged ("whisper model 'small' loaded on cuda", commit 1474fc7).
+- `_zip_release.py` `SKIP_DIRS` now includes `deps` so the release zip stays lean (197 MB).
+- Tray item hidden entirely on non-NVIDIA machines (`gpu_setup.nvidia_gpu_present()`, memoized).
+
+### 4. Released v1.0.4 (Latest) — the in-app updater ships all of the above to installed machines
+Lean 197 MB `DesktopKaraoke-portable.zip` + `.sha256` sidecar. Verified live (frozen v1.0.4):
+LOVE GAME (57), AWAKE (50), BANZAI (48) all found REAL lyrics via cover/title-variant (zero
+generation), sync-by-listening corrected BANZAI by −4.35s and tracked, furigana rendering,
+GPU engaged, 0 desync flags. NOTE: the defer fix (part-6 #2) + device-log landed AFTER the
+v1.0.4 build — they're committed but ride in the NEXT release (v1.0.5) once watched/validated.
