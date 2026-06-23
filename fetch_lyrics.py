@@ -696,6 +696,30 @@ def _synced_cjk(title, artist, duration):
     return None
 
 
+def _title_variants(title: str) -> list:
+    """Clean song-title candidates pulled out of a messy / bilingual video title,
+    so a niche song still gets found. E.g.
+    '理芽 - おしえてかみさま / RIM - Divine Delays｜from 神椿' →
+    ['理芽 - おしえてかみさま / RIM - Divine Delays', 'おしえてかみさま',
+     'Divine Delays', …]. The full title stays first (most specific)."""
+    out, seen = [], set()
+
+    def add(s):
+        s = (s or "").strip(" 　-–—|｜/／")
+        if len(s) >= 2 and s.lower() not in seen:
+            seen.add(s.lower())
+            out.append(s)
+
+    base = re.sub(r"\s*[|｜/／]\s*from\b.*$", "", title, flags=re.I)   # drop "｜from 神椿"
+    add(base)
+    add(title)
+    for seg in re.split(r"\s*[/／]\s*", base):                         # bilingual "JP / EN"
+        add(seg)
+        if re.search(r"\s[-–—]\s", seg):                              # strip "Artist - "
+            add(re.split(r"\s+[-–—]\s+", seg)[-1])
+    return out[:5]
+
+
 def fetch_lrc(title: str, artist: str = "", duration: float | None = None):
     """Return (lrc_string, meta) of a VERIFIED match, or (None, None).
     Widens the search across artist variants while guarding false positives.
@@ -755,13 +779,19 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None):
             return None
         return lrc if (lrc and "[" in lrc) else None
 
+    # Try each clean song-title candidate (full title first, then the song name
+    # pulled out of a bilingual "Artist - JP / Artist - EN｜from X" video title) so
+    # a niche song still resolves to its real lyrics instead of being generated.
     hi_q, seen = [], set()
-    if t and arts:
-        hi_q.append(f"{t} {a}")
-        for ar in arts:
-            hi_q += [f"{t} {ar}", f"{ar} {t}"]
-    elif t and a:
-        hi_q.append(f"{t} {a}")
+    for tt in (_title_variants(t) or [t]):
+        if arts:
+            hi_q.append(f"{tt} {a}")
+            for ar in arts:
+                hi_q += [f"{tt} {ar}", f"{ar} {tt}"]
+        elif a:
+            hi_q.append(f"{tt} {a}")
+        else:
+            hi_q.append(tt)
     for q in hi_q:
         k = q.lower().strip()
         if k in seen:
