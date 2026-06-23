@@ -32,6 +32,7 @@ _ENDPOINTS = {
     "GET /lyrics": "full loaded lyric lines",
     "POST /identify": "re-identify by sound now",
     "POST /wrong": "mark current lyrics wrong → re-identify + re-fetch",
+    "POST /nudge?s=2.5": "shift sync by s seconds (+ = lyrics later); for songs Shazam can't hear",
     "POST /reindex": "rescan the local library",
 }
 
@@ -118,6 +119,15 @@ def make_handler(app, log_file):
             elif path == "/wrong":
                 self._run(app.refetch)
                 self._send(200, {"ok": True, "action": "re-identifying + re-fetching"})
+            elif path == "/nudge":
+                s = 0.0
+                if "s=" in self.path:
+                    try:
+                        s = float(self.path.split("s=", 1)[1].split("&")[0])
+                    except Exception:
+                        s = 0.0
+                self._run(lambda: app.nudge(s))
+                self._send(200, {"ok": True, "action": f"sync nudged {s:+}s"})
             elif path == "/reindex":
                 self._run(app.index.refresh)
                 self._send(200, {"ok": True, "action": "library rescanned"})

@@ -649,7 +649,7 @@ class Overlay:
         self.root.after(300, self._tick)
         self.root.after(7000, self._health_check)
         self.root.after(4000, self._viewport_watchdog)
-        self._arm_recal(max(6, self.recal_secs or 30))
+        self._arm_recal(max(4, self.recal_secs or 30))
 
     # ── per-track ──
 
@@ -827,20 +827,20 @@ class Overlay:
         song starts (3 quick re-locks ~8s apart) so the offset settles within
         ~25s, then relaxes to recal_secs. Re-syncs use a short 5s capture so
         each pass finishes quickly."""
-        nxt = max(6, self.recal_secs or 30)
+        nxt = max(4, self.recal_secs or 30)
         try:
             st = self.media.get()
             if st and st.get("status") == PLAYING and not self._identifying:
                 if self._fast_calib > 0:
                     self._fast_calib -= 1
-                    self._start_identify(seconds=5, attempts=1)
-                    nxt = 7
+                    self._start_identify(seconds=4, attempts=1)   # short clip = fast turnaround
+                    nxt = 4
                 elif self.recal_secs:
-                    self._start_identify(seconds=5, attempts=1)
-                    # poll faster while the song isn't confirmed by sound yet,
-                    # so wrong lyrics get corrected quickly
+                    self._start_identify(seconds=4, attempts=1)
+                    # poll as fast as feasible while the song isn't confirmed by
+                    # sound yet (each listen is ~4s of audio — the floor)
                     unconfirmed = (not self._verified) or self._sound_song is None
-                    nxt = max(6, min(self.recal_secs, 7) if unconfirmed else self.recal_secs)
+                    nxt = max(4, min(self.recal_secs, 4) if unconfirmed else self.recal_secs)
         finally:
             self._arm_recal(nxt)
 
@@ -1768,9 +1768,9 @@ def main():
         return pystray.MenuItem(label, lambda *_: ov.root.after(0, lambda: ov.set_recal(secs)),
                                 radio=True, checked=lambda i, secs=secs: ov.recal_secs == secs)
     recal_menu = pystray.Menu(
-        _recal_item("Off", 0), _recal_item("Every 8s  (most aggressive)", 8),
-        _recal_item("Every 10s", 10), _recal_item("Every 15s", 15),
-        _recal_item("Every 20s", 20), _recal_item("Every 30s", 30),
+        _recal_item("Off", 0), _recal_item("Every 4s  (max — ~4s is the floor)", 4),
+        _recal_item("Every 8s", 8), _recal_item("Every 10s", 10),
+        _recal_item("Every 15s", 15), _recal_item("Every 20s", 20),
     )
 
     def _preset(name):
