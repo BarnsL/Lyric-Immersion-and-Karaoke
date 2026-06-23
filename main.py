@@ -490,9 +490,19 @@ def clean_artist(artist):
     '… - Topic' / VEVO / 'Official Artist Channel' uploads are real tracks; the
     suffix just blocks the provider/Shazam-name search."""
     a = (artist or "").strip()
-    a = re.sub(r"\s*[-–—]\s*Topic$", "", a, flags=re.I)
-    a = re.sub(r"\s*[-–—]\s*Official(\s+(Artist|Music))?\s+Channel$", "", a, flags=re.I)
+    D = r"[-–—‐]"          # include U+2010 ‐ used by hololive-style channel names
+    a = re.sub(rf"\s*{D}\s*Topic$", "", a, flags=re.I)
+    a = re.sub(rf"\s*{D}\s*Official(\s+(Artist|Music))?\s+Channel$", "", a, flags=re.I)
     a = re.sub(r"\s*VEVO$", "", a)
+    # VTuber / idol-unit channels carry the channel, not the artist, in the media
+    # "artist" field (e.g. "Hajime Ch. 轟はじめ ‐ ReGLOSS") — which broke the
+    # provider/local lookup and slowed it to a crawl (a 60s fetch lost the race to
+    # generate-by-ear). Reduce it to the performer: drop a trailing unit/group tag,
+    # then a "<romaji> Ch." channel prefix, then a plain " Channel" suffix.
+    a = re.sub(rf"\s*{D}\s*(ReGLOSS|hololive[\w-]*|holo\w*|NIJISANJI|Phase[\s-]?Connect"
+               r"|VSPO!?|VShojo)\b.*$", "", a, flags=re.I)
+    a = re.sub(r"^.*?\bCh\.\s+", "", a)            # "Hajime Ch. 轟はじめ" → "轟はじめ"
+    a = re.sub(r"\s+Channel$", "", a, flags=re.I)  # "Suisei Channel" → "Suisei"
     return a.strip() or (artist or "")
 
 
