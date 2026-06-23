@@ -720,12 +720,18 @@ def _title_variants(title: str) -> list:
     return out[:5]
 
 
-def fetch_lrc(title: str, artist: str = "", duration: float | None = None):
+def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
+              cover: bool = False):
     """Return (lrc_string, meta) of a VERIFIED match, or (None, None).
     Widens the search across artist variants while guarding false positives.
     Prefers ORIGINAL-script lyrics: a romaji-only result is stashed and used only
     if no kanji/kana version can be found, so a Japanese song shows real furigana
-    + romaji + translation instead of a bare romaji upload."""
+    + romaji + translation instead of a bare romaji upload.
+
+    ``cover=True`` (a 歌ってみた / cover upload) means the supplied ``artist`` is the
+    COVERING channel, not the song's artist — the lyrics are the ORIGINAL song's,
+    so they're looked up by TITLE (trusting the cover marker) before the
+    artist-keyed queries that would otherwise miss the original."""
     t, a = title.strip(), artist.strip()
     arts = split_artists(a)
     romaji_fallback = [None]   # (lrc, meta) — used only if nothing original-script
@@ -778,6 +784,21 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None):
         except Exception:
             return None
         return lrc if (lrc and "[" in lrc) else None
+
+    # COVER fast-path. A 歌ってみた / cover's lyrics ARE the original song's, but the
+    # "artist" we have is the COVERING channel — it only derails an artist-keyed
+    # search, which then loses to the ~11s generate-by-ear deadline. The cover
+    # marker already told us the title is a real, covered song, so query by TITLE
+    # and trust it: still language/duration-verified by verify_lrc, just without
+    # the stricter same-title guard (_strict_ok) ordinary title-only hits get.
+    if cover and t:
+        for tt in (_title_variants(t) or [t]):
+            lrc = _try(tt)
+            if lrc and verify_lrc(lrc, t, duration):
+                r = take(lrc, {"source": "syncedlyrics/cover", "artist": a or None,
+                               "duration": duration})
+                if r:
+                    return r
 
     # Try each clean song-title candidate (full title first, then the song name
     # pulled out of a bilingual "Artist - JP / Artist - EN｜from X" video title) so
@@ -1016,13 +1037,14 @@ def validate_file(path, duration: float | None = None) -> tuple[bool, str]:
 # ── Save ─────────────────────────────────────────────────────────────
 
 def fetch_and_save(title: str, artist: str = "", translate: bool = False,
-                   duration: float | None = None, interactive: bool = False) -> Path | None:
+                   duration: float | None = None, interactive: bool = False,
+                   cover: bool = False) -> Path | None:
     # Don't cache a song under a "title" that's just the artist/channel name
     # (e.g. a mangled YouTube title) — it indexes garbage that then false-matches
     # every other video by that artist. Sound ID will find the real song instead.
     if artist and _norm(title) and _norm(title) == _norm(artist):
         return None
-    lrc, meta = fetch_lrc(title, artist, duration)
+    lrc, meta = fetch_lrc(title, artist, duration, cover=cover)
     if not lrc:
         return None
     lines = parse_lrc_text(lrc)

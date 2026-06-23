@@ -538,3 +538,36 @@ every 15 min, logs desync / mismatch / churn / false-match observations to
 tested (compile + a targeted LyricsIndex/clean_title test + no self-match
 regressions). The FLOW GLOW false-match (#2) and another instance's
 sound-switch-churn fix were both found this way.
+
+### Cover detection → fetch the ORIGINAL song's lyrics (`cover=` fast-path)
+A 歌ってみた / cover (e.g. "Shout Baby / FLOW GLOW(cover) 【歌ってみた】") carries the
+COVERING channel as its media "artist" ("hololive DEV_IS FLOW GLOW"), not the song's
+artist. `clean_title` already reduces the title to the song, but the channel-as-artist
+made the immediate title-fetch (`_on_track_change` else-branch) MISS: every
+syncedlyrics query was "<song> <channel>", which doesn't exist, so the only thing that
+eventually found lyrics was the ~25s sound-ID supplying the real original artist — and
+the 11s generate-by-ear deadline fired first ("Generating by ear" flash before the real
+lyrics popped in). Worse, a Latin-titled cover with no duration (e.g. "Shout Baby")
+failed the title-only last resort's `_strict_ok` guard and never resolved by title at
+all (it needed Shazam to name "Ryokuoushoku Shakai").
+
+FIX (main.py + fetch_lyrics.py):
+- `is_cover_title()` (main.py) — the cover-marker regex, lifted out of `clean_title` so
+  the runtime can flag it. `_tick` sets `self._is_cover` from the RAW title alongside the
+  cached clean title; `_on_track_change` passes `cover=self._is_cover` → `_start_fetch`
+  → `fetch_and_save` → `fetch_lrc`.
+- `fetch_lrc(..., cover=False)` — when cover=True, a TITLE-FIRST fast-path runs before the
+  artist-keyed queries: for each `_title_variants(title)`, query syncedlyrics by TITLE
+  ONLY and trust the first `verify_lrc`-passing hit (still language/duration verified,
+  just skips the stricter same-title `_strict_ok` guard, since the cover marker already
+  confirmed the title is a real covered song). source="syncedlyrics/cover".
+- ONLY runs for covers (`if cover and t:`) → zero effect on non-cover songs.
+
+Tested in isolation (network): `fetch_lrc("Shout Baby","hololive DEV_IS FLOW GLOW",None,
+cover=True)` → real 緑黄色社会 lyrics ("いつもと違う髪のにおい…"); cover=False → None
+(reproduces the bug). feelingradation cover=True → real JP lyrics.
+Composes with 76b1135's `_title_variants` (bilingual title splitting) — the cover path
+REUSES it. Remaining ~20s syncedlyrics latency (still loses to the 11s generate deadline,
+so a brief AI flash can still precede the real lyrics) is a syncedlyrics-speed issue, not
+a correctness one; a future win is deferring generate-by-ear while a fetch is in flight
+(don't touch the generate timing here — it was just retuned in dc4b6a2).

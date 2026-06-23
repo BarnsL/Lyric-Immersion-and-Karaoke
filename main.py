@@ -365,6 +365,19 @@ def _is_generic_title(s):
     return bool(compact) and bool(_GENERIC_TITLE_RE.fullmatch(compact))
 
 
+# A 歌ってみた / cover upload: its lyrics are the ORIGINAL song's, so the fetch
+# looks the song up by TITLE and ignores the covering channel as the "artist".
+_COVER_RE = re.compile(
+    r"歌ってみた|うたってみた|歌わせて|covered?\s+by"
+    r"|\(\s*cover\s*\)|[/／]\s*cover\b", re.I)
+
+
+def is_cover_title(title):
+    """True if a media title marks a 歌ってみた / cover. Drives a title-first lyric
+    fetch — the original song's lyrics fit the cover (see fetch_lrc cover=)."""
+    return bool(_COVER_RE.search(title or ""))
+
+
 def clean_title(title, source=""):
     """Reduce a media title to the actual SONG NAME so it matches lyric metadata.
 
@@ -380,8 +393,7 @@ def clean_title(title, source=""):
     # lyrics are the ORIGINAL song's. Detect the marker from the RAW title now —
     # the (cover) / 歌ってみた tags get stripped below — so we can keep just the
     # song part at the end.
-    is_cover = bool(re.search(r"歌ってみた|うたってみた|歌わせて|covered?\s+by"
-                              r"|\(\s*cover\s*\)|[/／]\s*cover\b", t, re.I))
+    is_cover = is_cover_title(t)
     if any(h in source for h in BROWSER_HINTS):
         t = re.sub(r"\s*[-–—|]\s*YouTube\s*$", "", t, flags=re.I)
 
@@ -742,6 +754,7 @@ class Overlay:
         self._last_artist = None
         self._clean_title_cache = ""
         self._clean_artist_cache = ""
+        self._is_cover = False       # current title is a 歌ってみた / cover (title-first fetch)
         self._frame_ms = 0.0         # EWMA of render-frame interval (ms) → /status render_fps
         self._last_tick_t = None
         self._render_frame = False
@@ -883,7 +896,7 @@ class Overlay:
                 self._verified = False
                 self._title_locked = False
                 self._hint(f"♪ {title} — identifying…")
-                self._start_fetch(artist, title, duration)
+                self._start_fetch(artist, title, duration, cover=self._is_cover)
 
         # MV / cinematic dead-space intro: for an MV-titled video, hold the lyrics
         # through the leading intro (see _tick); for ANY unaligned track, anchor
@@ -972,7 +985,7 @@ class Overlay:
         if need_rm or (want_en and have_en < len(want_en) * 0.5):
             self._start_translate(self._lyrics_path)
 
-    def _start_fetch(self, artist, title, duration=None):
+    def _start_fetch(self, artist, title, duration=None, cover=False):
         key = (artist, title)
         if self._fetch_key == key:
             return
@@ -981,7 +994,8 @@ class Overlay:
         def work():
             try:
                 from fetch_lyrics import fetch_and_save
-                p = fetch_and_save(title, artist, translate=False, duration=duration)
+                p = fetch_and_save(title, artist, translate=False, duration=duration,
+                                   cover=cover)
             except Exception:
                 p = None
             self._fetch_result = (key, p)
@@ -1393,6 +1407,7 @@ class Overlay:
             self._last_raw_title, self._last_src, self._last_artist = rawt, src, rawa
             self._clean_title_cache = clean_title(rawt, src)
             self._clean_artist_cache = clean_artist(rawa)
+            self._is_cover = is_cover_title(rawt)
         track = (self._clean_artist_cache, self._clean_title_cache)
         if track != self._track:
             self._track = track
