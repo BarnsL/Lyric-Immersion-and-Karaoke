@@ -715,6 +715,7 @@ class Overlay:
         self._gen_token = 0           # bumped on track change to cancel generation
         self._gen_lines = []          # accumulated generated line dicts
         self._gen_title = self._gen_artist = ""
+        self._title_locked = False    # exact clean-title match → sound can't override
         self._api = None
         self._boundary = None         # song-change detector thread
         self._last_boundary = 0.0     # throttle: last boundary-triggered identify
@@ -853,10 +854,20 @@ class Overlay:
                 if path != self._lyrics_path:
                     self.load(path)
                 self._maybe_translate()
+                # LOCK to this match if it's an EXACT title match on a clean,
+                # official song name (not an MV/generic/live title): then a Shazam
+                # mis-ID of a *different* song by the same artist can't override it
+                # (the feelingradation → SKAVLA bug). Messy titles stay unlocked so
+                # sound still corrects them.
+                exact = _norm_title(self.meta.get("title", "")) == _norm_title(title)
+                self._title_locked = bool(
+                    exact and not is_mv_version(title)
+                    and not _is_generic_title(title))
             else:
                 self.lines, self._lyrics_path, self.idx = [], None, -1
                 self._kara = []
                 self._verified = False
+                self._title_locked = False
                 self._hint(f"♪ {title} — identifying…")
                 self._start_fetch(artist, title, duration)
 
@@ -1032,7 +1043,8 @@ class Overlay:
                     nxt = 4
                 elif self.recal_secs:
                     self._start_identify(seconds=4, attempts=1)
-                    confirmed = self._verified and self._sound_song is not None
+                    confirmed = (self._verified and self._sound_song is not None) \
+                        or self._title_locked
                     watched = (confirmed and self._boundary is not None
                                and self.boundary_on and not self._live_mode)
                     if watched:
@@ -1096,13 +1108,17 @@ class Overlay:
                     self._start_translate(Path(p))
                     if self.git_sync:           # back up the new song if opted in
                         self.git_backup()
-                elif not self._identifying and self._sound_song is None:
+                elif self._identifying:
+                    pass                       # sound-ID running → wait for it
+                elif self._sound_song is None:
                     # title/artist missed (e.g. name-variant) — Shazam returns
-                    # the canonical name, which usually fetches fine.
+                    # the canonical name, which usually fetches fine. Try sound first.
                     self._hint("🎧 Finding the song by sound…")
                     self._start_identify()
                 else:
-                    self._begin_generation()   # LAST RESORT: generate by ear
+                    # TRUE last resort: the title gave nothing, sound *did* identify
+                    # the song, and even that has no lyrics anywhere → generate by ear.
+                    self._begin_generation()
         if self._translate_result:
             path, ok = self._translate_result
             self._translate_result = None
@@ -1146,6 +1162,13 @@ class Overlay:
                                     self.offset = round(corr, 2)            # snap (intro / seek)
                                 elif abs(diff) > 0.15:
                                     self.offset = round(self.offset + 0.8 * diff, 2)  # ease drift
+                elif self._title_locked:
+                    # The lyrics came from a confident EXACT match on a clean
+                    # official title, but Shazam heard a DIFFERENT song — almost
+                    # always a mis-ID of another track by the SAME artist
+                    # (feelingradation heard as SKAVLA). Trust the title; ignore it.
+                    log.info("ignoring sound %r — title-locked to %r",
+                             f_title, self.meta.get("title", ""))
                 else:
                     # heard a DIFFERENT song → switch to it; start its timing fresh
                     # rather than carrying over the previous song's offset.
@@ -2113,6 +2136,7 @@ class Overlay:
         self._lyrics_path = None
         self.lines, self.idx, self._kara = [], -1, []
         self._sound_song = None
+        self._title_locked = False     # let sound override after a manual reject
         self._hint("🎧 Listening to identify the song…")
         self._start_identify()
 

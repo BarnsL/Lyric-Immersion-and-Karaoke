@@ -26,7 +26,15 @@ _SR = 44100
 
 def _capture(seconds=_DUR):
     """Record `seconds` of the system's audio output (WASAPI loopback) and return
-    it as in-memory WAV bytes, or None if no loopback device is found."""
+    ``(wav_bytes, t_cap)`` where `t_cap` is the wall-clock instant recording
+    actually began — or ``(None, None)`` if no loopback device.
+
+    `t_cap` is stamped INSIDE the recorder, NOT before this call: device
+    enumeration (`default_speaker` + `all_microphones` + opening the stream) can
+    take 0.5–1 s, and stamping `t_cap` before that made the sync calibration think
+    the song was ~1 s earlier than it was — the cause of the up-to-1-second sync
+    error. Anchoring `t_cap` to the real recording start removes that bias."""
+    import time
     import numpy as np
     import soundcard as sc
 
@@ -36,8 +44,10 @@ def _capture(seconds=_DUR):
                  and spk.name in m.name), None)
     loop = loop or next((m for m in mics if getattr(m, "isloopback", False)), None)
     if loop is None:
-        return None
+        return None, None
     with loop.recorder(samplerate=_SR, channels=2) as rec:
+        rec.record(numframes=256)       # prime the stream so the next read is live
+        t_cap = time.time()             # clock anchor = real recording start
         data = rec.record(numframes=_SR * seconds)
 
     pcm = (np.clip(data, -1.0, 1.0) * 32767).astype("<i2")
@@ -47,7 +57,7 @@ def _capture(seconds=_DUR):
         w.setsampwidth(2)
         w.setframerate(_SR)
         w.writeframes(pcm.tobytes())
-    return buf.getvalue()
+    return buf.getvalue(), t_cap
 
 
 async def _shazam(wav_bytes):
@@ -70,11 +80,9 @@ def recognize_playing(seconds=_DUR, attempts=2):
       • t_cap  = wall-clock time when that clip's capture began
     so the caller can align its playback clock to the real song position.
     (None, None, None, None) if not identified."""
-    import time
     for _ in range(max(1, attempts)):
         try:
-            t_cap = time.time()
-            wav = _capture(seconds)
+            wav, t_cap = _capture(seconds)
             if not wav:
                 return (None, None, None, None)
             t, a, off = asyncio.run(_shazam(wav))
