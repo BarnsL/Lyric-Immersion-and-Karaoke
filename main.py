@@ -809,6 +809,8 @@ class Overlay:
         self._line_left = self._line_right = 0
         self._fetch_key = None
         self._fetch_result = None
+        self._fetching = False        # a provider lookup is in flight (defer generate)
+        self._gen_defers = 0          # times generation waited on the in-flight fetch
         self._translate_result = None
         self._translating = None
         self._cur_duration = None
@@ -861,6 +863,7 @@ class Overlay:
         self._gen_token += 1       # cancel any in-flight lyric generation
         self._track_seq += 1
         self._generating = False
+        self._gen_defers = 0       # fresh defer budget for this track's fetch
         log.info("track change: %r / %r (dur %s)", title, artist, duration)
 
         self._live_mode = is_live_or_compilation(title, duration)
@@ -922,12 +925,23 @@ class Overlay:
                             lambda t=self._track_seq: self._maybe_generate(t))
 
     def _maybe_generate(self, track_seq):
-        """Deadline fallback: still no lyrics for this track → generate by ear."""
+        """Deadline fallback: still no lyrics for this track → generate by ear.
+
+        Generation is a genuine LAST resort, so if a provider lookup is still in
+        flight when the deadline fires we wait for it instead of pre-empting it —
+        otherwise a slow-but-successful fetch (covers/niche titles resolve in
+        ~20s) would flash AI lyrics that get replaced a moment later. Bounded so a
+        hung fetch can't postpone generation forever."""
         if track_seq != self._track_seq or self.lines or self._generating:
+            return
+        if self._fetching and self._gen_defers < 4:      # ~16s extra at most
+            self._gen_defers += 1
+            self.root.after(4000, lambda t=track_seq: self._maybe_generate(t))
             return
         st = self.media.get()
         if st and st.get("status") == PLAYING:
-            log.info("no lyrics after the grace window → generating by ear")
+            why = "lookup came up empty" if not self._fetching else "lookup still running"
+            log.info("no lyrics after the grace window (%s) → generating by ear", why)
             self._begin_generation()
 
     def _trusted_duration(self, state):
@@ -991,6 +1005,7 @@ class Overlay:
         if self._fetch_key == key:
             return
         self._fetch_key = key
+        self._fetching = True       # in flight → generation defers until this resolves
 
         def work():
             try:
@@ -1000,6 +1015,7 @@ class Overlay:
             except Exception:
                 p = None
             self._fetch_result = (key, p)
+            self._fetching = False
 
         threading.Thread(target=work, daemon=True).start()
 
