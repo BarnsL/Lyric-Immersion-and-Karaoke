@@ -1284,17 +1284,34 @@ class Overlay:
             new = [d for d in chunk if d["t"][0] >= last_end - 1.0 and d["jp"].strip()]
             if new:
                 try:
-                    annotate(new, "ja", translate=True)   # furigana + romaji + EN
+                    annotate(new, "ja", translate=False)   # furigana + romaji NOW (fast)
                 except Exception:
                     pass
                 for d in new:
-                    if d.get("en", "").strip():
-                        d["en"] = d["en"].strip() + " ***"   # mark as AI-generated
                     last_end = max(last_end, d["t"][1])
                 self._gen_lines += new
                 self.root.after(0, lambda t=token: self._apply_generated(t))
+                # Translate OFF the capture loop: the network round-trip used to
+                # block here (delaying the lyrics AND making the next capture miss
+                # several seconds of audio). JP+romaji now show immediately; the
+                # *** English fills in a moment later.
+                threading.Thread(target=self._translate_generated,
+                                 args=(token, list(new)), daemon=True).start()
             if self._cur_duration and pos >= self._cur_duration - CHUNK:
                 break
+
+    def _translate_generated(self, token, lines):
+        """Fill the English (marked ***) for generated lines, off the capture loop."""
+        try:
+            from fetch_lyrics import _translate_lines
+            _translate_lines(lines, "ja")
+        except Exception:
+            return
+        for d in lines:
+            if d.get("en", "").strip() and not d["en"].rstrip().endswith("***"):
+                d["en"] = d["en"].strip() + " ***"
+        if token == self._gen_token:
+            self.root.after(0, lambda t=token: self._apply_generated(t))
         if token == self._gen_token:
             self._generating = False
 

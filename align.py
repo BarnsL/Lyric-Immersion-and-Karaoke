@@ -62,7 +62,10 @@ def _ensure_deps_path():
             sys.path.append(p)
         if hasattr(os, "add_dll_directory"):
             for sub in ("", "ctranslate2", "ctranslate2.libs", "av", "av.libs",
-                        "tokenizers", "onnxruntime/capi", "numpy.libs"):
+                        "tokenizers", "onnxruntime/capi", "numpy.libs",
+                        # CUDA runtime (cuBLAS / cuDNN) for GPU transcription —
+                        # present only when the GPU extras were vendored.
+                        "nvidia/cublas/bin", "nvidia/cudnn/bin"):
                 d = cand / sub if sub else cand
                 try:
                     if d.is_dir():
@@ -101,16 +104,33 @@ def _data_models_dir():
         return None
 
 
+_device = {}          # which device each cached model actually loaded on
+
+
 def _get_model(size=_MODEL):
     if size not in _models:
         import os
+        _ensure_deps_path()
         md = _data_models_dir()
         if md:                                       # keep all model cache off C:
             os.environ.setdefault("HF_HOME", md)
             os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         from faster_whisper import WhisperModel
-        _models[size] = WhisperModel(size, device="cpu", compute_type="int8",
-                                     download_root=md)
+        m, used = None, None
+        # Prefer the GPU (CUDA) — transcription is ~5-10x faster, so generation
+        # keeps up with the song. Falls back to CPU when there's no GPU or the
+        # CUDA/cuDNN libraries aren't vendored (any load error → CPU).
+        for device, ctype in (("cuda", "float16"), ("cpu", "int8")):
+            try:
+                m = WhisperModel(size, device=device, compute_type=ctype,
+                                 download_root=md)
+                used = device
+                break
+            except Exception:
+                continue
+        _models[size] = m or WhisperModel(size, device="cpu", compute_type="int8",
+                                          download_root=md)
+        _device[size] = used or "cpu"
     return _models[size]
 
 
