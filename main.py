@@ -909,20 +909,6 @@ class Overlay:
             self._identifying = False
             if res:
                 title, artist, offset, t_cap = res
-                # Audio-calibrated SYNC: align our clock to the true song
-                # position Shazam reports (fixes MV intros / drift / seeks).
-                if offset is not None and t_cap is not None:
-                    st = self.media.get()
-                    if st and st.get("status") == PLAYING:
-                        # at non-1x the song advanced by elapsed×rate since capture
-                        true_now = offset + (time.time() - t_cap) * st.get("rate", 1.0)
-                        corr = true_now - st["position"]
-                        diff = corr - self.offset
-                        if abs(corr) < 180:
-                            if abs(diff) > 2.0:
-                                self.offset = round(corr, 2)            # snap to a clearly real offset (intro / new song)
-                            elif abs(diff) > 0.15:
-                                self.offset = round(self.offset + 0.8 * diff, 2)  # converge fast, smooth Shazam noise
                 # SOUND IS THE AUTHORITY. Shazam often romanizes JP titles
                 # ("Kira" for 綺羅), so when the player's own title is CJK keep
                 # that original script for fetching/matching.
@@ -932,15 +918,32 @@ class Overlay:
                 else:
                     f_artist, f_title = artist, title
                 heard = (f_title, f_artist)
-                # Paranoid self-correction: if the loaded lyrics don't match the
-                # song we just HEARD, they're wrong — fix them (this is what
-                # catches a wrong same-artist title match).
+                # Does the song we HEARD match the lyrics currently loaded?
                 loaded_ok = bool(self.lines) and self._titles_match(
                     self.meta.get("title", ""), f_title)
                 log.info("heard %r / %r | loaded %r | match=%s",
                          f_title, f_artist, self.meta.get("title", ""), loaded_ok)
-                if not loaded_ok:
+                if loaded_ok:
+                    # CALIBRATE timing ONLY when the heard song is the loaded one.
+                    # (Applying a heard song's offset to *different* lyrics — e.g.
+                    # a Shazam mis-ID on a mix — was what produced wild offsets.)
                     self._sound_song = heard
+                    if offset is not None and t_cap is not None:
+                        st = self.media.get()
+                        if st and st.get("status") == PLAYING:
+                            true_now = offset + (time.time() - t_cap) * st.get("rate", 1.0)
+                            corr = true_now - st["position"]
+                            diff = corr - self.offset
+                            if abs(corr) < 180:
+                                if abs(diff) > 2.0:
+                                    self.offset = round(corr, 2)            # snap (intro / seek)
+                                elif abs(diff) > 0.15:
+                                    self.offset = round(self.offset + 0.8 * diff, 2)  # ease drift
+                else:
+                    # heard a DIFFERENT song → switch to it; start its timing fresh
+                    # rather than carrying over the previous song's offset.
+                    self._sound_song = heard
+                    self.offset = 0.0
                     self._fast_calib = max(self._fast_calib, 2)
                     self._arm_recal(7)
                     cached = self.index.match(f_artist, f_title, self._cur_duration)
@@ -952,8 +955,6 @@ class Overlay:
                     else:
                         log.info("correcting -> fetching %r / %r", f_title, f_artist)
                         self._start_fetch(f_artist, f_title, self._cur_duration)
-                elif heard != self._sound_song:
-                    self._sound_song = heard
 
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
