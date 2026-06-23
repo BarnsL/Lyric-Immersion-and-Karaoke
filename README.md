@@ -75,9 +75,21 @@ No Python needed to *run* it — build the self-contained folder once (see
 `dist\DesktopKaraoke\`. It keeps its lyric library and settings next to itself,
 so you can copy the whole folder anywhere.
 
-Everything is controlled from the tray icon: presets, opacity, font size,
-position, scroll style, the dancing character, and more. See **[USAGE.md](USAGE.md)**
-for the full menu reference.
+### ⚙️ Where are the settings? — the tray icon
+
+Desktop Karaoke has **no window and no settings screen**. Everything lives in its
+**system-tray icon** — the small **purple microphone** at the **bottom-right of
+your taskbar**, in the notification area by the clock (you may need to click the
+little **˄** "show hidden icons" arrow to see it).
+
+**Right-click that icon** to open the full menu: **Presets**, **Opacity**, **Font
+size**, **Position**, **Scroll style**, **Sync timing** (nudge the lyrics earlier/
+later), **Fast song-change detect**, the **dancing character**, **Start with
+Windows**, **Wrong lyrics — fix this song**, and **Quit**. Left-click toggles the
+overlay show/hide.
+
+That tray icon *is* the control panel — see **[USAGE.md](USAGE.md)** for every
+menu option explained.
 
 ---
 

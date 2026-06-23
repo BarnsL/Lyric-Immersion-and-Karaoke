@@ -1,0 +1,27 @@
+Desktop Karaoke runs in your SYSTEM TRAY — it is not a normal window.
+
+WHERE IT IS
+   After it starts, look at the bottom-right of your taskbar (the notification
+   area, next to the clock). You may need to click the small "˄" arrow to show
+   hidden icons. You'll see a purple MICROPHONE icon.
+
+WHERE THE SETTINGS ARE
+   RIGHT-CLICK the purple microphone icon to open the full menu. Everything is
+   there — there is no separate settings window:
+
+       •  Presets (Gaming / Karaoke)
+       •  Opacity, Font size, Position, Scroll style
+       •  Sync timing — nudge the lyrics earlier / later
+       •  Fast song-change detect (for compilations)
+       •  Dancing character on/off
+       •  Start with Windows
+       •  Wrong lyrics — fix the current song
+       •  Quit
+
+   LEFT-CLICK the icon to show / hide the overlay.
+
+HOW TO USE IT
+   Just play any song in Spotify, YouTube, or any player, and the lyrics appear
+   automatically across your screen — with furigana, romaji, and an English
+   translation. The overlay never steals focus, so you can keep working,
+   watching, or gaming while it runs.

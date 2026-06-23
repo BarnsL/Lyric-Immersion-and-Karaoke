@@ -22,6 +22,10 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
+; Shown as a page near the end of the wizard — tells the user the app lives in
+; the system tray and that ALL settings are under the (right-click) tray icon,
+; since there is no normal window.
+InfoAfterFile=packaging\after_install.txt
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
