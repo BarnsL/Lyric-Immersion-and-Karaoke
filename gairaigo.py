@@ -81,3 +81,14 @@ _FUNCTION = {
 KATAKANA_EN: dict[str, str] = {}
 for _part in (_PRONOUNS, _LOVE, _THINGS, _ACTIONS, _FUNCTION):
     KATAKANA_EN.update(_part)
+
+# Stylized / sung katakana spellings → their standard katakana form. cutlet
+# exceptions only fire on dictionary tokens, so a non-word sung elongation like
+# ラービュー (sung "lo~ve you") can't be recovered as a single key — fugashi just
+# splits it into ラー+ビュー → "raa view". Normalizing it to the standard ラブユー
+# lets the existing ラブ + ユー tiling recover "love you" (so ベイビーアイラービュー
+# → "baby I love you"). Applied to the ROMAJI path only; the display keeps the
+# original katakana.
+KATA_NORMALIZE: dict[str, str] = {
+    "ラービュー": "ラブユー",   # "lo~ve you"  (アイラービュー = "I love you")
+}

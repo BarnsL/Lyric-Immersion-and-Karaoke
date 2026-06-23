@@ -374,7 +374,10 @@ def _segment_katakana(text: str) -> str:
     must NOT be broken into ノー+ト — and it isn't, because the leftover ト
     leaves no full tiling, so ノート is left intact for cutlet ("note"). Same
     for アイス (ice), アイドル (idol), etc."""
-    from gairaigo import KATAKANA_EN
+    from gairaigo import KATAKANA_EN, KATA_NORMALIZE
+    for _styl, _std in KATA_NORMALIZE.items():
+        if _styl in text:
+            text = text.replace(_styl, _std)   # ラービュー -> ラブユー so the tiling recovers it
     keys = KATAKANA_EN
 
     def full_tiling(run: str):
