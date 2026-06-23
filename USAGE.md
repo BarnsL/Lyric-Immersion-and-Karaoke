@@ -39,6 +39,7 @@ Both are just starting points — tweak anything afterward.
 | **Dancing character** | On/off. A small companion themed to the current song's artist that dances while music plays. Drag to move it; click it to make it hop. Drop a `characters/<artist>.png` next to the app to use your own image for that artist. |
 | **Local API (agent control)** | On/off. A localhost-only HTTP server on `127.0.0.1:8765` so an agent or script can read what's playing and drive it (`/status`, `/logs`, `/identify`, `/wrong`). Never exposed to the network. See the README's *Automation* section. |
 | **Start with Windows** | Launch automatically at login. |
+| **Check for updates / ⬆ Install update vX** | The app quietly checks GitHub for a newer release on launch and shows **⬆ Install update** here when one exists (Microsoft Store installs update themselves). Clicking it downloads the new build over **verified HTTPS**, checks its **SHA-256**, and swaps it in — keeping your lyric library and settings. Nothing is downloaded or applied unless you click. |
 | **Show / Hide**, **Re-fetch lyrics**, **Quit** | Self-explanatory. |
 
 ## How detection & sync work

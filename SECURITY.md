@@ -11,6 +11,8 @@ with data and the wider system.
 | Fetch lyrics | song **title + artist** (public strings) | LRCLIB, and via `syncedlyrics` to Musixmatch / NetEase / Megalobiz | no account, no user/device info |
 | Identify by sound | a few seconds of **system audio** | Shazam (via `shazamio`) | raw audio only — never a title, account, or device id |
 | Translate | lyric **lines** | Google (free) or DeepL (only if `DEEPL_API_KEY` is set) | source text only |
+| Check for updates | nothing — a public **version query** | GitHub Releases API (`api.github.com`) | a `GET` only; a download happens **only if you click Install** (see *Software updates*) |
+| Sync by listening (optional) | nothing — the **ASR model** is downloaded once | Hugging Face (`Systran/faster-whisper-base`) | transcription then runs **entirely locally**; no audio ever leaves the machine |
 
 Nothing else is transmitted. No playback history, library, settings, IP-linked
 identifiers, or machine details are sent anywhere. There is no analytics or
@@ -42,6 +44,28 @@ The optional agent-control API is built to be safe to leave on:
   and the local log; it cannot read files outside the app or run shell commands.
 * Toggle it off entirely from the tray ("Local API") if you don't want it.
 
+## Software updates (`updater.py`)
+
+An updater downloads and runs code, so it is hardened to fail **closed**:
+
+* **Verified HTTPS, GitHub hosts only.** Every request (the version check *and*
+  the download) uses a certificate-verifying TLS context and is refused unless the
+  URL is `https://` on `github.com` / `api.github.com` / `*.githubusercontent.com`.
+  A tampered API response can't redirect the download to another host or downgrade
+  to plain HTTP.
+* **Integrity-checked.** If a release publishes a **SHA-256** (a `<asset>.sha256`
+  file or a 64-hex digest in the notes), the downloaded `.zip` is verified against
+  it and **a mismatch aborts the update**. The download is size-capped.
+* **Safe extraction.** The archive is unpacked with **path-traversal ("zip-slip")
+  protection** (no member may escape the staging folder) and must contain
+  `DesktopKaraoke.exe`, or it's rejected.
+* **Never silent / never destructive.** Updates are **opt-in** — the app only
+  *notifies*; the swap runs after you click **Install update**. The helper copies
+  files in without purging, so your lyric cache and settings survive, and on **any**
+  failure it falls back to just opening the Releases page (nothing is applied).
+* The **Microsoft Store** build defers entirely to the Store; **source** checkouts
+  never self-update.
+
 ## Process / command execution
 
 * All `subprocess` calls use **list-form arguments** (never `shell=True`), so
@@ -51,6 +75,9 @@ The optional agent-control API is built to be safe to leave on:
   * `powershell` only to create/remove the "Start with Windows" shortcut — every
     interpolated path is escaped with `_psq()` (PowerShell single-quote doubling).
   * `yt-dlp` (playlist tools) — list-form arguments.
+  * the **update helper** (`cmd /c apply_update.cmd`) runs windowless/detached and
+    only **after** a download has passed the HTTPS, host, checksum, and zip-slip
+    checks above; its source folder is validated to contain `DesktopKaraoke.exe`.
 * No `eval`, `exec`, `os.system`, or dynamic code loading.
 
 ## Files

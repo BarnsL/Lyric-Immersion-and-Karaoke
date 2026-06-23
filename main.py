@@ -1919,13 +1919,12 @@ class Overlay:
             return
         try:
             import align
-            ok = align.available()
-        except Exception:
-            ok = False
+            ok, err = align.available(), align._last_error
+        except Exception as e:
+            ok, err = False, str(e)
         if not ok:
             self._hint("Sync-by-listening needs faster-whisper — see the README")
-            log.info("align requested but faster-whisper not available: %s",
-                     getattr(__import__("align"), "_last_error", None))
+            log.info("align requested but faster-whisper not available: %s", err)
             return
         if not self.lines:
             self._hint("Play a recognised song first, then sync by listening")
