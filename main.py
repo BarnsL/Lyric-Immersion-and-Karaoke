@@ -379,6 +379,23 @@ def is_cover_title(title):
     return bool(_COVER_RE.search(title or ""))
 
 
+# A VTuber / idol-channel "artist" — the upload carries the CHANNEL, not a catalog
+# artist ("Lumi Ch.【Phase Connect】", "Suisei Channel", "Hajime Ch. 轟はじめ ‐ ReGLOSS").
+_VCHAN_RE = re.compile(
+    r"\bCh\.|\bChannel\b|【[^】]+】"
+    r"|hololive|にじさんじ|ホロライブ|NIJISANJI|Phase\s*Connect|VSPO|VShojo|ReGLOSS",
+    re.I)
+
+
+def is_vtuber_channel(artist):
+    """True if the media 'artist' is really a VTuber/idol CHANNEL name. Such uploads
+    — covers AND the VTuber's own (often EP) tracks — never match an artist-keyed
+    lyric search, but a TITLE-FIRST fetch (the cover path) resolves them. So they're
+    treated as cover-like for fetching. (Live: 'Lucky star ✦ Kaneko Lumi' by
+    'Lumi Ch.【Phase Connect】' found nothing by artist, 62 lines by title.)"""
+    return bool(_VCHAN_RE.search(artist or ""))
+
+
 def clean_title(title, source=""):
     """Reduce a media title to the actual SONG NAME so it matches lyric metadata.
 
@@ -411,6 +428,12 @@ def clean_title(title, source=""):
             song = md.group(1)
     if song and song.strip():
         t = song.strip()
+
+    # VTuber/idol uploads often title as "Song ✦ Artist" with a decorative star
+    # separator (✦ ✧ ★ ☆ ◆ ❖ ♪ …). Keep the song (first part). Require spaces
+    # around the mark so a stylised title like "★STARLIGHT★" isn't split.
+    if not song:
+        t = re.split(r"\s+[✦✧✩⭐★☆◆◇❖♪♫]\s+", t, 1)[0]
 
     t = re.sub(r"\s*[\[(【「『][^\])】」』]*[\])】」』]", "", t)       # leftover (Official MV) etc.
     # cover / "tried singing" credits → keep only the song title
@@ -499,9 +522,18 @@ def clean_artist(artist):
     # provider/local lookup and slowed it to a crawl (a 60s fetch lost the race to
     # generate-by-ear). Reduce it to the performer: drop a trailing unit/group tag,
     # then a "<romaji> Ch." channel prefix, then a plain " Channel" suffix.
+    # Trailing agency/group tag in brackets (【Phase Connect】, [hololive]) …
+    a = re.sub(r"\s*[【\[][^】\]]*[】\]]\s*$", "", a)
+    # … or after a dash (‐ ReGLOSS).
     a = re.sub(rf"\s*{D}\s*(ReGLOSS|hololive[\w-]*|holo\w*|NIJISANJI|Phase[\s-]?Connect"
                r"|VSPO!?|VShojo)\b.*$", "", a, flags=re.I)
-    a = re.sub(r"^.*?\bCh\.\s+", "", a)            # "Hajime Ch. 轟はじめ" → "轟はじめ"
+    # "X Ch. Y" → the performer. Keep the name AFTER "Ch." when one remains
+    # ("Hajime Ch. 轟はじめ" → "轟はじめ"); otherwise keep the name BEFORE it
+    # ("Lumi Ch.【Phase Connect】" → "Lumi", the bracket tag already stripped). The
+    # old rule blindly kept what followed "Ch." and so returned the agency.
+    m = re.match(r"^(.+?)\s+Ch\.(?:\s+(.*))?$", a)
+    if m:
+        a = (m.group(2) or "").strip() or m.group(1).strip()
     a = re.sub(r"\s+Channel$", "", a, flags=re.I)  # "Suisei Channel" → "Suisei"
     return a.strip() or (artist or "")
 
@@ -1460,7 +1492,9 @@ class Overlay:
             self._last_raw_title, self._last_src, self._last_artist = rawt, src, rawa
             self._clean_title_cache = clean_title(rawt, src)
             self._clean_artist_cache = clean_artist(rawa)
-            self._is_cover = is_cover_title(rawt)
+            # Title-first fetch for explicit covers AND VTuber/idol-channel uploads
+            # (their channel-as-artist defeats the artist-keyed search).
+            self._is_cover = is_cover_title(rawt) or is_vtuber_channel(rawa)
         track = (self._clean_artist_cache, self._clean_title_cache)
         if track != self._track:
             self._track = track
