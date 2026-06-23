@@ -133,6 +133,12 @@ def _get_model(size=_MODEL):
         _models[size] = m or WhisperModel(size, device="cpu", compute_type="int8",
                                           download_root=md)
         _device[size] = used or "cpu"
+        try:        # surface GPU-vs-CPU once per model so it's visible in the log
+            import logging
+            logging.getLogger("karaoke").info(
+                "whisper model %r loaded on %s", size, _device[size])
+        except Exception:
+            pass
     return _models[size]
 
 
