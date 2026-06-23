@@ -9,6 +9,9 @@ hiddenimports = [
     "pystray._win32", "PIL._tkinter_finder", "PIL.ImageTk",
     "winsdk.windows.media.control", "winsdk.windows.foundation",
     "winsdk.windows.storage.streams",
+    # local modules imported lazily inside functions — pin them so the
+    # frozen build always includes them.
+    "songchange", "api", "character", "recognize", "fetch_lyrics",
 ]
 
 # Packages that ship data files / dynamically-imported submodules.

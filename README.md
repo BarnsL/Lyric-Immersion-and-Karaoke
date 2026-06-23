@@ -35,6 +35,12 @@ while it runs.
 - **Identify by sound.** When a title is wrong (covers, mislabeled uploads, DJ
   mixes), it listens with Shazam and fetches the lyrics for what's *actually*
   playing.
+- **Seamless switching in compilations.** In one long video with many songs
+  back-to-back ("openings 1-26", an album upload, a DJ set, a concert) the
+  player's title never changes — so a lightweight audio **song-change detector**
+  hears the moment one track ends and the next begins, and re-identifies *right
+  then* instead of on a slow timer. Switches are quick, and because changes are
+  now event-driven the heavy recognizer can idle between songs (**lower CPU**).
 - **Scroll-through mode** with staggered lanes for a flowing, room-filling
   karaoke look — or a clean fixed-line mode.
 - **Responsive sizing.** Text scales to your display automatically, so it looks
@@ -98,6 +104,15 @@ Shazam and aligns the clock to the true offset, with a quick burst of re-checks
 right after a song starts so the timing locks within ~25 seconds. That
 auto-corrects YouTube MV intros, catches drift, and follows **concert / live
 videos** that contain many songs back-to-back.
+
+For those multi-song videos there's a dedicated **song-change detector**
+(`songchange.py`): a cheap RMS loudness meter on the system audio that spots the
+brief near-silent gap between tracks and triggers an immediate re-identify — so
+the swap to the next song's lyrics happens in a second or two, not after the next
+blind poll. It's event-driven, so once a song is confirmed the Shazam poll relaxes
+to a slow safety heartbeat (much less CPU/network across a long compilation).
+Toggle it from the tray (**Fast song-change detect**); a *crossfaded* compilation
+with no gap falls back to that heartbeat.
 
 ### Gets the *right* lyrics (sound is the authority)
 Titles are unreliable — two songs by the same artist share a vibe, MV titles are
@@ -207,7 +222,7 @@ route schema — so it's safe and predictable to drive from an agent.
 | Method & path | What it does |
 |---------------|--------------|
 | `GET /health` | liveness + version + uptime |
-| `GET /status` | now-playing, the matched song, sync offset, current line |
+| `GET /status` | now-playing, matched song, sync offset, current line, song-change detector state |
 | `GET /logs?n=200` | the last N log lines (every match/sound/swap decision) |
 | `GET /lyrics` | the full loaded, annotated lyric lines |
 | `POST /identify` | re-identify the song by **sound** now |
@@ -237,6 +252,7 @@ when something looks off you can see exactly *why* it chose what it chose.
 | `main.py` | The overlay: transparent click-through window, media watcher, renderer, tray menu |
 | `fetch_lyrics.py` | Multi-provider fetch + verification + furigana / romaji / translation |
 | `recognize.py` | Identify the playing song by **sound** (loopback capture → Shazam) |
+| `songchange.py` | Audio **song-change detector** — RMS gap-spotter for seamless switching in compilations |
 | `api.py` | The local HTTP API (status / logs / identify) for agents & scripts |
 | `gairaigo.py` | Katakana → English loanword table (so ベイビー → "baby") |
 | `character.py` | The optional dancing on-screen companion |

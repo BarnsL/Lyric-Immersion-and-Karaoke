@@ -579,7 +579,10 @@ class Overlay:
         self.git_sync = bool(s.get("git_sync", False))  # push new songs to git
         self.character_on = bool(s.get("character", False))  # dancing companion
         self.api_on = bool(s.get("api", True))         # local agent-control API
+        self.boundary_on = bool(s.get("boundary", True))  # fast song-change detect
         self._api = None
+        self._boundary = None         # song-change detector thread
+        self._last_boundary = 0.0     # throttle: last boundary-triggered identify
         self._fps = 16
         self._last_pos = 0.0
         self._strm_rem = 0.0
@@ -644,7 +647,10 @@ class Overlay:
                 self._api = start_api(self, LOG_FILE)
             except Exception as e:
                 log.info("API failed to start: %s", e)
-        log.info("started (recal %ss, api %s)", self.recal_secs, self.api_on)
+        if self.boundary_on:
+            self._start_boundary()
+        log.info("started (recal %ss, api %s, boundary %s)",
+                 self.recal_secs, self.api_on, self.boundary_on)
         self._hint("Waiting for music…")
         self.root.after(300, self._tick)
         self.root.after(7000, self._health_check)
@@ -823,10 +829,13 @@ class Overlay:
 
     def _recalibrate_loop(self):
         """Listen again to re-lock timing AND catch a new song within one long
-        video (concert / DJ set / livestream). Cadence is fast right after a
-        song starts (3 quick re-locks ~8s apart) so the offset settles within
-        ~25s, then relaxes to recal_secs. Re-syncs use a short 5s capture so
-        each pass finishes quickly."""
+        video (compilation / concert / DJ set / livestream). The audio boundary
+        detector (songchange.py) now fires an immediate re-identify the instant a
+        track flips, so once a song is CONFIRMED by sound this loop relaxes to a
+        slow safety heartbeat — far fewer Shazam calls over a long compilation
+        (lower CPU + network) while still re-locking timing occasionally. Cadence
+        stays fast right after a song starts (the 3-shot burst) and while the song
+        is still unconfirmed. Re-syncs use a short 4s capture so each pass is quick."""
         nxt = max(4, self.recal_secs or 30)
         try:
             st = self.media.get()
@@ -837,10 +846,17 @@ class Overlay:
                     nxt = 4
                 elif self.recal_secs:
                     self._start_identify(seconds=4, attempts=1)
-                    # poll as fast as feasible while the song isn't confirmed by
-                    # sound yet (each listen is ~4s of audio — the floor)
-                    unconfirmed = (not self._verified) or self._sound_song is None
-                    nxt = max(4, min(self.recal_secs, 4) if unconfirmed else self.recal_secs)
+                    confirmed = self._verified and self._sound_song is not None
+                    watched = confirmed and self._boundary is not None and self.boundary_on
+                    if watched:
+                        # The detector is listening for the next song, so blind
+                        # polling is wasteful — just re-lock timing slowly.
+                        nxt = max(self.recal_secs, 25)
+                    else:
+                        # poll as fast as feasible while the song isn't confirmed by
+                        # sound yet (each listen is ~4s of audio — the floor)
+                        unconfirmed = (not self._verified) or self._sound_song is None
+                        nxt = max(4, min(self.recal_secs, 4) if unconfirmed else self.recal_secs)
         finally:
             self._arm_recal(nxt)
 
@@ -1457,6 +1473,52 @@ class Overlay:
         self.character.set_enabled(self.character_on)
         self._persist()
 
+    def set_boundary(self, on):
+        """Turn the audio song-change detector on/off (the fast switcher for
+        compilations). Starts the thread lazily the first time it's enabled."""
+        self.boundary_on = bool(on)
+        if self.boundary_on and self._boundary is None:
+            self._start_boundary()
+        elif self._boundary is not None:
+            self._boundary.set_enabled(self.boundary_on)
+        self._persist()
+
+    def _start_boundary(self):
+        """Spin up the song-boundary detector (cheap RMS listener). On a detected
+        track change it pulls a re-identify in immediately — see _on_boundary."""
+        try:
+            from songchange import SongChangeDetector
+            self._boundary = SongChangeDetector(self._fire_boundary)
+            self._boundary.set_enabled(self.boundary_on)
+            self._boundary.start()
+            log.info("song-change detector on")
+        except Exception as e:
+            log.info("song-change detector failed to start: %s", e)
+
+    def _fire_boundary(self):
+        """Called from the detector thread → marshal onto the Tk thread."""
+        try:
+            self.root.after(0, self._on_boundary)
+        except Exception:
+            pass
+
+    def _on_boundary(self):
+        """A new song likely just started inside the same video (compilation /
+        DJ set). Re-identify by sound RIGHT NOW so the swap is quick, instead of
+        waiting for the slow blind poll. Cheap to call: short capture, throttled,
+        and skipped if we're already listening or just did."""
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING):
+            return
+        now = time.time()
+        if self._identifying or now - self._last_boundary < 4.0:
+            return
+        self._last_boundary = now
+        log.info("audio boundary detected → re-identifying by sound")
+        self._fast_calib = max(self._fast_calib, 2)
+        self._start_identify(seconds=5, attempts=1)
+        self._arm_recal(6)
+
     def set_api(self, on):
         """Start/stop the local agent-control API (127.0.0.1:8765)."""
         self.api_on = bool(on)
@@ -1503,7 +1565,8 @@ class Overlay:
                         "scroll": self.scroll_dir, "font_scale": self.font_scale,
                         "scroll_speed": self.scroll_speed, "perf": self.perf,
                         "recal_secs": self.recal_secs, "git_sync": self.git_sync,
-                        "character": self.character_on, "api": self.api_on})
+                        "character": self.character_on, "api": self.api_on,
+                        "boundary": self.boundary_on})
 
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
@@ -1663,6 +1726,11 @@ class Overlay:
         self._start_identify()
 
     def quit(self):
+        if self._boundary is not None:
+            try:
+                self._boundary.stop()
+            except Exception:
+                pass
         self.media.stop()
         self.root.quit()
 
@@ -1784,6 +1852,7 @@ def main():
     def _backup_now(*_):   ov.root.after(0, ov.git_backup)
     def _toggle_char(*_):  ov.root.after(0, lambda: ov.set_character(not ov.character_on))
     def _toggle_api(*_):   ov.root.after(0, lambda: ov.set_api(not ov.api_on))
+    def _toggle_bound(*_): ov.root.after(0, lambda: ov.set_boundary(not ov.boundary_on))
     git_menu = pystray.Menu(
         pystray.MenuItem("Auto-push new songs", _toggle_git,
                          checked=lambda i: ov.git_sync),
@@ -1809,6 +1878,8 @@ def main():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
         pystray.MenuItem("🎧  Identify by sound", _ident),
+        pystray.MenuItem("Fast song-change detect (compilations)", _toggle_bound,
+                         checked=lambda i: ov.boundary_on),
         pystray.MenuItem("Auto re-sync by sound", recal_menu),
         pystray.MenuItem("Library backup (Git)", git_menu),
         pystray.Menu.SEPARATOR,

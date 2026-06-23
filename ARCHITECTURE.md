@@ -58,10 +58,18 @@ plus a `pystray` tray menu.
   - **audio**: `_start_identify(seconds, attempts)` (short captures re-sync
     fast, long ones detect reliably), `_recalibrate_loop` + `_arm_recal`
     (adaptive cadence — a 3-shot fast burst ~8s apart right after a song starts
-    so the offset locks in ~25s, then relaxes to `recal_secs`; also catches
-    concert song-changes), `_health_check`, `_suspect`. Correction snaps to a
-    clearly-real offset (>2s, e.g. an MV intro) and otherwise eases 0.8× toward
-    it, smoothing Shazam's sub-second noise.
+    so the offset locks in ~25s, then relaxes; once a song is **confirmed and
+    the boundary detector is on**, the blind poll relaxes further to a slow
+    safety heartbeat so a long compilation isn't Shazam-polled every few seconds),
+    `_health_check`, `_suspect`. Correction snaps to a clearly-real offset (>2s,
+    e.g. an MV intro) and otherwise eases 0.8× toward it, smoothing Shazam's
+    sub-second noise.
+  - **song-change detector**: `_start_boundary` spins up `songchange.py`'s
+    `SongChangeDetector`; `_on_boundary` (marshalled to the Tk thread via
+    `_fire_boundary`) fires when a track flip is heard inside one long video and
+    pulls an immediate re-identify in — the seamless switcher for compilations.
+    Throttled (ignores a boundary if one fired <4s ago or an identify is in
+    flight); `set_boundary` toggles it.
   - rendering: `_render`, `_karaoke`, `_render_block`/`_ticker_update`
     (scroll-through ticker), `_animate_in`/`_anim_step`, `_hint`
   - **scroll layout**: `_relayout_song` sizes blocks + lane count to the rows
@@ -118,6 +126,20 @@ dir), holding `lyrics/` and `settings.json`.
   Captures system audio (`soundcard` WASAPI loopback) and asks Shazam
   (`shazamio`). `offset` = seconds into the song; `t_cap` = capture timestamp,
   so the overlay can align its clock to the true position.
+
+## songchange.py — detect a track flip inside one long video
+
+- **`SongChangeDetector(on_change, …)`** — a daemon thread with a cheap RMS
+  loudness meter on the WASAPI loopback (short, low-rate blocks → a few wake-ups
+  a second, negligible CPU). It fires `on_change()` on the tell-tale shape of a
+  track boundary: a stretch of music → a brief near-silent **gap** → music
+  returning. Conservative by design (silence judged against both an absolute
+  floor and a fraction of the recent loud level; the gap must persist `min_gap`
+  and be preceded by real music; `debounce` after each fire) so a quiet musical
+  passage doesn't false-trigger. `set_enabled(on)` / `stop()`. Only loudness is
+  analysed — no audio is stored, fingerprinted, or sent anywhere. A *crossfaded*
+  compilation (no gap) won't trip it; the overlay's slow Shazam heartbeat is the
+  backstop for that.
 
 ## Tools (run from a terminal)
 

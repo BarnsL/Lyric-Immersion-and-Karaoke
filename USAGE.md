@@ -25,6 +25,7 @@ Both are just starting points — tweak anything afterward.
 | **Presets** | One-click Gaming / Karaoke setups (above). |
 | **⚑ Wrong lyrics — fix this song** | Bin the current match and re-identify by sound. |
 | **🎧 Identify by sound** | Force an immediate Shazam listen. |
+| **Fast song-change detect (compilations)** | On/off (on by default). Listens for the near-silent gap between tracks in a multi-song video ("openings 1-26", album upload, DJ set) and re-identifies the *instant* a new song starts — seamless switching. Because it's event-driven, it also lets the auto re-sync poll relax (lower CPU). A crossfaded video with no gaps falls back to the re-sync poll. |
 | **Auto re-sync by sound** | Re-listen on an interval (Off / 20s / 30s / 60s) to keep timing locked and to catch a new song inside a concert/live video. |
 | **Library backup (Git)** | *Auto-push new songs* (opt-in) and *Back up now* — see below. |
 | **Sync timing** | Nudge the offset ±0.5s / ±2.0s; shows the current offset. |

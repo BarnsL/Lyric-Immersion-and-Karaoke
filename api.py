@@ -88,6 +88,7 @@ def _status(app):
         "lang": app.meta.get("lang"),
         "verified": app._verified,
         "heard_by_sound": app._sound_song,
+        "boundary_detect": getattr(app, "boundary_on", None),
         "line_count": len(app.lines),
         "current_line": _current_line(app),
     }

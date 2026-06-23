@@ -14,7 +14,10 @@ with data and the wider system.
 
 Nothing else is transmitted. No playback history, library, settings, IP-linked
 identifiers, or machine details are sent anywhere. There is no analytics or
-crash-reporting service.
+crash-reporting service. The **song-change detector** (`songchange.py`) reads the
+system-audio loopback to measure **loudness only** — it computes an RMS level in
+memory to spot the silent gap between tracks and transmits nothing; no audio is
+stored or fingerprinted by it.
 
 ## Secrets
 

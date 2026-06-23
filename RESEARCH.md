@@ -179,6 +179,38 @@ with a fast-lock burst after each song change.
   instead of a 0.1 s poll — marginally lower CPU, but the poll is already cheap
   and simpler/robust. Deferred.
 
+### 3b. Seamless switching in compilations (this pass) — ROOT CAUSE + fix
+
+**Problem.** In one long video with many songs back-to-back ("openings 1-26", an
+album upload, a DJ set), the player's GSMTC **title never changes**, so the only
+signal a new song started is the **audio**. The app caught these only via the
+blind `_recalibrate_loop` Shazam poll, so a switch lagged ~one poll + a capture
+(≈8-12 s of the *previous* song's lyrics over the new one), and polling Shazam
+every few seconds for a whole compilation is wasteful (each call is a multi-second
+capture + fingerprint + network round-trip).
+
+**Fix — an energy-gated boundary detector (`songchange.py`).** A song boundary in
+a compilation almost always shows up as a brief **near-silent gap** between
+tracks. We watch the system-audio loudness with a tiny RMS meter (short, low-rate
+blocks — a few wake-ups a second, trivial CPU) and detect the change-point shape
+*music → gap → music*, then trigger an immediate re-identify. This is the
+lightweight, real-time end of the **audio-segmentation / change-point-detection**
+literature (energy-threshold activity detection à la `auditok`; change-point
+detection à la `ruptures`) — we deliberately use the cheap energy-gate, not a
+model, so it adds ~nothing to CPU. Conservative thresholds (absolute **and**
+relative silence floor, a minimum gap length, a "was preceded by music" latch, a
+post-fire debounce) keep a quiet musical passage from false-triggering.
+
+- ✅ **Faster switches** — the swap now happens within a second or two of the
+  real boundary (Shazam latency is the floor), not after the next blind poll.
+- ✅ **Lower CPU/network** — because changes are now event-driven, once a song is
+  confirmed the blind Shazam poll **relaxes to a slow safety heartbeat** instead
+  of firing every few seconds for the length of the compilation.
+- 📝 **Honest limit** — a *crossfaded* compilation with no inter-track gap won't
+  trip the silence gate; the slow Shazam heartbeat remains the backstop. A pure
+  spectral-novelty detector would catch those too but costs real CPU, so it's
+  deferred. Tray-toggleable ("Fast song-change detect").
+
 ## 4. Rendering & performance
 
 **Current:** a transparent, click-through Tk canvas. Scroll-through renders each
@@ -218,7 +250,8 @@ call; lanes + block height adapt per song.
 | Spaces | `to_furigana` preserves whitespace (fugashi dropped it); cache re-spaced | `fetch_lyrics.py` `to_furigana` |
 | Perf | PhotoImage paste-in-place, 0.15s poll, measure_text cache, idle char fps | `main.py`, `character.py` |
 | Matching | Title match is strict + scored (no loose same-artist grabs); sound is the authority and re-checks every ~20s and self-corrects | `main.py` `LyricsIndex.match`, `_consume_async` |
-| Automation | Local HTTP API + rolling `karaoke.log` of every decision | `api.py`, `main.py` |
+| Automation | Local HTTP API (hardened: total error-wrapping, `{ok}` shape, `/health`, auth token) + rolling `karaoke.log` of every decision | `api.py`, `main.py` |
+| Switching | Energy-gated **song-change detector** for seamless switching in compilations; blind Shazam poll relaxes to a slow heartbeat once confirmed (lower CPU) | `songchange.py`, `main.py` `_on_boundary`/`_recalibrate_loop` |
 | Languages | German + Russian (Cyrillic transliteration + translation); per-line CJK font on rm/en rows kills mixed-line □ boxes; whitespace-safe furigana | `fetch_lyrics.py`, `main.py` |
 | Polish | All subprocess calls windowless (no flashing terminals) | `main.py` |
 | Docs | Word-level finding, candidates, this file | `fetch_lyrics.py` header, `RESEARCH.md` |
@@ -236,5 +269,7 @@ GSMTC, pitch accent) is intentionally deferred for the reasons above.
 - [Tk Canvas performance (Tcl wiki)](https://wiki.tcl-lang.org/page/Tk+Performance) ·
   [Tk Canvas limitations](https://www.ancisoft.com/blog/understanding-performance-limitations-of-the-tkinter-canvas/)
 - [deep-translator (DeepL/Google)](https://pypi.org/project/deep-translator/)
+- [auditok — energy-based audio activity detection / segmentation](https://github.com/amsehili/auditok) ·
+  [ruptures — change-point detection (music segmentation example)](https://github.com/deepcharles/ruptures) — the approach behind `songchange.py`
 - [animelyrics (PyPI)](https://pypi.org/project/animelyrics/) ·
   [Miraikyun](https://miraikyun.com/) — anime/Vocaloid romaji + English (plain text)
