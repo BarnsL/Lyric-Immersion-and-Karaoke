@@ -5,7 +5,7 @@ A cheat-sheet so another agent (or contributor) can pick this project up cold. T
 `USAGE.md`, `BUILD.md`, `SECURITY.md`, `AGENTS.md`. This file is the
 session/state + build-process summary.
 
-Last updated: 2026-06-23 (cycle 2).
+Last updated: 2026-06-23 (cycle 3 + Lucky Star fix).
 
 ---
 
@@ -669,3 +669,45 @@ Monitor (`_monitor.py`, local/gitignored) desync proxy made span-aware: only fla
 when the song clock is WITHIN [first_line, last_line] and the cur=None run exceeds
 the song's biggest interlude — kills the false desyncs on intros/outros/interludes
 (Girly Cupid 50s break, 今夜はブギーバック outro).
+
+---
+
+## 2026-06-23 (part 8): "Lucky star" wrong-lyrics — verified vs the real video, v1.0.7 reverted → v1.0.8
+
+User pushed back: "make sure ur right, look at the video, it has lyrics in vid."
+They were RIGHT — I had cached the wrong song.
+
+**How it was verified (reusable):** `yt-dlp --skip-download --write-auto-subs
+--sub-langs en --sub-format srv1 <url>` pulls YouTube's ASR caption = a transcript
+of the ACTUAL audio. Compared it to the cached lyrics → totally different songs.
+The real "Lucky star ✦ Kaneko Lumi" is *"I'll be your lucky star cuz I know it's
+been hard… I'll be a Guiding Light, Find Your Way in the dark"*; the cache had a
+Cantonese "Lucky Star", then a "Twinkle Twinkle" one.
+
+**Root cause:** v1.0.7's `is_vtuber_channel → cover` routing. For a GENERIC title
+the title-only cover search grabs a same-titled DIFFERENT song. And the real niche
+EP track has **NO synced lyrics in any provider** (Genius plain only, no
+timestamps), so generate-by-ear (transcribe the audio) is the correct result — which
+the routing suppressed.
+
+**v1.0.8 fix:** reverted to `self._is_cover = is_cover_title(rawt)` (explicit covers
+only); removed `is_vtuber_channel`/`_VCHAN_RE`. KEPT the correct v1.0.7 cleaners:
+`clean_artist` ("Lumi Ch.【Phase Connect】"→"Lumi", "Suisei Channel"→"Suisei",
+"Hajime Ch. 轟はじめ"→"轟はじめ") and `clean_title` ✦/★ separator → "Lucky star".
+For the user's specific song, cached the correct lyrics built from the YT caption
+(`dist/.../lyrics/lucky_star.json`, source="youtube-caption", 61 synced lines) so it
+shows right immediately; other unindexed VTuber tracks now generate.
+
+**LESSON:** title-only search on a GENERIC title is unreliable (no artist/duration
+verify for browser sources). Don't broaden the cover/title-first path. A real future
+fix would AUDIO-VERIFY a loose fetch (align._best_anchor ratio vs a transcribed
+snippet) before accepting, and reject→generate on a mismatch.
+
+**Feature quality smoke-test (all PASS):** annotate furigana+romaji (JA) + romaji
+(KO); detect_lang ja/ko/en; align.available (faster-whisper) True; updater.check
+callable; clean_title version-subtitle strip ("Into Starlight -anniversary special
+ver.-"→"Into Starlight"); offset-confirmation `_pending_corr` gate present; specific-
+title fetch correct (廻廻奇譚/Eve → 55 lines). Regression-swept clean_title/clean_artist
+over the live playlist (Reol/Dunk/ピーナッツくん/V.W.P/AWAKE/今夜はブギーバック/天誅) — no
+regressions; pre-existing un-clean cases (Reol -DEAD CENTER, album-name artists) are
+compensated by sound-ID + _title_variants.
