@@ -376,6 +376,12 @@ def clean_title(title, source=""):
     and **cover credits** ('天誅 / covered by 幸祜' → '天誅'). `source` is the player
     app id (browser titles get extra cleanup)."""
     t = title or ""
+    # A 歌ってみた / cover is usually titled "OriginalSong / Singer(s)" and its
+    # lyrics are the ORIGINAL song's. Detect the marker from the RAW title now —
+    # the (cover) / 歌ってみた tags get stripped below — so we can keep just the
+    # song part at the end.
+    is_cover = bool(re.search(r"歌ってみた|うたってみた|歌わせて|covered?\s+by"
+                              r"|\(\s*cover\s*\)|[/／]\s*cover\b", t, re.I))
     if any(h in source for h in BROWSER_HINTS):
         t = re.sub(r"\s*[-–—|]\s*YouTube\s*$", "", t, flags=re.I)
 
@@ -414,6 +420,11 @@ def clean_title(title, source=""):
     # a trailing anime tie-in with no song info ('… - TVアニメOPテーマ')
     t = re.sub(r"\s*[-–—/／]\s*(?:tv\s*)?(?:アニメ|anime)\s*.*?"
                r"(?:op|ed|主題歌|テーマ|opening|ending|theme).*$", "", t, flags=re.I)
+    # Cover titled "OriginalSong / Singer(s)": keep the song (before the first
+    # slash), dropping the coverer names so the search hits the original's lyrics
+    # ('ウェカピポ / 綺々羅々ヴィヴィ × 白銀ノエル' → 'ウェカピポ').
+    if is_cover and re.search(r"\s[/／]\s", t):
+        t = re.split(r"\s[/／]\s", t, 1)[0]
     return t.strip(" -–—|/　").strip()
 
 
