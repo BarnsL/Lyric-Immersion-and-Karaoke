@@ -488,3 +488,53 @@ run ahead through the whole intro.
 lyric-provider + Shazam-name search. `clean_artist()` strips those; wired into the
 `_tick` track build (cached alongside `clean_title`). Helps every Topic/VEVO upload
 find lyrics, not just one song.
+
+---
+
+## Work done in the 2026-06-22/23 session (part 5): cover titles, false-match, first release
+
+### 1. utattemita / cover titles -> match the ORIGINAL song (`clean_title`, commit b9f2e69)
+A cover like `ウェカピポ / 綺々羅々ヴィヴィ × 白銀ノエル(cover) 【SOUL'd OUT/歌ってみた】` is titled
+"OriginalSong / Singer(s)" and its lyrics are the ORIGINAL song's. clean_title left
+the whole "song / singers" string, so the provider search missed -- even though the
+original (ウェカピポ by SOUL'd OUT) has 61 timed lines. Fix: detect the cover marker
+(歌ってみた / うたってみた / (cover) / covered by) from the RAW title, and after the other
+strips keep the part before the first " / " (the song), dropping the coverer names.
+Non-cover "Artist / Song" titles are untouched. (Seeded ウェカピポ.json into the cache.)
+
+### 2. An artist/group-only SEGMENT must not carry a title match (`LyricsIndex.match`, 9c29fbe)
+ANY `X / FLOW GLOW` matched the one cached FLOW GLOW song (`上海ハニー / FLOW GLOW` ->
+`宵々古今`, `Tokyo / FLOW GLOW` -> `宵々古今`) because `_title_forms` splits "Song / Group"
+into segments and the shared `FLOW GLOW` segment matched exactly (score 100). Fix: in
+match(), skip a SEGMENT (NEVER the whole title -- guarded by `ct != e_core` and
+`q != qt`) that equals or is contained in either side's normalized artist name. So
+the SONG must match; self-titled songs still match; composes with the
+"Artist / Song -ver-" handling (the artist segment is dropped whichever side it sits
+on). The 2 pre-existing `(feat ...)` self-match misses are unrelated -- clean_title
+strips `(feat ...)` before the real query.
+
+### 3. First release + auto-updater activated (v1.0.1)
+Built the portable onedir, zipped it `DesktopKaraoke-portable.zip` (+ a `.sha256`),
+and published GitHub **Release v1.0.1** -- the baseline that makes the in-app updater
+live. `updater.py` checks Releases for a `desktopkaraoke*.zip` (containing
+`DesktopKaraoke.exe`), verifies the `.sha256` fail-closed, and swaps it in. version.py
+is the single source of truth (kept in sync with the Inno AppVer); bump it + cut a
+release to ship an update. Verified end-to-end: a 1.0.0 build would receive v1.0.1;
+the current build reports "up to date". (Other instances later bumped to 1.0.2 with
+generate-by-ear + match fixes.)
+
+### Multi-machine reality (IMPORTANT)
+This repo is edited by **several Claude instances on different machines at once** --
+commits land every few minutes (e.g. "Generate lyrics by ear", "Stop sound-switch
+churn", "Fix wrong-match override", "Make generate-by-ear kick in fast" all arrived
+from OTHER instances mid-session). ALWAYS `git fetch` + rebase onto origin/master
+before any push; clean fast-forwards routinely fail and a rebase is the norm.
+Contributors must stay **BarnsL** only (noreply identity), **no Co-Authored-By**.
+
+### The "watch + improve" loop pattern
+A session-local cron (`/loop 15m ...`) samples the running app's `/status` + `/logs`
+every 15 min, logs desync / mismatch / churn / false-match observations to
+`%TEMP%\dk_lyric_watch.md`, and pushes a fix only when an issue is reproduced AND
+tested (compile + a targeted LyricsIndex/clean_title test + no self-match
+regressions). The FLOW GLOW false-match (#2) and another instance's
+sound-switch-churn fix were both found this way.
