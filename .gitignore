@@ -32,6 +32,13 @@ _icon_preview.png
 _preview_cur.png
 _exe_icon.png
 
+# Optional "sync by listening" runtime (faster-whisper) + downloaded ASR models
+# — vendored locally, never committed (heavy, machine-specific).
+.deps/
+.deps-ship/
+deps/
+models/
+
 # Build artifacts
 build/
 dist/

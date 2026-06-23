@@ -91,6 +91,25 @@ the `.exe` and bundled as a data file by `DesktopKaraoke.spec`, so **rebuild the
 app after changing it** for the new icon to show in the tray, taskbar, and Start
 menu.
 
+## Optional: "Sync by listening" (faster-whisper)
+
+The tray's **🎤 Sync by listening** transcribes the live vocals to align the lyrics
+when Shazam can't ID the exact cut. It needs **faster-whisper**, which is **heavy
+(~500 MB) and off by default**. To include it in the build, vendor it into `.deps`
+first (kept off the C: drive):
+
+```bat
+set PIP_CACHE_DIR=D:\pip-cache
+pip install --target .deps faster-whisper
+pyinstaller --noconfirm DesktopKaraoke.spec    :: now auto-detects .deps and bundles it (~650 MB .exe)
+```
+
+The spec sets `WHISPER = os.path.isdir(".deps")`: **no `.deps` → lean ~150 MB build**
+(the feature shows a "needs faster-whisper" hint); **`.deps` present → self-contained
+~650 MB build** with the feature working. PyInstaller's hooks are required — a loose
+`sys.path` vendor fails on PyAV's `av._core` DLLs. The ASR model (~75 MB) downloads
+to the app's data folder on first use (copy `models\` next to the `.exe` to pre-seed).
+
 ## Notes
 
 - `DesktopKaraoke.exe` is windowed (no console) and bundles Python and every

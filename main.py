@@ -737,6 +737,7 @@ class Overlay:
         self._verified = False
         self._health_attempts = 0
         self._identifying = False
+        self._aligning = False        # sync-by-listening (Whisper) in progress
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
         self._fast_calib = 0          # remaining quick re-locks after a song change
@@ -1902,6 +1903,57 @@ class Overlay:
         self._hint("🎧 Listening to identify the song…")
         self._start_identify()
 
+    # ── sync by listening (align cached lyrics to the HEARD audio) ──
+    def _align_pos(self):
+        """The player's RAW position right now (no offset applied) — read at
+        capture start so the alignment can derive an absolute offset."""
+        st = self.media.get() or {}
+        return float(st.get("position") or 0.0)
+
+    def align_by_listening(self):
+        """On-demand: transcribe a few seconds of the live vocals and match them
+        to the loaded lyrics to set the sync offset — fixes timing when Shazam
+        can't identify the exact cut. Opt-in, runs once in a background thread,
+        and no-ops gracefully if faster-whisper isn't installed."""
+        if self._aligning:
+            return
+        try:
+            import align
+            ok = align.available()
+        except Exception:
+            ok = False
+        if not ok:
+            self._hint("Sync-by-listening needs faster-whisper — see the README")
+            log.info("align requested but faster-whisper not available: %s",
+                     getattr(__import__("align"), "_last_error", None))
+            return
+        if not self.lines:
+            self._hint("Play a recognised song first, then sync by listening")
+            return
+        self._aligning = True
+        self._hint("🎧 Listening to sync the lyrics…")
+        lines, lang = self.lines, self.meta.get("lang", "ja")
+
+        def work():
+            res = None
+            try:
+                res = align.capture_and_align(lines, lang=lang, get_pos=self._align_pos)
+            except Exception as e:
+                log.info("align error: %s", e)
+            self.root.after(0, lambda: self._apply_align(res))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_align(self, res):
+        self._aligning = False
+        if not res:
+            self._hint("Couldn't hear the lyrics clearly — try again")
+            return
+        offset, ratio, _start = res
+        self.offset = round(offset, 2)
+        log.info("aligned by listening: offset=%.2fs (match %.2f)", offset, ratio)
+        self._hint(f"Synced by ear ({offset:+.1f}s)")
+
     def quit(self):
         if self._boundary is not None:
             try:
@@ -1952,6 +2004,7 @@ def main():
     def _refetch(*_): ov.root.after(0, ov.refetch)
     def _wrong(*_):   ov.root.after(0, ov.report_wrong)
     def _ident(*_):   ov.root.after(0, ov.identify_by_sound)
+    def _align(*_):   ov.root.after(0, ov.align_by_listening)
     def _quit(icon, *_):
         icon.stop()
         ov.root.after(0, ov.quit)
@@ -2092,6 +2145,7 @@ def main():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
         pystray.MenuItem("🎧  Identify by sound", _ident),
+        pystray.MenuItem("🎤  Sync by listening  (match lyrics to the audio)", _align),
         pystray.MenuItem("Fast song-change detect (compilations)", _toggle_bound,
                          checked=lambda i: ov.boundary_on),
         pystray.MenuItem("Auto re-sync by sound", recal_menu),

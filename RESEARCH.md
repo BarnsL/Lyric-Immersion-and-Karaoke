@@ -354,6 +354,18 @@ but targets isolated/classical voice with a reference, not mixed pop over loopba
 that aligns to the heard sound *without a catalog or reference audio*, which is the
 actual failure mode. Keep it **opt-in** (dependency + CPU weight) and **on-demand**.
 
+✅ **Phase 1 BUILT** (`align.py`): tray **🎤 Sync by listening** + `POST /align`
+capture ~9 s → `faster-whisper` (`base`, int8, CPU) → transcribe → fuzzy-match
+(difflib) the transcript to the cached lines → set the offset. Validated: the
+anchor+offset math is exact on a noisy synthetic transcript, and the ASR pipeline
+loads + runs (~0.5 s on a short clip; model cached to `<data>/models`). Packaging:
+a "lean EXE + loose-vendored `deps/`" approach **failed in the frozen app** (PyAV's
+`av._core` can't find its FFmpeg DLLs from a non-bundled path), so the stack is
+**bundled via PyInstaller's hooks** (`pathex=.deps` + `collect_all`), which place
+the ctranslate2/av DLLs correctly. From source it auto-loads from `.deps`
+(`_ensure_deps_path`); either way it degrades gracefully (`available()` False →
+hint) when absent. Phase 0/2 remain future work.
+
 ---
 
 ## What changed in code (this pass)
@@ -372,6 +384,7 @@ actual failure mode. Keep it **opt-in** (dependency + CPU weight) and **on-deman
 | Matching | Handle `Artist / Song -ver-` MV titles: strip dash-version subtitles, match the song segment after the last `/`; drop + block corrupt `title==artist` cache files | `main.py` `clean_title`/`_title_forms`/`match`, `fetch_lyrics.py` `fetch_and_save` |
 | Automation | Local HTTP API (hardened: total error-wrapping, `{ok}` shape, `/health`, auth token) + rolling `karaoke.log` of every decision | `api.py`, `main.py` |
 | Switching | Energy-gated **song-change detector** for seamless switching in compilations; blind Shazam poll relaxes to a slow heartbeat once confirmed (lower CPU) | `songchange.py`, `main.py` `_on_boundary`/`_recalibrate_loop` |
+| Sync | **Sync by listening** — opt-in faster-whisper transcribes live vocals + fuzzy-matches the cached lines to set the offset when Shazam can't ID the cut; not bundled, auto-loaded from `deps/` | `align.py`, `main.py` `align_by_listening`, `api.py` `/align` |
 | Languages | German + Russian (Cyrillic transliteration + translation); per-line CJK font on rm/en rows kills mixed-line □ boxes; whitespace-safe furigana | `fetch_lyrics.py`, `main.py` |
 | Polish | All subprocess calls windowless (no flashing terminals) | `main.py` |
 | Docs | Word-level finding, candidates, this file | `fetch_lyrics.py` header, `RESEARCH.md` |

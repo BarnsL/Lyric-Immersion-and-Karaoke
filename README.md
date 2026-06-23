@@ -133,6 +133,24 @@ to a slow safety heartbeat (much less CPU/network across a long compilation).
 Toggle it from the tray (**Fast song-change detect**); a *crossfaded* compilation
 with no gap falls back to that heartbeat.
 
+### Sync by listening (optional) — match the lyrics to what's *heard*
+When Shazam can't identify the exact thing playing (a fan MV, a remix, an
+"anniversary special ver." with a longer intro), there's no catalog anchor and the
+timing can drift. **Sync by listening** fixes that a different way: it transcribes
+a few seconds of the live vocals locally (with **faster-whisper**) and fuzzy-matches
+them against the song's *already-cached* lyric lines to work out where in the song
+you actually are — then sets the offset. No catalog or reference audio needed; it
+matches the heard words to the lyrics you already have. Trigger it from the tray
+(**🎤 Sync by listening**) or `POST /align`.
+
+It's **opt-in and on-demand** (transcription is CPU-heavy, so it only runs when you
+ask). The **portable build bundles faster-whisper**, so it just works. From source,
+`pip install faster-whisper` (the overlay also auto-loads it from a local `.deps`
+folder if you vendored it there). Without it, every other feature works as normal
+and this one shows a "needs faster-whisper" hint. The ASR model (~75 MB) downloads
+once to the app's data folder on first use. Transcribing sung vocals over backing
+music is imperfect, but the fuzzy line-anchor tolerates a noisy transcript.
+
 ### Gets the *right* lyrics (sound is the authority)
 Titles are unreliable — two songs by the same artist share a vibe, MV titles are
 messy, and covers lie. So matching is **paranoid and sound-led**: a cached title
@@ -257,6 +275,7 @@ route schema — so it's safe and predictable to drive from an agent.
 | `POST /wrong` | mark the current lyrics wrong → re-identify + re-fetch |
 | `POST /nudge?s=2.5` | shift sync by *s* seconds (for songs Shazam can't hear) |
 | `POST /reset` | reset the sync offset to 0 |
+| `POST /align` | **sync by listening** — transcribe the live audio + match it to the lyrics (needs faster-whisper) |
 | `POST /reindex` | rescan the local library |
 
 ```bash

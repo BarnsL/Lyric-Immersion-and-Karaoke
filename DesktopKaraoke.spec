@@ -1,7 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller build spec for Desktop Karaoke → a single windowed .exe.
 #   pyinstaller --noconfirm DesktopKaraoke.spec   (or run build.bat)
+import os
 from PyInstaller.utils.hooks import collect_all
+
+# OPTIONAL "Sync by listening" stack (faster-whisper) is bundled ONLY when it has
+# been vendored into ./.deps (pip install --target .deps faster-whisper). Without
+# it the default build stays lean (~150 MB) and the feature shows a "needs
+# faster-whisper" hint; with it the .exe is self-contained (~650 MB) and the
+# feature works out of the box. PyInstaller's hooks place the ctranslate2/PyAV
+# DLLs correctly — a loose sys.path vendor fails on av._core.
+WHISPER = os.path.isdir(".deps")
 
 datas = [("icon.ico", ".")]
 binaries = []
@@ -11,7 +20,7 @@ hiddenimports = [
     "winsdk.windows.storage.streams",
     # local modules imported lazily inside functions — pin them so the
     # frozen build always includes them.
-    "appdata", "version", "updater", "songchange", "api", "character", "recognize", "fetch_lyrics",
+    "appdata", "version", "updater", "songchange", "align", "api", "character", "recognize", "fetch_lyrics",
 ]
 
 # Packages that ship data files / dynamically-imported submodules.
@@ -20,7 +29,10 @@ hiddenimports = [
 for pkg in ("winsdk", "soundcard", "shazamio", "pykakasi", "jaconv",
             "fugashi", "unidic_lite", "cutlet", "mojimoji",
             "pypinyin", "hangul_romanize", "deep_translator", "syncedlyrics",
-            "pystray", "spotipy", "aiohttp", "aiosignal", "pydub", "numpy"):
+            "pystray", "spotipy", "aiohttp", "aiosignal", "pydub", "numpy",
+            # The faster-whisper stack is appended only when ./.deps exists.
+            *(("faster_whisper", "ctranslate2", "av", "tokenizers",
+               "huggingface_hub", "onnxruntime") if WHISPER else ())):
     try:
         d, b, h = collect_all(pkg)
         datas += d
@@ -31,7 +43,7 @@ for pkg in ("winsdk", "soundcard", "shazamio", "pykakasi", "jaconv",
 
 a = Analysis(
     ["main.py"],
-    pathex=[],
+    pathex=[".deps"] if WHISPER else [],   # vendored faster-whisper (optional)
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

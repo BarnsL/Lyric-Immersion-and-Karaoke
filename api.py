@@ -56,6 +56,7 @@ _ROUTES = {
         "/wrong": "mark current lyrics wrong → re-identify + re-fetch",
         "/nudge": "shift sync by ?s=2.5 seconds (+ = lyrics later)",
         "/reset": "reset the sync offset to 0",
+        "/align": "sync by listening — transcribe the audio + match to lyrics (needs faster-whisper)",
         "/reindex": "rescan the local library",
     },
 }
@@ -211,6 +212,9 @@ def make_handler(app, log_file, token):
                 elif path == "/reset":
                     self._run(app.reset_offset)
                     self._send(200, {"ok": True, "action": "sync offset reset to 0"})
+                elif path == "/align":
+                    self._run(app.align_by_listening)
+                    self._send(200, {"ok": True, "action": "syncing by listening (transcribe + match)"})
                 elif path == "/reindex":
                     self._run(app.index.refresh)
                     self._send(200, {"ok": True, "action": "library rescanned"})

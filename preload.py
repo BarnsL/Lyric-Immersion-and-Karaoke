@@ -264,6 +264,40 @@ SONGS = [
     ("鳥の詩", "Lia", False),
     ("unravel", "TK from 凛として時雨", False),
     ("紅蓮の弓矢", "Linked Horizon", False),
+
+    # ── YOASOBI (full discography — Ayase / ikura) ──
+    ("夜に駆ける", "YOASOBI", True),
+    ("あの夢をなぞって", "YOASOBI", True),
+    ("ハルジオン", "YOASOBI", True),
+    ("たぶん", "YOASOBI", True),
+    ("アンコール", "YOASOBI", True),
+    ("ハルカ", "YOASOBI", True),
+    ("群青", "YOASOBI", True),
+    ("優しさ", "YOASOBI", True),
+    ("怪物", "YOASOBI", True),
+    ("三原色", "YOASOBI", True),
+    ("もう少しだけ", "YOASOBI", True),
+    ("ツバメ", "YOASOBI", True),
+    ("大正浪漫", "YOASOBI", True),
+    ("セブンティーン", "YOASOBI", True),
+    ("もしも命が描けたら", "YOASOBI", True),
+    ("ラブレター", "YOASOBI", True),
+    ("好きだ", "YOASOBI", True),
+    ("ミスター", "YOASOBI", True),
+    ("祝福", "YOASOBI", True),
+    ("海のまにまに", "YOASOBI", True),
+    ("勇者", "YOASOBI", True),
+    ("アイドル", "YOASOBI", True),
+    ("ビビビ", "YOASOBI", True),
+    ("UNDEAD", "YOASOBI", True),
+    ("レオ", "YOASOBI", True),
+    ("舞台に立って", "YOASOBI", True),
+    ("Biri-Biri", "YOASOBI", True),
+    ("New Me", "YOASOBI", True),
+    ("モノトーン", "YOASOBI", True),
+    ("アドベンチャー", "YOASOBI", True),
+    ("Idol", "YOASOBI", True),                 # English ver.
+    ("Into The Night", "YOASOBI", True),       # 夜に駆ける English ver.
 ]
 
 

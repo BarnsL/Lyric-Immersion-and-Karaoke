@@ -344,6 +344,76 @@ remove the underlying ~50ms/PhotoImage wall.
 ### Git / multi-machine (reinforced this session)
 The repo is worked on from multiple computers / Claude installs simultaneously —
 **always `git fetch` + rebase onto `origin/master` before every push.** This session
-caught 3 separate concurrent pushes from another machine (`32d1ab0`, `ee82b14`,
-`1dffbc5`) and combined a same-file `clean_title` collision cleanly. Contributors must
-stay **BarnsL only**; no `Co-Authored-By`.
+caught several separate concurrent pushes from another machine and combined a
+same-file `clean_title` collision cleanly. Contributors must stay **BarnsL only**;
+no `Co-Authored-By`. **This is a GLOBAL standing rule** — the repo is edited from
+several machines at once, so always `git fetch` → commit → `git pull --rebase` →
+recompile → push; never blind-push a stale clone.
+
+### Note on the two build machines
+The **part-2** notes above are from a machine on **Python 3.13 + a per-project
+`.venv`** with **Smart App Control enforced**. The **part-1/part-3** work is from a
+machine where the full interpreter is **`%LOCALAPPDATA%\Programs\Python\Python312`**
+(and a *different* pip-less tool venv sometimes shadows `python` on PATH — call the
+full interpreter explicitly). Both are valid; use whichever matches the box you're
+on. `appdata.data_dir()` keeps data-paths correct either way.
+
+### A. Title matching — `Artist / Song -ver-`, `「」/『』`, and corrupt files
+*Into Starlight* showed "No lyrics found" though it was cached: JP-MV titles wrap
+the song as `Artist / Song -anniversary special ver.- (MUSIC VIDEO)`, which
+normalized to a long string where the cached title was <60 % (the matcher's
+paranoia threshold). Fixes in `main.py`:
+- `clean_title` strips trailing dash-delimited **version/edit subtitles**.
+- `_title_forms(title)` adds the **song segment after the last `/`** as a match form
+  (leading artist segment intentionally NOT tried); `LyricsIndex.match` uses it.
+- A concurrent commit added `「」/『』` song-name extraction — composes with the
+  above (verified: `IA & ОИЕ / Into Starlight` ✓, `米津玄師 MV「KICK BACK」` ✓,
+  `YOASOBI / Idol` → the song ✓).
+- Deleted corrupt **`title == artist`** cache files (false-match landmines) and
+  guarded `fetch_and_save` from ever caching `title == artist` again.
+
+### B. Sync by listening — `align.py` (NEW), optional faster-whisper
+Fixes timing when Shazam can't ID the exact cut (fan MV / remix / "special ver.").
+Transcribes ~9 s of live vocals with **faster-whisper** (`base`, int8, CPU) and
+fuzzy-matches (difflib) the transcript to the **cached** lyric lines → sets the
+offset. No catalog/reference audio needed — it matches the heard words to the
+lyrics you already have. (Background + research recommendation in `RESEARCH.md §7`.)
+- **Wiring:** tray **🎤 Sync by listening**, `POST /align`, `Overlay.align_by_listening`
+  → bg thread → `_apply_align` sets `self.offset`. Opt-in/on-demand; never runs
+  unless triggered. `_align_pos()` returns the RAW player position at capture start;
+  offset = `line.start - (pos_cap + seg_t)`.
+- **Packaging — BUNDLED via PyInstaller (the working path).** First tried "lean
+  EXE + loose-vendored `deps/` on `sys.path`" — it **failed in the frozen app** with
+  `ImportError: DLL load failed while importing _core` (PyAV's FFmpeg DLLs in
+  `av.libs` don't resolve when av is loaded from a non-bundled path; PyAV is
+  delvewheel-packed and hard to relocate). **Fix:** bundle the stack with
+  PyInstaller's hooks instead — in `DesktopKaraoke.spec`, `pathex=[".deps"]` +
+  `collect_all` for `faster_whisper, ctranslate2, av, tokenizers, huggingface_hub,
+  onnxruntime` (and NOT in `excludes`). PyInstaller places the ctranslate2/av DLLs
+  correctly. The portable build then has it out of the box; from source it loads
+  from `.deps` via `align._ensure_deps_path()` (kept as a source-run convenience).
+- **Vendoring for the BUILD (D: only, per the D:-rule):** `pip install --target
+  D:\…\.deps faster-whisper` (cache+TEMP forced to D:). PyInstaller analyzes it via
+  `pathex`. The ASR model (~75 MB `base`) downloads at runtime to `<data_dir>\models`
+  (HF cache forced there; copy `models\` next to the .exe to pre-seed). `.deps*`,
+  `deps/`, `models/` are **gitignored**. `align._last_error` records why
+  `available()` failed (surfaced in `karaoke.log`) — that's how the av DLL error was
+  found.
+- **Validated:** anchor+offset math exact on a noisy synthetic transcript; ASR
+  loads + transcribes (~0.5 s short clip); title-match fix confirmed live in the EXE
+  (`Into Starlight` → score 100).
+- **requirements.txt:** faster-whisper listed but **commented out** (optional).
+
+### C. Library — YOASOBI discography added
+Fetched YOASOBI's tracks into the cache (`_yfetch.py`, a one-off; `YOASOBI` block
+also added to `preload.py`). Lyrics stay gitignored; the curated list in
+`preload.py` is the committable record. (Removed a junk live-title cache file too.)
+
+### Quick recipes (this machine)
+```bash
+PY="%LOCALAPPDATA%/Programs/Python/Python312/python.exe"   # call explicitly
+"$PY" -m py_compile main.py align.py api.py fetch_lyrics.py songchange.py
+# sync-by-listening loads faster-whisper from .deps automatically (source run):
+"$PY" -c "import align; print(align.available())"
+curl -X POST http://127.0.0.1:8765/align          # trigger sync-by-listening
+```
