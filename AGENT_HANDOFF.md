@@ -274,3 +274,76 @@ replace the `<!-- STORE LINK -->` placeholder in `README.md`. Full steps:
 Committed as `BarnsL <252321079+BarnsL@users.noreply.github.com>` (the repo-local
 git identity was mis-set to `Barns <barnsl@pm.me>` — corrected to match every
 existing commit). **No `Co-Authored-By` trailer**, per this file's convention.
+
+---
+
+## Work done in the 2026-06-22 session (part 3): matching accuracy + render perf
+
+### 1. Song name was being stripped from 「」/『』 titles (`clean_title`, main.py)
+JP uploads put the song INSIDE brackets: `Daoko「COMIT COMET」(with BEATBROS.) -
+TVアニメ『よわよわ先生』OPテーマ`. The old `clean_title` *stripped* all bracketed text,
+leaving the generic `Daoko - TVアニメOPテーマ`, which fetched a DIFFERENT Daoko song
+and then false-confirmed (the sound-ID title was genericised to the same garbage).
+Fix: **extract** the 「…」 song (or a non-tie-in 『…』, which catches `『水星』`) instead
+of stripping it; `_is_generic_title()` stops a generic descriptor (テーマ…) from
+overriding a real Shazam ID. Coexists with another agent's "Artist / Song -ver-"
+MV-title handling (their `-ver-` strip + my bracket extract are both in `clean_title`).
+
+### 2. Concerts were read as one song (`is_live_or_compilation`, main.py)
+A video titled `【#FG3Dライブ】MAKE IT, BREAK IT` cleans to `MAKE IT, BREAK IT`, which IS
+a real song — so it title-matched and showed that one song's lyrics for the whole
+concert, and Shazam (can't fingerprint live arrangements) never corrected it.
+`is_live_or_compilation(title, duration)` flags live/concert/fes/medley/3D-LIVE
+keywords (JP+EN) or >12 min. In live mode `_on_track_change` **refuses the title**
+(no title-match/fetch), shows "🎤 Live set — listening…", and lets SOUND drive every
+track; `_recalibrate_loop` keeps re-listening fast (live songs often segue with no
+silent gap for the boundary detector), and the concert title can't override Shazam
+(`_consume_async` CJK-preference guard `... and not self._live_mode`). Live captures
+use a longer clip (≥8s) for better recognition.
+
+### 3. Scroll-through performance — READ THIS BEFORE TOUCHING THE RENDERER
+**The hard wall: a Tk `PhotoImage` create/paste of a wide scroll-block image costs
+~50–60ms on this machine** (`paint` itself is only ~11ms — the cost is the Tk image
+transfer, measured with a standalone bench). So each block SPAWN (`_render_img_block`)
+and each fill REPAINT (`_paint_block_img`→`photo.paste`) is ~50ms = ~3× the 16ms (60fps)
+frame budget, and the fill repainted on **every sung character**. That's the stutter.
+
+**DO NOT "fix" this by switching to text-item blocks (`_use_img=False`).** Measured:
+spawning one text block (~610 `create_text` items, 5/char outline) is ~260ms, and
+`cv.move` of a full stream (~7k text items) is **~480ms/frame (2fps)** because Tk
+re-rasterizes every glyph on each move. Images are pre-rasterized → cheap to move;
+text is catastrophic here. `_use_img` stays **True**.
+
+What actually helped (commit "Smooth out scrolling…"):
+- The belt `cv.move("strm", …)` stays **every frame** (smooth motion is cheap).
+- The expensive part (visibility scan + spawn/despawn + fill) runs on a frame
+  throttle (`_fill_skip`) AND is budgeted: `_spawn_budget=1` (spread the ~50ms
+  spawns; blocks appear 1200px off-screen so latency is invisible) and the fill
+  repaints at `_repaint_budget`/frame with a per-block `_fill_interval` (~5fps — a
+  coarse karaoke sweep reads fine; per-char pastes were the killer).
+- `_tick` caches `clean_title()` (was re-running ~5 regexes every frame).
+- **fps meter:** `/status` now reports `render_fps` (+ `perf`, `fps_target`,
+  `live_mode`). Use it to measure. NOTE it only updates while lyrics are actually
+  rendering (playing + lines loaded); it reads blank between songs.
+
+**Measuring perf reliably:** live YouTube readings are confounded by song content
+(line length/density changes the PIL load 2×). Use a controlled bench instead:
+instantiate `Overlay` with `api.start_api` and `_start_boundary` patched to no-ops,
+patch `_on_track_change` to a no-op, `ov.load(<cached .json>)`, set `scroll_dir="rl"`,
+feed a fake `media.get()` with an advancing `position`, wrap `_ticker_update` to count
+calls, run `_tick()` + `mainloop()` for ~6s. Same 90-line song: **47 → 66 fps (+40%)**
+old→new. (Real-world over video is lower for both — the layered window compositing
+over the playing video is extra cost outside the app's control.)
+
+**The real ceiling** is still tkinter Canvas + Tk image transfer. A genuinely smooth
+60fps with a per-character fill needs a different renderer (Qt/QML, Direct2D, or a
+GL/skia canvas) — see the long-standing note in "Known limits". The above makes the
+*current* renderer hit/clear its target and bounds the frame-time spikes; it does not
+remove the underlying ~50ms/PhotoImage wall.
+
+### Git / multi-machine (reinforced this session)
+The repo is worked on from multiple computers / Claude installs simultaneously —
+**always `git fetch` + rebase onto `origin/master` before every push.** This session
+caught 3 separate concurrent pushes from another machine (`32d1ab0`, `ee82b14`,
+`1dffbc5`) and combined a same-file `clean_title` collision cleanly. Contributors must
+stay **BarnsL only**; no `Co-Authored-By`.
