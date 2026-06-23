@@ -417,6 +417,29 @@ def clean_title(title, source=""):
     return t.strip(" -–—|/　").strip()
 
 
+# Titles that name an EVENT (a whole concert / festival / medley), not a song.
+_LIVE_RE = re.compile(
+    r"\b(?:live|concert|fes(?:tival)?|tour|setlist|set\s*list|medley|megamix|"
+    r"mega\s*mix|non-?stop|dj\s*set|full\s*(?:album|live|concert|set)|"
+    r"rock\s*japan|rising\s*sun|summer\s*sonic|fuji\s*rock|countdown|"
+    r"anniversary\s*live)\b"
+    r"|ライブ|ﾗｲﾌﾞ|生放送|コンサート|フェス|ツアー|メドレー|セットリスト|セトリ|"
+    r"周年ライブ|[0-9]+\s*周年|[0-9]\s*d\s*live",
+    re.I,
+)
+
+
+def is_live_or_compilation(title, duration=None):
+    """True for a long video, or one whose title says 'live / concert / festival /
+    medley / 3D LIVE / メドレー' — almost always MANY songs under one title, where
+    the title names the EVENT, not the song. Such videos must be driven by SOUND:
+    title-matching them is what makes a whole concert show one (wrong) song's
+    lyrics, with no way for Shazam to override a title that's a real song name."""
+    if duration and duration > 12 * 60:      # >12 min ⇒ multi-song in practice
+        return True
+    return bool(_LIVE_RE.search(title or ""))
+
+
 # ── Lyrics data ──────────────────────────────────────────────────────
 
 @dataclass
@@ -699,6 +722,7 @@ class Overlay:
         self._sound_song = None       # last (title, artist) heard by Shazam
         self._fast_calib = 0          # remaining quick re-locks after a song change
         self._recal_after = None      # pending recalibrate timer id
+        self._live_mode = False       # concert/compilation → sound-only, no title-match
 
         self.index = LyricsIndex()
         self.media = MediaWatcher()
@@ -735,19 +759,31 @@ class Overlay:
         self._sound_song = None    # new video → re-identify by ear
         log.info("track change: %r / %r (dur %s)", title, artist, duration)
 
-        # Provisional: show the title/artist match instantly (so there's no
-        # dead air) — but AUDIO is primary and confirms/overrides it below.
-        path = self.index.match(artist, title, duration)
-        if path and self._file_valid(path, duration):
-            if path != self._lyrics_path:
-                self.load(path)
-            self._maybe_translate()
-        else:
+        self._live_mode = is_live_or_compilation(title, duration)
+        if self._live_mode:
+            # A concert / live / festival / compilation: the title is the EVENT,
+            # not a song. Title-matching it is what made a whole concert show one
+            # song's lyrics — so refuse the title entirely and let SOUND drive.
+            # The song-change detector + the fast re-ID loop pick up each track.
+            log.info("live/compilation title → ignoring title, identifying by sound")
             self.lines, self._lyrics_path, self.idx = [], None, -1
             self._kara = []
             self._verified = False
-            self._hint(f"♪ {title} — identifying…")
-            self._start_fetch(artist, title, duration)
+            self._hint("🎤 Live set — listening for each song…")
+        else:
+            # Provisional: show the title/artist match instantly (so there's no
+            # dead air) — but AUDIO is primary and confirms/overrides it below.
+            path = self.index.match(artist, title, duration)
+            if path and self._file_valid(path, duration):
+                if path != self._lyrics_path:
+                    self.load(path)
+                self._maybe_translate()
+            else:
+                self.lines, self._lyrics_path, self.idx = [], None, -1
+                self._kara = []
+                self._verified = False
+                self._hint(f"♪ {title} — identifying…")
+                self._start_fetch(artist, title, duration)
 
         # PRIMARY signal: identify by sound and let it decide the real song.
         self._start_identify(seconds=6, attempts=2)
@@ -853,6 +889,8 @@ class Overlay:
         if self._identifying:
             return
         self._identifying = True
+        if self._live_mode:
+            seconds = max(seconds, 8)   # live arrangements need more signal to ID
 
         def work():
             res = None
@@ -912,10 +950,13 @@ class Overlay:
                 elif self.recal_secs:
                     self._start_identify(seconds=4, attempts=1)
                     confirmed = self._verified and self._sound_song is not None
-                    watched = confirmed and self._boundary is not None and self.boundary_on
+                    watched = (confirmed and self._boundary is not None
+                               and self.boundary_on and not self._live_mode)
                     if watched:
                         # The detector is listening for the next song, so blind
-                        # polling is wasteful — just re-lock timing slowly.
+                        # polling is wasteful — just re-lock timing slowly. (In a
+                        # live set songs often segue with no silent gap for the
+                        # detector to catch, so live mode keeps polling instead.)
                         nxt = max(self.recal_secs, 25)
                     else:
                         # poll as fast as feasible while the song isn't confirmed by
@@ -994,7 +1035,8 @@ class Overlay:
                 # ("Kira" for 綺羅), so when the player's own title is CJK keep
                 # that original script for fetching/matching.
                 g_artist, g_title = (self._track or ("", ""))
-                if _has_cjk(g_title) and not _has_cjk(title) and not _is_generic_title(g_title):
+                if (_has_cjk(g_title) and not _has_cjk(title)
+                        and not _is_generic_title(g_title) and not self._live_mode):
                     f_artist, f_title = (g_artist or artist), g_title
                 else:
                     f_artist, f_title = artist, title
