@@ -349,16 +349,51 @@ class MediaWatcher:
         self._stop = True
 
 
+# Tie-in descriptors that are NOT a song name — a title that cleans down to only
+# these ('TVアニメOPテーマ', 'OP Theme') has no real song and must defer to sound.
+_GENERIC_TITLE_RE = re.compile(
+    r"^(?:tv)?(?:アニメ|anime)?"
+    r"(?:op|ed|opening|ending|主題歌|オープニング|エンディング|テーマ|theme)+$",
+    re.I,
+)
+
+
+def _is_generic_title(s):
+    """True if `s` is only a tie-in tag like 'TVアニメOPテーマ' / 'OP Theme', with
+    no actual song name (so it must never override a Shazam sound-ID)."""
+    compact = re.sub(r"[\s　・:：\-–—|/／'\"]+", "", s or "")
+    return bool(compact) and bool(_GENERIC_TITLE_RE.fullmatch(compact))
+
+
 def clean_title(title, source=""):
-    """Strip noise from a media title so it matches lyric metadata — removes a
-    trailing '- YouTube', bracketed notes, 'Official MV / Lyric Video / HD' tags,
-    and **cover credits** ('天誅 / covered by 幸祜' → '天誅'). A cover's lyrics are
-    the original song's, so we search the real song title, not the cover credit.
-    `source` is the player app id (browser titles get extra cleanup)."""
-    t = title
+    """Reduce a media title to the actual SONG NAME so it matches lyric metadata.
+
+    Japanese uploads name the song inside 「」 (and put the work/anime in 『』):
+    'Daoko「COMIT COMET」(with BEATBROS.) - TVアニメ『よわよわ先生』OPテーマ' → the song
+    is **COMIT COMET**, not 'TVアニメOPテーマ'. So we EXTRACT the bracketed song
+    rather than stripping it — stripping 「」 used to leave only the generic
+    descriptor and fetch a *different* song. Also drops 'Official MV / HD' tags
+    and **cover credits** ('天誅 / covered by 幸祜' → '天誅'). `source` is the player
+    app id (browser titles get extra cleanup)."""
+    t = title or ""
     if any(h in source for h in BROWSER_HINTS):
         t = re.sub(r"\s*[-–—|]\s*YouTube\s*$", "", t, flags=re.I)
-    t = re.sub(r"\s*[\[(【「『].*?[\])】」』]", "", t)            # (Official MV) etc.
+
+    # The song is the 「…」 content if present; otherwise a 『…』 that is NOT a
+    # work-name tie-in (i.e. not '『Anime』OPテーマ') — that covers '『水星』' = the song.
+    song = None
+    mq = re.search(r"「([^」]+)」", t)
+    if mq:
+        song = mq.group(1)
+    else:
+        md = re.search(r"『([^』]+)』(\s*(?:tv|アニメ|anime|op|ed|opening|ending|主題歌|テーマ)\b)?",
+                       t, flags=re.I)
+        if md and not md.group(2) and not _is_generic_title(md.group(1)):
+            song = md.group(1)
+    if song and song.strip():
+        t = song.strip()
+
+    t = re.sub(r"\s*[\[(【「『][^\])】」』]*[\])】」』]", "", t)       # leftover (Official MV) etc.
     # cover / "tried singing" credits → keep only the song title
     t = re.sub(r"\s*([/／]\s*)?\bcover(ed)?\s+by\b.*$", "", t, flags=re.I)
     t = re.sub(r"\s*[/／]\s*cover\b.*$", "", t, flags=re.I)
@@ -376,6 +411,9 @@ def clean_title(title, source=""):
         r"long\s*ver|self\s*cover|live)\b[^-–—]*[-–—]?\s*$",
         "", t, flags=re.I,
     )
+    # a trailing anime tie-in with no song info ('… - TVアニメOPテーマ')
+    t = re.sub(r"\s*[-–—/／]\s*(?:tv\s*)?(?:アニメ|anime)\s*.*?"
+               r"(?:op|ed|主題歌|テーマ|opening|ending|theme).*$", "", t, flags=re.I)
     return t.strip(" -–—|/　").strip()
 
 
@@ -956,7 +994,7 @@ class Overlay:
                 # ("Kira" for 綺羅), so when the player's own title is CJK keep
                 # that original script for fetching/matching.
                 g_artist, g_title = (self._track or ("", ""))
-                if _has_cjk(g_title) and not _has_cjk(title):
+                if _has_cjk(g_title) and not _has_cjk(title) and not _is_generic_title(g_title):
                     f_artist, f_title = (g_artist or artist), g_title
                 else:
                     f_artist, f_title = artist, title
