@@ -209,3 +209,68 @@ Re-fetch a wrong/romaji cached song from the live app: tray **⚑ Wrong lyrics**
   carry the load).
 - tkinter Canvas is CPU-bound (no GPU); a Qt/Direct2D rewrite is the only
   step-change for raw render performance (deferred).
+
+---
+
+## Work done in the 2026-06-22 session (part 2): Store packaging + auto-updater
+
+Goal: make this a **true one-click install for a non-technical user**. Diagnosis:
+the app code was fine — the blocker is Windows trust. **Smart App Control blocks
+unsigned `.exe`/installers outright**, and SmartScreen warns on them; there is no
+free way to get that trust. Chosen path: **Microsoft Store (MSIX)** — the Store
+signs the package with a Microsoft-trusted identity, so it installs with no
+warnings and auto-updates. (See `STORE_SUBMISSION.md`.)
+
+### New files
+- **`appdata.py`** — single source of truth for the writable data dir. **Behaviour
+  change:** portable `.exe` still uses next-to-exe, but a **packaged (MSIX) install
+  uses `%LOCALAPPDATA%\DesktopKaraoke`** because the MSIX install dir is read-only.
+  `main.py` (`_DATA`) and `fetch_lyrics.py` (`LYRICS_DIR`) both call
+  `appdata.data_dir()` so they always agree. `is_packaged()` uses
+  `GetCurrentPackageFullName`.
+- **`version.py`** — `__version__` single source; `api.py` `/health` and
+  `updater.py` read it. Bump it with the MSIX `Version` when releasing.
+- **`updater.py`** — in-app updater. **Store/MSIX:** no-op (`check()` returns None;
+  Store updates it). **Portable `.exe`:** checks GitHub Releases; if a newer build
+  is published as a **`.zip` of the onedir folder**, downloads it and launches a
+  helper (`apply_update.cmd`) that waits for the app to exit, `robocopy /E` (no
+  purge → lyric cache + settings survive), and relaunches. **Source:** no self-
+  update. Wired into `main()`: tray item "Check for updates" / "⬆ Install update
+  vX" + a 15 s-delayed background check that notifies via the tray.
+- **`make_assets.py`** — renders the Store tiles/logos from `icon.ico` via
+  `make_icon._compose` into an `Assets/` dir.
+- **`packaging/build_msix.ps1`** + **`AppxManifest.template.xml`** — build a
+  full-trust MSIX (`runFullTrust` + `internetClient`). Produces
+  `dist\DesktopKaraoke.msix`. Pass `-CertThumbprint` for a signed local-test
+  package; leave unsigned for Store upload (the Store re-signs).
+- **`STORE_SUBMISSION.md`** — the Partner Center steps that can't be scripted.
+
+### requirements.txt (Python 3.13 install fixes)
+`winsdk>=1.0.0b10` (only betas are published; bare `>=1.0` is unsatisfiable) and
+`audioop-lts; python_version >= "3.13"` (PEP 594 removed stdlib `audioop`, which
+pydub/shazamio need). `DesktopKaraoke.spec` hiddenimports now also list
+`appdata, version, updater`.
+
+### Build / test env notes for THIS machine (differs from part-1 notes)
+- Base interpreter is **Python 3.13** (`%LOCALAPPDATA%\Programs\Python\Python313`),
+  used via a per-project **`.venv`** (the `python` on PATH is a pip-less tool venv).
+  Build with `.venv\Scripts\python.exe -m PyInstaller …` (or `build_msix.ps1`).
+- **Smart App Control is ENFORCED** here → a freshly built unsigned `.exe` is
+  **blocked at launch** ("Application Control policy has blocked this file"), and
+  **Developer Mode is OFF** → loose-file `Add-AppxPackage -Register` fails
+  `0x80073CFF`. So the MSIX couldn't be launch-tested locally. It IS validated:
+  `makeappx pack` succeeds, Windows accepts the manifest (derives
+  `BarnsL.DesktopKaraoke_1.0.0.0_x64__…`), and the signed package has all required
+  parts (`AppxManifest.xml`, `AppxBlockMap.xml`, `AppxSignature.p7x`, `resources.pri`,
+  assets). Store-signed builds run fine — this is a local-only limitation.
+
+### PENDING (only the repo owner can do it)
+Partner Center account ($19) → reserve "Desktop Karaoke" → put the 3 identity
+values into `build_msix.ps1` → upload `dist\DesktopKaraoke.msix` → submit. Then
+replace the `<!-- STORE LINK -->` placeholder in `README.md`. Full steps:
+`STORE_SUBMISSION.md`.
+
+### Contributor hygiene (honored)
+Committed as `BarnsL <252321079+BarnsL@users.noreply.github.com>` (the repo-local
+git identity was mis-set to `Barns <barnsl@pm.me>` — corrected to match every
+existing commit). **No `Co-Authored-By` trailer**, per this file's convention.

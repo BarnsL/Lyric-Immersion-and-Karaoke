@@ -11,7 +11,7 @@ hiddenimports = [
     "winsdk.windows.storage.streams",
     # local modules imported lazily inside functions — pin them so the
     # frozen build always includes them.
-    "appdata", "songchange", "api", "character", "recognize", "fetch_lyrics",
+    "appdata", "version", "updater", "songchange", "api", "character", "recognize", "fetch_lyrics",
 ]
 
 # Packages that ship data files / dynamically-imported submodules.

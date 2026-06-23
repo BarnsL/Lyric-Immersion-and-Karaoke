@@ -38,7 +38,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-API_VERSION = "1.0"
+from version import __version__ as API_VERSION
 PLAYING = 4
 _MAX_BODY = 64 * 1024          # cap POST bodies — we don't need a payload anyway
 _START = time.time()

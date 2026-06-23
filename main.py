@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from character import Character
+import updater
 
 # Run every subprocess (git, PowerShell, pip) with NO console window — otherwise
 # Windows flashes a black cmd window each time the app shells out.
@@ -1870,6 +1871,45 @@ def main():
         pystray.MenuItem(lambda i: f"Reset  (now {ov.offset:+.1f}s)", _reset),
     )
 
+    # ── Updates ──────────────────────────────────────────────────────
+    # Store (MSIX) installs auto-update via the Microsoft Store; the portable
+    # .exe self-updates from GitHub Releases. updater.py handles the difference.
+    _upd = {"info": None}
+
+    def _upd_label(i=None):
+        info = _upd["info"]
+        return f"⬆  Install update v{info['version']}" if info else "Check for updates"
+
+    def _on_updates(icon_, *_):
+        info = _upd["info"]
+        if info:                                   # an update is known → apply it
+            try: icon_.notify(f"Updating to v{info['version']}…", "Desktop Karaoke")
+            except Exception: pass
+            def _do():
+                if updater.stage_update(info, log=log.info):
+                    ov.root.after(0, lambda: _quit(icon_))   # exit so the helper swaps + relaunches
+            threading.Thread(target=_do, daemon=True).start()
+            return
+        try: icon_.notify("Checking for updates…", "Desktop Karaoke")    # manual check
+        except Exception: pass
+        def _check():
+            got = updater.check()
+            _upd["info"] = got
+            try: icon_.update_menu()
+            except Exception: pass
+            try: icon_.notify(
+                f"Update v{got['version']} available — open the tray menu to install." if got
+                else f"You're up to date (v{updater.current_version()}).", "Desktop Karaoke")
+            except Exception: pass
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _on_update_found(info):                    # background check found one
+        _upd["info"] = info
+        try: icon.update_menu()
+        except Exception: pass
+        try: icon.notify(f"Desktop Karaoke v{info['version']} is available.", "Update available")
+        except Exception: pass
+
     menu = pystray.Menu(
         pystray.MenuItem("Presets", preset_menu),
         pystray.Menu.SEPARATOR,
@@ -1898,9 +1938,11 @@ def main():
         pystray.MenuItem("Re-fetch lyrics", _refetch),
         pystray.MenuItem("Show / Hide", _toggle),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem(_upd_label, _on_updates),
         pystray.MenuItem("Quit", _quit),
     )
     icon = pystray.Icon("desktop-karaoke", make_icon(), "Desktop Karaoke", menu)
+    updater.background_check(_on_update_found)   # notify if a newer release exists (portable build)
     threading.Thread(target=icon.run, daemon=True).start()
     ov.run()
 
