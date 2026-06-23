@@ -290,6 +290,70 @@ call; lanes + block height adapt per song.
   present the fetcher uses **DeepL**, which is noticeably better for JP/CJK→EN.
   (`fetch_lyrics._make_translator`.)
 
+## 7. Aligning lyrics to the HEARD audio (transcription vs sonic matching)
+
+**The problem.** Sync today is GSMTC position + a Shazam **offset** that calibrates
+when Shazam can identify the playing track. When it *can't* — a fan MV, a remix, an
+"anniversary special ver." with a different intro length (e.g. *Into Starlight*,
+5:50 vs the 5:36 single) — there's no anchor, so the cached LRC timestamps don't
+line up and the only fix is a manual nudge. We want to align the lyrics to *what's
+actually being heard*, not to a catalog match. Surveyed two families.
+
+### Family A — transcription anchoring (ASR; **no reference audio needed**)
+Capture a few seconds of the live vocals, **transcribe** them, then fuzzy-match the
+transcript against the song's *already-cached* lyric lines to find which line is
+playing now → `offset = cached_line_time − live_position`. The key insight: we
+don't need an accurate transcript, only enough to **locate** the current line among
+known lyrics (a forgiving fuzzy-match), so noisy sung-vocal ASR is acceptable.
+
+- **Tooling.** [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)
+  (CTranslate2; ~2× faster than openai-whisper on CPU, int8 quant, most portable),
+  [`whisper-timestamped`](https://github.com/linto-ai/whisper-timestamped)
+  (DTW/cross-attention word timing — more robust than stable-ts's token-prob
+  timestamps), [`WhisperX`](https://github.com/m-bain/whisperx) (adds VAD +
+  wav2vec2 word alignment + optional **Demucs vocal isolation**, heavier).
+- **Why it fits us.** It matches *content* (words) to *our* cached lyrics, so it
+  works for any cut/intro/tempo and needs **no catalog** — exactly the case Shazam
+  fails. The `tiny`/`base` model on CPU is feasible for an **occasional** anchor.
+- **Costs / honest limits.** Adds a real dependency (faster-whisper + a ~40–150 MB
+  model) and CPU; sung Japanese over backing music is hard for ASR (mitigated by
+  the fuzzy anchor, and further by Demucs vocal isolation — but Demucs is heavy).
+  Best run **on demand / at song start**, not continuously.
+
+### Family B — sonic alignment (audio↔audio cross-correlation; **needs reference audio**)
+[`audio-offset-finder`](https://github.com/bbc/audio-offset-finder) (MFCC
+cross-correlation, ~0.01 s accuracy), [`audalign`](https://pypi.org/project/audalign/),
+or chroma cross-correlation find the offset between a **reference** recording and
+the live capture extremely accurately and cheaply. But we only cache LRC **text**,
+not audio — and storing per-song reference audio is a storage + copyright problem.
+This is essentially what Shazam already does; the technique isn't the gap, the
+*missing reference for the specific cut* is. (Idea: when Shazam *does* confirm a
+song, stash a short chroma "anchor" at a known time and cross-correlate against it
+next time — but a different cut may not match it. Limited.)
+
+### Real-time research systems
+On-line audio-to-lyrics alignment exists ([Park et al. 2024 — chroma + phonetic for
+classical/opera](https://laurenceyoon.github.io/real-time-lyrics-alignment/);
+[on-line alignment vs a reference performance, arXiv:2107.14496](https://arxiv.org/pdf/2107.14496))
+but targets isolated/classical voice with a reference, not mixed pop over loopback.
+
+### Recommendation — phased, opt-in
+1. **Phase 1 (best effort/ROI): on-demand Whisper anchor.** A tray action + API
+   `POST /align` ("sync by listening"): capture ~8–10 s, `faster-whisper` (`base`,
+   int8, CPU) → fuzzy-match (rapidfuzz) the transcript to cached lines → set the
+   offset. One-shot, opt-in, no continuous CPU. Directly fixes unidentifiable cuts.
+   Reuses the existing loopback capture (`recognize.py`).
+2. **Phase 2 (quality): Demucs vocal isolation** before ASR, and optional periodic
+   re-anchor to track drift. Much heavier — opt-in / GPU-friendly only.
+3. **Phase 0 (cheap stop-gap): vocal-onset offset.** Reuse the RMS/VAD from
+   `songchange.py` to estimate the first sustained vocal onset and align it to the
+   first lyric line — catches the common "MV has a longer intro" case with no new
+   deps, though it's only a rough start anchor.
+
+**Verdict:** Family A / Phase 1 is the right first build — it's the only approach
+that aligns to the heard sound *without a catalog or reference audio*, which is the
+actual failure mode. Keep it **opt-in** (dependency + CPU weight) and **on-demand**.
+
 ---
 
 ## What changed in code (this pass)
@@ -329,3 +393,11 @@ GSMTC, pitch accent) is intentionally deferred for the reasons above.
   [ruptures — change-point detection (music segmentation example)](https://github.com/deepcharles/ruptures) — the approach behind `songchange.py`
 - [animelyrics (PyPI)](https://pypi.org/project/animelyrics/) ·
   [Miraikyun](https://miraikyun.com/) — anime/Vocaloid romaji + English (plain text)
+- **Lyric↔audio alignment (§7):**
+  [faster-whisper](https://github.com/SYSTRAN/faster-whisper) ·
+  [whisper-timestamped](https://github.com/linto-ai/whisper-timestamped) ·
+  [WhisperX](https://github.com/m-bain/whisperx) (VAD + word align + Demucs) ·
+  [audio-offset-finder](https://github.com/bbc/audio-offset-finder) ·
+  [audalign](https://pypi.org/project/audalign/) ·
+  [Real-time lyrics alignment (Park et al. 2024)](https://laurenceyoon.github.io/real-time-lyrics-alignment/) ·
+  [On-line audio-to-lyrics alignment (arXiv:2107.14496)](https://arxiv.org/pdf/2107.14496)
