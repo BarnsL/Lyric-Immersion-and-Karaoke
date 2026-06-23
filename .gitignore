@@ -56,7 +56,7 @@ priconfig.xml
 
 # Local 3h-watch + release packaging artifacts
 _monitor.py
-_monitor.jsonl
+_monitor*.jsonl
 _zip_release.py
 DesktopKaraoke-portable.zip
 DesktopKaraoke-portable.zip.sha256

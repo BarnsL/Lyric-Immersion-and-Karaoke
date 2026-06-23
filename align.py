@@ -63,9 +63,11 @@ def _ensure_deps_path():
         if hasattr(os, "add_dll_directory"):
             for sub in ("", "ctranslate2", "ctranslate2.libs", "av", "av.libs",
                         "tokenizers", "onnxruntime/capi", "numpy.libs",
-                        # CUDA runtime (cuBLAS / cuDNN) for GPU transcription —
-                        # present only when the GPU extras were vendored.
-                        "nvidia/cublas/bin", "nvidia/cudnn/bin"):
+                        # CUDA runtime (cuBLAS / cuDNN / nvRTC) for GPU transcription
+                        # — present only when the GPU extras were vendored or fetched
+                        # on demand by gpu_setup.
+                        "nvidia/cublas/bin", "nvidia/cudnn/bin",
+                        "nvidia/cuda_nvrtc/bin"):
                 d = cand / sub if sub else cand
                 try:
                     if d.is_dir():

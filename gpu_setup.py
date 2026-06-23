@@ -1,0 +1,257 @@
+"""Optional GPU acceleration — fetched on demand, never bundled.
+
+Transcription (sync-by-listening and last-resort lyric *generation*) runs on the
+CPU by default and that is fine: a 16-second clip transcribes in ~2 seconds, and
+generation is a rare last-resort path. GPU (CUDA) makes it a couple of seconds
+faster per chunk — a marginal win that costs **~1.9 GB** of NVIDIA cuBLAS/cuDNN
+libraries. Bundling that into everyone's install (most machines can't even use it)
+would be absurd, so it is **opt-in and downloaded on demand** for the user who
+explicitly wants it and has an NVIDIA GPU.
+
+The libraries are the SAME official NVIDIA wheels that ``pip install faster-whisper
+[cuda]`` would pull — fetched straight from **PyPI** (we host nothing) at the exact
+versions that match the bundled CTranslate2, then unpacked next to the app where
+``align._ensure_deps_path`` already looks (``<data_dir>/deps/nvidia/...``). On the
+next transcription, ``align`` finds the cuBLAS/cuDNN DLLs and uses CUDA; with no
+GPU or no libraries it silently stays on the CPU.
+
+SECURITY (this downloads native DLLs, so it is hardened like the updater):
+  • **Verified HTTPS, PyPI hosts only** — the metadata comes from ``pypi.org`` and
+    the wheels from ``files.pythonhosted.org`` over a cert-verifying TLS context;
+    any other host/scheme is refused, so a tampered response can't redirect the
+    download elsewhere.
+  • **Integrity checked, fail-closed** — every wheel is verified against the
+    SHA-256 that PyPI publishes in its own JSON metadata; a mismatch aborts and
+    nothing is installed.
+  • **Safe extraction** — wheels are unzipped with zip-slip protection and a size
+    cap, and only the ``nvidia/`` payload is written.
+  • A ``.gpu_ready`` marker is written ONLY after every wheel verified + extracted,
+    so a half-finished download never looks installed.
+
+Standard library only.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import ssl
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
+
+import appdata
+
+# Pinned to the versions that ship with the bundled CTranslate2 (4.8.0) — the same
+# set vendored for local GPU builds. cuBLAS + cuDNN are what CTranslate2 loads on
+# CUDA; nvRTC backs runtime kernel compilation.
+_PKGS = (
+    ("nvidia-cublas-cu12", "12.9.2.10"),
+    ("nvidia-cudnn-cu12", "9.23.2.1"),
+    ("nvidia-cuda-nvrtc-cu12", "12.9.86"),
+)
+_MARKER = ".gpu_ready"
+_SENTINEL = "nvidia/cublas/bin/cublas64_12.dll"   # the keystone DLL CTranslate2 needs
+_MAX_WHEEL = 2 * 1024 ** 3        # cap any single wheel download at 2 GB
+_CTX = ssl.create_default_context()   # verifies TLS certs — never disabled
+_UA = "DesktopKaraoke-gpu-setup"
+
+# Rough download footprint, shown to the user before they commit to it.
+APPROX_MB = 1500
+
+
+_gpu_present = None        # memoized — GPU presence can't change during a session
+
+
+def nvidia_gpu_present() -> bool:
+    """True if an NVIDIA GPU + driver is installed — the driver always provides
+    ``nvcuda.dll``, so loading it is a cheap, dependency-free probe. Memoized
+    because the tray re-checks it on every menu render. (Having the GPU doesn't
+    mean the CUDA *libraries* are here yet — that's what the download provides;
+    see ``gpu_ready``.)"""
+    global _gpu_present
+    if _gpu_present is None:
+        try:
+            import ctypes
+            ctypes.WinDLL("nvcuda.dll")
+            _gpu_present = True
+        except Exception:
+            _gpu_present = False
+    return _gpu_present
+
+
+def _deps_dir() -> Path:
+    """The writable ``deps`` folder next to the app, where ``align`` looks for
+    vendored libraries. Created if missing."""
+    d = appdata.data_dir() / "deps"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def gpu_ready(deps: Path | None = None) -> bool:
+    """True once the CUDA libraries are fully installed (marker present and the
+    keystone cuBLAS DLL on disk)."""
+    deps = deps or _deps_dir()
+    return (deps / _MARKER).exists() and (deps / _SENTINEL).exists()
+
+
+def status() -> str:
+    """One-word state for the tray label: 'ready', 'available' (GPU present, not
+    yet downloaded), or 'none' (no NVIDIA GPU)."""
+    if gpu_ready():
+        return "ready"
+    return "available" if nvidia_gpu_present() else "none"
+
+
+def _is_pypi_https(url: str) -> bool:
+    """True only for an https:// URL on PyPI's own hosts. Every fetch is gated
+    through this so a manipulated metadata response can't point the download at an
+    attacker host or downgrade to plain HTTP."""
+    try:
+        u = urllib.parse.urlparse(url or "")
+    except Exception:
+        return False
+    if u.scheme != "https":
+        return False
+    host = (u.hostname or "").lower()
+    return host in ("pypi.org", "files.pythonhosted.org")
+
+
+def _get(url: str, timeout: float = 15.0) -> bytes:
+    if not _is_pypi_https(url):
+        raise ValueError("refusing non-PyPI or non-HTTPS URL")
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    with urllib.request.urlopen(req, timeout=timeout, context=_CTX) as r:
+        return r.read(4 * 1024 * 1024)        # metadata JSON is small
+
+
+def _wheel_for(name: str, ver: str):
+    """Resolve a package@version to its Windows wheel (url, sha256) via PyPI's
+    JSON metadata — picking the cp-agnostic ``win_amd64`` wheel NVIDIA publishes."""
+    data = json.loads(_get(f"https://pypi.org/pypi/{name}/{ver}/json"))
+    best = None
+    for f in data.get("urls", []) or []:
+        fn = (f.get("filename") or "").lower()
+        url = f.get("url") or ""
+        if fn.endswith("win_amd64.whl") and _is_pypi_https(url):
+            sha = (f.get("digests") or {}).get("sha256")
+            if sha:
+                best = (url, sha.lower())
+                break
+    if not best:
+        raise RuntimeError(f"no verified win_amd64 wheel for {name} {ver}")
+    return best
+
+
+def _safe_members(zf: zipfile.ZipFile, base: Path):
+    """Yield the members under ``nvidia/`` whose paths resolve INSIDE base
+    (zip-slip guard); skip wheel metadata."""
+    root = base.resolve()
+    for name in zf.namelist():
+        if not name.startswith("nvidia/") or name.endswith("/"):
+            continue
+        target = (root / name).resolve()
+        if target != root and root not in target.parents:
+            raise RuntimeError(f"unsafe path in wheel: {name!r}")
+        yield name
+
+
+def _download_wheel(url: str, sha256: str, dest: Path, on_bytes=None) -> Path:
+    """Stream a wheel to disk over verified HTTPS (size-capped) and verify its
+    SHA-256 against PyPI's digest — fail-closed (a mismatch raises and the partial
+    file is removed)."""
+    if not _is_pypi_https(url):
+        raise ValueError("refusing non-PyPI wheel URL")
+    h = hashlib.sha256()
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    total = 0
+    with urllib.request.urlopen(req, timeout=120, context=_CTX) as r, \
+            open(dest, "wb") as f:
+        size = int(r.headers.get("Content-Length") or 0)
+        while True:
+            chunk = r.read(512 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_WHEEL:
+                raise RuntimeError("wheel exceeds size cap")
+            h.update(chunk)
+            f.write(chunk)
+            if on_bytes:
+                try:
+                    on_bytes(total, size)
+                except Exception:
+                    pass
+    if h.hexdigest() != sha256:
+        try:
+            dest.unlink()
+        except Exception:
+            pass
+        raise RuntimeError("wheel checksum mismatch — refusing GPU libraries")
+    return dest
+
+
+def download_gpu_libs(progress=None, log=None) -> bool:
+    """Download + install the CUDA libraries on demand. Returns True on full
+    success (GPU then usable on the next transcription), False on any failure —
+    in which case nothing is marked ready and the app stays on the CPU.
+
+    ``progress(pkg_index, pkg_total, name, done_bytes, total_bytes)`` is called as
+    it streams; ``log(msg)`` receives human-readable steps. Both optional."""
+    def _say(m):
+        if log:
+            try:
+                log(f"[gpu] {m}")
+            except Exception:
+                pass
+
+    if not nvidia_gpu_present():
+        _say("no NVIDIA GPU detected — GPU acceleration not applicable")
+        return False
+    if gpu_ready():
+        _say("CUDA libraries already installed")
+        return True
+
+    import tempfile
+    deps = _deps_dir()
+    staging = Path(tempfile.mkdtemp(prefix="dk_gpu_"))
+    try:
+        for i, (name, ver) in enumerate(_PKGS):
+            _say(f"resolving {name} {ver}")
+            url, sha = _wheel_for(name, ver)
+            whl = staging / f"{name}.whl"
+            _say(f"downloading {name} ({i + 1}/{len(_PKGS)})")
+            _download_wheel(
+                url, sha, whl,
+                on_bytes=lambda d, t, i=i, n=name:
+                    progress and progress(i, len(_PKGS), n, d, t))
+            _say(f"verifying + extracting {name}")
+            with zipfile.ZipFile(whl) as z:
+                for member in _safe_members(z, deps):
+                    out = deps / member
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(member) as src, open(out, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 1024)
+            try:
+                whl.unlink()
+            except Exception:
+                pass
+        if not (deps / _SENTINEL).exists():
+            raise RuntimeError("install incomplete — keystone DLL missing")
+        (deps / _MARKER).write_text("ok", encoding="ascii")
+        _say("CUDA libraries installed — GPU will be used on the next song")
+        return True
+    except Exception as e:
+        _say(f"failed ({e!r}); staying on CPU")
+        return False
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+if __name__ == "__main__":      # quick manual check
+    print("NVIDIA GPU present:", nvidia_gpu_present())
+    print("GPU libraries ready:", gpu_ready(), "→ status:", status())

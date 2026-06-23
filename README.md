@@ -156,6 +156,15 @@ and this one shows a "needs faster-whisper" hint. The ASR model (~75 MB) downloa
 once to the app's data folder on first use. Transcribing sung vocals over backing
 music is imperfect, but the fuzzy line-anchor tolerates a noisy transcript.
 
+> **GPU is optional — and not bundled on purpose.** Transcription runs on the CPU
+> by default and that's plenty (a 16-second clip takes ~2 seconds). If you have an
+> NVIDIA GPU and want the marginal speed-up, the tray shows **⚡ Enable GPU
+> acceleration** — it downloads the official NVIDIA CUDA libraries (~1.5 GB) once,
+> on demand, and uses the GPU from the next song on. Those libraries are far too
+> large (1.9 GB unpacked) to ship in everyone's install, most of which can't use
+> them, so they're fetched only if you ask. The item is hidden entirely on machines
+> with no NVIDIA GPU.
+
 ### Gets the *right* lyrics (sound is the authority)
 Titles are unreliable — two songs by the same artist share a vibe, MV titles are
 messy, and covers lie. So matching is **paranoid and sound-led**: a cached title

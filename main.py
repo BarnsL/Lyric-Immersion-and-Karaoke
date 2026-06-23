@@ -30,6 +30,7 @@ from pathlib import Path
 
 from character import Character
 import updater
+import gpu_setup
 
 # Run every subprocess (git, PowerShell, pip) with NO console window — otherwise
 # Windows flashes a black cmd window each time the app shells out.
@@ -1313,9 +1314,13 @@ class Overlay:
                                  args=(token, list(new)), daemon=True).start()
             if self._cur_duration and pos >= self._cur_duration - CHUNK:
                 break
+        if token == self._gen_token:
+            self._generating = False        # loop finished — clear the in-progress flag
 
     def _translate_generated(self, token, lines):
-        """Fill the English (marked ***) for generated lines, off the capture loop."""
+        """Fill the English (marked ***) for generated lines, off the capture loop.
+        Runs once per chunk in its own thread; does NOT touch _generating (that's the
+        capture loop's lifecycle, not the translation's)."""
         try:
             from fetch_lyrics import _translate_lines
             _translate_lines(lines, "ja")
@@ -1326,8 +1331,6 @@ class Overlay:
                 d["en"] = d["en"].strip() + " ***"
         if token == self._gen_token:
             self.root.after(0, lambda t=token: self._apply_generated(t))
-        if token == self._gen_token:
-            self._generating = False
 
     def _apply_generated(self, token):
         """(Tk thread) sort/dedup the accumulated lines, show them, and save the
@@ -2403,6 +2406,41 @@ def main():
     def _toggle_api(*_):   ov.root.after(0, lambda: ov.set_api(not ov.api_on))
     def _toggle_bound(*_): ov.root.after(0, lambda: ov.set_boundary(not ov.boundary_on))
     def _toggle_gen(*_):   ov.root.after(0, lambda: ov.set_generate(not ov.generate_on))
+
+    # ── Optional GPU acceleration ────────────────────────────────────────
+    # Transcription runs on the CPU by default (fine — 16s clip in ~2s). On an
+    # NVIDIA GPU the user can opt in to CUDA, which is a bit faster; the ~1.5 GB of
+    # libraries are downloaded on demand (gpu_setup) instead of bloating everyone's
+    # install. The item is hidden entirely on machines with no NVIDIA GPU.
+    _gpu = {"busy": False}
+
+    def _gpu_label(i=None):
+        if _gpu["busy"]:
+            return "⏳  Installing GPU acceleration…"
+        return ("⚡  GPU acceleration: on" if gpu_setup.gpu_ready()
+                else f"⚡  Enable GPU acceleration (~{gpu_setup.APPROX_MB} MB)")
+
+    def _on_gpu(icon_, *_):
+        if _gpu["busy"] or gpu_setup.gpu_ready() or not gpu_setup.nvidia_gpu_present():
+            return
+        _gpu["busy"] = True
+        try: icon_.update_menu()
+        except Exception: pass
+        try: icon_.notify("Downloading CUDA libraries (~1.5 GB) in the background — "
+                          "keep using the app; GPU kicks in when it's done.",
+                          "Desktop Karaoke")
+        except Exception: pass
+        def _do():
+            ok = gpu_setup.download_gpu_libs(log=log.info)
+            _gpu["busy"] = False
+            try: icon_.update_menu()
+            except Exception: pass
+            try: icon_.notify(
+                "GPU acceleration enabled — used from the next song on." if ok
+                else "Couldn't enable GPU acceleration; staying on CPU.",
+                "Desktop Karaoke")
+            except Exception: pass
+        threading.Thread(target=_do, daemon=True).start()
     git_menu = pystray.Menu(
         pystray.MenuItem("Auto-push new songs", _toggle_git,
                          checked=lambda i: ov.git_sync),
@@ -2472,6 +2510,9 @@ def main():
                          checked=lambda i: ov.boundary_on),
         pystray.MenuItem("Generate lyrics by ear when none found (AI, ***)", _toggle_gen,
                          checked=lambda i: ov.generate_on),
+        pystray.MenuItem(_gpu_label, _on_gpu,
+                         enabled=lambda i: not _gpu["busy"] and not gpu_setup.gpu_ready(),
+                         visible=lambda i: gpu_setup.nvidia_gpu_present()),
         pystray.MenuItem("Auto re-sync by sound", recal_menu),
         pystray.MenuItem("Library backup (Git)", git_menu),
         pystray.Menu.SEPARATOR,
