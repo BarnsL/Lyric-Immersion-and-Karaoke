@@ -673,13 +673,32 @@ class Overlay:
         self._fps = 16
         self._last_pos = 0.0
         self._strm_rem = 0.0
+        self._tick_n = 0           # frame counter for throttling the heavy ticker work
+        self._fill_skip = 3        # spawn/despawn/fill every Nth frame (set by _apply_perf)
+        self._last_raw_title = None  # cache so clean_title() isn't re-run every frame
+        self._last_src = None
+        self._clean_title_cache = ""
+        self._frame_ms = 0.0         # EWMA of render-frame interval (ms) → /status render_fps
+        self._last_tick_t = None
+        self._render_frame = False
+        self._spawn_budget = 1       # max scroll blocks to PIL-render per heavy frame
+                                     # (1: spawning a block allocates a new image +
+                                     # PhotoImage — the priciest op; off-screen, so
+                                     # spreading it across frames is invisible)
+        self._repaint_budget = 2     # max karaoke-fill repaints per heavy frame
+        self._fill_interval = 0.2    # min seconds between a block's fill repaints (~5fps)
         self._apply_perf()
         self._anim_id = None
         self._scroll_x = self._scroll_start = self._scroll_end = 0
         self._stream = []          # scroll-through ticker: live line blocks
         self._blk_seq = 0
         self._pil_fonts = {}       # cache of PIL fonts for image blocks
-        self._use_img = True       # render scroll blocks as images (fast); auto-off on failure
+        self._use_img = True       # image scroll blocks. Measured: a text-item block is
+                                   # FAR worse here — cv.move of a full stream (~7k text
+                                   # items) re-rasterizes every glyph at ~480ms/frame (2fps).
+                                   # Images are pre-rasterized (cheap to move); the only cost
+                                   # is the ~50ms PhotoImage create/paste, paid just on
+                                   # spawn/fill-repaint and throttled below.
         self._v_floor = 0.0        # min scroll speed for THIS song (anti-overlap)
         self._apply_scale()                            # sets fonts + layout + H
 
@@ -1095,6 +1114,18 @@ class Overlay:
     # ── main loop ──
 
     def _tick(self):
+        # Measure the interval between consecutive RENDER frames (only) for the
+        # /status render_fps readout — paused/no-music frames use a slower cadence
+        # and would skew it, so they're excluded.
+        now = time.time()
+        if self._render_frame and self._last_tick_t is not None:
+            dt = (now - self._last_tick_t) * 1000.0
+            if 0.0 < dt < 500.0:
+                self._frame_ms = (dt if self._frame_ms <= 0
+                                  else 0.9 * self._frame_ms + 0.1 * dt)
+        self._last_tick_t = now
+        self._render_frame = False
+
         self._consume_async()
         state = self.media.get()
 
@@ -1105,7 +1136,13 @@ class Overlay:
             self.root.after(120, self._tick)
             return
 
-        track = (state["artist"], clean_title(state["title"], state["source"]))
+        # clean_title() runs several regexes; the raw title rarely changes, so
+        # only recompute it when it does (this loop runs every frame).
+        rawt, src = state["title"], state["source"]
+        if rawt != self._last_raw_title or src != self._last_src:
+            self._last_raw_title, self._last_src = rawt, src
+            self._clean_title_cache = clean_title(rawt, src)
+        track = (state["artist"], self._clean_title_cache)
         if track != self._track:
             self._track = track
             self._on_track_change(track, self._trusted_duration(state))
@@ -1120,6 +1157,7 @@ class Overlay:
 
         if self.scroll_dir in ("lr", "rl"):       # continuous scroll-through
             self._ticker_update(pos)
+            self._render_frame = True
             self.root.after(self._fps, self._tick)
             return
 
@@ -1138,6 +1176,7 @@ class Overlay:
         elif new >= 0:
             self._karaoke(pos)
 
+        self._render_frame = True
         self.root.after(self._fps, self._tick)
 
     # ── drawing ──
@@ -1451,6 +1490,17 @@ class Overlay:
                 self.cv.move("strm", dx, 0)
         self._last_pos = pos
 
+        # The belt move above (one cv.move) is cheap and runs EVERY frame for
+        # smooth scrolling. Everything below — an O(lines) visibility scan,
+        # spawning/despawning blocks, and the PIL karaoke-fill repaints — is the
+        # expensive, variable-cost work that made scrolling stutter at 60fps. It
+        # needn't run every frame: blocks spawn 1200px off-screen (so a frame or
+        # two of spawn latency is invisible) and a fill sweeping at ~20fps looks
+        # identical — so do it every Nth frame, keeping the belt at full rate.
+        self._tick_n += 1
+        if self._tick_n % self._fill_skip:
+            return
+
         want = {}
         for i, ln in enumerate(self.lines):
             cx = center + d * v * ((ln.start + ln.end) / 2 - pos)
@@ -1459,14 +1509,25 @@ class Overlay:
         if want:
             self.cv.delete("hint")        # real lyrics showing → drop any stale hint
         have = {b["idx"] for b in self._stream}
-        for i, cx in want.items():
-            if i not in have:                       # spawn at absolute target
-                ln = self.lines[i]
-                dur = ln.end - ln.start
-                frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
-                b = self._spawn_block(i, frac)
-                self.cv.move(b["tag"], (cx - b["w"] / 2) - b["x"], 0)
-                self._stream.append(b)
+        # Spawn missing blocks, but only a couple per pass — each spawn PIL-renders
+        # an image (the costliest op), so creating several at once is what spiked
+        # frame time. Blocks appear 1200px off-screen, so a frame or two of spawn
+        # latency is invisible; render the nearest-to-centre (most imminent) first.
+        missing = sorted((i for i in want if i not in have),
+                         key=lambda i: abs(want[i] - center))
+        for i in missing[:self._spawn_budget]:
+            cx = want[i]
+            ln = self.lines[i]
+            dur = ln.end - ln.start
+            frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
+            b = self._spawn_block(i, frac)
+            self.cv.move(b["tag"], (cx - b["w"] / 2) - b["x"], 0)
+            self._stream.append(b)
+        # Despawn off-screen blocks, and advance karaoke fills — but cap PIL-paste
+        # repaints per pass (the other heavy op). Only blocks whose sung-count
+        # actually changed need it, and usually just the one line currently singing.
+        now = time.time()
+        repaints = 0
         for b in self._stream[:]:
             if b["idx"] not in want:
                 self.cv.delete(b["tag"])
@@ -1477,11 +1538,18 @@ class Overlay:
             frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
             if b.get("img"):
                 n = int(frac * b["nchars"] + 0.5)
-                if n != b["sung_n"]:                 # re-paint only when fill advances
+                # Each fill repaint is a ~50ms PhotoImage paste, so cap BOTH the
+                # repaints per frame AND each block's repaint rate — a karaoke
+                # sweep at ~5fps reads fine, while per-character pastes were what
+                # stalled the belt. Idle (not-currently-sung) blocks never repaint.
+                if (n != b["sung_n"] and repaints < self._repaint_budget
+                        and now - b.get("paint_t", 0.0) >= self._fill_interval):
                     b["sung_n"] = n
+                    b["paint_t"] = now
                     # paste into the existing PhotoImage (no new allocation) —
                     # the canvas reflects it without an itemconfig call
                     b["photo"].paste(self._paint_block_img(b["spec"], frac))
+                    repaints += 1
             else:
                 self._highlight_block(b, frac)
 
@@ -1710,9 +1778,11 @@ class Overlay:
         if self.perf == "fast":
             _OUTLINE = _OUTLINE_LITE     # 2 items/char, 30fps → much less to draw
             self._fps = 33
+            self._fill_skip = 2          # heavy ticker work every 2nd frame (~15fps)
         else:
             _OUTLINE = _OUTLINE_FULL     # 5 items/char, 60fps
             self._fps = 16
+            self._fill_skip = 3          # belt moves at 60fps; fills/spawns at ~20fps
 
     def set_quality(self, mode):
         self.perf = mode

@@ -89,6 +89,11 @@ def _status(app):
         "verified": app._verified,
         "heard_by_sound": app._sound_song,
         "boundary_detect": getattr(app, "boundary_on", None),
+        "live_mode": getattr(app, "_live_mode", None),
+        "perf": getattr(app, "perf", None),
+        "fps_target": (round(1000.0 / app._fps) if getattr(app, "_fps", 0) else None),
+        "render_fps": (round(1000.0 / app._frame_ms)
+                       if getattr(app, "_frame_ms", 0) else None),
         "line_count": len(app.lines),
         "current_line": _current_line(app),
     }
