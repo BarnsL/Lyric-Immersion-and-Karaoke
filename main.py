@@ -1943,14 +1943,14 @@ class Overlay:
         self._start_identify(seconds=5, attempts=1)
         self._arm_recal(6)
 
-    def _fire_onset_event(self):
+    def _fire_onset_event(self, pre_quiet=0.0):
         """Detector thread heard the song start after a quiet intro → Tk thread."""
         try:
-            self.root.after(0, self._on_song_onset)
+            self.root.after(0, lambda q=pre_quiet: self._on_song_onset(q))
         except Exception:
             pass
 
-    def _on_song_onset(self):
+    def _on_song_onset(self, pre_quiet=0.0):
         """The audio just kicked in after a leading quiet stretch — the end of an
         MV's cinematic / instrumental DEAD-SPACE intro. When Shazam can't ID the
         song (so it can't supply the real offset), anchor the lyric clock to THIS
@@ -1963,14 +1963,21 @@ class Overlay:
         if not (st and st.get("status") == PLAYING):
             return
         vpos = st.get("position", 0.0)
-        # Only a *leading* intro: the onset must land in the first ~50s, and after a
-        # real gap from t=0 (skip near-zero — that's a song that simply starts).
-        if not (1.0 < vpos < 50.0):
+        # Only a real LEADING dead-space intro — NOT a mid-song breakdown. The
+        # run-up must have been quiet for MOST of the time before the onset
+        # (pre_quiet ≈ vpos), and capped at ~25s. Without this, a brief quiet
+        # passage 40s into the song was mistaken for the intro and anchored the
+        # offset to ~-40s (a severe desync). pre_quiet is the leading-quiet length
+        # the detector measured just before the music kicked in.
+        if not (1.0 < vpos < 25.0 and pre_quiet >= max(3.0, vpos * 0.6)):
+            log.info("onset at %.1fs (quiet %.1fs) — not a leading intro; ignored",
+                     vpos, pre_quiet)
             return
         self._intro_anchored = True
         self.offset = round(-vpos, 2)        # video time `vpos` → lyric time 0
         self.idx = -1
-        log.info("MV intro dead-space ~%.1fs → anchored lyrics to the song onset", vpos)
+        log.info("MV intro dead-space ~%.1fs (quiet %.1fs) → anchored to song onset",
+                 vpos, pre_quiet)
 
     def set_api(self, on):
         """Start/stop the local agent-control API (127.0.0.1:8765)."""

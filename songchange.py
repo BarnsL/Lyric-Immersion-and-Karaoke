@@ -195,8 +195,9 @@ class SongChangeDetector(threading.Thread):
 
     def _fire_onset(self):
         """Music just started after a quiet stretch — likely a cinematic/MV intro
-        ending. Best-effort; the overlay decides whether it matters."""
+        ending. Passes the length of that leading quiet so the overlay can tell a
+        real leading intro from a brief mid-song breakdown. Best-effort."""
         try:
-            self.on_onset()
+            self.on_onset(self._pre_quiet)
         except Exception:
             pass
