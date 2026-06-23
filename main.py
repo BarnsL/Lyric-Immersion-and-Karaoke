@@ -379,23 +379,6 @@ def is_cover_title(title):
     return bool(_COVER_RE.search(title or ""))
 
 
-# A VTuber / idol-channel "artist" — the upload carries the CHANNEL, not a catalog
-# artist ("Lumi Ch.【Phase Connect】", "Suisei Channel", "Hajime Ch. 轟はじめ ‐ ReGLOSS").
-_VCHAN_RE = re.compile(
-    r"\bCh\.|\bChannel\b|【[^】]+】"
-    r"|hololive|にじさんじ|ホロライブ|NIJISANJI|Phase\s*Connect|VSPO|VShojo|ReGLOSS",
-    re.I)
-
-
-def is_vtuber_channel(artist):
-    """True if the media 'artist' is really a VTuber/idol CHANNEL name. Such uploads
-    — covers AND the VTuber's own (often EP) tracks — never match an artist-keyed
-    lyric search, but a TITLE-FIRST fetch (the cover path) resolves them. So they're
-    treated as cover-like for fetching. (Live: 'Lucky star ✦ Kaneko Lumi' by
-    'Lumi Ch.【Phase Connect】' found nothing by artist, 62 lines by title.)"""
-    return bool(_VCHAN_RE.search(artist or ""))
-
-
 def clean_title(title, source=""):
     """Reduce a media title to the actual SONG NAME so it matches lyric metadata.
 
@@ -1492,9 +1475,14 @@ class Overlay:
             self._last_raw_title, self._last_src, self._last_artist = rawt, src, rawa
             self._clean_title_cache = clean_title(rawt, src)
             self._clean_artist_cache = clean_artist(rawa)
-            # Title-first fetch for explicit covers AND VTuber/idol-channel uploads
-            # (their channel-as-artist defeats the artist-keyed search).
-            self._is_cover = is_cover_title(rawt) or is_vtuber_channel(rawa)
+            # Only EXPLICIT covers (歌ってみた / "covered by") take the loose
+            # title-first path. Routing VTuber-channel uploads through it too was
+            # WRONG: for a generic title like "Lucky Star" the title-only search
+            # grabbed a same-titled DIFFERENT song (a Cantonese one, then a
+            # "Twinkle Twinkle" one) instead of letting generate-by-ear transcribe
+            # the actual audio — and these niche EP tracks usually have NO synced
+            # lyrics anywhere, so generation is the correct result.
+            self._is_cover = is_cover_title(rawt)
         track = (self._clean_artist_cache, self._clean_title_cache)
         if track != self._track:
             self._track = track
