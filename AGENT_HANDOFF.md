@@ -5,7 +5,7 @@ A cheat-sheet so another agent (or contributor) can pick this project up cold. T
 `USAGE.md`, `BUILD.md`, `SECURITY.md`, `AGENTS.md`. This file is the
 session/state + build-process summary.
 
-Last updated: 2026-06-23.
+Last updated: 2026-06-23 (cycle 2).
 
 ---
 
@@ -637,3 +637,35 @@ Verified on RTX 3060 (CTranslate2 4.8.0 / cuDNN 9.23): model loads on cuda + a r
 transcribe forward pass runs on GPU (encode ~0.3-0.4s). Clean CPU fallback when the
 libs/GPU are absent. For the GPU-feature owner: gpu_setup + the tray download are
 correct; this was purely the DLL-load path in align.
+
+---
+
+## 2026-06-23 (part 7): generate-as-last-resort tuning — v1.0.5 + v1.0.6 shipped
+
+Released from the live-watch loop:
+- **v1.0.5** — GPU encode PATH fix (see part 6 / the cuDNN note above), sync-by-
+  listening confidence now scales with offset size (a 0.44 match no longer yanks
+  the offset ~95s; `align.capture_and_align` requires ratio ≥ MIN_RATIO +
+  min(0.30, |offset|/200)), device logged.
+- **v1.0.6** — two changes so generate-by-ear is a TRUER last resort (live watch
+  showed it flashing AI on songs that DO have lyrics, which always won + cached):
+  1. `clean_artist` reduces VTuber/idol CHANNEL names to the performer
+     ("Hajime Ch. 轟はじめ ‐ ReGLOSS" → "轟はじめ", "Suisei Channel" → "Suisei";
+     handles U+2010 ‐). The channel-as-artist broke artist-keyed lookup and made it
+     ~60s. (87a53f5)
+  2. `_maybe_generate` defer raised to ~35s (6×4s after the 11s deadline) — niche/
+     Vocaloid/VTuber provider lookups take 25-35s, so 27s was too short. (13d9e52)
+
+**NEXT LEVER (not yet done — biggest remaining win):** the lyric provider search is
+SERIAL (`fetch_lrc` / `_search_original_script` loop syncedlyrics.search per query×
+provider), ~35s for niche titles — so a few still graze the 35s defer (kaza-アンテナ
+fetch = 34.7s, real lyrics exist). Parallelizing the provider/query search (first
+valid verified hit wins) would cut this to ~10s and end the flash for ALL niche
+songs, not just channel-artist ones. Deeper/riskier change to core fetch — do it as
+a focused effort with care for the provider-preference + verify_lrc ordering, not a
+rushed watch-cycle edit.
+
+Monitor (`_monitor.py`, local/gitignored) desync proxy made span-aware: only flags
+when the song clock is WITHIN [first_line, last_line] and the cur=None run exceeds
+the song's biggest interlude — kills the false desyncs on intros/outros/interludes
+(Girly Cupid 50s break, 今夜はブギーバック outro).
