@@ -587,11 +587,23 @@ class LyricsIndex:
         q_forms = _title_forms(title)
         best, best_score = None, 0
         for e in self.entries:
+            ea = _norm_title(e["artist"])
+            e_core = _norm_title(e["core"])
             score = 0
-            for ct in e.get("forms") or {_norm_title(e["core"])}:
+            for ct in e.get("forms") or {e_core}:
+                # An ARTIST/GROUP-only SEGMENT (e.g. 'flowglow' from 'Song / FLOW
+                # GLOW') is shared across that artist's songs, so on its own it must
+                # not carry a match — require the SONG to match. Skip a *segment*
+                # (never the whole title) that is (contained in) either artist name.
+                if (ct and len(ct) >= 3 and ct != e_core
+                        and ((ea and (ct == ea or ct in ea))
+                             or (qa and (ct == qa or ct in qa)))):
+                    continue
                 for q in q_forms:
                     if not ct or not q:
                         continue
+                    if qa and len(q) >= 3 and q != qt and (q == qa or q in qa):
+                        continue   # query SEGMENT that's just the artist, not the song
                     if ct == q:
                         s = 100
                     elif ct in q or q in ct:
