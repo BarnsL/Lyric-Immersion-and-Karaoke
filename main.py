@@ -846,6 +846,7 @@ class Overlay:
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
         self._pending_corr = 1e9      # a large sound offset awaiting a 2nd confirming read
+        self._pending_switch = None   # a contradicting heard song awaiting a 2nd confirming read
         self._fast_calib = 0          # remaining quick re-locks after a song change
         self._recal_after = None      # pending recalibrate timer id
         self._live_mode = False       # concert/compilation → sound-only, no title-match
@@ -887,6 +888,7 @@ class Overlay:
         self.offset = 0.0          # fresh baseline; sound calibration sets it
         self._sound_song = None    # new video → re-identify by ear
         self._pending_corr = 1e9   # drop any pending large-offset confirmation
+        self._pending_switch = None  # drop any pending song-switch confirmation
         self._gen_token += 1       # cancel any in-flight lyric generation
         self._track_seq += 1
         self._generating = False
@@ -1244,6 +1246,7 @@ class Overlay:
                     # (Applying a heard song's offset to *different* lyrics — e.g.
                     # a Shazam mis-ID on a mix — was what produced wild offsets.)
                     self._sound_song = heard
+                    self._pending_switch = None     # current song reconfirmed
                     if offset is not None and t_cap is not None:
                         st = self.media.get()
                         if st and st.get("status") == PLAYING:
@@ -1285,9 +1288,20 @@ class Overlay:
                     # re-reset the offset / re-fetch on every repeat hearing — that
                     # churned the sync and restarted generation. Just leave it be.
                     pass
+                elif self.lines and heard != self._pending_switch:
+                    # Heard a DIFFERENT song while we already have lyrics for the
+                    # current one. A single contradicting reading is usually a
+                    # spurious Shazam mis-ID on a niche track (Tombi briefly heard as
+                    # a piano concerto), which used to reset the offset + re-fetch +
+                    # re-generate. Require a SECOND reading of the same new song
+                    # before switching; a real song change re-confirms in seconds.
+                    self._pending_switch = heard
+                    log.info("heard %r ≠ loaded %r — awaiting confirmation before switch",
+                             f_title, self.meta.get("title", ""))
                 else:
-                    # heard a DIFFERENT song → switch to it; start its timing fresh
-                    # rather than carrying over the previous song's offset.
+                    # A different song, confirmed (or nothing loaded yet) → switch to
+                    # it; start its timing fresh rather than carrying the old offset.
+                    self._pending_switch = None
                     self._sound_song = heard
                     self.offset = 0.0
                     self._fast_calib = max(self._fast_calib, 2)
