@@ -135,6 +135,13 @@ fonts that have the right glyphs (no □ boxes). Songs are cached to
 `lyrics/*.json` on first play and never fetched again — the local library only
 grows.
 
+It also **prefers the original kanji/kana over romaji uploads.** Many lyric
+sites host a *romanized* version of a Japanese song (`sora kara maiorite` instead
+of 空から舞い降りて) — useful for singing, but you can't get furigana or a real
+translation from it. When that's all a provider returns, the fetcher detects it
+and upgrades to the original-script version (NetEase carries it) so you get the
+full three rows: **Japanese, romaji, and English**.
+
 ---
 
 ## 🌐 Lyric sources

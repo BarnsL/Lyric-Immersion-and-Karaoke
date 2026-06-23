@@ -738,9 +738,10 @@ class Overlay:
             return
         cjk = [ln for ln in self.lines if ln.jp.strip() and _has_cjk(ln.jp)]
         need_rm = any(not ln.rm.strip() for ln in cjk)
-        # non-English Latin/Cyrillic songs (Spanish, German, Russian) should have
-        # every line translated; CJK songs only their CJK lines.
-        whole = self.meta.get("lang") in ("es", "de", "ru")
+        # non-English Latin/Cyrillic songs (Spanish, German, Russian, and
+        # romanized-Japanese) should have every line translated; CJK songs only
+        # their CJK lines.
+        whole = self.meta.get("lang") in ("es", "de", "ru", "ja-romaji")
         want_en = (self.lines if whole else cjk)
         want_en = [ln for ln in want_en if ln.jp.strip()]
         have_en = sum(1 for ln in want_en if ln.en.strip())

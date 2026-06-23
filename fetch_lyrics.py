@@ -10,6 +10,17 @@ SOURCES USED
                   Genius. Great coverage for VTuber / anime / CJK songs
                   that LRCLIB lacks, but returns only an LRC string with
                   no metadata, so results MUST be verified heuristically.
+                  NetEase in particular reliably carries the ORIGINAL kanji/
+                  kana of Japanese songs — used to upgrade romaji-only uploads
+                  (see _looks_romaji / _synced_cjk below).
+
+PREFER ORIGINAL SCRIPT OVER ROMAJI
+  Many LRCLIB uploads of Japanese songs are *romaji* (e.g. "sora kara maiorite"
+  for 空から舞い降りて). Shown as-is that gives romaji with no kanji and no way to
+  add furigana or a real translation. So fetch_lrc detects a romaji-only hit
+  (_looks_romaji), stashes it, and tries to UPGRADE to the kanji/kana original
+  (NetEase) first; only if no original-script version exists anywhere does it
+  fall back to the romaji — and even then it still translates it to English.
   • fugashi + unidic-lite + cutlet — Japanese → furigana + romaji via a real
                   morphological analyzer. Segments correctly (今生きて →
                   今/生きて "ima ikite", not 今生 "konjou"), which is the single
@@ -220,6 +231,61 @@ def detect_lang(text: str) -> str:
         de = (2 if _DE_DIA.search(text) else 0) + len(words & _DE_WORDS)
         return "de" if de > es else "es"
     return "other"
+
+
+# ── Romaji (romanized Japanese) detection ────────────────────────────
+# Some providers (and many LRCLIB uploads) carry a *romaji* transliteration
+# instead of the original kanji/kana — e.g. "sora kara maiorite" for 空から舞い降りて.
+# We detect that so we can prefer the original-script version (which then gets
+# proper furigana + romaji + translation) and never show romaji-only by mistake.
+_EN_STOP = frozenset("""
+    the a an and or but you your my me we is are be been to of in on for with this
+    that it its all we love can will would could should about there here just like
+    dont cant wont im ive lets what when where why how not no yes oh yeah baby
+    starlight future tonight forever everything beautiful heart light dream world
+    night sky time girl boy fly away into out down up never always
+""".split())
+# Tokens that are unmistakably romanized Japanese — they don't occur as words in
+# Spanish/German/Italian/English, so a couple of them confirm romaji (vs. just
+# "vowel-rich Latin", which Spanish also is).
+_ROMAJI_MARK = frozenset("""
+    wa wo youna desu masu kimi boku watashi anata kokoro yume tsunagu tsunaide
+    hikari kaze namida koe sayonara arigatou yasashii kanashii ureshii itsumo
+    itsuka doushite naze maiorite miseteku misete iroaseru egaite kakete moyou
+    daisuki aishiteru suki naku naite naide yuku kimochi kanjiru sugiru darou
+    deshou nano dakara kedo keredo zutto kitto sotto futari hitori
+""".split())
+
+
+def _romaji_word(w: str) -> bool:
+    """Structural test: looks like a run of Japanese morae (open CV syllables,
+    ends on a vowel or n, none of the letters rare in romaji)."""
+    if not re.fullmatch(r"[a-z]+", w) or len(w) < 2:
+        return False
+    if re.search(r"[lqxcv]", w):                  # rare in Hepburn romaji
+        return False
+    if not (w[-1] in "aeiou" or w.endswith("n")):
+        return False
+    vowels = sum(c in "aeiou" for c in w)
+    return vowels >= len(w) * 0.34
+
+
+def _looks_romaji(text: str) -> bool:
+    """True if Latin text is really romanized Japanese — so we should hunt for the
+    original kanji/kana version. False for English / Spanish / German / actual CJK.
+    Needs BOTH a high fraction of mora-shaped words AND a couple of unmistakably
+    Japanese tokens, so vowel-rich Romance text isn't misread as romaji."""
+    if detect_lang(text) != "other":
+        return False                              # real CJK/Cyrillic/Spanish/German
+    words = [w for w in re.findall(r"[a-z']+", text.lower()) if len(w) > 1]
+    if len(words) < 6:
+        return False
+    eng = sum(1 for w in words if w in _EN_STOP)
+    if eng > len(words) * 0.30:
+        return False                              # mostly English → it's English
+    structural = sum(1 for w in words if _romaji_word(w))
+    marks = sum(1 for w in set(words) if w in _ROMAJI_MARK)
+    return structural >= len(words) * 0.6 and marks >= 2
 
 
 def slugify(title: str) -> str:
@@ -594,30 +660,93 @@ def _strict_ok(lrc: str, title: str, duration: float | None) -> bool:
     return False                           # Latin title, no duration → don't risk it
 
 
+def _synced_cjk(title, artist, duration):
+    """Search syncedlyrics across providers that carry ORIGINAL-script lyrics and
+    return (lrc, provider) for the first synced result that actually contains CJK
+    and verifies — so a romanized upload gets upgraded to the real kanji/kana
+    (NetEase in particular reliably has the Japanese original)."""
+    try:
+        import syncedlyrics
+    except ImportError:
+        return None
+    arts = split_artists(artist)
+    queries, seen = [], set()
+    if title and artist:
+        queries.append(f"{title} {artist}")
+    for ar in arts:
+        queries.append(f"{title} {ar}")
+    if title:
+        queries.append(title)
+    for q in queries[:4]:
+        k = q.lower().strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        for prov in ("NetEase", "Musixmatch", "Megalobiz"):
+            try:
+                lrc = syncedlyrics.search(q, synced_only=True, providers=[prov])
+            except Exception:
+                lrc = None
+            if not lrc or "[" not in lrc:
+                continue
+            body = re.sub(r"\[[^\]]*\]", "", lrc)
+            if (_KANA.search(body) or _HAN.search(body)) \
+                    and verify_lrc(lrc, title, duration):
+                return lrc, prov
+    return None
+
+
 def fetch_lrc(title: str, artist: str = "", duration: float | None = None):
     """Return (lrc_string, meta) of a VERIFIED match, or (None, None).
-    Widens the search across artist variants while guarding false positives."""
+    Widens the search across artist variants while guarding false positives.
+    Prefers ORIGINAL-script lyrics: a romaji-only result is stashed and used only
+    if no kanji/kana version can be found, so a Japanese song shows real furigana
+    + romaji + translation instead of a bare romaji upload."""
     t, a = title.strip(), artist.strip()
     arts = split_artists(a)
+    romaji_fallback = [None]   # (lrc, meta) — used only if nothing original-script
+
+    def take(lrc, meta):
+        """Accept this match now — unless it's romanized Japanese, in which case
+        stash it and return None so the search keeps looking for the original."""
+        body = re.sub(r"\[[^\]]*\]", "", lrc)
+        if _looks_romaji(body):
+            if romaji_fallback[0] is None:
+                romaji_fallback[0] = (lrc, {**meta, "romaji": True})
+            return None
+        return lrc, meta
 
     # 1. LRCLIB duration-exact, trying the full credit then each artist
     for ca in ([a] + arts if a else []):
         hit = _lrclib_get(t, ca, duration)
         if hit and verify_lrc(hit["lrc"], t, duration):
-            return hit["lrc"], {"source": "lrclib/get", "artist": hit["artist"],
-                                "duration": hit.get("duration")}
+            r = take(hit["lrc"], {"source": "lrclib/get", "artist": hit["artist"],
+                                  "duration": hit.get("duration")})
+            if r:
+                return r
 
     # 2. LRCLIB scored search (artist/title/duration)
     hit = _pick_lrclib(t, a, duration)
     if hit and verify_lrc(hit["lrc"], t, duration):
-        return hit["lrc"], {"source": "lrclib/search", "artist": hit["artist"],
-                            "duration": hit.get("duration")}
+        r = take(hit["lrc"], {"source": "lrclib/search", "artist": hit["artist"],
+                              "duration": hit.get("duration")})
+        if r:
+            return r
+
+    # 2b. LRCLIB only gave us romaji → try to UPGRADE to the kanji/kana original
+    #     (NetEase etc. carry it) before settling for the romaji.
+    if romaji_fallback[0] is not None:
+        up = _synced_cjk(t, a, duration)
+        if up:
+            lrc, prov = up
+            return lrc, {"source": f"syncedlyrics/{prov.lower()}",
+                         "artist": a or None, "duration": duration}
 
     # 3. syncedlyrics — title+artist queries (high confidence) first
     try:
         import syncedlyrics
     except ImportError:
-        return None, None
+        return romaji_fallback[0] or (None, None)
 
     def _try(q):
         try:
@@ -640,17 +769,22 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None):
         seen.add(k)
         lrc = _try(q)
         if lrc and verify_lrc(lrc, t, duration):
-            return lrc, {"source": "syncedlyrics", "artist": a or None,
-                         "duration": duration}
+            r = take(lrc, {"source": "syncedlyrics", "artist": a or None,
+                           "duration": duration})
+            if r:
+                return r
 
     # 4. title-only — last resort, strict guard against same-title wrong songs
     if t:
         lrc = _try(t)
         if lrc and verify_lrc(lrc, t, duration) and _strict_ok(lrc, t, duration):
-            return lrc, {"source": "syncedlyrics/title", "artist": a or None,
-                         "duration": duration}
+            r = take(lrc, {"source": "syncedlyrics/title", "artist": a or None,
+                           "duration": duration})
+            if r:
+                return r
 
-    return None, None
+    # Nothing original-script found → use the stashed romaji if we have one.
+    return romaji_fallback[0] or (None, None)
 
 
 # ── Annotation ───────────────────────────────────────────────────────
@@ -664,6 +798,8 @@ def _song_lang(lines: list[dict]) -> str:
     body = " ".join(ln["jp"] for ln in lines)
     if _KANA.search(body):
         return "ja"
+    if _looks_romaji(body):
+        return "ja-romaji"      # romanized Japanese — can't furigana, but DO translate
     return detect_lang(body)
 
 
@@ -689,7 +825,7 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
         tr = _make_translator()
     except ImportError:
         return 0
-    whole = song_lang in ("ja", "ko", "zh", "es", "de", "ru")
+    whole = song_lang in ("ja", "ko", "zh", "es", "de", "ru", "ja-romaji")
 
     def want(ln):
         if only_missing and ln.get("en", "").strip():

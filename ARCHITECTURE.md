@@ -98,11 +98,17 @@ dir), holding `lyrics/` and `settings.json`.
 
 ## fetch_lyrics.py — get & annotate lyrics (see its header for sources)
 
-- **`detect_lang(text)`** → `ja|ko|zh|es|other` (script + Spanish markers).
+- **`detect_lang(text)`** → `ja|ko|zh|ru|es|de|other` (script + Spanish/German
+  markers). **`_looks_romaji(text)`** flags *romanized* Japanese (mora-shaped
+  words + unmistakable JP tokens) so the original script can be preferred.
 - **`fetch_lrc(title, artist, duration)`** → verified timed LRC. LRCLIB
   duration-exact first, then scored search, then `syncedlyrics` (Musixmatch/
   NetEase/…) with a guarded title-only last resort. `verify_lrc` rejects
-  wrong-language / wrong-duration matches.
+  wrong-language / wrong-duration matches. **Prefers original script over
+  romaji**: a romaji-only hit is stashed and `_synced_cjk` tries to upgrade it to
+  the kanji/kana original (NetEase-first) — so a Japanese song shows real furigana
+  + romaji + translation, not a bare romaji upload; only if no original exists
+  anywhere is the romaji kept (and still translated, via the `ja-romaji` tag).
 - **Romanization**: `to_furigana` + `romanize(text, lang)` use **fugashi +
   UniDic** (via **cutlet** for romaji) for Japanese — a real morphological
   analyzer that segments correctly (今生きて → 今(いま)生き), with **pykakasi** as

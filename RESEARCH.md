@@ -104,6 +104,22 @@ every result verified by duration + language. See `fetch_lyrics.py`.
   anime, and stay consistent with the rest of the library. Three layers now
   guarantee it: `annotate()` (fetch), `reannotate.py` (cache — found 5 mixed
   files), and `backfill_file()` + `_maybe_translate` (runtime self-heal).
+- ✅ **Romaji-upload upgrade (this pass) — ROOT CAUSE.** A Japanese song could
+  show **romaji only, no kanji and no translation** (e.g. *Into Starlight* / IA).
+  Cause: many LRCLIB uploads of Japanese tracks are a **romaji transliteration**
+  ("sora kara maiorite" for 空から舞い降りて). The English title ("Into Starlight")
+  meant the language gate didn't fire, the romaji LRCLIB hit matched first, and
+  `fetch_lrc` returned it — so `lang` came out `other`: no furigana (it's already
+  Latin), no translation (not a recognised language). Verified live that **NetEase
+  carries the full kanji/kana original** while LRCLIB and Musixmatch only had
+  romaji. **Fix:** `_looks_romaji()` detects romanized Japanese (mora-shaped words
+  + unmistakable JP tokens, guarded against vowel-rich Romance text by
+  `detect_lang`), and `fetch_lrc` now **stashes a romaji hit and upgrades to the
+  kanji/kana original** (`_synced_cjk`, NetEase-first) before settling. Only if no
+  original exists anywhere does it keep the romaji — and even then a new
+  `ja-romaji` language tag routes it through translation, so it's at least
+  romaji + English, never romaji alone. Re-fetch fixed both affected library
+  files (*Into Starlight*, *unravel*) to full JP + romaji + English.
 
 **Net:** the free stack is already near-optimal; the only real upgrade (word
 timing) isn't available for free. No code change beyond documentation.
