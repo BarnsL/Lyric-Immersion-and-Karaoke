@@ -830,6 +830,7 @@ class Overlay:
         self._aligning = False        # sync-by-listening (Whisper) in progress
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
+        self._pending_corr = 1e9      # a large sound offset awaiting a 2nd confirming read
         self._fast_calib = 0          # remaining quick re-locks after a song change
         self._recal_after = None      # pending recalibrate timer id
         self._live_mode = False       # concert/compilation → sound-only, no title-match
@@ -870,6 +871,7 @@ class Overlay:
         self._health_attempts = 0
         self.offset = 0.0          # fresh baseline; sound calibration sets it
         self._sound_song = None    # new video → re-identify by ear
+        self._pending_corr = 1e9   # drop any pending large-offset confirmation
         self._gen_token += 1       # cancel any in-flight lyric generation
         self._track_seq += 1
         self._generating = False
@@ -1234,10 +1236,27 @@ class Overlay:
                             corr = true_now - st["position"]
                             diff = corr - self.offset
                             if abs(corr) < 180:
-                                if abs(diff) > 2.0:
-                                    self.offset = round(corr, 2)            # snap (intro / seek)
-                                elif abs(diff) > 0.15:
-                                    self.offset = round(self.offset + 0.8 * diff, 2)  # ease drift
+                                if abs(diff) > 25.0:
+                                    # A BIG jump from a single sound reading is
+                                    # unreliable — niche tracks Shazam times poorly
+                                    # produced a bogus 131s offset that desynced the
+                                    # lyrics for ~40s. Apply a large jump only when a
+                                    # second reading agrees; genuine long intros are
+                                    # handled by onset anchoring, and a real seek
+                                    # re-confirms on the next read a few seconds later.
+                                    if abs(corr - self._pending_corr) < 6.0:
+                                        self.offset = round(corr, 2)
+                                        self._pending_corr = 1e9
+                                    else:
+                                        self._pending_corr = corr
+                                        log.info("holding large sound offset %.1fs "
+                                                 "pending confirmation", corr)
+                                else:
+                                    self._pending_corr = 1e9
+                                    if abs(diff) > 2.0:
+                                        self.offset = round(corr, 2)        # snap (intro / seek)
+                                    elif abs(diff) > 0.15:
+                                        self.offset = round(self.offset + 0.8 * diff, 2)  # ease drift
                 elif self._title_locked:
                     # The lyrics came from a confident EXACT match on a clean
                     # official title, but Shazam heard a DIFFERENT song — almost
