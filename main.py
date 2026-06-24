@@ -2284,10 +2284,23 @@ class Overlay:
                      vpos, pre_quiet)
             return
         self._intro_anchored = True
-        self.offset = round(-vpos, 2)        # video time `vpos` → lyric time 0
+        # Anchor ONLY when the lyrics genuinely run AHEAD of the song. The lyrics'
+        # own first timestamp decides it:
+        #  • If the first line is already at/after the onset (first_start >= vpos),
+        #    the LRC has the dead-space BUILT IN — its timestamps are absolute video
+        #    time — so the right offset is 0. Anchoring (-vpos) double-shifted it
+        #    (サクラミラージュ: 1st line @18.9s, onset @11s → drifted to -11s; the user's
+        #    reset-to-0 fixed it). Now it auto-stays at 0.
+        #  • If the first line starts BEFORE the onset (generated lyrics ~0, or a
+        #    relative LRC), the lyrics ARE ahead → anchor lyric-time 0 to the onset.
+        first_start = self.lines[0].start if self.lines else 0.0
+        if first_start >= vpos - 2.0:
+            self.offset = 0.0
+        else:
+            self.offset = round(-vpos, 2)
         self.idx = -1
-        log.info("MV intro dead-space ~%.1fs (quiet %.1fs) → anchored to song onset",
-                 vpos, pre_quiet)
+        log.info("onset @%.1fs (quiet %.1fs, 1st line @%.1fs) → offset %+.1fs",
+                 vpos, pre_quiet, first_start, self.offset)
 
     def set_api(self, on):
         """Start/stop the local agent-control API (127.0.0.1:8765)."""

@@ -264,6 +264,20 @@ offset is large (>6 s) **and** the match ratio is low (<0.72) — the player pos
 right far more often than a low-confidence big jump. High-confidence large offsets
 (genuine long intros) still apply. Complements TICKET-015's dead-band on the Shazam recal.
 
+## TICKET-021 — MV-intro onset-anchor double-shifted a fetched LRC (サクラミラージュ drift) 🟢
+**Symptom:** サクラミラージュ's lyrics drifted ~11s late; resetting Sync→0 fixed it every
+time. The watcher caught a persistent **-11s** offset on it.
+**Root cause:** `_on_song_onset` anchored the MV intro with `offset = -vpos`, which
+ASSUMES the lyrics start at time 0 (true for *generated* lyrics). But サクラミラージュ's
+**fetched LRC already has the intro built in** (first line @18.9s, audio onset @~11s), so
+its timestamps are **absolute video-time** — the right offset is **0**, and `-vpos`
+double-shifted it by 11s.
+**Fix (pushed, v1.0.11):** anchor only when the lyrics genuinely run AHEAD — if the first
+line is already at/after the onset (`first_start >= vpos-2`), the LRC is absolute →
+**offset 0** (no anchor); otherwise (generated ~0, or relative LRC) keep the `-vpos`
+anchor. This makes the user's manual "reset to 0" automatic and correct. Verified across
+fetched-with-intro / generated / relative / at-onset cases. Clione lyrics confirmed correct.
+
 ---
 
 ### Research summary (cross-cutting)
