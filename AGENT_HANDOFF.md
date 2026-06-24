@@ -272,8 +272,9 @@ replace the `<!-- STORE LINK -->` placeholder in `README.md`. Full steps:
 
 ### Contributor hygiene (honored)
 Committed as `BarnsL <252321079+BarnsL@users.noreply.github.com>` (the repo-local
-git identity was mis-set to `Barns <barnsl@pm.me>` — corrected to match every
-existing commit). **No `Co-Authored-By` trailer**, per this file's convention.
+git identity was briefly mis-set to a personal email — corrected to the noreply
+address above to match every existing commit). **No `Co-Authored-By` trailer**,
+per this file's convention.
 
 ---
 
