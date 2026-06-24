@@ -264,6 +264,28 @@ offset is large (>6 s) **and** the match ratio is low (<0.72) — the player pos
 right far more often than a low-confidence big jump. High-confidence large offsets
 (genuine long intros) still apply. Complements TICKET-015's dead-band on the Shazam recal.
 
+## TICKET-023 — Popular JP/VTuber songs generate when the providers HAVE them 🟢
+**Symptom:** very popular songs (KizunaAI "white balance" 2M views, "LOVESHII", 大神ミオ
+"Howling") **generated** lyrics. The user assumed a database gap and asked for better
+lyric libraries.
+**Decisive finding (NOT a database gap):** the providers already carry them —
+`fetch_lrc("white balance", "Kizuna AI")` → 32 lines, `fetch_lrc("LOVESHII", "Kizuna AI")`
+→ 47. The bottleneck was the **title/artist cleaning algorithm**:
+  - `clean_title` left the **"Artist - Song" hyphen prefix** ("KizunaAI - white balance",
+    "Kizuna AI x KAF - LOVESHII", "Reol - Edge") — the same class as Dunk's "Song/Artist"
+    slash, but with `-`.
+  - `clean_artist` didn't strip a **dash-prefixed channel suffix** ("Kizuna AI -
+    A.I.Channel" → must be "Kizuna AI"; the suffix made the search miss).
+**Fix (pushed, v1.0.13):** the artist-aware reducer now also strips a leading artist
+credit before the first ` - ` (only when that head matches the artist, so a real "A - B"
+song title is left alone), and `clean_artist` strips `- …Channel`. Verified: white balance
+→ 32 lines, LOVESHII → 47, Edge → 73, Dunk/LOAD/幻界 unaffected, bilingual untouched.
+Deleted the stale generated caches so they re-fetch the real lyrics.
+**Takeaway documented in RESEARCH.md:** for this catalog, *matching* (clean titles +
+right artist) beats *adding databases* — Musixmatch + NetEase + LRCLIB already cover most
+J-pop / anime / VTuber; the gaps left (genuinely niche covers, live takes) are handled by
+OCR (TICKET-022) + generation, not a different fingerprinter.
+
 ## TICKET-022 — Concert song detection via on-screen banner OCR 🟡 (feature)
 **Request:** in a long concert video (ReGLOSS 3D live) the app should play the CURRENT
 song's lyrics (SUPER DUPER, 泡沫メイビー, …) and sync — Shazam alone fails on live takes.

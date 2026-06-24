@@ -405,6 +405,36 @@ quality lever is **Demucs vocal isolation** before ASR (heavy; deferred).
 Everything else researched (word-level providers, GPU backend, event-driven
 GSMTC, pitch accent) is intentionally deferred for the reasons above.
 
+## 8. "Popular JP/VTuber songs generate" — it was MATCHING, not the database (2026-06)
+
+A recurring complaint was that popular songs (KizunaAI *white balance* — 2M views,
+*LOVESHII*, 大神ミオ *Howling*) **generated** lyrics, with the assumption that we needed
+a better / more Japanese lyric database. **Tested and disproven:** the existing providers
+already carry them —
+
+```
+fetch_lrc("white balance", "Kizuna AI") → 32 lines
+fetch_lrc("LOVESHII", "Kizuna AI")      → 47 lines
+```
+
+— they were only missed because the **title/artist we searched with was wrong**:
+`"KizunaAI - white balance"` (Artist-Song hyphen) and artist `"Kizuna AI - A.I.Channel"`
+(channel suffix). Fixing `clean_title` (strip a leading artist credit before ` - ` when it
+matches the artist) and `clean_artist` (strip `- …Channel`) made them fetch. **Conclusion:
+for this catalog, invest in MATCHING (clean title + correct artist), not in adding
+databases.** Musixmatch + NetEase + LRCLIB already cover most J-pop / anime / VTuber.
+
+### Audio fingerprinting (Shazam) — keep it; alternatives don't move the needle
+Shazam (`shazamio`) is **global**, not US-only — its catalog has strong J-pop / anime / a
+lot of VTuber. The cases it misses are **genuinely niche covers and LIVE arrangements**,
+which **no fingerprinter solves** (they aren't in any catalog): ACRCloud / AudD are
+commercial with the same catalog ceiling; AcoustID/Chromaprint is free but MusicBrainz has
+thin VTuber coverage. The real answers to those gaps are the **on-screen banner OCR**
+(TICKET-022, [docs/CONCERT_DETECTION.md](docs/CONCERT_DETECTION.md)) and **generation**,
+not a different fingerprinter. Candidate *lyric* providers for truly-niche anime, if ever
+needed: [animelyrics API](https://github.com/colorfusion/animelyrics), PetitLyrics
+(commercial), uta-net (scrape).
+
 ## Sources
 
 - [syncedlyrics (PyPI)](https://pypi.org/project/syncedlyrics/) ·

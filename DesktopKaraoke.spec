@@ -15,13 +15,16 @@ WHISPER = os.path.isdir(".deps")
 datas = [("icon.ico", ".")]
 binaries = []
 hiddenimports = [
-    "pystray._win32", "PIL._tkinter_finder", "PIL.ImageTk",
+    "pystray._win32", "PIL._tkinter_finder", "PIL.ImageTk", "PIL.ImageGrab",
     "winsdk.windows.media.control", "winsdk.windows.foundation",
-    "winsdk.windows.storage.streams",
+    "winsdk.windows.storage.streams", "winsdk.windows.storage",
+    # concert-banner OCR (concert_ocr.py) uses the built-in Windows OCR engine:
+    "winsdk.windows.media.ocr", "winsdk.windows.globalization",
+    "winsdk.windows.graphics.imaging",
     # local modules imported lazily inside functions — pin them so the
     # frozen build always includes them.
     "appdata", "version", "updater", "songchange", "align", "api", "character", "recognize", "fetch_lyrics", "gpu_setup",
-    "playlist_import", "playlist_import_gui",
+    "playlist_import", "playlist_import_gui", "concert_ocr", "deep_transcribe",
 ]
 
 # Packages that ship data files / dynamically-imported submodules.
