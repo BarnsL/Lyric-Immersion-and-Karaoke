@@ -369,7 +369,8 @@ def _is_generic_title(s):
 # A 歌ってみた / cover upload: its lyrics are the ORIGINAL song's, so the fetch
 # looks the song up by TITLE and ignores the covering channel as the "artist".
 _COVER_RE = re.compile(
-    r"歌ってみた|うたってみた|歌わせて|covered?\s+by"
+    r"歌ってみた|うたってみた|歌わせて|踊ってみた|おどってみた"
+    r"|演奏してみた|弾いてみた|叩いてみた|covered?\s+by"
     r"|\(\s*cover\s*\)|[/／]\s*cover\b", re.I)
 
 
@@ -422,7 +423,8 @@ def clean_title(title, source=""):
     # cover / "tried singing" credits → keep only the song title
     t = re.sub(r"\s*([/／]\s*)?\bcover(ed)?\s+by\b.*$", "", t, flags=re.I)
     t = re.sub(r"\s*[/／]\s*cover\b.*$", "", t, flags=re.I)
-    t = re.sub(r"\s*[/／]?\s*(歌ってみた|歌わせて|アコギ|acoustic\s*ver).*$", "", t, flags=re.I)
+    t = re.sub(r"\s*(?:[/／]|を)?\s*(歌ってみた|歌わせて|踊ってみた|おどってみた|"
+               r"演奏してみた|弾いてみた|叩いてみた|アコギ|acoustic\s*ver).*$", "", t, flags=re.I)
     t = re.sub(
         r"\b(Official\s*(Music\s*)?(Video|Audio)|Official|Music\s*Video|MV|PV|"
         r"Lyric\s*Video|Audio|HD|4K|FULL|Full\s*Ver\.?)\b",
