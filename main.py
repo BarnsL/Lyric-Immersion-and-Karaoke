@@ -31,6 +31,7 @@ from pathlib import Path
 from character import Character
 import updater
 import version
+import confidence
 import gpu_setup
 
 # Run every subprocess (git, PowerShell, pip) with NO console window — otherwise
@@ -1022,9 +1023,18 @@ class Overlay:
                 # (the feelingradation → SKAVLA bug). Messy titles stay unlocked so
                 # sound still corrects them.
                 exact = _norm_title(self.meta.get("title", "")) == _norm_title(title)
+                # LOCK the lyrics to the title only when the title is strong evidence:
+                # an exact match on a clean, official, NON-generic, and DISTINCTIVE
+                # name. A COMMON title ("Awake", "BANG", "Lucky Star") is shared by
+                # many songs, so it must stay UNLOCKED and let the heard AUDIO decide
+                # — that's the confidence model in confidence.py (the "Awake" rule).
                 self._title_locked = bool(
                     exact and not is_mv_version(title)
-                    and not _is_generic_title(title))
+                    and not _is_generic_title(title)
+                    and not confidence.is_common_title(title))
+                if exact and confidence.is_common_title(title):
+                    log.info("title %r is common (distinctiveness %.2f) → audio decides, not locked",
+                             title, confidence.title_distinctiveness(title))
             else:
                 self.lines, self._lyrics_path, self.idx = [], None, -1
                 self._kara = []
@@ -1071,7 +1081,12 @@ class Overlay:
         # arriving after a brief AI flash. Wait out a realistic fetch (≈35s total
         # with the 11s deadline) before generating, so generation stays a genuine
         # last resort. Still bounded, so a hung fetch can't postpone it forever.
-        if self._fetching and self._gen_defers < 6:      # ~24s extra at most
+        # Only the defer extends while the fetch is STILL RUNNING (it might still
+        # win); a no-lyrics song's fetch returns None fast and falls straight
+        # through to generate, so this doesn't delay genuine generation. Cleaner
+        # titles (TICKET-023) make most fetches resolve in <15s; this is the backstop
+        # for the slow ones so they aren't pre-empted ("generated before finding it").
+        if self._fetching and self._gen_defers < 8:      # ~32s extra; ~43s total
             self._gen_defers += 1
             self.root.after(4000, lambda t=track_seq: self._maybe_generate(t))
             return
@@ -1591,7 +1606,12 @@ class Overlay:
         """(Tk thread) save the already-annotated deep lines as the cache
         (`generated-deep`) and upgrade the overlay live if this song still plays."""
         if token != self._deep_token:
-            return                      # track changed while we worked → discard
+            return                      # track changed (or real lyrics loaded) → discard
+        # REAL lyrics may have arrived (a slow fetch finally resolved) while we
+        # transcribed — they WIN. Don't save or show a generated-deep version over
+        # them (that was the "some ended up generated too" overwrite).
+        if self.lines and not (self.meta.get("source") or "").startswith("generated"):
+            return
         from fetch_lyrics import slugify
         try:
             out = LYRICS_DIR / f"{slugify(title)}.json"
@@ -1706,9 +1726,16 @@ class Overlay:
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
         self._lyrics_path = Path(path)
-        if self.meta.get("source") != "generated":
-            self._gen_token += 1       # real lyrics arrived → stop any generation
+        if not (self.meta.get("source") or "").startswith("generated"):
+            # REAL lyrics supersede ALL generation. Cancel BOTH the realtime
+            # best-effort (_gen_token) AND the background deep transcription
+            # (_deep_token), and drop any accumulated generated lines — otherwise a
+            # late deep pass would overwrite the real lyrics, or two sets would show
+            # at once ("multiple sets of lyrics" / "some ended up generated too").
+            self._gen_token += 1
+            self._deep_token += 1
             self._generating = False
+            self._gen_lines = []
         self._mark_verified()
         self._relayout_song()           # size lanes/blocks to this song's rows
         self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")

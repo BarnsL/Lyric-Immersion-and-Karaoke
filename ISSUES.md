@@ -264,6 +264,34 @@ offset is large (>6 s) **and** the match ratio is low (<0.72) — the player pos
 right far more often than a low-confidence big jump. High-confidence large offsets
 (genuine long intros) still apply. Complements TICKET-015's dead-band on the Shazam recal.
 
+## TICKET-024 — "Multiple sets of lyrics" + "some ended up generated too" 🟢
+**Symptom:** lyrics looked like two overlapping sets; songs that eventually FETCHED real
+lyrics sometimes still showed AI-generated lines.
+**Root cause (a feature CONFLICT):** when a slow song generated and THEN the fetch
+finally resolved, `load()` of the real lyrics cancelled the realtime generation
+(`_gen_token`) but **NOT the background deep transcription** (`_deep_token`). The deep
+pass would complete a bit later and `_apply_deep` would **overwrite the real fetched
+lyrics** with its `generated-deep` version (and re-save the cache).
+**Fix (pushed, v1.0.14):** real lyrics now supersede ALL generation — `load()` of a
+non-`generated*` source bumps `_deep_token` too, clears `_gen_lines`, and stops the gen
+loop; `_apply_deep` also bails if real lyrics are already loaded (no save, no display).
+Plus the generate-vs-fetch defer was widened (~43s) so a slow-but-successful fetch wins
+before generation even starts ("generated before finding it"); cleaner titles (TICKET-023)
+already make most fetches resolve in <15s.
+
+## TICKET-025 — Confidence score: generic titles must defer to the AUDIO ("Awake" rule) 🟢
+**Request:** "Awake"/"BANG" are common names — the AUDIO should weigh more than the title;
+document in source what contributes to the confidence score.
+**Root cause:** `_is_generic_title` only caught tie-in *tags* ("OP Theme"), so a common but
+real name like "Awake" / "BANG" / "Lucky Star" still got **title-locked** — and a wrong
+same-title match couldn't be corrected by sound.
+**Fix (pushed, v1.0.14):** new [confidence.py](confidence.py) documents EVERY signal that
+contributes to song-match confidence (banner OCR > clean-source title > heard-by-sound >
+title-exactness > duration > artist > language) and adds `title_distinctiveness()` /
+`is_common_title()`. The title-lock now also requires the title to be DISTINCTIVE, so
+Awake/BANG/Love/Lucky Star (distinctiveness 0.10–0.27) stay unlocked and let Shazam decide,
+while feelingradation/シンメトリー/white balance (0.57–0.85) still lock. Logged for transparency.
+
 ## TICKET-023 — Popular JP/VTuber songs generate when the providers HAVE them 🟢
 **Symptom:** very popular songs (KizunaAI "white balance" 2M views, "LOVESHII", 大神ミオ
 "Howling") **generated** lyrics. The user assumed a database gap and asked for better
