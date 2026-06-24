@@ -280,6 +280,30 @@ title OR one contains the other) AND requires the title to be **distinctive**
 over. Deleted the stale generated `regloss_feelingradation.json` (kept the real
 `feelingradation.json`) and the old `dist/` build so the latest code runs.
 
+## TICKET-030 — Mode-aware sync: FOLLOW live/short arrangements, distrust repeated-chorus reads 🟢
+**Symptoms (from live telemetry, TICKET-029's logs):**
+- Studio サクラミラージュ "desynced multiple times" — log showed offsets oscillating
+  `applied -10.36s` … `holding -70.36s`. The ~60 s jumps are the spacing between the song's
+  **repeated choruses** (花桜/徒桜 ×3): Shazam matched the *wrong repetition*, and on a studio
+  track the player clock is exact so chasing them is what desynced it.
+- V.W.P `【LIVE MV】魔女(真) Short Ver.` — a **live/short arrangement** whose timing is wildly
+  different from the studio LRC (massive real offset). It wasn't even detected as live
+  (`is_live_or_compilation`=False) so it got studio handling and stranded.
+**Insight:** studio and live pull in OPPOSITE directions — studio wants the offset *reset*
+(exact clock, big reads = artifacts); live wants it *followed* (the offset is real and drifts
+with tempo). So sync must be **mode-aware**.
+**Fix (v1.0.20):**
+- New `is_live_arrangement()` (`_LIVE_VER_RE`: LIVE/LIVE MV/Short Ver/Acoustic/`from "…"`/
+  ライブ/弾き語り…) + a **duration-mismatch** test (playing length vs the LRC's span >25 s)
+  classify each track as **studio** or **live** per read.
+- **Live = FOLLOW:** apply a corroborated offset even when large (cap raised to the studio
+  length), EWMA-smoothed (`0.6·new + 0.4·old`) to ride tempo drift, polling every ≤8 s.
+- **Studio = distrust ambiguity:** track the spread of recent reads; if they diverge >15 s
+  (repeated-chorus matches), RESET to 0 instead of chasing — plus all of TICKET-029's
+  reset-first logic. Legit small studio offsets still apply.
+- Telemetry now logs `mode=studio|live` and `spread=` per read. Verified by simulation across
+  studio-repetitive, live-short, and studio-normal scenarios.
+
 ## TICKET-029 — Sync redesign: RESET is the first-line defense; add/drop time only on sonic confirmation 🟢
 **Request:** "I just reset to get me back to proper place but that should happen
 automatically. Make the reset the first line of defense against desync; only when sonic

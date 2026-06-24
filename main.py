@@ -549,6 +549,27 @@ def is_mv_version(title):
     return bool(_MV_RE.search(title or ""))
 
 
+# A SINGLE-song LIVE / short / alternate ARRANGEMENT (not a multi-song event):
+# 'LIVE MV', 'Short Ver.', 'Acoustic', 'from "<concert>"' … The lyrics still match
+# the song, but the TIMING differs hugely from the studio LRC (different intro,
+# tempo, edits), so a STUDIO reset-to-0 strategy strands them — these need the
+# offset to be FOLLOWED, not reset. (Distinct from is_live_or_compilation, which is
+# a multi-song event we drive by sound alone.)
+_LIVE_VER_RE = re.compile(
+    r"\b(?:live(?:\s*(?:mv|ver(?:sion)?|performance|stage|clip))?|short\s*ver(?:sion)?|"
+    r"acoustic|unplugged|orchestral?|piano\s*ver|ballad\s*ver|spinning\s*ver)\b"
+    r"|from\s+[\"'“”『「]"                       # 'from "<concert/album>"'
+    r"|ライブ|ﾗｲﾌﾞ|生歌|ショート(?:バージョン|ver)|アコースティック|弾き語り",
+    re.I,
+)
+
+
+def is_live_arrangement(title):
+    """True for a single-song LIVE/short/alternate version whose timing won't match
+    the studio LRC (so sync must FOLLOW the measured offset, not reset to 0)."""
+    return bool(_LIVE_VER_RE.search(title or ""))
+
+
 def clean_artist(artist):
     """Strip YouTube channel cruft so the artist matches lyric providers:
     'Kaneko Lumi - Topic' → 'Kaneko Lumi', 'LMFAOVEVO' → 'LMFAO'. Auto-generated
@@ -948,6 +969,8 @@ class Overlay:
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
         self._pending_corr = 1e9      # a large sound offset awaiting a 2nd confirming read
+        self._recent_corr = []        # last few audio offsets — spot repeated-chorus ambiguity
+        self._live_arrangement = False  # LIVE/short/alt version → FOLLOW the offset, don't reset
         self._last_drift = 0.0        # last audio-vs-display drift measured (sync telemetry)
         self._last_drift_t = 0.0      # when that drift was measured (time.time)
         self._pending_switch = None   # a contradicting heard song awaiting a 2nd confirming read
@@ -999,7 +1022,10 @@ class Overlay:
         self._generating = False
         self._gen_defers = 0       # fresh defer budget for this track's fetch
         self._fetch_key = None     # let this track re-attempt a real fetch (upgrade path)
-        log.info("track change: %r / %r (dur %s)", title, artist, duration)
+        self._recent_corr = []     # reset ambiguity history for the new song
+        self._live_arrangement = is_live_arrangement(title)  # LIVE/short/alt → follow offset
+        log.info("track change: %r / %r (dur %s)%s", title, artist, duration,
+                 " [live-arrangement]" if self._live_arrangement else "")
 
         self._live_mode = is_live_or_compilation(title, duration)
         if self._live_mode:
@@ -1316,8 +1342,11 @@ class Overlay:
                         nxt = max(4, min(self.recal_secs, 4) if unconfirmed else self.recal_secs)
                     # A non-zero offset is the main desync risk (a bad correction that
                     # stuck). Re-verify SOON so the reset-first logic snaps it back within
-                    # seconds instead of a full slow cycle.
-                    if abs(self.offset) > 0.8:
+                    # seconds. A LIVE arrangement is FOLLOWED continuously (its offset drifts
+                    # with the live tempo), so poll fast regardless of the current offset.
+                    if self._live_arrangement:
+                        nxt = min(nxt, 8)
+                    elif abs(self.offset) > 0.8:
                         nxt = min(nxt, 12)
         finally:
             self._arm_recal(nxt)
@@ -1484,57 +1513,85 @@ class Overlay:
                             corr = true_now - st["position"]   # offset the AUDIO implies
                             diff = corr - self.offset          # how far the DISPLAY is off NOW
                             dur = self._cur_duration or st.get("duration") or 0
-                            cap = min(120.0, max(45.0, 0.4 * dur)) if dur else 75.0
-                            # Digital playback has NO clock drift — the player's own
-                            # position is EXACT — so the correct offset is almost always
-                            # 0, and a wrong offset (a chased noisy read) is the usual
-                            # cause of desync. Policy (per user direction):
-                            #   1) RESET to the player clock is the first-line defense —
-                            #      whenever the audio says ~no offset is needed but we're
-                            #      showing one, or a read is absurd/uncorroborated, snap
-                            #      straight back to 0 (the manual "reset to 0", automatic).
-                            #   2) Only DROP/ADD time when sonic markers CONFIRM a real,
-                            #      stable offset — two independent reads that agree.
                             DEADBAND = 0.8      # within this the exact player clock wins
                             AGREE = 2.0         # two reads this close ⇒ a corroborated offset
-                            # SYNC TELEMETRY — log EVERY read so a developing desync is
-                            # visible: drift = how far the shown lyrics are from where the
-                            # audio says they should be (+ve ⇒ lyrics are LATE).
+                            # MODE decides the whole strategy. A STUDIO track has an EXACT
+                            # player clock, so its true offset is ~0 and big readings are
+                            # artifacts (Shazam matching a repeated chorus) to distrust →
+                            # reset-first. A LIVE/short/alternate ARRANGEMENT (by title, or a
+                            # big duration mismatch vs the studio LRC) has a REAL, possibly
+                            # large/drifting offset that must be FOLLOWED, not reset.
+                            lrc_span = self.lines[-1].end if self.lines else 0.0
+                            dur_mismatch = bool(lrc_span and dur and abs(dur - lrc_span) > 25)
+                            dur_match = bool(lrc_span and dur and abs(dur - lrc_span) < 12)
+                            live = dur_mismatch or (self._live_arrangement and not dur_match)
+                            # live offset can land anywhere in the song → cap at the studio
+                            # length; studio keeps the tight cap.
+                            cap = (((lrc_span + 15) if lrc_span else 600.0) if live
+                                   else (min(120.0, max(45.0, 0.4 * dur)) if dur else 75.0))
+                            # AMBIGUITY: repeated choruses make Shazam return wildly varying
+                            # offsets (e.g. -10s then -70s on サクラミラージュ). Track the spread
+                            # of recent reads to detect it.
+                            self._recent_corr.append(round(corr, 2))
+                            self._recent_corr = self._recent_corr[-4:]
+                            spread = (max(self._recent_corr) - min(self._recent_corr)
+                                      if len(self._recent_corr) >= 2 else 0.0)
+                            # SYNC TELEMETRY — log EVERY read so a developing desync is visible:
+                            # drift = how far the shown lyrics are from where the audio says they
+                            # should be (+ve ⇒ lyrics are LATE).
                             cur_t = (self.lines[self.idx].start
                                      if 0 <= self.idx < len(self.lines) else -1.0)
                             self._last_drift = round(diff, 2)
                             self._last_drift_t = time.time()
                             log.info("sync-read: drift=%+.2fs audio_off=%+.2f shown_off=%+.2f "
-                                     "pos=%.1f line#%d@%.1f pend=%s", diff, corr, self.offset,
-                                     st["position"], self.idx, cur_t,
+                                     "mode=%s spread=%.1f pos=%.1f line#%d@%.1f pend=%s",
+                                     diff, corr, self.offset, "live" if live else "studio",
+                                     spread, st["position"], self.idx, cur_t,
                                      ("%+.2f" % self._pending_corr) if self._pending_corr < 1e8 else "-")
                             if abs(corr) >= cap:
-                                # Shazam matched a DIFFERENT recording/segment (e.g. +160s
-                                # on a 3-min song) — never a real seek, and NO information
-                                # about whether our current offset is right → just ignore.
+                                # matched a different recording/segment — no usable info; ignore.
                                 self._pending_corr = 1e9
                             elif abs(diff) <= DEADBAND:
                                 self._pending_corr = 1e9      # already in sync — leave it
+                            elif live:
+                                # FOLLOW: the offset is real. Apply a corroborated reading even
+                                # when large, smoothing toward it to ride tempo drift without
+                                # jitter, and keep following (pending stays set so each read
+                                # nudges the offset).
+                                AGREE_LIVE = 4.0
+                                if abs(corr - self._pending_corr) < AGREE_LIVE:
+                                    new = (corr if abs(self.offset) < DEADBAND
+                                           else 0.6 * corr + 0.4 * self.offset)
+                                    self.offset = round(new, 2)
+                                    self._pending_corr = corr
+                                    log.info("sync(live): following → offset %+.2fs (drift was %+.2f)",
+                                             self.offset, diff)
+                                else:
+                                    self._pending_corr = corr
+                                    log.info("sync(live): holding %+.2fs for a 2nd read", corr)
+                            elif spread > 15.0:
+                                # STUDIO with AMBIGUOUS reads (repeated choruses): the player
+                                # clock is exact, so do NOT chase these contradictory offsets —
+                                # reset to 0 (fixes サクラミラージュ's -10s/-70s chorus jumps).
+                                self._pending_corr = 1e9
+                                if abs(self.offset) > DEADBAND:
+                                    log.info("sync: ambiguous reads (spread %.0fs — repeated "
+                                             "sections) → RESET to 0", spread)
+                                    self.offset = 0.0
                             elif abs(corr) <= DEADBAND:
-                                # Audio says NO offset is needed, yet we're showing one →
-                                # we've drifted onto a bad offset. FIRST-LINE DEFENSE: reset
-                                # to the exact player clock now (the manual "reset to 0 and
-                                # it's fixed", made automatic).
+                                # audio says NO offset needed but we're showing one → drifted →
+                                # reset to the exact player clock (manual "reset to 0", automatic).
                                 self._pending_corr = 1e9
                                 log.info("sync: audio_off≈0 but showing %+.2fs → AUTO-RESET to 0", self.offset)
                                 self.offset = 0.0
                             elif abs(corr - self._pending_corr) < AGREE:
-                                # A real non-zero offset CORROBORATED by a 2nd agreeing read
-                                # (sonic markers confirm the lyrics are genuinely mis-timed)
-                                # → only NOW is it justified to drop/add time.
+                                # real non-zero offset CORROBORATED by a 2nd agreeing read → apply.
                                 self.offset = round(corr, 2)
                                 self._pending_corr = 1e9
                                 log.info("sync: CONFIRMED offset %+.2fs (two reads agree) → applied", corr)
                             else:
-                                # A non-zero offset proposed by ONE read — a real intro/seek
-                                # or just noise. Don't apply (await a 2nd agreeing read) and
-                                # don't disturb a possibly-correct current offset; a genuinely
-                                # WRONG one is caught by the audio≈0 reset above.
+                                # one-read non-zero offset — hold for confirmation; don't disturb
+                                # a possibly-correct current offset (audio≈0 reset handles a wrong one).
                                 self._pending_corr = corr
                                 log.info("sync: holding %+.2fs pending a 2nd agreeing read", corr)
                 elif self._title_locked:

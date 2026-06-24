@@ -3,7 +3,7 @@
 ; (build.bat does this automatically if iscc is on PATH.)
 
 #define AppName "Desktop Karaoke"
-#define AppVer  "1.0.19"
+#define AppVer  "1.0.20"
 #define AppExe  "DesktopKaraoke.exe"
 
 [Setup]
