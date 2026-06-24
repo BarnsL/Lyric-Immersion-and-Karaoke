@@ -1373,13 +1373,13 @@ class Overlay:
             idle = 0
             pos = float(st.get("position") or 0.0)
             secs = 8 if first else CHUNK      # short FIRST chunk → lyrics appear sooner
-            # First chunk: lang=None → Whisper AUTO-DETECTS the sung language (so an
-            # English/Korean cover isn't mangled into Japanese gibberish), then pin
-            # the detected language for the rest of the song.
-            chunk = align.transcribe_for_generation(pos, lang=self._gen_lang, seconds=secs)
-            if first:
-                self._gen_lang = getattr(align, "_last_gen_lang", None) or self._gen_lang
-                first = False
+            first = False
+            # Auto-detect the sung language on EVERY chunk (lang=None). Pinning the
+            # first chunk's guess mis-fired when the intro was instrumental/ambiguous
+            # and locked e.g. an English cover into Japanese gibberish; per-chunk
+            # detection self-corrects and even handles bilingual songs.
+            chunk = align.transcribe_for_generation(pos, lang=None, seconds=secs)
+            self._gen_lang = getattr(align, "_last_gen_lang", None) or self._gen_lang
             if token != self._gen_token:
                 return
             new = [d for d in chunk if d["t"][0] >= last_end - 1.0 and d["jp"].strip()]
