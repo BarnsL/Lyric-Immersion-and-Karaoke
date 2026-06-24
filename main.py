@@ -1308,28 +1308,29 @@ class Overlay:
                             true_now = offset + (time.time() - t_cap) * st.get("rate", 1.0)
                             corr = true_now - st["position"]
                             diff = corr - self.offset
-                            if abs(corr) < 180:
-                                if abs(diff) > 25.0:
-                                    # A BIG jump from a single sound reading is
-                                    # unreliable — niche tracks Shazam times poorly
-                                    # produced a bogus 131s offset that desynced the
-                                    # lyrics for ~40s. Apply a large jump only when a
-                                    # second reading agrees; genuine long intros are
-                                    # handled by onset anchoring, and a real seek
-                                    # re-confirms on the next read a few seconds later.
-                                    if abs(corr - self._pending_corr) < 6.0:
-                                        self.offset = round(corr, 2)
-                                        self._pending_corr = 1e9
-                                    else:
-                                        self._pending_corr = corr
-                                        log.info("holding large sound offset %.1fs "
-                                                 "pending confirmation", corr)
-                                else:
-                                    self._pending_corr = 1e9
-                                    if abs(diff) > 2.0:
-                                        self.offset = round(corr, 2)        # snap (intro / seek)
-                                    elif abs(diff) > 0.15:
-                                        self.offset = round(self.offset + 0.8 * diff, 2)  # ease drift
+                            # Shazam's per-read timing is NOISY (±~1s, worse on niche
+                            # tracks) and digital playback has NO clock drift — the
+                            # player's own position is exact. So fine, single-read
+                            # corrections only CHASE that noise and desync a baseline
+                            # that was already right (the "auto-sync made it worse →
+                            # reset to 0 fixes it" report). Move the offset ONLY for a
+                            # correction that is (a) outside a dead-band where the
+                            # player clock is the better authority, AND (b) CONFIRMED
+                            # by a second reading that agrees — a real seek / long
+                            # intro re-confirms within seconds; random noise does not.
+                            DEADBAND = 0.8      # ≤ this ⇒ trust the player clock, leave it
+                            AGREE = 2.5         # two reads this close ⇒ a real offset
+                            if abs(corr) >= 180:
+                                pass                          # absurd read — ignore
+                            elif abs(diff) <= DEADBAND:
+                                self._pending_corr = 1e9      # in sync; drop any pending jump
+                            elif abs(corr - self._pending_corr) < AGREE:
+                                self.offset = round(corr, 2)  # confirmed seek / real intro
+                                self._pending_corr = 1e9
+                                log.info("sync: applied confirmed offset %+.2fs", corr)
+                            else:
+                                self._pending_corr = corr     # first sighting — hold, don't apply
+                                log.info("sync: holding %+.2fs pending a 2nd agreeing read", corr)
                 elif self._title_locked:
                     # The lyrics came from a confident EXACT match on a clean
                     # official title, but Shazam heard a DIFFERENT song — almost
