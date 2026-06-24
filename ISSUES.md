@@ -1,78 +1,120 @@
-# Desktop Karaoke — Issues Tracker
+# Desktop Karaoke — Issue Tickets
 
-Numbered log of reported problems + improvements, with status, root cause, and fix.
-Status: 🔴 open · 🟡 in progress · 🟢 fixed (pushed) · 🔵 needs-info/repro
+Numbered tickets for matching / sync / rendering / performance / features.
+Status: 🔴 open · 🟡 in-progress · 🟢 fixed (pushed) · 🔵 needs-repro
 
-Always verify a fix by **comparing the app's lyrics to the video's on-screen lyrics**
-(burned-in / official subs) at the same playback position, not just `/status`.
+**Verification rule:** always compare the app's line to the **video's on-screen
+lyrics** at the same playback position — not just `/status`.
 
 ---
 
-## #1 — Dance/play covers (踊ってみた etc.) generate instead of fetching real lyrics 🟢
-**Symptom:** common songs (e.g. "Breaking Dimensions を踊ってみた", hololive) sit on
-"Generating lyrics by ear…" and never load the real lyrics; slow + spotty.
-**Root cause:** `is_cover_title` / `clean_title` only knew 歌ってみた/(cover); they MISSED
-踊ってみた (dance), 演奏してみた, 弾いてみた, 叩いてみた. So those titles weren't flagged
-covers → the title-first fetch never fired → fell through to generation.
-**Fix:** added the dance/play cover markers to `_COVER_RE` + the `clean_title` strip
-(handles the を particle: "Song を踊ってみた" → "Song"). Verified `fetch_lrc('Breaking
-Dimensions', cover=True)` → 70 lines. Commit: (this change).
+## TICKET-001 — Dance/play covers generate instead of fetching real lyrics 🟢
+**Symptom:** "Breaking Dimensions を踊ってみた", hololive covers, sit on "Generating…"
+and never load real lyrics (slow, spotty, wrong language).
+**Root cause:** `is_cover_title`/`clean_title` only knew 歌ってみた/(cover); they missed
+踊ってみた (dance), 演奏してみた, 弾いてみた, 叩いてみた → no title-first fetch → fell to
+generation.
+**Fix (pushed 87a6de9):** added those markers to `_COVER_RE` + the `clean_title` strip
+(handles the を particle). `fetch_lrc('Breaking Dimensions', cover=True)` → 70 lines.
 
-## #2 — False match: wrong song's lyrics shown 🔴
-**Symptom:** "BANCHO【轟はじめ/ReGLOSS】" showed "Me and my girls / Turn it up now" — a
-DIFFERENT song (possibly same artist 轟はじめ). Also seen earlier (feelingradation→skavla,
-fixed; this is a new instance).
-**Suspect:** sound-ID (Shazam) or a same-artist cached file matched the wrong song; the
-match wasn't re-verified against the actual sung lyrics. Needs the master-tracks DB +
-duration/lyltic cross-check to reject wrong-but-same-artist matches.
-**Status:** open — needs investigation (which path picked the wrong file).
+## TICKET-002 — Same-title collision: wrong song's lyrics get cached + reused 🔴
+**Symptom:** "BANCHO / 轟はじめ" showed another song's lyrics. Identification was correct
+(`heard BANCHO | loaded BANCHO | match=True`) — the cached *content* was a wrong
+"BANCHO" fetched from a same-title collision.
+**Research:** lyric finders stress **verifying the artist + not trusting the first
+match** — "compare the artist… before you save it, the first match is not always the
+right version." ([Musely](https://musely.ai/tools/lyrics-finder), [Chosic](https://www.chosic.com/find-song-by-lyrics/))
+**Plan:** cross-check the fetched LRC's length against a **trusted duration** (the
+master-tracks library DB, TICKET-009) and the artist; reject same-title/wrong-duration
+hits instead of caching them. Deleted the bad BANCHO cache for now.
 
-## #3 — Desync: correct lyrics, wrong timing 🔴
-**Symptom:** "Deep Dive / 轟はじめ" matched the right lyrics (furigana+romaji+EN) but the
-displayed line was far off the video's burned-in line ("massive desync").
-**Suspect:** fetched LRC timeline vs the MV differ (intro length), and sound-sync didn't
-correct it; or the offset drifted. Needs sync-precision work (see #7).
-**Status:** open.
+## TICKET-003 — Desync: correct lyrics, wrong timing 🔴
+**Symptom:** "Deep Dive / 轟はじめ" matched the right lyrics but the displayed line was
+far off the video's burned-in line. Likely behind several "wrong song" reports.
+**Research:** the field uses **forced alignment** — separate vocals, recognize the
+singing, align phonetic units (Viterbi/HMM). ([AutoLyrixAlign/MIREX](https://music-ir.org/mirex/wiki/2024:Lyrics-to-Audio_Alignment),
+[lyrics-sync](https://github.com/mikezzb/lyrics-sync), [real-time chroma+phonetic](https://laurenceyoon.github.io/real-time-lyrics-alignment/))
+**Plan:** the app's "Sync by listening" is forced-alignment-lite (Whisper transcribe →
+fuzzy-match heard words to lyric lines → offset). Run it **automatically** right after a
+fetch on MV/cover titles (where catalog offset ≠ video), and re-anchor on a confident
+hit. Vocal separation (Demucs) is the heavier upgrade.
 
-## #4 — Identification too slow 🔴
-**Symptom:** long "♪ … — identifying…" before any lyrics appear, especially on covers.
-**Tie-in:** #1 (covers now fetch immediately by title); plus the generate-deadline vs
-fetch race. Needs: fire the cover/title fetch instantly on track-change and only
-generate if it truly comes up empty.
-**Status:** partly addressed by #1; revisit speed.
+## TICKET-004 — Identification too slow ("identifying…" for a long time) 🔴
+**Symptom:** long delay before lyrics appear, especially covers.
+**Research:** faster-whisper chunk tuning; Shazam capture length. ([faster-whisper](https://github.com/SYSTRAN/faster-whisper))
+**Plan:** TICKET-001 makes covers fetch by title immediately. Also: try the
+master-tracks DB **locally first** (instant, no network), and shorten the first Shazam
+capture. Overlaps TICKET-010.
 
-## #5 — Spotty / intermittent generation 🔴
-**Symptom:** "pieces of lyrics then blank then pieces then blank" — generated lyrics have
-big gaps. (VAD-off fix #cb8b7a3 helped but gaps remain on quiet/instrumental stretches.)
-**Suspect:** chunk capture timing + no_speech_threshold dropping chunks. Research says
-RMS-VAD segmentation reduces this. Most of these songs should MATCH (see #1), avoiding
-generation entirely.
-**Status:** open — mitigated by better matching; RMS-VAD is the real fix.
+## TICKET-005 — Spotty / intermittent generation ("pieces then blank") 🔴
+**Symptom:** generated lyrics appear, go blank, reappear — big gaps.
+**Research:** for streaming, **`condition_on_previous_text=False`** is recommended (True
+"causes the model to condition on potentially incorrect previous hypotheses"). Smaller
+chunks + overlap reduce latency/gaps; **RMS-VAD** segmentation cuts hallucinations
+without dropping vocals. ([saytowords](https://www.saytowords.com/blogs/Real-Time-Streaming-with-Whisper/),
+[arXiv ALT](https://arxiv.org/html/2506.15514v1))
+**Plan:** test `condition_on_previous_text=False` for generation; add RMS-VAD; overlap
+chunks so boundaries don't drop words. (Most of these songs should MATCH after
+TICKET-001, avoiding generation entirely.)
 
-## #6 — Box / corrupt characters in the overlay 🔵
-**Symptom:** boxes (□) / tofu glyphs in some rendered lyrics.
-**Finding:** a scan of recent cached lyrics found NO replacement/box chars in the DATA —
-so this is a FONT glyph-coverage issue in the Tk renderer (missing glyphs for some
-kanji/symbols/half-width katakana), not corrupted lyrics.
-**Status:** needs repro — capture the exact line that shows boxes, then pick a font with
-full CJK + symbol coverage (or per-glyph fallback).
+## TICKET-006 — Box / "tofu" characters in the overlay 🔵
+**Symptom:** some lines show □ boxes.
+**Finding:** a scan of cached lyrics found **no** corrupt chars in the DATA → it's a
+**font glyph-coverage** issue in the Tk renderer (missing glyphs → .notdef tofu).
+**Research:** "tofu = font lacks a glyph and no fallback." Fix = a font with full CJK +
+symbol coverage and a fallback chain. ([SimpleLocalize](https://simplelocalize.io/blog/posts/tofu-symbol/),
+[SymbolFYI](https://symbolfyi.com/guides/tofu-missing-glyphs/))
+**Plan:** set the overlay font to a verified full-coverage CJK face (Meiryo / Yu Gothic
+UI / MS Gothic) and add a per-glyph fallback. Need the exact line that shows boxes to
+confirm which glyphs are missing (symbols? half-width katakana? rare kanji?).
 
-## #7 — Sync precision 🔴
-**Symptom:** lyrics not tightly aligned to the audio (general request for "greater
-precision in lyric syncing").
-**Plan:** for matched LRC, tighten sound-sync (Shazam offset) + the recal cadence; for
-generated, anchor to the audio onset. Overlaps #3.
-**Status:** open.
+## TICKET-007 — Sync precision (general) 🔴
+**Symptom:** request for "greater precision in lyric syncing."
+**Research:** word-level "enhanced LRC" exists but free providers return line-level only;
+real-time alignment uses chroma + phonetic features. ([EasyLRC enhanced LRC](https://easylrc.com/blog/enhanced-lrc-word-level-timing-guide-2026),
+[real-time alignment](https://laurenceyoon.github.io/real-time-lyrics-alignment/))
+**Plan:** tighten the Shazam offset recal cadence on unstable songs; interpolate
+word-fill across each line (already partial); overlaps TICKET-003.
 
-## #8 — Multi-monitor 🔴 (feature)
-**Request:** move the lyrics overlay to a CHOSEN display, and an option to MIRROR on ALL
-connected displays at once.
-**Plan:** enumerate monitors (ctypes), tray "Display" submenu (each monitor + "All"),
-reposition the overlay, and spawn mirror windows for "All".
-**Status:** open — not started.
+## TICKET-008 — Multi-monitor: move to a display + mirror on all 🔴 (feature)
+**Symptom/request:** send the overlay to a chosen display; mirror on ALL displays.
+**Research:** Tkinter can't enumerate monitors — use the **`screeninfo`** library
+(resolution + x/y position + primary). Position via `geometry('+x+y')` (negative x =
+monitor to the left); watch **DPI scaling**. Mirror = one Toplevel per monitor.
+([wikiPython multi-screen](https://www.wikipython.com/tkinter-ttk-tix/gui-demos/a-tkinter-multi-screen-strategy-demo/),
+[PySimpleGUI multi-monitor](https://docs.pysimplegui.com/en/latest/cookbook/original/multi_monitor/))
+**Plan:** add `screeninfo`; tray "Display" submenu (each monitor + "All displays");
+reposition the band to the chosen monitor's bounds; for "All", spawn mirror overlays.
+*(Only 1 display connected now — buildable, but needs a 2nd screen to validate.)*
 
-## #9 — Use the master-tracks library DB for matching 🔴 (feature)
-**Idea:** `BarnsL/Music-Migrator` `data/master_tracks.json` (ISRC → track/artist/album/
-duration) is the user's real library. Fuzzy-match messy YouTube titles → clean (artist,
-title, duration) → correct fetch + same-title disambiguation (#2). Helps library songs.
-**Status:** CSV obtained locally; integration not started.
+## TICKET-009 — Use the master-tracks library DB for matching/verification 🔴 (feature)
+**Idea:** `Music-Migrator/data/master_tracks.json` (ISRC → track/artist/album/
+duration_ms) is the user's real library. Fuzzy-match messy YouTube titles → clean
+(artist, title, duration) for accurate fetch + same-title disambiguation (TICKET-002).
+**Research:** duration + artist verification is the standard guard. ([Musely](https://musely.ai/tools/lyrics-finder))
+**Plan:** load the DB once; normalized-title index; on track-change, fuzzy-match → if a
+confident hit, use its (artist, title, duration) to fetch + verify. (CSV obtained.)
+
+## TICKET-010 — Generate-vs-fetch race (covers still flash "Generating…") 🔴
+**Plan:** the generate-defer (commit 71fdc2c) waits while a lookup is in flight; extend
+so a cover/title fetch (TICKET-001) always pre-empts the 11s generate deadline, so
+findable covers never flash AI text.
+
+## TICKET-011 — Performance (render FPS / GPU / CPU) 🟡
+**Status:** GPU now used for Whisper (cuBLAS/cuDNN fix, commit 142512a); render is
+throttled (PIL repaint budget). FPS shows N/A in the browser HUD (that's the page, not
+us). **Plan:** profile the Tk frame time (`/status` render_fps) on heavy songs.
+
+## TICKET-012 — Generated-lyric language detection 🟢
+**Was:** generation hard-forced Japanese → English covers became gibberish ("あかんぽう").
+**Fix (pushed):** auto-detect the language **per chunk** (no first-chunk pin), flowing
+into transcription / annotate / translate / saved meta.lang.
+
+---
+
+### Research summary (cross-cutting)
+- **Matching:** verify artist + duration, don't trust the first hit (TICKET-002/009).
+- **Sync:** forced alignment / vocal separation; auto sync-by-listening (TICKET-003/007).
+- **Generation:** `condition_on_previous_text=False`, RMS-VAD, overlap chunks (TICKET-005).
+- **Rendering:** full-coverage CJK font + fallback to kill tofu (TICKET-006).
+- **Multi-monitor:** `screeninfo` + per-monitor Toplevels (TICKET-008).
