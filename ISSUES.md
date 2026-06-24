@@ -264,6 +264,25 @@ offset is large (>6 s) **and** the match ratio is low (<0.72) — the player pos
 right far more often than a low-confidence big jump. High-confidence large offsets
 (genuine long intros) still apply. Complements TICKET-015's dead-band on the Shazam recal.
 
+## TICKET-022 — Concert song detection via on-screen banner OCR 🟡 (feature)
+**Request:** in a long concert video (ReGLOSS 3D live) the app should play the CURRENT
+song's lyrics (SUPER DUPER, 泡沫メイビー, …) and sync — Shazam alone fails on live takes.
+Use the **song name shown on screen** as a high-confidence hint feeding the confidence score.
+**Approach (new [concert_ocr.py](concert_ocr.py) + [docs/CONCERT_DETECTION.md](docs/CONCERT_DETECTION.md)):**
+capture the screen → crop the top banner strip → OCR with the **built-in Windows OCR**
+(`Windows.Media.Ocr` via winsdk — no new dep) → fuzzy-match to the song library → if
+`score >= 0.85`, load that song (cache/fetch), title-lock it (OCR is authoritative in a
+concert), and lock timing by sound. Runs throttled in **live mode** on a background thread.
+**Research:** burned-in-text OCR is a proven approach (VideOCR/PaddleOCR ~99% JP). Combining
+**on-screen text OCR + audio fingerprint** is the recommended design.
+([VideOCR](https://www.fcportables.com/videocr-portable/), [meikipop JP OCR](https://github.com/rtr46/meikipop))
+**Findings:** Windows OCR works (read "SUPER DUPER" cleanly); ships **en-US** only —
+Japanese banners need the pack once: `Add-WindowsCapability -Online -Name
+"Language.OCR~~~ja-JP~0.0.1.0"`. The in-memory bitmap path segfaults → use a temp PNG +
+`StorageFile`. Matcher verified: real banners → 1.0, hashtag/chat noise → 0.36 (ignored).
+**Status:** 🟡 module + matcher built & tested, wired into live mode (en-US live now);
+needs the ja-JP pack for Japanese banners + live concert validation + intermission handling.
+
 ## TICKET-021 — MV-intro onset-anchor double-shifted a fetched LRC (サクラミラージュ drift) 🟢
 **Symptom:** サクラミラージュ's lyrics drifted ~11s late; resetting Sync→0 fixed it every
 time. The watcher caught a persistent **-11s** offset on it.

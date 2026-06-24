@@ -846,6 +846,9 @@ class Overlay:
         self.api_on = bool(s.get("api", True))         # local agent-control API
         self.boundary_on = bool(s.get("boundary", True))  # fast song-change detect
         self.generate_on = bool(s.get("generate", True))  # generate lyrics by ear
+        self.concert_ocr = bool(s.get("concert_ocr", True))  # read the on-screen song banner in concerts
+        self._last_ocr_t = 0.0        # throttle the concert OCR check
+        self._ocr_song = None         # last song the banner OCR confidently read
         self._generating = False      # Whisper lyric-generation in progress
         self._gen_token = 0           # bumped on track change / real-lyric load to stop generation
         self._track_seq = 0           # bumped per track change (gates the generation deadline)
@@ -1231,6 +1234,14 @@ class Overlay:
         nxt = max(4, self.recal_secs or 30)
         try:
             st = self.media.get()
+            # CONCERT banner OCR: a long live video shows the CURRENT song's name on
+            # screen — read it (a high-confidence hint that Shazam can't beat on a
+            # live arrangement) and switch to the right lyrics. Throttled, on a
+            # background thread. See concert_ocr.py / docs/CONCERT_DETECTION.md.
+            if (st and st.get("status") == PLAYING and self._live_mode
+                    and self.concert_ocr and time.time() - self._last_ocr_t > 6.0):
+                self._last_ocr_t = time.time()
+                threading.Thread(target=self._concert_ocr_check, daemon=True).start()
             if st and st.get("status") == PLAYING and not self._identifying:
                 if self._fast_calib > 0:
                     self._fast_calib -= 1
@@ -1255,6 +1266,54 @@ class Overlay:
                         nxt = max(4, min(self.recal_secs, 4) if unconfirmed else self.recal_secs)
         finally:
             self._arm_recal(nxt)
+
+    def _concert_ocr_check(self):
+        """(background thread) Read the on-screen song-title banner and, if it
+        confidently names a song we have, switch the overlay to that song's lyrics.
+        Runs only in live/concert mode. Best-effort: any failure is ignored and the
+        sound-driven detection stands. See concert_ocr.py / docs/CONCERT_DETECTION.md."""
+        try:
+            import concert_ocr
+            if not concert_ocr.available():
+                return
+            cands = [e.get("title") for e in self.index.entries if e.get("title")]
+            if not cands:
+                return
+            m = concert_ocr.match_song(concert_ocr.read_banner_lines(), cands)
+        except Exception:
+            return
+        if not m or m[1] < 0.85:
+            return
+        title, score = m
+        if self._titles_match(self.meta.get("title", ""), title):
+            self._ocr_song = title           # already showing it
+            return
+        if title == self._ocr_song:
+            return                           # already acted on this read
+        self._ocr_song = title
+        self.root.after(0, lambda t=title, s=score: self._apply_ocr_song(t, s))
+
+    def _apply_ocr_song(self, title, score):
+        """(Tk thread) The concert banner named `title` — load it (from cache, else
+        fetch) and let sound lock the timing. OCR is the authority in a concert, so
+        we title-lock it: a Shazam mis-ID on the live arrangement can't override it."""
+        artist = (self._track or ("", ""))[0]
+        cached = self.index.match(artist, title, self._cur_duration)
+        if cached and self._file_valid(cached, self._cur_duration):
+            if cached != self._lyrics_path:
+                log.info("concert OCR read %r (%.2f) → %s", title, score, cached.name)
+                self.load(cached)
+                self._maybe_translate()
+                self._verified = True
+                self._title_locked = True          # OCR is authoritative in a concert
+                self._sound_song = (title, artist)
+                self.offset = 0.0
+                self._fast_calib = max(self._fast_calib, 2)
+                self._arm_recal(5)
+                self._start_identify(seconds=6, attempts=2)   # lock timing by sound
+        else:
+            log.info("concert OCR read %r (%.2f) → fetching", title, score)
+            self._start_fetch(artist, title, self._cur_duration)
 
     def _viewport_watchdog(self):
         """Light keeper for the FIXED full-work-area window. The window never
@@ -2350,6 +2409,7 @@ class Overlay:
                         "recal_secs": self.recal_secs, "git_sync": self.git_sync,
                         "character": self.character_on, "api": self.api_on,
                         "boundary": self.boundary_on, "generate": self.generate_on,
+                        "concert_ocr": self.concert_ocr,
                         "display": self.display})
 
     def set_generate(self, on):
