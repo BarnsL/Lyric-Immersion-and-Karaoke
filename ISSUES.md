@@ -280,6 +280,20 @@ title OR one contains the other) AND requires the title to be **distinctive**
 over. Deleted the stale generated `regloss_feelingradation.json` (kept the real
 `feelingradation.json`) and the old `dist/` build so the latest code runs.
 
+## TICKET-032 — "Was fine then desynced": a spurious same-song track-change wiped the offset 🟢
+**Symptom:** a song synced correctly, then suddenly jumped ~30s off (Shinigami Eyes, white
+balance). Telemetry showed it: `CONFIRMED offset -29.89s → applied` (drift→0, synced), then a
+few reads later `shown_off=+0.00` with `track change: 'Shinigami Eyes' / 'Grimes'` — the SAME
+song re-fired as a track change.
+**Root cause:** track changes fire on exact `(clean_artist, clean_title)` inequality, but YouTube's
+SMTC re-reports the same song mid-play with slightly fluctuating metadata (a channel suffix
+appears/disappears, the title reflows). Each flicker re-entered `_on_track_change`, which resets
+`self.offset = 0.0` and re-identifies — wiping a confirmed sync.
+**Fix (v1.0.22):** `_on_track_change` now bails early when the "new" track's title still matches
+the currently-loaded song (`_titles_match`, and not live) — it keeps the sync and only refreshes
+duration. The recal loop keeps listening, so a genuine same-title-different-song is still caught
+by sound. Fixes the "was fine then desynced" class for every song.
+
 ## TICKET-031 — Romaji-only cover showed no Japanese / no English (Blue Bird) 🟢
 **Symptom:** Raon Lee's "Blue Bird" cover displayed ONLY romaji ("aoi aoi ano sora") — no
 kanji/kana, no English translation.

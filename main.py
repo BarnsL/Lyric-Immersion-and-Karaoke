@@ -1013,6 +1013,20 @@ class Overlay:
         if not artist and " - " in title:
             a, t = title.split(" - ", 1)
             artist, title = a.strip(), t.strip()
+        # SMTC re-reports the SAME song mid-playback (YouTube nudges its metadata —
+        # a channel suffix appears/disappears, the title reflows), which flips the
+        # cleaned (artist,title) tuple and used to re-enter here and WIPE a confirmed
+        # sync offset back to 0 — a song that was perfectly synced suddenly jumped
+        # ~30s off (Shinigami Eyes/white balance "was fine then desynced"). If this
+        # "new" track is really the one already loaded, keep the sync and bail; the
+        # recal loop keeps listening, so a genuine same-title-different-song is still
+        # caught by sound.
+        if (self.lines and not self._live_mode
+                and self._titles_match(self.meta.get("title", ""), title)):
+            if duration:
+                self._cur_duration = duration
+            log.info("same song re-reported (%r) — keeping sync, no reset", title)
+            return
         self.character.set_artist(artist or title)   # spawn this song's artist
         self._cur_duration = duration
         self._health_attempts = 0
