@@ -123,6 +123,7 @@ def _data_models_dir():
 
 
 _device = {}          # which device each cached model actually loaded on
+_last_gen_lang = None  # language Whisper auto-detected on the most recent generation chunk
 
 
 def _get_model(size=_MODEL):
@@ -189,11 +190,15 @@ def _transcribe(audio, lang):
     return [(seg.start, seg.text) for seg in segments if seg.text.strip()]
 
 
-def transcribe_for_generation(pos_cap, lang="ja", seconds=16, size=_GEN_MODEL):
+def transcribe_for_generation(pos_cap, lang=None, seconds=16, size=_GEN_MODEL):
     """LAST-RESORT lyric generation: capture `seconds` of the live audio and
     transcribe it into timed lyric lines (for songs no provider has). Returns
     ``[{"t":[start,end], "jp": text}, …]`` on the SONG clock (offset by the player
     position `pos_cap` at capture start), or ``[]`` on silence/failure.
+
+    ``lang=None`` (the default) lets Whisper AUTO-DETECT the sung language, so an
+    English / Korean cover isn't force-fit into Japanese gibberish; the detected
+    language is stashed in ``_last_gen_lang`` for the caller to pin on later chunks.
 
     Uses a **bigger model** than sync-by-listening (this text is *shown*, not just
     matched) and in-chunk context for the best transcription quality feasible. VAD
@@ -201,10 +206,11 @@ def transcribe_for_generation(pos_cap, lang="ja", seconds=16, size=_GEN_MODEL):
     whole clips (no lyrics generated); Whisper's own no_speech_threshold still skips
     the instrumental gaps. Still imperfect — the caller marks every generated line
     so the user knows it's machine-made, not official."""
+    global _last_gen_lang
     _ensure_deps_path()
     lang = {"ja-romaji": "ja"}.get(lang, lang)
     hint = lang if lang in ("ja", "ko", "zh", "es", "de", "ru", "en",
-                            "fr", "it", "pt") else None
+                            "fr", "it", "pt") else None   # None → Whisper auto-detects
     audio = _capture(seconds)
     if audio is None:
         return []
@@ -219,6 +225,7 @@ def transcribe_for_generation(pos_cap, lang="ja", seconds=16, size=_GEN_MODEL):
         segs, _info = model.transcribe(
             audio, language=hint, beam_size=5, vad_filter=False,
             condition_on_previous_text=True)
+        _last_gen_lang = getattr(_info, "language", None) or _last_gen_lang
     except Exception:
         return []
     out = []

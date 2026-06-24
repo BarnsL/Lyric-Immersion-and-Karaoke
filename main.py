@@ -766,6 +766,7 @@ class Overlay:
         self._track_seq = 0           # bumped per track change (gates the generation deadline)
         self._gen_lines = []          # accumulated generated line dicts
         self._gen_title = self._gen_artist = ""
+        self._gen_lang = None         # language auto-detected for the current generation
         self._title_locked = False    # exact clean-title match → sound can't override
         self._api = None
         self._boundary = None         # song-change detector thread
@@ -1344,6 +1345,7 @@ class Overlay:
         self._gen_token += 1
         self._gen_title, self._gen_artist = (title or "song"), (artist or "")
         self._gen_lines = []
+        self._gen_lang = None          # first chunk auto-detects the sung language
         self.lines, self.idx, self._kara = [], -1, []
         self._lyrics_path = None
         self._verified = False
@@ -1371,14 +1373,19 @@ class Overlay:
             idle = 0
             pos = float(st.get("position") or 0.0)
             secs = 8 if first else CHUNK      # short FIRST chunk → lyrics appear sooner
-            first = False
-            chunk = align.transcribe_for_generation(pos, lang="ja", seconds=secs)
+            # First chunk: lang=None → Whisper AUTO-DETECTS the sung language (so an
+            # English/Korean cover isn't mangled into Japanese gibberish), then pin
+            # the detected language for the rest of the song.
+            chunk = align.transcribe_for_generation(pos, lang=self._gen_lang, seconds=secs)
+            if first:
+                self._gen_lang = getattr(align, "_last_gen_lang", None) or self._gen_lang
+                first = False
             if token != self._gen_token:
                 return
             new = [d for d in chunk if d["t"][0] >= last_end - 1.0 and d["jp"].strip()]
             if new:
                 try:
-                    annotate(new, "ja", translate=False)   # furigana + romaji NOW (fast)
+                    annotate(new, self._gen_lang or "ja", translate=False)   # furigana/romaji NOW
                 except Exception:
                     pass
                 for d in new:
@@ -1402,7 +1409,7 @@ class Overlay:
         capture loop's lifecycle, not the translation's)."""
         try:
             from fetch_lyrics import _translate_lines
-            _translate_lines(lines, "ja")
+            _translate_lines(lines, self._gen_lang or "ja")
         except Exception:
             return
         for d in lines:
@@ -1430,7 +1437,7 @@ class Overlay:
             from fetch_lyrics import slugify
             out = LYRICS_DIR / f"{slugify(self._gen_title)}.json"
             data = {"meta": {"title": self._gen_title, "artist": self._gen_artist,
-                             "lang": "ja", "duration": self._cur_duration,
+                             "lang": self._gen_lang or "ja", "duration": self._cur_duration,
                              "source": "generated"},
                     "lines": [{"t": d["t"], "jp": d.get("jp", ""), "rm": d.get("rm", ""),
                                "en": d.get("en", "")} for d in merged]}
