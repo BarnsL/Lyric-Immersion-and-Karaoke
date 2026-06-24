@@ -30,6 +30,7 @@ from pathlib import Path
 
 from character import Character
 import updater
+import version
 import gpu_setup
 
 # Run every subprocess (git, PowerShell, pip) with NO console window — otherwise
@@ -2682,6 +2683,9 @@ def main():
     def _wrong(*_):   ov.root.after(0, ov.report_wrong)
     def _ident(*_):   ov.root.after(0, ov.identify_by_sound)
     def _align(*_):   ov.root.after(0, ov.align_by_listening)
+    def _about(*_):
+        import webbrowser
+        webbrowser.open("https://github.com/BarnsL/Desktop-Karaoke#readme")
 
     def _open_import(*_):
         from playlist_import_gui import show_import_window
@@ -2909,6 +2913,7 @@ def main():
         pystray.MenuItem("Show / Hide", _toggle),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(_upd_label, _on_updates),
+        pystray.MenuItem(f"ℹ️  About  ·  v{version.__version__}", _about),
         pystray.MenuItem("Quit", _quit),
     )
     icon = pystray.Icon("desktop-karaoke", make_icon(), "Desktop Karaoke", menu)
