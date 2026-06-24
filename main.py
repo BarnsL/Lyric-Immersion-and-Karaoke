@@ -1736,43 +1736,56 @@ class Overlay:
                 return
             if not res or token != self._deep_token:
                 return
-            lines, dl = res
+            lines, dl, real_meta = res
             dlang = dl or lang or "ja"
-            # Annotate (furigana / romaji + the NETWORK translation) HERE, off the
-            # Tk thread — the round-trip must never block the UI (the best-effort
-            # path translates off-thread for the same reason).
-            try:
-                from fetch_lyrics import annotate
-                annotate(lines, dlang, translate=True)
-            except Exception:
-                pass
-            for d in lines:             # keep the AI marker, like the best-effort
-                if d.get("en", "").strip() and not d["en"].rstrip().endswith("***"):
-                    d["en"] = d["en"].strip() + " ***"
+            if real_meta:
+                # REAL provider lyrics, found via the video's canonical title
+                # (deep_transcribe already annotated them) — the player gave an
+                # English/translated title that missed the cache, but yt-dlp's real
+                # title reached the lyrics. Save as REAL, no AI '***' marker.
+                src = real_meta.get("source") or "provider"
+            else:
+                # By-ear transcription. Annotate (furigana / romaji + the NETWORK
+                # translation) HERE, off the Tk thread — the round-trip must never
+                # block the UI — and mark each line AI ('***').
+                src = "generated-deep"
+                try:
+                    from fetch_lyrics import annotate
+                    annotate(lines, dlang, translate=True)
+                except Exception:
+                    pass
+                for d in lines:
+                    if d.get("en", "").strip() and not d["en"].rstrip().endswith("***"):
+                        d["en"] = d["en"].strip() + " ***"
             if token == self._deep_token:
-                self.root.after(0, lambda: self._apply_deep(token, title, artist, lines, dlang))
+                self.root.after(0, lambda: self._apply_deep(token, title, artist, lines, dlang, src))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _apply_deep(self, token, title, artist, lines, lang):
-        """(Tk thread) save the already-annotated deep lines as the cache
-        (`generated-deep`) and upgrade the overlay live if this song still plays."""
+    def _apply_deep(self, token, title, artist, lines, lang, source="generated-deep"):
+        """(Tk thread) save the already-annotated deep lines as the cache and
+        upgrade the overlay live if this song still plays. `source` is
+        `generated-deep` for a by-ear transcription, or a provider source when the
+        canonical-title lookup found REAL lyrics."""
         if token != self._deep_token:
             return                      # track changed (or real lyrics loaded) → discard
         # REAL lyrics may have arrived (a slow fetch finally resolved) while we
         # transcribed — they WIN. Don't save or show a generated-deep version over
-        # them (that was the "some ended up generated too" overwrite).
-        if self.lines and not (self.meta.get("source") or "").startswith("generated"):
+        # them (that was the "some ended up generated too" overwrite). A canonical
+        # REAL result is itself real, so it may replace a generated stopgap.
+        real = not source.startswith("generated")
+        if self.lines and not (self.meta.get("source") or "").startswith("generated") and not real:
             return
         from fetch_lyrics import slugify
         try:
             out = LYRICS_DIR / f"{slugify(title)}.json"
             data = {"meta": {"title": title, "artist": artist, "lang": lang,
-                             "duration": self._cur_duration, "source": "generated-deep"},
+                             "duration": self._cur_duration, "source": source},
                     "lines": lines}
             out.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
             self.index.add(out)
-            log.info("deep gen: saved %d lines -> %s", len(lines), out.name)
+            log.info("deep %s: saved %d lines -> %s",
+                     "real" if real else "gen", len(lines), out.name)
         except Exception as e:
             log.info("deep gen save failed: %s", e)
             return
@@ -1782,7 +1795,7 @@ class Overlay:
             self._gen_token += 1        # stop the Tier-1 best-effort loop
             self._generating = False
             self.load(out, keep_idx=True)
-            self._hint("✨ Upgraded to full transcription")
+            self._hint("✨ Found the real lyrics" if real else "✨ Upgraded to full transcription")
 
     def _generate_loop(self, token):
         """Capture the song in chunks, transcribe each, annotate, accumulate.

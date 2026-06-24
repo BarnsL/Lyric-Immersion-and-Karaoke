@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import glob
 import logging
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -53,10 +54,13 @@ def available() -> bool:
         return False
 
 
-def _download_audio(query: str, dest: Path) -> Path | None:
+def _download_audio(query: str, dest: Path) -> tuple[Path | None, str | None]:
     """ytsearch the query and download the top hit's AUDIO-ONLY stream into
-    ``dest``. Returns the downloaded file path, or None on any failure / an
-    over-long match (a concert or "1 hour loop" is not the song we want)."""
+    ``dest``. Returns (downloaded file path, the hit's CANONICAL title), or
+    (None, None) on any failure / an over-long match (a concert or "1 hour loop"
+    is not the song we want). The canonical title is the video's REAL name — often
+    the Japanese original even when the player reported an English/translated one —
+    so the caller can look up real lyrics before transcribing by ear."""
     import shutil as _sh
     import yt_dlp
     out = str(dest / "src.%(ext)s")
@@ -74,14 +78,59 @@ def _download_audio(query: str, dest: Path) -> Path | None:
     # machine with neither, the download may 403 and we degrade gracefully.
     if _sh.which("node"):
         opts["js_runtimes"] = {"node": {}}
+    info_title = None
     try:
         with yt_dlp.YoutubeDL(opts) as y:
-            y.download([f"ytsearch1:{query}"])
+            info = y.extract_info(f"ytsearch1:{query}", download=True)
+            if isinstance(info, dict):
+                ents = info.get("entries") or [info]
+                if ents and isinstance(ents[0], dict):
+                    info_title = ents[0].get("title")
     except Exception as e:
         log.info("deep: download failed for %r: %s", query, str(e)[:140])
-        return None
+        return None, None
     files = glob.glob(str(dest / "src.*"))
-    return Path(files[0]) if files else None
+    return (Path(files[0]) if files else None), info_title
+
+
+def _real_from_canonical(canon_title: str | None, artist: str):
+    """Try to find REAL provider lyrics using the video's CANONICAL title (from
+    yt-dlp) rather than transcribing by ear. yt-dlp reports the Japanese name even
+    when the player gave an English/translated one ('KAF #27 - And Become a Flower'
+    vs the real 花譜「そして花になる」), which is why songs with perfectly good provider
+    lyrics were being generated. Returns (annotated lines, lang, meta) or None."""
+    if not canon_title:
+        return None
+    import fetch_lyrics as F
+    cands = []
+    m = re.search(r"「([^」]+)」|『([^』]+)』", canon_title)   # song is in 「」 for JP uploads
+    if m:
+        cands.append(m.group(1) or m.group(2))
+    base = re.sub(r"【[^】]*】|\([^)]*\)|（[^）]*）", "", canon_title)   # drop 【MV】/(tags)
+    base = re.sub(r"^\s*[^#「」]*#\s*\d+\s*[-‐–—]?\s*", "", base).strip(" 　-–—|｜/／")
+    if base:
+        cands.append(base)
+    cands.append(canon_title)
+    seen = set()
+    for t in cands:
+        t = (t or "").strip()
+        if len(t) < 2 or t.lower() in seen:
+            continue
+        seen.add(t.lower())
+        try:
+            lrc, meta = F.fetch_lrc(t, artist, cover=True)
+        except Exception:
+            continue
+        if lrc:
+            lines = F.parse_lrc_text(lrc)
+            if len(lines) >= 6:
+                lang2 = F._song_lang(lines)
+                F.annotate(lines, lang2, translate=True)
+                log.info("deep: REAL lyrics via canonical title %r — %d %s lines (%s), "
+                         "skipping by-ear transcription", t, len(lines), lang2,
+                         (meta or {}).get("source"))
+                return lines, lang2, (meta or {"source": "provider"})
+    return None
 
 
 def transcribe_file(path: str | Path, lang: str | None = None,
@@ -110,10 +159,12 @@ def transcribe_file(path: str | Path, lang: str | None = None,
 
 
 def deep_transcribe(title: str, artist: str = "", lang: str | None = None,
-                    size: str = _DEEP_SIZE) -> tuple[list[dict], str | None] | None:
-    """Full pipeline: search + download the source audio, transcribe the whole
-    file with the large model, DELETE the audio, return ``(lines, lang)``.
-    Returns None on any failure. The downloaded audio is ALWAYS removed."""
+                    size: str = _DEEP_SIZE):
+    """Full pipeline: search + download the source audio, then FIRST try REAL
+    provider lyrics via the video's canonical (yt-dlp) title, and only transcribe
+    by ear if that fails. DELETE the audio. Returns ``(lines, lang, meta)`` where
+    ``meta`` is a provider dict for REAL lyrics or ``None`` for a by-ear
+    transcription; ``None`` on total failure. The audio is ALWAYS removed."""
     if not available():
         return None
     query = f"{title} {artist}".strip()
@@ -121,9 +172,13 @@ def deep_transcribe(title: str, artist: str = "", lang: str | None = None,
         return None
     tmp = Path(tempfile.mkdtemp(prefix="dk_deep_"))
     try:
-        audio = _download_audio(query, tmp)
+        audio, canon = _download_audio(query, tmp)
         if not audio:
             return None
+        # Prefer REAL lyrics reachable via the canonical title before by-ear work.
+        real = _real_from_canonical(canon, artist)
+        if real:
+            return real
         log.info("deep: transcribing %s (%d KB) with %s",
                  audio.name, audio.stat().st_size // 1024, size)
         lines, detected = transcribe_file(audio, lang=lang, size=size)
@@ -131,7 +186,7 @@ def deep_transcribe(title: str, artist: str = "", lang: str | None = None,
             log.info("deep: only %d lines — keeping best-effort", len(lines))
             return None
         log.info("deep: %d lines transcribed (lang=%s)", len(lines), detected)
-        return lines, detected
+        return lines, detected, None
     except Exception as e:
         log.info("deep: error: %s", str(e)[:160])
         return None
