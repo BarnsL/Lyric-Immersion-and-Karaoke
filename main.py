@@ -410,6 +410,15 @@ def clean_title(title, source=""):
                        t, flags=re.I)
         if md and not md.group(2) and not _is_generic_title(md.group(1)):
             song = md.group(1)
+    # VTuber/idol uploads also wrap the song in straight/smart quotes, e.g.
+    # "ReGLOSS 'サクラミラージュ' Performance Video" → サクラミラージュ. Require a real
+    # PAIR around ≥2 chars so an apostrophe ("Don't") isn't taken for a quote.
+    if not song:
+        qm = re.search(r"['‘’]([^'‘’]{2,})['‘’]|[\"“”]([^\"“”]{2,})[\"“”]", t)
+        if qm:
+            cand = (qm.group(1) or qm.group(2) or "").strip()
+            if cand and not _is_generic_title(cand):
+                song = cand
     if song and song.strip():
         t = song.strip()
 
@@ -426,10 +435,14 @@ def clean_title(title, source=""):
     t = re.sub(r"\s*(?:[/／]|を)?\s*(歌ってみた|歌わせて|踊ってみた|おどってみた|"
                r"演奏してみた|弾いてみた|叩いてみた|アコギ|acoustic\s*ver).*$", "", t, flags=re.I)
     t = re.sub(
-        r"\b(Official\s*(Music\s*)?(Video|Audio)|Official|Music\s*Video|MV|PV|"
+        r"\b(Official\s*(Music\s*)?(Video|Audio)|Official|Music\s*Video|"
+        r"Performance\s*Video|Visuali[sz]er|MV|PV|"
         r"Lyric\s*Video|Audio|HD|4K|FULL|Full\s*Ver\.?)\b",
         "", t, flags=re.I,
     )
+    # "Song feat./ft. Artist" → the SONG is before feat (the collaborator is the
+    # artist, not part of the lyric-search title): "Clione feat. 轟はじめ" → "Clione".
+    t = re.sub(r"\s*\b(?:feat|ft|featuring)\.?\s+.*$", "", t, flags=re.I)
     # Trailing dash-delimited version/edit subtitle, common on JP MV uploads:
     # "Into Starlight -anniversary special ver.-", "曲名 -Remix-", "- Acoustic ver -".
     t = re.sub(
@@ -451,7 +464,7 @@ def clean_title(title, source=""):
 
 # Titles that name an EVENT (a whole concert / festival / medley), not a song.
 _LIVE_RE = re.compile(
-    r"\b(?:live|concert|fes(?:tival)?|tour|setlist|set\s*list|medley|megamix|"
+    r"\b(?:concert|fes(?:tival)?|tour|setlist|set\s*list|medley|megamix|"
     r"mega\s*mix|non-?stop|dj\s*set|full\s*(?:album|live|concert|set)|"
     r"rock\s*japan|rising\s*sun|summer\s*sonic|fuji\s*rock|countdown|"
     r"anniversary\s*live)\b"

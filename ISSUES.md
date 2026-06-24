@@ -130,6 +130,22 @@ self-exits, port owner unchanged.
 **Note:** the stale dist exe is old code; rebuild it if you want the *packaged* version
 current — the active path (shortcuts + running instance) is already the latest source.
 
+## TICKET-014 — Common songs generate instead of fetching (title not cleaned) 🟢
+**Symptom:** "ReGLOSS 'サクラミラージュ' Performance Video" generated wrong JP; "Clione feat.
+轟はじめ (Live at PQ)" generated "me me me ***" — both HAVE real lyrics (サクラミラージュ 65
+lines, Clione 27). Generation is meant to be a LAST RESORT.
+**Root cause:** `clean_title` left the messy title so the fetch missed → fell to
+generation: (a) the song wasn't extracted from `'…'`/`"…"` quotes (only 「」/『』);
+(b) "Performance Video" not stripped; (c) "feat. X" not stripped; (d) a SINGLE live song
+("X (Live at Y)") matched the bare word "live" in `_LIVE_RE` → forced sound-only mode (no
+title fetch) → generated.
+**Fix (pushed):** `clean_title` now also extracts a song from straight/smart quotes,
+strips "Performance Video"/"Visualizer" and "feat./ft. X"; `_LIVE_RE` no longer trips on
+bare "live" (keeps concert/tour/festival/medley/3D-live + the >12 min duration guard).
+Verified: both titles clean to the song and fetch real lyrics; concerts ("Live Tour")
+stay sound-driven; apostrophes ("Don't Stop Me Now") + covers unaffected. Bad generated
+caches deleted.
+
 ---
 
 ### Research summary (cross-cutting)
