@@ -788,24 +788,15 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
             return None
         return lrc if (lrc and "[" in lrc) else None
 
-    # COVER fast-path. A 歌ってみた / cover's lyrics ARE the original song's, but the
-    # "artist" we have is the COVERING channel — it only derails an artist-keyed
-    # search, which then loses to the ~11s generate-by-ear deadline. The cover
-    # marker already told us the title is a real, covered song, so query by TITLE
-    # and trust it: still language/duration-verified by verify_lrc, just without
-    # the stricter same-title guard (_strict_ok) ordinary title-only hits get.
-    if cover and t:
-        for tt in (_title_variants(t) or [t]):
-            lrc = _try(tt)
-            if lrc and verify_lrc(lrc, t, duration):
-                r = take(lrc, {"source": "syncedlyrics/cover", "artist": a or None,
-                               "duration": duration})
-                if r:
-                    return r
-
     # Try each clean song-title candidate (full title first, then the song name
     # pulled out of a bilingual "Artist - JP / Artist - EN｜from X" video title) so
     # a niche song still resolves to its real lyrics instead of being generated.
+    # ARTIST-KEYED queries run FIRST — even for a COVER, adding the (covering)
+    # channel disambiguates a super-common title: "地球儀 花譜" ranks Kenshi
+    # Yonezu's 地球儀 (the song actually being covered) first, whereas a bare
+    # "地球儀" title query grabs an unrelated same-title song. The cover title-only
+    # fast-path is the FALLBACK below — only for true 歌ってみた uploads where the
+    # channel-as-artist genuinely derails the search (TICKET-001 vs TICKET-002).
     hi_q, seen = [], set()
     for tt in (_title_variants(t) or [t]):
         if arts:
@@ -827,6 +818,24 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
                            "duration": duration})
             if r:
                 return r
+
+    # COVER fast-path (FALLBACK). A 歌ってみた / cover's lyrics ARE the original
+    # song's, but the "artist" we have is the COVERING channel. When the
+    # artist-keyed queries above already resolved the original (the channel name
+    # actually helped narrow it), we never get here. We only fall back to a
+    # title-only query — trusting the cover marker, without the stricter
+    # same-title guard (_strict_ok) — for true covers the artist token couldn't
+    # resolve, so they still beat the ~11s generate-by-ear deadline. Running this
+    # AFTER the artist-keyed pass is what stops a common title (地球儀) from
+    # loading the wrong same-title song when the right one was reachable.
+    if cover and t:
+        for tt in (_title_variants(t) or [t]):
+            lrc = _try(tt)
+            if lrc and verify_lrc(lrc, t, duration):
+                r = take(lrc, {"source": "syncedlyrics/cover", "artist": a or None,
+                               "duration": duration})
+                if r:
+                    return r
 
     # 4. title-only — last resort, strict guard against same-title wrong songs
     if t:
