@@ -2490,7 +2490,29 @@ def make_icon():
     return img
 
 
+_SINGLE_INSTANCE_MUTEX = None
+
+
+def _is_only_instance():
+    """Single-instance guard: hold a process-lifetime named mutex so a SECOND Desktop
+    Karaoke launch exits instead of opening a duplicate overlay. The venv `pythonw`
+    stub that re-execs the real interpreter does NOT run this (only the real app
+    process does), so an instance never blocks its own stub→child pair."""
+    global _SINGLE_INSTANCE_MUTEX
+    try:
+        k32 = ctypes.windll.kernel32
+        h = k32.CreateMutexW(None, False, "Local\\DesktopKaraoke.SingleInstance")
+        if not h:
+            return True
+        _SINGLE_INSTANCE_MUTEX = h         # keep alive for the run (releases on exit)
+        return k32.GetLastError() != 183   # 183 = ERROR_ALREADY_EXISTS
+    except Exception:
+        return True
+
+
 def main():
+    if not _is_only_instance():
+        return                 # another Desktop Karaoke is already running
     offset = 0.0
     args = sys.argv[1:]
     for i, a in enumerate(args):

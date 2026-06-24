@@ -115,6 +115,21 @@ us). **Plan:** profile the Tk frame time (`/status` render_fps) on heavy songs.
 **Fix (pushed):** auto-detect the language **per chunk** (no first-chunk pin), flowing
 into transcription / annotate / translate / saved meta.lang.
 
+## TICKET-013 — Single-instance + "only the latest running" 🟢
+**Request:** make sure only the latest version is installed/running; prevent >1 instance.
+**Found:** repeated dev restarts had left **two** instance-pairs running (the venv
+`pythonw` stub re-execs the real interpreter, so each instance = 2 processes; only the
+newest owned port 8765). Desktop + Startup shortcuts both target the SOURCE
+`pythonw main.py` (= latest). A stale `dist\DesktopKaraoke.exe` build exists but is
+unlinked + not running.
+**Fix (pushed):** `_is_only_instance()` — a process-lifetime named mutex
+(`Local\\DesktopKaraoke.SingleInstance`); `main()` exits if it's already held. It runs
+only in the real app (the venv stub doesn't), so it never blocks its own stub→child
+pair. Killed the duplicates → one clean latest instance. **Tested:** a 2nd launch
+self-exits, port owner unchanged.
+**Note:** the stale dist exe is old code; rebuild it if you want the *packaged* version
+current — the active path (shortcuts + running instance) is already the latest source.
+
 ---
 
 ### Research summary (cross-cutting)
