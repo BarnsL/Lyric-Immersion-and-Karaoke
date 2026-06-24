@@ -1307,22 +1307,28 @@ class Overlay:
             import concert_ocr
             if not concert_ocr.available():
                 return
+            lines = concert_ocr.read_banner_lines()
             cands = [e.get("title") for e in self.index.entries if e.get("title")]
-            if not cands:
-                return
-            m = concert_ocr.match_song(concert_ocr.read_banner_lines(), cands)
+            m = concert_ocr.match_song(lines, cands) if cands else None
+            uncached = concert_ocr.plausible_title(lines)
         except Exception:
             return
-        if not m or m[1] < 0.85:
+        cur = self.meta.get("title", "")
+        # 1) a CACHED song the banner names → load it (highest confidence).
+        if m and m[1] >= 0.85:
+            title = m[0]
+            if self._titles_match(cur, title):
+                self._ocr_song = title
+            elif title != self._ocr_song:
+                self._ocr_song = title
+                self.root.after(0, lambda t=title, s=m[1]: self._apply_ocr_song(t, s))
             return
-        title, score = m
-        if self._titles_match(self.meta.get("title", ""), title):
-            self._ocr_song = title           # already showing it
-            return
-        if title == self._ocr_song:
-            return                           # already acted on this read
-        self._ocr_song = title
-        self.root.after(0, lambda t=title, s=score: self._apply_ocr_song(t, s))
+        # 2) a plausible banner title we DON'T have yet → fetch it ('Departures', …),
+        #    so the concert detection isn't limited to pre-cached songs.
+        if (uncached and not self._titles_match(cur, uncached)
+                and uncached != self._ocr_song):
+            self._ocr_song = uncached
+            self.root.after(0, lambda t=uncached: self._fetch_ocr_song(t))
 
     def _apply_ocr_song(self, title, score):
         """(Tk thread) The concert banner named `title` — load it (from cache, else
@@ -1345,6 +1351,16 @@ class Overlay:
         else:
             log.info("concert OCR read %r (%.2f) → fetching", title, score)
             self._start_fetch(artist, title, self._cur_duration)
+
+    def _fetch_ocr_song(self, title):
+        """(Tk thread) the concert banner named a song we DON'T have cached — fetch its
+        lyrics COVER-style (the banner gives the SONG; the concert group isn't its
+        artist, so a title-first lookup finds the original — e.g. 'Departures'). The
+        loaded result shows the moment the fetch resolves (_consume_async)."""
+        log.info("concert OCR read uncached %r → fetching (cover-style)", title)
+        self._title_locked = True               # OCR is authoritative in a concert
+        self._hint(f"🎤 {title} — fetching…")
+        self._start_fetch("", title, None, cover=True)
 
     def _viewport_watchdog(self):
         """Light keeper for the FIXED full-work-area window. The window never

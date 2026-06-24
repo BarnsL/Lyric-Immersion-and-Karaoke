@@ -86,7 +86,9 @@ def read_banner_lines() -> list:
     try:
         from PIL import ImageGrab
         im = ImageGrab.grab()                       # COM grab OUTSIDE the asyncio loop
-        strip = im.crop((0, 0, im.width, int(im.height * _TOP_FRAC)))
+        # The song banner sits TOP-LEFT; the hashtag is top-right and the chat panel
+        # is far right — so OCR only the top-LEFT region to skip that UI noise.
+        strip = im.crop((0, 0, int(im.width * 0.60), int(im.height * _TOP_FRAC)))
         fd, path = tempfile.mkstemp(prefix="dk_ocr_", suffix=".png")
         os.close(fd)
         strip.save(path)
@@ -116,6 +118,31 @@ _NORM = re.compile(r"[^0-9a-z぀-ヿ一-鿿]")
 
 def _norm(s: str) -> str:
     return _NORM.sub("", (s or "").lower())
+
+
+_NOISE_RE = re.compile(r"#|ライブ|\blive\b|welcome|member|subscribe|http|プラン|@|"
+                       r"top\s*(?:chat|fans)|replay|premium|search|create", re.I)
+
+
+def plausible_title(ocr_lines) -> str | None:
+    """Best line that LOOKS like a song-title banner but ISN'T in our cache yet — so a
+    concert song we don't already have can still be FETCHED (e.g. 'Departures'). Filters
+    the hashtag / chat / membership noise and pulls the clean LATIN run out of a line
+    (the en-US engine reads English banners reliably; a Japanese-only banner needs the
+    ja-JP pack). Returns the candidate title, or None. Caller still guards the fetch."""
+    best = None
+    for raw in ocr_lines:
+        s = (raw or "").strip()
+        if not s or _NOISE_RE.search(s):
+            continue
+        for cand in sorted(re.findall(r"[A-Za-z][A-Za-z'’ \-!?.&]{2,33}", s),
+                           key=len, reverse=True):
+            cand = cand.strip(" -.&")
+            if 3 <= len(cand) <= 34 and sum(c.isalpha() for c in cand) >= 3:
+                if best is None or len(cand) > len(best):
+                    best = cand
+                break
+    return best
 
 
 def match_song(ocr_lines, candidates) -> tuple | None:

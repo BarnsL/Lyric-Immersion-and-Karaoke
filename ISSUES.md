@@ -345,6 +345,12 @@ Japanese banners need the pack once: `Add-WindowsCapability -Online -Name
 `StorageFile`. Matcher verified: real banners → 1.0, hashtag/chat noise → 0.36 (ignored).
 **Status:** 🟡 module + matcher built & tested, wired into live mode (en-US live now);
 needs the ja-JP pack for Japanese banners + live concert validation + intermission handling.
+**v1.0.16 update:** the concert ("Departures") sat on "Listening to identify…" because OCR
+only matched ALREADY-CACHED songs. Added `concert_ocr.plausible_title()` (extracts a clean
+Latin banner name, filters hashtag/chat/UI noise; OCR cropped to the top-LEFT to skip the
+right-side chat panel) + `_fetch_ocr_song()` so a confident banner we DON'T have is
+**fetched cover-style** ('Departures' → 37 lines). Verified the matcher rejects "Top fans"/
+"Top chat replay" noise. So concert detection is no longer limited to pre-cached songs.
 
 ## TICKET-021 — MV-intro onset-anchor double-shifted a fetched LRC (サクラミラージュ drift) 🟢
 **Symptom:** サクラミラージュ's lyrics drifted ~11s late; resetting Sync→0 fixed it every
