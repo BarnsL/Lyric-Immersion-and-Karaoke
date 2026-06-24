@@ -12,6 +12,13 @@ the singing. There's no window and no panel: just clean, outlined text over your
 screen that never steals focus, so you can keep working, watching, or gaming
 while it runs.
 
+**Two one-click modes** (right-click the tray icon → **Presets**):
+- 🎮 **Gaming** — a *faint, out-of-the-way* overlay at the **top** of the screen.
+  Glance up between fights and you passively absorb furigana, readings, and meaning
+  while you play — it never blocks clicks or steals focus from the game.
+- 🎤 **Karaoke** — *big, bold, flowing* lyrics across the **bottom** that a whole
+  room can read and sing along to, scrolling in time with the music.
+
 ![overlay](docs/preview.png)
 
 ## ▶️ Demo
