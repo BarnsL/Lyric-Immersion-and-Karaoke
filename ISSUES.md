@@ -280,6 +280,25 @@ title OR one contains the other) AND requires the title to be **distinctive**
 over. Deleted the stale generated `regloss_feelingradation.json` (kept the real
 `feelingradation.json`) and the old `dist/` build so the latest code runs.
 
+## TICKET-031 — Romaji-only cover showed no Japanese / no English (Blue Bird) 🟢
+**Symptom:** Raon Lee's "Blue Bird" cover displayed ONLY romaji ("aoi aoi ano sora") — no
+kanji/kana, no English translation.
+**Root cause:** the cached `naruto_shippuden_blue_bird.json` was `lang: ja-romaji` (a romanized
+upload) with `en` = the romaji copied verbatim (romaji can't be furigana'd or translated). The
+romaji→kanji upgrade (`_synced_cjk`, which DOES find the NetEase Japanese original) had failed
+when first fetched — it searched the COVER channel ("Raon") as the artist — and the stale
+romaji then stuck forever, because a cache hit never re-fetched (same trap as TICKET-028, but
+for romaji). A stray `┃` (a truncated "| Cover by …") in the stored title also made the search
+match a *Spanish* track.
+**Fix (v1.0.21):**
+- The runtime cache-hit upgrade (TICKET-028) now also fires for **romaji-only** hits
+  (`lang endswith '-romaji'`), re-fetching **cover-style** (by TITLE) so it reaches the kanji
+  original; `load()` supersedes the romaji the moment Japanese arrives. Romaji hits never lock.
+- `clean_title` + `_title_variants` now strip box-drawing / fullwidth bars (`┃│｜／・‖`) so a
+  truncated "Song┃" no longer poisons the search.
+- `audit_cache.py --upgrade-generated` now also upgrades romaji-only files in place (only when a
+  real CJK result is found). Verified: `fetch_lrc('Blue Bird', cover=True)` → 42 JP lines.
+
 ## TICKET-030 — Mode-aware sync: FOLLOW live/short arrangements, distrust repeated-chorus reads 🟢
 **Symptoms (from live telemetry, TICKET-029's logs):**
 - Studio サクラミラージュ "desynced multiple times" — log showed offsets oscillating

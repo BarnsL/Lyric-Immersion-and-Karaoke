@@ -153,20 +153,26 @@ def upgrade_generated(verbose=True):
         except Exception:
             continue
         m = d.get("meta", {})
-        if not (m.get("source") or "").startswith("generated"):
+        is_gen = (m.get("source") or "").startswith("generated")
+        is_romaji = (m.get("lang") or "").endswith("-romaji")
+        if not (is_gen or is_romaji):
             continue
         title, artist = m.get("title"), m.get("artist") or ""
         if not title:
             continue
         try:
-            lrc, meta = FL.fetch_lrc(title, artist, m.get("duration"))
+            # romaji uploads are usually covers (wrong artist) → hunt by TITLE.
+            lrc, meta = FL.fetch_lrc(title, artist, m.get("duration"), cover=is_romaji)
             lines = FL.parse_lrc_text(lrc) if lrc else []
         except Exception:
             lines = []
-        if len(lines) >= 6:
-            lang = FL._song_lang(lines)
-            lines = FL.annotate(lines, lang, translate=False)
-            d["meta"] = {**m, "lang": lang,
+        new_lang = FL._song_lang(lines) if lines else ""
+        # generated → any real lyrics is an upgrade; romaji-only → only a CJK
+        # (kanji/kana) result is an upgrade (else we'd swap romaji for romaji).
+        good = len(lines) >= 6 and (is_gen or new_lang in ("ja", "zh", "ko"))
+        if good:
+            lines = FL.annotate(lines, new_lang, translate=False)
+            d["meta"] = {**m, "lang": new_lang,
                          "duration": (meta or {}).get("duration") or m.get("duration"),
                          "source": (meta or {}).get("source", "unknown")}
             d["lines"] = lines
@@ -175,12 +181,13 @@ def upgrade_generated(verbose=True):
             tmp.replace(p)
             up += 1
             if verbose:
-                print(f"  UPGRADE {p.name[:40]:40} -> {len(lines)} real lines", flush=True)
+                kind = "gen" if is_gen else "romaji"
+                print(f"  UPGRADE [{kind}] {p.name[:34]:34} -> {len(lines)} {new_lang} lines", flush=True)
         else:
             none += 1
             if verbose:
-                print(f"  keep-gen {p.name[:40]:40} (no real lyrics)", flush=True)
-    print(f"\n  upgraded {up} generated files to REAL lyrics; {none} stay generated", flush=True)
+                print(f"  keep     {p.name[:40]:40} (no better lyrics)", flush=True)
+    print(f"\n  upgraded {up} stale files (generated/romaji) to REAL lyrics; {none} unchanged", flush=True)
     return up
 
 

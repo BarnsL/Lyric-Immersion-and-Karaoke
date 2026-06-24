@@ -708,7 +708,7 @@ def _title_variants(title: str) -> list:
     out, seen = [], set()
 
     def add(s):
-        s = (s or "").strip(" 　-–—|｜/／")
+        s = (s or "").strip(" 　-–—|｜/／┃│‖・")
         if len(s) >= 2 and s.lower() not in seen:
             seen.add(s.lower())
             out.append(s)

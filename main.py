@@ -503,7 +503,11 @@ def clean_title(title, source="", artist=""):
         head, _, tail = t.partition(" - ")
         if len(tail.strip()) >= 2 and _artistish(head):
             t = tail.strip()
-    return t.strip(" -–—|/　").strip()
+    # strip trailing/leading separators INCLUDING box-drawing / fullwidth bars
+    # (┃│｜／・‖): a truncated "Song | Cover by X" arrives as "Song┃", and that
+    # stray bar made the search match a different-language song (Blue Bird┃ → a
+    # Spanish track instead of the Japanese original).
+    return t.strip(" -–—|/　┃│｜／・‖").strip()
 
 
 # Titles that name an EVENT (a whole concert / festival / medley), not a song.
@@ -1058,28 +1062,34 @@ class Overlay:
                 # over. Containment is robust to that. LOCK only a DISTINCTIVE name
                 # (confidence.py): a COMMON title ('Awake'/'BANG'/'Lucky Star') stays
                 # UNLOCKED so the heard AUDIO decides (the "Awake" rule).
-                # A GENERATED cache hit is a stopgap, NOT ground truth — it must
-                # never lock, and it should try to upgrade itself to real lyrics.
+                # A GENERATED or ROMANIZED-only cache hit is a stopgap, NOT ground
+                # truth — it must never lock, and it should upgrade itself. The
+                # romaji→kanji hunt can miss transiently (or by searching the cover
+                # channel as artist), and the stale romaji then sticks forever:
+                # Blue Bird showed only romaji with no JP/EN even though NetEase has
+                # the kanji original.
                 gen = (self.meta.get("source") or "").startswith("generated")
+                romaji_only = (self.meta.get("lang") or "").endswith("-romaji")
+                stale = gen or romaji_only
                 pt, ct = _norm_title(title), _norm_title(self.meta.get("title", ""))
                 matched = bool(pt and ct and (pt == ct or pt in ct or ct in pt))
                 distinct = confidence.title_distinctiveness(title)
                 self._title_locked = bool(
-                    matched and distinct >= 0.40 and not gen
+                    matched and distinct >= 0.40 and not stale
                     and not is_mv_version(title) and not _is_generic_title(title))
                 if matched and not self._title_locked:
-                    log.info("title %r not locked (distinctiveness %.2f, gen=%s) → audio decides",
-                             title, distinct, gen)
-                # Show the generated lines instantly (no dead air), but ALSO
-                # re-fetch in the background: a real version may exist now, or the
-                # original generation was a transient miss / since-fixed cleaning
-                # bug. load() supersedes the generated lines the moment real ones
-                # arrive. Fixes the "popular song keeps generating" trap where one
-                # generation stuck forever because a cache hit never re-fetched.
-                if gen:
-                    log.info("cache hit for %r is GENERATED → background real-fetch to upgrade", title)
+                    log.info("title %r not locked (distinctiveness %.2f, stale=%s) → audio decides",
+                             title, distinct, stale)
+                # Show the cached lines instantly (no dead air) but re-fetch in the
+                # background to upgrade; load() supersedes them the moment real lyrics
+                # arrive. Romaji-only uploads are usually COVERS (wrong artist), so
+                # hunt by TITLE (cover-style) to reach the kanji/kana original.
+                if stale:
+                    why = "GENERATED" if gen else "ROMAJI-only"
+                    log.info("cache hit for %r is %s → background upgrade-fetch", title, why)
                     self._start_fetch(artist, title, duration,
-                                      cover=self._is_cover, strict=self._clean_source())
+                                      cover=(self._is_cover or romaji_only),
+                                      strict=(self._clean_source() and not romaji_only))
             else:
                 self.lines, self._lyrics_path, self.idx = [], None, -1
                 self._kara = []
