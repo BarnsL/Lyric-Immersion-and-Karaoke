@@ -16,7 +16,10 @@ spotify_config.json
 
 # Cached song lyrics are copyrighted third-party content — not redistributed.
 # Run `python preload.py` (or just play music) to build your own local library.
-lyrics/*.json
+# Ignore EVERYTHING under lyrics/ (the cache, any nested private backup repo's
+# .git, and the personal library DB) except the .gitkeep placeholder — so none of
+# that copyrighted/personal data can ever leak into this public repo.
+lyrics/*
 !lyrics/.gitkeep
 
 # OS
