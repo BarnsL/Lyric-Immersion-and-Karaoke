@@ -747,11 +747,18 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     t, a = title.strip(), artist.strip()
     arts = split_artists(a)
     romaji_fallback = [None]   # (lrc, meta) — used only if nothing original-script
+    # A CJK-script artist's song is in a CJK language (or, for a cover, English) —
+    # never German/Spanish/Russian. So a European-language hit on a Latin title is a
+    # SAME-TITLE COLLISION (a German song also called "Beyond the Way" outranked the
+    # Japanese cover, which lives on NetEase under a romanized name we can't derive).
+    exp_cjk = bool(a and (_KANA.search(a) or _HAN.search(a) or _HANGUL.search(a)))
 
     def take(lrc, meta):
-        """Accept this match now — unless it's romanized Japanese, in which case
-        stash it and return None so the search keeps looking for the original."""
+        """Accept this match now — unless it's romanized Japanese (stash + keep
+        looking for the original) or a same-title hit in the wrong language."""
         body = re.sub(r"\[[^\]]*\]", "", lrc)
+        if exp_cjk and detect_lang(body) in ("de", "es", "ru", "fr", "it", "pt"):
+            return None   # CJK artist + European-language lyrics → collision, skip
         if _looks_romaji(body):
             if romaji_fallback[0] is None:
                 romaji_fallback[0] = (lrc, {**meta, "romaji": True})

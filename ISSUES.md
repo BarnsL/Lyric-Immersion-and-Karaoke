@@ -280,6 +280,22 @@ title OR one contains the other) AND requires the title to be **distinctive**
 over. Deleted the stale generated `regloss_feelingradation.json` (kept the real
 `feelingradation.json`) and the old `dist/` build so the latest code runs.
 
+## TICKET-033 — Cover matched a WRONG-LANGUAGE same-title song (Beyond the Way → German) 🟡
+**Symptom:** the cover 「Beyond the way」(音乃瀬奏＆Mori Calliope) was being generated, and the
+title-only cover search was matching an unrelated **German** song also called "Beyond the Way".
+**Root cause:** the cover fast-path does a TITLE-only lookup, and `verify_lrc`'s language gate
+only fires for CJK *titles* — "Beyond the way" is Latin, so a German body passed. The real
+Japanese cover lives on NetEase under the romanized artist "Kanade Otonose", which the app
+can't derive (音乃瀬奏 romanizes to "oto no se sou", a literal kanji reading, not the name).
+**Fix (v1.0.23):** `fetch_lrc` now gates on the ARTIST's script — a CJK-script artist's song is
+CJK (or, for a cover, English), never German/Spanish/Russian/etc., so a European-language hit on
+a Latin title is rejected as a same-title collision. This also stops the v1.0.22 romaji/generated
+re-fetch from *replacing* a deep-transcription with the German words. English covers by JP artists
+still pass (detect_lang→"other" is allowed).
+**Status:** 🟡 the German collision is fixed, but this specific cover still falls back to
+deep-transcription (its real synced lyrics are only findable via a romanized name we can't derive
+from 音乃瀬奏). Tracked as a known limit; the transcription is at least the real audio.
+
 ## TICKET-032 — "Was fine then desynced": a spurious same-song track-change wiped the offset 🟢
 **Symptom:** a song synced correctly, then suddenly jumped ~30s off (Shinigami Eyes, white
 balance). Telemetry showed it: `CONFIRMED offset -29.89s → applied` (drift→0, synced), then a
