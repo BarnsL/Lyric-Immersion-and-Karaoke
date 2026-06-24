@@ -110,6 +110,26 @@ The spec sets `WHISPER = os.path.isdir(".deps")`: **no `.deps` → lean ~150 MB 
 `sys.path` vendor fails on PyAV's `av._core` DLLs. The ASR model (~75 MB) downloads
 to the app's data folder on first use (copy `models\` next to the `.exe` to pre-seed).
 
+## Optional: deep lyric transcription (`yt-dlp` + a JS runtime)
+
+The background **deep generation** ([docs/GENERATION.md](docs/GENERATION.md)) — which
+downloads a no-lyrics-anywhere song's source audio and transcribes the whole file for a
+clean generated lyric — needs **faster-whisper** (above) plus **`yt-dlp`** and a **JS
+runtime** (YouTube otherwise 403s the audio download). To ship it in the portable build:
+
+```bat
+pip install --target .deps yt-dlp        :: vendor it alongside faster-whisper
+:: then place a JS runtime next to the .exe so yt-dlp finds it on PATH:
+::   - Node:  copy node.exe into the app folder, OR
+::   - Deno:  copy the single deno.exe into the app folder (smaller, ~40 MB)
+pyinstaller --noconfirm DesktopKaraoke.spec
+```
+
+`deep_transcribe.available()` is just `import yt_dlp`, and `_download_audio` only enables
+`node` when it's on `PATH` — so a build **without** these still runs fine: the instant
+best-effort generation stands and the deep pass quietly no-ops. (The lyric library backup
+and the personal music DB are kept in a **private** repo, never the public one.)
+
 ## Notes
 
 - `DesktopKaraoke.exe` is windowed (no console) and bundles Python and every

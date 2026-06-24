@@ -82,6 +82,25 @@ instead, see [BUILD.md](BUILD.md).
 > libraries on demand (~1.5 GB) — they're not bundled, so the download above stays
 > small (~200 MB). Everything already works without it.
 
+#### ✅ What you need for each feature
+
+The **portable build and the Microsoft Store install include everything below** —
+nothing extra to install. The right-hand column is only for running **from source**.
+
+| Feature | Portable / Store | From source (`pip install -r requirements.txt` covers all but the optional ones) |
+|---|---|---|
+| Synced lyrics · furigana · romaji · pinyin/romaja · translation · karaoke fill | ✅ built-in | ✅ in `requirements.txt` |
+| Identify-by-sound (Shazam) · fast song-change detect | ✅ built-in | ✅ in `requirements.txt` |
+| Multi-monitor: move to a screen · span/scroll across all · mirror | ✅ built-in | ✅ in `requirements.txt` |
+| Import playlists (Spotify OAuth · Exportify CSV · YouTube Music) | ✅ built-in | ✅ in `requirements.txt` |
+| **Generate lyrics by ear** (instant best-effort) · **Sync by listening** | ✅ bundles **faster-whisper** | `pip install faster-whisper` |
+| **Deep transcription** (downloads the source audio + transcribes the whole song for a clean, complete generated lyric — see [docs/GENERATION.md](docs/GENERATION.md)) | ✅ bundles **faster-whisper + yt-dlp** | `pip install faster-whisper yt-dlp` **+** a JS runtime on `PATH` (**Node** or **Deno**) so YouTube downloads don't 403 |
+| GPU acceleration (NVIDIA, optional speed-up) | tray → **⚡ Enable GPU acceleration** (downloads CUDA on demand) | same, or `python gpu_setup.py` |
+
+Every optional piece **degrades gracefully** — if it's missing, that one feature
+shows a hint and everything else keeps working. The lyric library and the small
+speech model build/download themselves the first time they're needed.
+
 ### Microsoft Store — recommended
 
 <!-- STORE LINK --> _Store listing pending — see [STORE_SUBMISSION.md](STORE_SUBMISSION.md)._
@@ -240,16 +259,25 @@ Niche VTuber / indie tracks (a B-side that isn't on LRCLIB, Musixmatch, or
 NetEase) sometimes have **no lyrics on any provider** — that's a content gap, not
 a bug.
 
-**As a last resort the app generates them by ear.** When every provider comes up
-empty, it transcribes the playing audio with Whisper (the bigger `small` model,
-with voice-activity filtering for quality) into **timed Japanese**, then adds
-furigana, romaji, and a likely translation — **each line marked `***`** so it's
-clearly machine-made. It builds up over the song and **saves the result**, so a
-replay is instant and perfectly in sync. The first pass lags ~20 s behind the
-audio (it's transcribing in chunks) and the transcription is imperfect — it's a
-genuine best-effort fallback for songs that simply have no lyrics anywhere. Toggle
-it from the tray (**Generate lyrics by ear…**); it needs faster-whisper, which the
-portable build bundles.
+**As a last resort the app generates them by ear — in two tiers.** When every
+provider comes up empty:
+
+1. **Best effort, instantly.** It transcribes the playing audio with Whisper in
+   short chunks while the song plays, into **timed Japanese** + furigana + romaji +
+   a likely translation — **each line marked `***`** so it's clearly machine-made.
+   It builds up over the song and **saves the result**. The first pass lags ~20 s
+   and is rough (it's racing the playhead), but you get something right away.
+2. **Then it does it properly, in the background.** It downloads the *source* audio
+   and re-transcribes the **whole song** with a larger model — accurate and
+   complete because it isn't racing playback — then **replaces the rough version**
+   (and the audio file is deleted afterward; only the lyrics are kept). The overlay
+   upgrades live if the song's still playing, and the next play is clean and synced.
+   See **[docs/GENERATION.md](docs/GENERATION.md)** for the full pipeline.
+
+Toggle it from the tray (**Generate lyrics by ear…**). Tier 1 needs faster-whisper
+(bundled in the portable build); Tier 2 also needs **yt-dlp + a JS runtime** (Node
+or Deno — see the [feature table](#-what-you-need-for-each-feature)). Both degrade
+gracefully — if Tier 2 can't run, the Tier 1 best effort stands.
 
 For a *known* missing song you'd rather supply exactly, find or make a timed
 `.lrc` (a fan wiki, the video description, or a tool like QuickLRC) and add it —
@@ -377,6 +405,46 @@ whole API off from the tray.
 It also writes a rolling log to **`karaoke.log`** (next to the app) recording
 every track change, title‑vs‑sound match, correction, and sync adjustment — so
 when something looks off you can see exactly *why* it chose what it chose.
+
+---
+
+## ❓ Troubleshooting & FAQ
+
+**I don't see the overlay.** Play a song first (it only shows when music is
+playing). The controls live in the **system-tray icon** — the purple microphone by
+the clock (click the **˄** "show hidden icons" arrow). Left-click the icon to
+toggle show/hide; right-click for the menu.
+
+**It's catching my mouse clicks / I can't click my game.** It shouldn't — the
+overlay is fully **click-through** (input passes straight to whatever's underneath)
+and re-asserts that continuously, so it can't get stuck stealing clicks. If you
+ever hit this, update to the latest build; as an immediate workaround, left-click
+the tray icon to hide it.
+
+**The lyrics are out of sync.** Use **Sync timing** in the tray to nudge them, or
+**🎤 Sync by listening** to match them to the audio. For a fan-MV/remix with a
+different intro, a quick nudge usually locks it. (Auto re-sync only moves the
+offset on a *confirmed* change, so it won't drift a good sync.)
+
+**Wrong song's lyrics.** Click **⚑ Wrong lyrics — fix this song** — it re-identifies
+by ear and re-fetches. Covers usually resolve to the original's lyrics.
+
+**Lyrics say `***` at the end of each line.** That song has no lyrics on any
+provider, so they were **generated by ear** (AI) — the `***` flags that. It's a
+last resort; the background **deep transcription** then cleans them up if it can.
+
+**Boxes (□) instead of characters.** Update to the latest build — each script is
+rendered with a font that has its glyphs. If it persists, open an issue with the
+song.
+
+**Generate-by-ear / Sync-by-listening shows "needs faster-whisper".** You're
+running **from source** without it: `pip install faster-whisper` (the portable
+build bundles it). For the **deep transcription** upgrade also `pip install yt-dlp`
+and have **Node** or **Deno** on `PATH`.
+
+**Nothing downloads for deep transcription (it 403s).** yt-dlp needs a JS runtime
+to fetch YouTube audio — install **Node** (or **Deno**) so it's on `PATH`. Without
+it, the instant best-effort generation still works.
 
 ## 📁 Project structure
 
