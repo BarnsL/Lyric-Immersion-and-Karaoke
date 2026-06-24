@@ -398,6 +398,11 @@ def clean_title(title, source=""):
     # the (cover) / 歌ってみた tags get stripped below — so we can keep just the
     # song part at the end.
     is_cover = is_cover_title(t)
+    # An Original / MV upload titled "Song/Artist" (very common for VTuber MVs,
+    # e.g. "[Original] Dunk/Todoroki Hajime [Official MV]") puts the SONG first —
+    # used below to keep just the song so it matches + fetches by its real name.
+    is_mv = bool(re.search(r"\b(?:Official|MV|PV|Music\s*Video|"
+                           r"Performance\s*Video|Lyric\s*Video)\b", t, re.I))
     if any(h in source for h in BROWSER_HINTS):
         t = re.sub(r"\s*[-–—|]\s*YouTube\s*$", "", t, flags=re.I)
 
@@ -456,11 +461,16 @@ def clean_title(title, source=""):
     # a trailing anime tie-in with no song info ('… - TVアニメOPテーマ')
     t = re.sub(r"\s*[-–—/／]\s*(?:tv\s*)?(?:アニメ|anime)\s*.*?"
                r"(?:op|ed|主題歌|テーマ|opening|ending|theme).*$", "", t, flags=re.I)
-    # Cover titled "OriginalSong / Singer(s)": keep the song (before the first
-    # slash), dropping the coverer names so the search hits the original's lyrics
-    # ('ウェカピポ / 綺々羅々ヴィヴィ × 白銀ノエル' → 'ウェカピポ').
-    if is_cover and re.search(r"\s[/／]\s", t):
-        t = re.split(r"\s[/／]\s", t, 1)[0]
+    # "Song / Artist" (or "Song/Artist", no spaces): a COVER and an ORIGINAL/MV
+    # upload both put the SONG first — '[Original] Dunk/Todoroki Hajime [Official
+    # MV]' → 'Dunk', 'ウェカピポ / 綺々羅々ヴィヴィ × 白銀ノエル' (cover) → 'ウェカピポ'. Only split a
+    # SINGLE slash whose two sides have no ' - ' (so a bilingual 'Artist - JP /
+    # Artist - EN' upload is left intact for _title_variants to resolve).
+    if is_cover or is_mv:
+        parts = re.split(r"\s*[/／]\s*", t)
+        if (len(parts) == 2 and len(parts[0].strip()) >= 2
+                and " - " not in parts[0] and " - " not in parts[1]):
+            t = parts[0].strip()
     return t.strip(" -–—|/　").strip()
 
 
@@ -2606,6 +2616,16 @@ class Overlay:
             self._hint("Couldn't hear the lyrics clearly — try again")
             return
         offset, ratio, _start = res
+        # A BIG alignment offset on a song whose player clock is already accurate is
+        # usually a MIS-match (the transcript matched the wrong repeated line) — and
+        # the user's observed fix is "reset to 0". So only trust a large offset when
+        # the match is strong; otherwise snap back to 0 (the player position), which
+        # is right far more often than a low-confidence big jump.
+        if abs(offset) > 6.0 and ratio < 0.72:
+            self.offset = 0.0
+            log.info("align: large offset %.1fs at low match %.2f → reset to 0", offset, ratio)
+            self._hint("Couldn't sync confidently — reset to 0")
+            return
         self.offset = round(offset, 2)
         log.info("aligned by listening: offset=%.2fs (match %.2f)", offset, ratio)
         self._hint(f"Synced by ear ({offset:+.1f}s)")

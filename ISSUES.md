@@ -240,6 +240,30 @@ only writes when a bit is missing) and **re-assert it after every window-attribu
 re-asserts every **500 ms** as a self-heal, so the overlay can *never* get stuck eating
 clicks regardless of the trigger. Verified self-healing on the live window.
 
+## TICKET-019 — "Song/Artist" MV titles generate instead of fetching (Dunk) 🟢
+**Symptom:** "[Original] Dunk/Todoroki Hajime [Official MV]" (a *common* ReGLOSS song)
+showed **generated** lyrics. Two stale caches existed: `dunk_轟はじめ.json` (good, 86 lines)
+and `dunk_todoroki_hajime.json` (generated, 13 lines).
+**Root cause:** `clean_title` stripped the brackets but left **`Dunk/Todoroki Hajime`**
+(the slash-split only ran for *covers*). So the title-match exact-hit the *generated*
+13-line file, and a live fetch of the messy title took **36.5 s** — far past the 11 s
+generate deadline. `fetch_lrc("Dunk", "轟はじめ")` returns 87 real lines, and the good
+`Dunk` cache was already there — it just wasn't being matched.
+**Fix (pushed):** `clean_title` now treats an **Original/MV** upload like a cover for the
+`Song/Artist` slash: "Dunk/Todoroki Hajime" → **"Dunk"** (so it instant-matches the good
+cache). Guarded to a single slash with no `" - "` on either side, so bilingual
+"Artist - JP / Artist - EN" uploads are left for `_title_variants`. Deleted the stale
+generated cache. Verified: Dunk→"Dunk"; シンメトリー/アイドル/covers/bilingual all still correct.
+
+## TICKET-020 — Sync-by-listening: reset to 0 when a big offset is low-confidence 🟢
+**Request:** "return timing to 0 if significantly desynced after attempting sync — that
+fixes it often." A big alignment offset on a song whose player clock is accurate is
+usually a *mis-match* (the transcript matched the wrong repeated line).
+**Fix (pushed):** `_apply_align` now snaps the offset back to **0** when the aligned
+offset is large (>6 s) **and** the match ratio is low (<0.72) — the player position is
+right far more often than a low-confidence big jump. High-confidence large offsets
+(genuine long intros) still apply. Complements TICKET-015's dead-band on the Shazam recal.
+
 ---
 
 ### Research summary (cross-cutting)
