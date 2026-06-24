@@ -14,6 +14,12 @@ while it runs.
 
 ![overlay](docs/preview.png)
 
+## ▶️ Demo
+
+[![Desktop Karaoke — AI song recognition & lyric synchronization](https://img.youtube.com/vi/bZ1t7MSgU4Q/hqdefault.jpg)](https://youtu.be/bZ1t7MSgU4Q)
+
+*[Watch on YouTube](https://youtu.be/bZ1t7MSgU4Q) — AI song recognition + lyric synchronization in action.*
+
 ---
 
 ## ✨ What it does
