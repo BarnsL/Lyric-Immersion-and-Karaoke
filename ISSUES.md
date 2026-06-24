@@ -17,16 +17,29 @@ generation.
 **Fix (pushed 87a6de9):** added those markers to `_COVER_RE` + the `clean_title` strip
 (handles the を particle). `fetch_lrc('Breaking Dimensions', cover=True)` → 70 lines.
 
-## TICKET-002 — Same-title collision: wrong song's lyrics get cached + reused 🔴
-**Symptom:** "BANCHO / 轟はじめ" showed another song's lyrics. Identification was correct
-(`heard BANCHO | loaded BANCHO | match=True`) — the cached *content* was a wrong
-"BANCHO" fetched from a same-title collision.
+## TICKET-002 — Same-title collision: wrong song's lyrics loaded for a common title 🟡
+**Symptom (cover, FIXED):** 【歌ってみた】地球儀 covered by 花譜 — the video plays Kenshi
+Yonezu's 地球儀 (僕が生まれた日の空は…, the *Boy and the Heron* theme) but the overlay
+showed an **unrelated** 地球儀 (愛に飢えている / こんな夜に流されあっている / 揺られちまえよ).
+Proved: those overlay lines are lines 6-8 of the *wrong* 地球儀, so it was a wrong-title
+**fetch**, not generation.
+**Root cause (cover):** the COVER fast-path queried by TITLE only, skipped the
+`_strict_ok` guard, and ran **before** the artist-keyed queries — so for a super-common
+title it short-circuited onto the first same-title hit. Yet `fetch_lrc('地球儀','花譜')`
+artist-keyed *already* resolves Yonezu's 地球儀 (the song actually covered); the cover
+path was overriding a correct result with a wrong one.
+**Fix (pushed 0eeb696):** reordered `fetch_lrc` so the **artist-keyed queries run first**
+and the title-only cover path is the **FALLBACK** — only for true 歌ってみた uploads where
+the channel-as-artist genuinely derails search (TICKET-001). Verified: 地球儀/花譜 cover
+now returns 僕が生まれた日の空は; Breaking Dimensions dance cover still fetches (no regression).
 **Research:** lyric finders stress **verifying the artist + not trusting the first
 match** — "compare the artist… before you save it, the first match is not always the
 right version." ([Musely](https://musely.ai/tools/lyrics-finder), [Chosic](https://www.chosic.com/find-song-by-lyrics/))
-**Plan:** cross-check the fetched LRC's length against a **trusted duration** (the
-master-tracks library DB, TICKET-009) and the artist; reject same-title/wrong-duration
-hits instead of caching them. Deleted the bad BANCHO cache for now.
+**Still open (non-cover + no-artist edge):** the original "BANCHO / 轟はじめ" report was a
+*non-cover* same-title collision (relies on `_strict_ok` in the title-only last resort);
+and a bare-title cover with **no artist at all** can't disambiguate (returns the first
+同名 song). Both want the **duration cross-check** against a trusted duration (player
+duration arrives a few s late, or the master-tracks library DB, TICKET-009). → kept 🟡.
 
 ## TICKET-003 — Desync: correct lyrics, wrong timing 🔴
 **Symptom:** "Deep Dive / 轟はじめ" matched the right lyrics but the displayed line was
