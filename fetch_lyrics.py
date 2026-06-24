@@ -122,6 +122,77 @@ from pathlib import Path
 for _n in ("syncedlyrics", "syncedlyrics.providers"):
     logging.getLogger(_n).setLevel(logging.CRITICAL)
 
+# -- Musixmatch token-refresh resilience patch ------------------------------------
+# The upstream syncedlyrics Musixmatch provider retries infinitely on 401 and
+# doesn't auto-purge revoked tokens. This monkey-patch adds:
+#  - A 3-retry cap on token.get (prevents infinite recursion)
+#  - Auto-purge + single retry on 401 during track.search
+def _patch_musixmatch_token_refresh():
+    """Make Musixmatch auto-refresh its token when revoked server-side."""
+    try:
+        from syncedlyrics.providers.musixmatch import Musixmatch
+        from syncedlyrics.utils import get_cache_path
+        import json as _json, time as _time
+
+        def _robust_get_token(self, _retries=0):
+            token_path = get_cache_path('syncedlyrics', False) / 'musixmatch_token.json'
+            current_time = int(_time.time())
+            if token_path.exists():
+                with open(token_path, 'r') as f:
+                    cached = _json.load(f)
+                if cached.get('token') and current_time < cached.get('expiration_time', 0):
+                    self.token = cached['token']
+                    return
+            d = self._get('token.get', [('user_language', 'en')]).json()
+            if d['message']['header']['status_code'] == 401:
+                if _retries >= 2:
+                    if token_path.exists():
+                        token_path.unlink()
+                    return
+                _time.sleep(10)
+                return _robust_get_token(self, _retries + 1)
+            new_token = d['message']['body']['user_token']
+            self.token = new_token
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(token_path, 'w') as f:
+                _json.dump({'token': new_token, 'expiration_time': current_time + 600}, f)
+
+        def _robust_get_lrc(self, search_term, _refreshed=False):
+            r = self._get('track.search', [('q', search_term), ('page_size', '5'), ('page', '1')])
+            status_code = r.json()['message']['header']['status_code']
+            if status_code == 401 and not _refreshed:
+                token_path = get_cache_path('syncedlyrics', False) / 'musixmatch_token.json'
+                if token_path.exists():
+                    token_path.unlink()
+                self.token = None
+                self._get_token()
+                return _robust_get_lrc(self, search_term, _refreshed=True)
+            if status_code != 200:
+                return None
+            body = r.json()['message']['body']
+            if not isinstance(body, dict):
+                return None
+            from syncedlyrics.utils import get_best_match
+            tracks = body['track_list']
+            cmp_key = lambda t: t['track']['track_name'] + ' ' + t['track']['artist_name']
+            track = get_best_match(tracks, search_term, cmp_key)
+            if not track:
+                return None
+            track_id = track['track']['track_id']
+            if self.enhanced:
+                lrc = self.get_lrc_word_by_word(track_id)
+                if lrc and lrc.synced:
+                    return lrc
+            return self.get_lrc_by_id(track_id)
+
+        Musixmatch._get_token = _robust_get_token
+        Musixmatch.get_lrc = _robust_get_lrc
+    except ImportError:
+        pass  # syncedlyrics not installed
+
+_patch_musixmatch_token_refresh()
+
+
 if sys.platform == "win32":
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     try:

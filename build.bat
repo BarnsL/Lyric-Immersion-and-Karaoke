@@ -1,17 +1,30 @@
 @echo off
-REM ── Build Desktop Karaoke into a single .exe (and, if Inno Setup is
+REM ?? Build Desktop Karaoke into a single .exe (and, if Inno Setup is
 REM    installed, a one-click Setup installer). Run this from the repo folder.
 setlocal
 
-echo [1/3] Installing build + app dependencies...
+echo [1/4] Installing build + app dependencies...
 python -m pip install --upgrade pip >nul
 python -m pip install pyinstaller -r requirements.txt || goto :err
 
-echo [2/3] Building DesktopKaraoke.exe ...
+echo.
+echo ????????????????????????????????????????????????????????????
+echo ?  Bundle faster-whisper into the portable build?          ?
+echo ?  This adds ~150 MB but enables AI lyric generation and   ?
+echo ?  sync-by-listening out of the box for end users.         ?
+echo ????????????????????????????????????????????????????????????
+choice /C YN /M "Bundle faster-whisper (recommended)?"
+if %errorlevel%==1 (
+    echo Installing faster-whisper for bundling...
+    python -m pip install faster-whisper>=1.0 || echo [!] Warning: faster-whisper install failed - build will continue without it.
+)
+
+echo.
+echo [2/4] Building DesktopKaraoke.exe ...
 python -m PyInstaller --noconfirm DesktopKaraoke.spec || goto :err
 echo     -> dist\DesktopKaraoke.exe
 
-echo [3/3] Building the installer (optional) ...
+echo [3/4] Building the installer (optional) ...
 where iscc >nul 2>nul
 if %errorlevel%==0 (
     iscc installer.iss && echo     -> dist\DesktopKaraoke-Setup.exe
@@ -21,7 +34,12 @@ if %errorlevel%==0 (
 )
 
 echo.
-echo Done.
+echo [4/4] Done.
+echo.
+echo  Outputs:
+echo    dist\DesktopKaraoke\DesktopKaraoke.exe  (portable)
+if exist dist\DesktopKaraoke-Setup.exe echo    dist\DesktopKaraoke-Setup.exe        (installer)
+echo.
 goto :eof
 
 :err

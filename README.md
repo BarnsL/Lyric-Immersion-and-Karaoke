@@ -304,9 +304,15 @@ python add_lrc.py --folder manual
 git clone https://github.com/BarnsL/Desktop-Karaoke.git
 cd Desktop-Karaoke
 pip install -r requirements.txt
+install_extras.bat               # optional: installs faster-whisper, yt-dlp, GPU libs
 pythonw main.py                  # start the overlay (no console window)
 python  main.py --offset -1.5    # nudge sync earlier for an intro-heavy video
 ```
+
+> **?? Optional features:** Run **`install_extras.bat`** for a guided installer
+> that offers faster-whisper (AI lyric generation + sync by listening), yt-dlp
+> (deep transcription), and GPU acceleration. Each is a Y/N choice — skip what
+> you don't want.
 
 **Build the one-click installer yourself** â€” see [BUILD.md](BUILD.md):
 
