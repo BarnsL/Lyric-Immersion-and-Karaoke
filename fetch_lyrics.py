@@ -718,9 +718,11 @@ def _title_variants(title: str) -> list:
     add(title)
     for seg in re.split(r"\s*[/／]\s*", base):                         # bilingual "JP / EN"
         add(seg)
-        if re.search(r"\s[-–—]\s", seg):                              # strip "Artist - "
-            add(re.split(r"\s+[-–—]\s+", seg)[-1])
-    return out[:5]
+        if re.search(r"\s[-–—]\s", seg):
+            dparts = re.split(r"\s+[-–—]\s+", seg)
+            add(dparts[-1])      # song after "Artist - " ('米津玄師 - Lemon' → Lemon)
+            add(dparts[0])       # JP before "- romaji" ('プリズムの魔法 - Prism no Mahou' → プリズムの魔法)
+    return out[:6]
 
 
 def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
