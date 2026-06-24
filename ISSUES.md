@@ -223,6 +223,23 @@ Lucky Star: deep pass returned **48 complete lines** matching the video's burned
 Degrades gracefully (no yt-dlp / 403 / over-long match / <4 lines → best-effort stands).
 Documented in [docs/GENERATION.md](docs/GENERATION.md).
 
+## TICKET-018 — Overlay ate mouse clicks ("can't click anything in a game") 🟢
+**Symptom:** with the overlay up, clicks didn't reach the game/app underneath — the
+full-screen (fixed full-work-area) overlay was intercepting mouse input instead of
+being click-through.
+**Root cause:** click-through (`WS_EX_TRANSPARENT`) is applied **once at startup**.
+It can be lost later (the overlay is a layered, `overrideredirect`, topmost window, and
+various window operations re-touch the extended style) — and because the window covers
+the **whole screen**, the moment that bit drops, the ENTIRE screen stops accepting clicks.
+**Research/verify:** confirmed live — forcibly clearing `WS_EX_TRANSPARENT` on the running
+overlay made it eat clicks; the new guard restored it automatically within ~0.5 s.
+**Fix (pushed):** extracted `_click_through()` (NOACTIVATE|TOOLWINDOW|LAYERED|TRANSPARENT,
+only writes when a bit is missing) and **re-assert it after every window-attribute change**
+— init, `set_opacity`, `apply_preset` (the 45 %-opacity Gaming preset was a prime trigger),
+`_place_window`, and `toggle()` (Show/Hide re-`deiconify`). Plus a **`_click_guard`** that
+re-asserts every **500 ms** as a self-heal, so the overlay can *never* get stuck eating
+clicks regardless of the trigger. Verified self-healing on the live window.
+
 ---
 
 ### Research summary (cross-cutting)

@@ -871,14 +871,8 @@ class Overlay:
         self.root.attributes("-alpha", self.opacity)
         self.root.update_idletasks()
 
-        hwnd = ctypes.windll.user32.GetAncestor(self.root.winfo_id(), 2) \
-            or self.root.winfo_id()
-        ex = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-        # NOACTIVATE | TOOLWINDOW (no focus steal / no taskbar button) +
-        # LAYERED | TRANSPARENT → click-through, so the full-screen overlay never
-        # intercepts mouse input.
-        ex |= 0x08000000 | 0x00000080 | 0x00080000 | 0x00000020
-        ctypes.windll.user32.SetWindowLongW(hwnd, -20, ex)
+        self._click_through()   # make the overlay pass mouse input straight through
+        self.root.after(1500, self._click_guard)   # self-heal if anything resets it
 
         self.cv = tk.Canvas(self.root, bg=TRANSPARENT, highlightthickness=0)
         self.cv.pack(fill="both", expand=True)
@@ -2167,6 +2161,7 @@ class Overlay:
         self._apply_scale()
         self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
+        self._click_through()      # preset changed -alpha → re-assert click-through
         self._cancel_anim(); self._clear_stream(); self.cv.delete("all")
         self._kara, self.idx = [], -1
         self.root.update_idletasks()
@@ -2319,9 +2314,45 @@ class Overlay:
         self.generate_on = bool(on)
         self._persist()
 
+    def _click_through(self):
+        """(Re)assert the overlay's click-through window style.
+
+        CRITICAL: this MUST be re-applied after every ``-alpha`` /
+        ``-transparentcolor`` change. On Windows, tkinter resets the window's
+        EXTENDED style when those are set, which silently DROPS our
+        ``WS_EX_TRANSPARENT`` bit — turning the full-screen overlay into a window
+        that EATS every click (you can't click your game/app underneath). That is
+        the "can't click anything in game" bug: it appeared the moment the opacity
+        changed (e.g. applying the 45%-opacity Gaming preset).
+
+        WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW keep it from stealing focus or adding a
+        taskbar button; WS_EX_LAYERED + WS_EX_TRANSPARENT make every pixel pass
+        mouse input straight through to whatever is below."""
+        try:
+            u = ctypes.windll.user32
+            hwnd = u.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
+            GWL_EXSTYLE = -20
+            WS_EX = 0x08000000 | 0x00000080 | 0x00080000 | 0x00000020  # NOACTIVATE|TOOLWINDOW|LAYERED|TRANSPARENT
+            ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if (ex & WS_EX) != WS_EX:                  # only re-apply if a bit was lost
+                u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX)
+        except Exception:
+            pass
+
+    def _click_guard(self):
+        """Safety net: periodically re-assert click-through so the overlay can NEVER
+        get stuck eating clicks, even if some future code path resets the window
+        style. Cheap — `_click_through` only writes when a style bit is missing."""
+        self._click_through()
+        try:
+            self.root.after(500, self._click_guard)
+        except Exception:
+            pass
+
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
         self.root.attributes("-alpha", self.opacity)
+        self._click_through()      # -alpha resets the exstyle → re-assert click-through
         self.root.update_idletasks()
         self._persist()
 
@@ -2336,6 +2367,7 @@ class Overlay:
         """(Re)position the overlay band at its current monitor / span coordinates."""
         self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
+        self._click_through()      # a display move can reset the exstyle → re-assert
 
     def _apply_display(self):
         """Place the overlay per ``self.display``: 'primary', 'mon:N' (a specific
@@ -2496,7 +2528,9 @@ class Overlay:
             self.root.withdraw()
         else:
             self.root.deiconify()
+            self.root.overrideredirect(True)   # re-assert borderless...
             self.root.attributes("-topmost", True)
+            self._click_through()              # ...and click-through after re-showing
 
     def refetch(self):
         self._fetch_key = None
