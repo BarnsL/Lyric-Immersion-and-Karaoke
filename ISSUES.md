@@ -264,6 +264,22 @@ offset is large (>6 s) **and** the match ratio is low (<0.72) — the player pos
 right far more often than a low-confidence big jump. High-confidence large offsets
 (genuine long intros) still apply. Complements TICKET-015's dead-band on the Shazam recal.
 
+## TICKET-027 — feelingradation showed SKAVLA again — my own clean_title fix broke the title-lock 🟢
+**Symptom:** ReGLOSS "feelingradation" (bread-and-butter) showed SKAVLA's lyrics — the old
+"feelingradation → SKAVLA" Shazam mis-ID, back again.
+**Root cause (a regression I introduced):** the title-lock used an EXACT-string compare of
+the player title vs the loaded cache's stored title. The TICKET-023 cleaning made the
+player title `'ReGLOSS - feelingradation' → 'feelingradation'`, which no longer
+string-equals a cache stored under the longer name (e.g. a stale generated
+`regloss_feelingradation.json`) — so `_title_locked` went False and a Shazam mis-ID
+(SKAVLA, a different ReGLOSS-adjacent song) overrode it.
+**Fix (pushed, v1.0.17):** the lock now MATCHES by **containment** (player title == cache
+title OR one contains the other) AND requires the title to be **distinctive**
+(`confidence.title_distinctiveness >= 0.40`) — robust to cleaning, while common titles
+(Awake/BANG) still defer to audio. So feelingradation (0.85) locks and SKAVLA can't take
+over. Deleted the stale generated `regloss_feelingradation.json` (kept the real
+`feelingradation.json`) and the old `dist/` build so the latest code runs.
+
 ## TICKET-026 — Absurd Shazam offset desynced a song (シンメトリー +160s) 🟢
 **Symptom:** "messing up on this ReGLOSS song again" (シンメトリー). The LYRICS were correct
 (`heard 'シンメトリー' | loaded 'シンメトリー' | match=True`, 51-line cache); the SYNC was the

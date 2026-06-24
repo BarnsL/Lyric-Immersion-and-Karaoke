@@ -1022,19 +1022,22 @@ class Overlay:
                 # mis-ID of a *different* song by the same artist can't override it
                 # (the feelingradation → SKAVLA bug). Messy titles stay unlocked so
                 # sound still corrects them.
-                exact = _norm_title(self.meta.get("title", "")) == _norm_title(title)
-                # LOCK the lyrics to the title only when the title is strong evidence:
-                # an exact match on a clean, official, NON-generic, and DISTINCTIVE
-                # name. A COMMON title ("Awake", "BANG", "Lucky Star") is shared by
-                # many songs, so it must stay UNLOCKED and let the heard AUDIO decide
-                # — that's the confidence model in confidence.py (the "Awake" rule).
+                # MATCH = equal OR one contains the other. The old EXACT-string check
+                # was brittle: cleaning the player title ('ReGLOSS - feelingradation' →
+                # 'feelingradation') no longer string-equals a cache stored under the
+                # longer name, so the lock broke and a Shazam mis-ID (→ SKAVLA) took
+                # over. Containment is robust to that. LOCK only a DISTINCTIVE name
+                # (confidence.py): a COMMON title ('Awake'/'BANG'/'Lucky Star') stays
+                # UNLOCKED so the heard AUDIO decides (the "Awake" rule).
+                pt, ct = _norm_title(title), _norm_title(self.meta.get("title", ""))
+                matched = bool(pt and ct and (pt == ct or pt in ct or ct in pt))
+                distinct = confidence.title_distinctiveness(title)
                 self._title_locked = bool(
-                    exact and not is_mv_version(title)
-                    and not _is_generic_title(title)
-                    and not confidence.is_common_title(title))
-                if exact and confidence.is_common_title(title):
-                    log.info("title %r is common (distinctiveness %.2f) → audio decides, not locked",
-                             title, confidence.title_distinctiveness(title))
+                    matched and distinct >= 0.40
+                    and not is_mv_version(title) and not _is_generic_title(title))
+                if matched and not self._title_locked:
+                    log.info("title %r not locked (distinctiveness %.2f) → audio decides",
+                             title, distinct)
             else:
                 self.lines, self._lyrics_path, self.idx = [], None, -1
                 self._kara = []
