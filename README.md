@@ -16,9 +16,9 @@ while it runs.
 
 ## ▶️ Demo
 
-[![Desktop Karaoke — AI song recognition & lyric synchronization](https://img.youtube.com/vi/bZ1t7MSgU4Q/hqdefault.jpg)](https://youtu.be/bZ1t7MSgU4Q)
+[![Desktop Karaoke — AI song recognition & lyric synchronization](https://img.youtube.com/vi/bZ1t7MSgU4Q/hqdefault.jpg)](https://youtu.be/aTtGICNRhiY)
 
-*[Watch on YouTube](https://youtu.be/bZ1t7MSgU4Q) — AI song recognition + lyric synchronization in action.*
+*[Watch on YouTube](https://youtu.be/aTtGICNRhiY) — AI song recognition + lyric synchronization in action.*
 
 ---
 
@@ -65,19 +65,7 @@ while it runs.
 
 ## ⬇️ Install (one click, no Python needed)
 
-### Microsoft Store — recommended
 
-<!-- STORE LINK --> _Store listing pending — see [STORE_SUBMISSION.md](STORE_SUBMISSION.md)._
-
-Open the **Microsoft Store**, search **Desktop Karaoke**, and click **Get**. It
-installs with no Python and **no security warnings** (the Store signs it), and
-keeps itself up to date. The app launches into your **system tray** (look for the
-purple microphone icon) and adds a **Desktop Karaoke** entry to your **Start
-menu**. Play any song and the lyrics appear automatically.
-
-> Why the Store? Windows **Smart App Control** blocks unsigned installers
-> outright, and SmartScreen warns on them. The Store ships a Microsoft-trusted
-> signature, so it just works — that's the true one-click path.
 
 ### Portable build (no install, no Python — just download and run)
 
@@ -93,6 +81,20 @@ instead, see [BUILD.md](BUILD.md).
 > Optional, NVIDIA only: the tray's **⚡ Enable GPU acceleration** fetches the CUDA
 > libraries on demand (~1.5 GB) — they're not bundled, so the download above stays
 > small (~200 MB). Everything already works without it.
+
+### Microsoft Store — recommended
+
+<!-- STORE LINK --> _Store listing pending — see [STORE_SUBMISSION.md](STORE_SUBMISSION.md)._
+
+Open the **Microsoft Store**, search **Desktop Karaoke**, and click **Get**. It
+installs with no Python and **no security warnings** (the Store signs it), and
+keeps itself up to date. The app launches into your **system tray** (look for the
+purple microphone icon) and adds a **Desktop Karaoke** entry to your **Start
+menu**. Play any song and the lyrics appear automatically.
+
+> Why the Store? Windows **Smart App Control** blocks unsigned installers
+> outright, and SmartScreen warns on them. The Store ships a Microsoft-trusted
+> signature, so it just works — that's the true one-click path.
 
 ### ⚙️ Where are the settings? — the tray icon
 
