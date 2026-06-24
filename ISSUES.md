@@ -264,6 +264,19 @@ offset is large (>6 s) **and** the match ratio is low (<0.72) — the player pos
 right far more often than a low-confidence big jump. High-confidence large offsets
 (genuine long intros) still apply. Complements TICKET-015's dead-band on the Shazam recal.
 
+## TICKET-026 — Absurd Shazam offset desynced a song (シンメトリー +160s) 🟢
+**Symptom:** "messing up on this ReGLOSS song again" (シンメトリー). The LYRICS were correct
+(`heard 'シンメトリー' | loaded 'シンメトリー' | match=True`, 51-line cache); the SYNC was the
+problem — `sync: holding +160.61s` in the log.
+**Root cause:** Shazam matched a DIFFERENT recording/segment and returned a +160s offset.
+The TICKET-015 cap was 180s, so +160s slipped through; the dead-band held it for ONE read,
+but two consistent bad reads would "confirm" each other and apply +160s → the whole song
+desyncs (clione live had the same shape).
+**Fix (pushed, v1.0.15):** the re-sync cap is now duration-aware — reject any |corr| ≥
+`min(120, max(45, 0.4×duration))` (a correction that's a big fraction of the song is a
+Shazam mismatch, not a real seek) AND clear the pending value so two bad reads can't
+confirm. Real seeks/intros (small) still apply via the dead-band + 2-read confirm.
+
 ## TICKET-024 — "Multiple sets of lyrics" + "some ended up generated too" 🟢
 **Symptom:** lyrics looked like two overlapping sets; songs that eventually FETCHED real
 lyrics sometimes still showed AI-generated lines.

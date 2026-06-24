@@ -1455,8 +1455,16 @@ class Overlay:
                             # intro re-confirms within seconds; random noise does not.
                             DEADBAND = 0.8      # ≤ this ⇒ trust the player clock, leave it
                             AGREE = 2.5         # two reads this close ⇒ a real offset
-                            if abs(corr) >= 180:
-                                pass                          # absurd read — ignore
+                            # SANITY CAP: a re-sync correction can't sensibly be a large
+                            # chunk of the song. A huge |corr| (e.g. +160s on a 3-min
+                            # song — シンメトリー) means Shazam matched a DIFFERENT
+                            # recording/segment, NOT a real seek; applying it would
+                            # desync the whole song. Reject AND clear the pending value
+                            # so two consistent bad reads can't "confirm" each other.
+                            dur = self._cur_duration or st.get("duration") or 0
+                            cap = min(120.0, max(45.0, 0.4 * dur)) if dur else 75.0
+                            if abs(corr) >= cap:
+                                self._pending_corr = 1e9      # absurd read — ignore + clear
                             elif abs(diff) <= DEADBAND:
                                 self._pending_corr = 1e9      # in sync; drop any pending jump
                             elif abs(corr - self._pending_corr) < AGREE:
