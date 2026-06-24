@@ -382,7 +382,7 @@ def is_cover_title(title):
     return bool(_COVER_RE.search(title or ""))
 
 
-def clean_title(title, source=""):
+def clean_title(title, source="", artist=""):
     """Reduce a media title to the actual SONG NAME so it matches lyric metadata.
 
     Japanese uploads name the song inside 「」 (and put the work/anime in 『』):
@@ -435,7 +435,7 @@ def clean_title(title, source=""):
     if not song:
         t = re.split(r"\s+[✦✧✩⭐★☆◆◇❖♪♫]\s+", t, 1)[0]
 
-    t = re.sub(r"\s*[\[(【「『][^\])】」』]*[\])】」』]", "", t)       # leftover (Official MV) etc.
+    t = re.sub(r"\s*[\[(（【「『][^\])）】」』]*[\])）】」』]", "", t)    # leftover (Official MV) / （cover） etc.
     # cover / "tried singing" credits → keep only the song title
     t = re.sub(r"\s*([/／]\s*)?\bcover(ed)?\s+by\b.*$", "", t, flags=re.I)
     t = re.sub(r"\s*[/／]\s*cover\b.*$", "", t, flags=re.I)
@@ -461,16 +461,35 @@ def clean_title(title, source=""):
     # a trailing anime tie-in with no song info ('… - TVアニメOPテーマ')
     t = re.sub(r"\s*[-–—/／]\s*(?:tv\s*)?(?:アニメ|anime)\s*.*?"
                r"(?:op|ed|主題歌|テーマ|opening|ending|theme).*$", "", t, flags=re.I)
-    # "Song / Artist" (or "Song/Artist", no spaces): a COVER and an ORIGINAL/MV
-    # upload both put the SONG first — '[Original] Dunk/Todoroki Hajime [Official
-    # MV]' → 'Dunk', 'ウェカピポ / 綺々羅々ヴィヴィ × 白銀ノエル' (cover) → 'ウェカピポ'. Only split a
-    # SINGLE slash whose two sides have no ' - ' (so a bilingual 'Artist - JP /
-    # Artist - EN' upload is left intact for _title_variants to resolve).
-    if is_cover or is_mv:
+    # "X / Y": a COVER or ORIGINAL/MV upload puts the SONG on one side and the
+    # ARTIST/GROUP on the other — but EITHER order occurs: '[Original] Dunk/Todoroki
+    # Hajime' (Song/Artist → 'Dunk') vs 'FLOW GLOW / LOAD' (Group/Song → 'LOAD').
+    # Disambiguate with the artist: keep the side that does NOT match it; default to
+    # the FIRST side when neither matches ('幻界/V.W.P #30' → '幻界'). Only a SINGLE
+    # slash with no ' - ' on either side (a bilingual 'Artist - JP / Artist - EN' is
+    # left whole for _title_variants).
+    if (is_cover or is_mv):
         parts = re.split(r"\s*[/／]\s*", t)
         if (len(parts) == 2 and len(parts[0].strip()) >= 2
                 and " - " not in parts[0] and " - " not in parts[1]):
-            t = parts[0].strip()
+            p0, p1 = parts[0].strip(), parts[1].strip()
+            a_low = (artist or "").lower()
+            a_norm = re.sub(r"[^0-9a-z぀-ヿ一-鿿]", "", a_low)
+            a_tok = {x for x in re.split(r"[^0-9a-z]+", a_low) if len(x) >= 4}
+
+            def _artistish(p):
+                pl = p.lower()
+                pn = re.sub(r"[^0-9a-z぀-ヿ一-鿿]", "", pl)
+                if pn and a_norm and (pn in a_norm or a_norm in pn):
+                    return True
+                return bool({x for x in re.split(r"[^0-9a-z]+", pl) if len(x) >= 4} & a_tok)
+
+            if _artistish(p1) and not _artistish(p0):
+                t = p0                      # 'Dunk / Todoroki Hajime' → Dunk
+            elif _artistish(p0) and not _artistish(p1):
+                t = p1                      # 'FLOW GLOW / LOAD' → LOAD
+            else:
+                t = p0                      # ambiguous → song-first is the common case
     return t.strip(" -–—|/　").strip()
 
 
@@ -1656,7 +1675,7 @@ class Overlay:
         if (rawt != self._last_raw_title or src != self._last_src
                 or rawa != self._last_artist):
             self._last_raw_title, self._last_src, self._last_artist = rawt, src, rawa
-            self._clean_title_cache = clean_title(rawt, src)
+            self._clean_title_cache = clean_title(rawt, src, rawa)
             self._clean_artist_cache = clean_artist(rawa)
             # Only EXPLICIT covers (歌ってみた / "covered by") take the loose
             # title-first path. Routing VTuber-channel uploads through it too was
