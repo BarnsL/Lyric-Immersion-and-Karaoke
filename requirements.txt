@@ -24,3 +24,12 @@ audioop-lts>=0.2; python_version >= "3.13"
 #     pip install faster-whisper        (when running from source)
 # or vendor it into the app's `deps/` folder (see README → Sync by listening).
 # faster-whisper>=1.0
+#
+# OPTIONAL — high-quality OFFLINE lyric generation (deep_transcribe.py): when a
+# song has NO synced lyrics anywhere, download the source audio and transcribe the
+# WHOLE file with the large model, replacing the rough realtime best-effort and
+# caching it for next time. Needs faster-whisper (above) + yt-dlp, plus a JS
+# runtime on PATH for yt-dlp (node or deno) so YouTube audio downloads don't 403.
+# Degrades gracefully if absent. See docs/GENERATION.md.
+#     pip install yt-dlp
+# yt-dlp>=2024.0

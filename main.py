@@ -822,6 +822,8 @@ class Overlay:
         self._gen_lines = []          # accumulated generated line dicts
         self._gen_title = self._gen_artist = ""
         self._gen_lang = None         # language auto-detected for the current generation
+        self._deep_token = 0          # bumped on track change → cancels in-flight deep transcription
+        self._deep_tried = set()      # song slugs we've already attempted a deep upgrade for
         self._title_locked = False    # exact clean-title match → sound can't override
         self._api = None
         self._boundary = None         # song-change detector thread
@@ -946,6 +948,7 @@ class Overlay:
         self._pending_corr = 1e9   # drop any pending large-offset confirmation
         self._pending_switch = None  # drop any pending song-switch confirmation
         self._gen_token += 1       # cancel any in-flight lyric generation
+        self._deep_token += 1      # cancel any in-flight deep (offline) transcription
         self._track_seq += 1
         self._generating = False
         self._gen_defers = 0       # fresh defer budget for this track's fetch
@@ -1429,6 +1432,86 @@ class Overlay:
         log.info("generating lyrics by Whisper for %r", self._gen_title)
         threading.Thread(target=self._generate_loop,
                          args=(self._gen_token,), daemon=True).start()
+        # Tier 2 (deep): in the BACKGROUND, download the source audio + transcribe
+        # the WHOLE file with the large model, then replace this rough best-effort
+        # cache with a clean, complete one. Runs once per song. See
+        # deep_transcribe.py / docs/GENERATION.md.
+        self._begin_deep_generation(self._deep_token, self._gen_title, self._gen_artist)
+
+    def _begin_deep_generation(self, token, title, artist):
+        """Spawn the offline high-quality transcription (Tier 2). No-op if deep
+        transcription isn't available (no yt-dlp), generation is off, or we've
+        already tried this song. Cancels via `token` when the track changes."""
+        try:
+            import deep_transcribe
+        except Exception:
+            return
+        if not (self.generate_on and deep_transcribe.available()):
+            return
+        from fetch_lyrics import slugify
+        slug = slugify(title)
+        if slug in self._deep_tried:
+            return                      # one attempt per song (per run)
+        # Already have a deep cache for this song? then nothing to redo.
+        try:
+            existing = LYRICS_DIR / f"{slug}.json"
+            if existing.exists() and '"generated-deep"' in existing.read_text("utf-8"):
+                return
+        except Exception:
+            pass
+        self._deep_tried.add(slug)
+        lang = self._gen_lang
+
+        def work():
+            try:
+                res = deep_transcribe.deep_transcribe(title, artist, lang=lang)
+            except Exception as e:
+                log.info("deep gen error: %s", e)
+                return
+            if not res or token != self._deep_token:
+                return
+            lines, dl = res
+            dlang = dl or lang or "ja"
+            # Annotate (furigana / romaji + the NETWORK translation) HERE, off the
+            # Tk thread — the round-trip must never block the UI (the best-effort
+            # path translates off-thread for the same reason).
+            try:
+                from fetch_lyrics import annotate
+                annotate(lines, dlang, translate=True)
+            except Exception:
+                pass
+            for d in lines:             # keep the AI marker, like the best-effort
+                if d.get("en", "").strip() and not d["en"].rstrip().endswith("***"):
+                    d["en"] = d["en"].strip() + " ***"
+            if token == self._deep_token:
+                self.root.after(0, lambda: self._apply_deep(token, title, artist, lines, dlang))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_deep(self, token, title, artist, lines, lang):
+        """(Tk thread) save the already-annotated deep lines as the cache
+        (`generated-deep`) and upgrade the overlay live if this song still plays."""
+        if token != self._deep_token:
+            return                      # track changed while we worked → discard
+        from fetch_lyrics import slugify
+        try:
+            out = LYRICS_DIR / f"{slugify(title)}.json"
+            data = {"meta": {"title": title, "artist": artist, "lang": lang,
+                             "duration": self._cur_duration, "source": "generated-deep"},
+                    "lines": lines}
+            out.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+            self.index.add(out)
+            log.info("deep gen: saved %d lines -> %s", len(lines), out.name)
+        except Exception as e:
+            log.info("deep gen save failed: %s", e)
+            return
+        # If this is still the song playing, upgrade the overlay live.
+        _, cur_t = (self._track or ("", ""))
+        if self._titles_match(cur_t, title):
+            self._gen_token += 1        # stop the Tier-1 best-effort loop
+            self._generating = False
+            self.load(out, keep_idx=True)
+            self._hint("✨ Upgraded to full transcription")
 
     def _generate_loop(self, token):
         """Capture the song in chunks, transcribe each, annotate, accumulate.

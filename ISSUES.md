@@ -199,6 +199,30 @@ Covers (歌ってみた) + messy YouTube uploads are unaffected (not a clean sou
 Verified: Lucky Star strict→None (no Twinkle Twinkle); 世惑い子/Lemon/Driver's License still
 fetch real lyrics; 地球儀 cover still correct; source-classification unit-tested.
 
+## TICKET-017 — Generated lyrics incomplete: add a deep OFFLINE transcription pass 🟢 (feature)
+**Symptom:** for songs we MUST generate (no synced lyrics anywhere — e.g. Lucky Star /
+Kaneko Lumi, Clione live), the realtime by-ear generation is **incomplete + rough**: it
+transcribes short loopback chunks with a *small* model while racing the playhead.
+**Request:** keep the realtime pass as instant best-effort, but ALSO download the source
+audio and do a **proper full-file transcription**, cache that, and delete the audio.
+**Fix (pushed):** new [`deep_transcribe.py`](deep_transcribe.py) — Tier 2:
+(1) `yt-dlp` searches `ytsearch1:<title> <artist>` and downloads **audio-only** (`bestaudio`;
+no ffmpeg — PyAV decodes the .webm/.m4a); (2) faster-whisper **`medium`** transcribes the
+WHOLE file (`vad_filter=False` so sung vocals survive, `condition_on_previous_text=False`);
+(3) lines are annotated + saved as `source: "generated-deep"`; (4) the audio is **deleted**
+(`finally:`). Wired in `main.py`: `_begin_generation` also spawns `_begin_deep_generation`
+→ `_apply_deep` (saves + upgrades the overlay live if still playing); `_deep_token` cancels
+on track change; `_deep_tried` runs it **once per song**; an existing `generated-deep` cache
+is never re-downloaded.
+**Key findings:** YouTube now 403s audio downloads without a JS runtime — yt-dlp enables only
+`deno` by default, so we opt in to **`node`** when on PATH (fixed the 403, 3.5 MB in ~3 s).
+`large-v3` was exact-match accurate but spilled to CPU (~4 min) next to the running app, so
+the default is **`medium`** (fits GPU, faster, near-identical on clear vocals). Verified on
+Lucky Star: deep pass returned **48 complete lines** matching the video's burned-in lyrics
+("And I'll be there for you, finding hope from a spark") vs the fragmentary best-effort.
+Degrades gracefully (no yt-dlp / 403 / over-long match / <4 lines → best-effort stands).
+Documented in [docs/GENERATION.md](docs/GENERATION.md).
+
 ---
 
 ### Research summary (cross-cutting)
