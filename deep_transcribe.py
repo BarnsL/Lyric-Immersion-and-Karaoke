@@ -71,6 +71,12 @@ def _download_audio(query: str, dest: Path) -> tuple[Path | None, str | None]:
         "outtmpl": out, "retries": 3, "socket_timeout": 30,
         # reject an over-long top hit (concert / compilation / hour-long loop)
         "match_filter": yt_dlp.utils.match_filter_func(f"duration < {_MAX_DUR}"),
+        # Also grab the MANUAL caption track (NOT auto-captions): on an official MV
+        # this is the EXACT official lyrics WITH the video's own timing — strictly
+        # better than a provider LRC (correct words AND perfect sync).
+        "writesubtitles": True, "writeautomaticsub": False,
+        "subtitleslangs": ["ja", "zh-Hans", "zh-Hant", "zh", "ko"],
+        "subtitlesformat": "vtt",
     }
     # YouTube now needs a JS runtime to mint un-throttled format URLs, else the
     # audio download 403s. yt-dlp only enables `deno` by default; opt in to
@@ -158,6 +164,86 @@ def transcribe_file(path: str | Path, lang: str | None = None,
     return lines, detected
 
 
+_CAP_CREDIT = re.compile(
+    r"作詞|作曲|編曲|translat|字幕|subtitle|lyrics?\s*by|sub(?:title)?\s*by|転載|©|"
+    r"youtube\.com|^@", re.I)
+
+
+def _vtt_ts(s: str) -> float:
+    s = s.strip().replace(",", ".")
+    p = s.split(":")
+    if len(p) == 3:
+        return int(p[0]) * 3600 + int(p[1]) * 60 + float(p[2])
+    if len(p) == 2:
+        return int(p[0]) * 60 + float(p[1])
+    return float(p[0])
+
+
+def _parse_vtt(path: Path) -> list[dict]:
+    """Parse a .vtt caption file → timed line dicts (credits / blank cues dropped,
+    rolling-caption duplicates collapsed into one timed line)."""
+    out, cur, buf = [], None, []
+
+    def flush():
+        nonlocal cur, buf
+        if cur and buf:
+            txt = re.sub(r"<[^>]+>", "", " ".join(buf)).strip()
+            txt = re.sub(r"\s+", " ", txt)
+            if txt and not _CAP_CREDIT.search(txt):
+                out.append({"t": [round(cur[0], 2), round(cur[1], 2)],
+                            "jp": txt, "rm": "", "en": ""})
+        buf = []
+
+    for L in path.read_text("utf-8", errors="ignore").splitlines():
+        L = L.rstrip()
+        m = re.match(r"(\d+:[\d:]+[.,]\d+)\s*-->\s*(\d+:[\d:]+[.,]\d+)", L)
+        if m:
+            flush(); cur = [_vtt_ts(m.group(1)), _vtt_ts(m.group(2))]; continue
+        if not L:
+            flush(); cur = None; continue
+        if L.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")) or L.isdigit():
+            continue
+        buf.append(L)
+    flush()
+    ded = []
+    for ln in out:                       # collapse consecutive identical captions
+        if ded and ded[-1]["jp"] == ln["jp"]:
+            ded[-1]["t"][1] = ln["t"][1]
+            continue
+        ded.append(ln)
+    return ded
+
+
+def _captions_from_dir(dest: Path, lang: str | None):
+    """Find + parse the best MANUAL caption track matching the song's ORIGINAL
+    language → (lines, lang) or None. A Japanese song's 'ja' track is its lyrics; a
+    'zh-TW'/'en' track is a TRANSLATION we must never show as the lyrics."""
+    order = ([lang] if lang in ("ja", "zh", "ko") else []) + \
+            ["ja", "zh-Hans", "zh", "zh-Hant", "ko"]
+    files = glob.glob(str(dest / "*.vtt"))
+    if not files:
+        return None
+
+    def rank(f):
+        n = Path(f).name.lower()
+        for i, w in enumerate(order):
+            if f".{w.lower()}." in n:
+                return i, w
+        return 99, None
+
+    files.sort(key=lambda f: rank(f)[0])
+    r, w = rank(files[0])
+    if r == 99:
+        return None                      # only translation tracks → don't use
+    try:
+        lines = _parse_vtt(Path(files[0]))
+    except Exception:
+        return None
+    clang = ("zh" if w and w.startswith("zh") else
+             "ko" if w == "ko" else "ja")
+    return (lines, clang) if len(lines) >= 6 else None
+
+
 def deep_transcribe(title: str, artist: str = "", lang: str | None = None,
                     size: str = _DEEP_SIZE):
     """Full pipeline: search + download the source audio, then FIRST try REAL
@@ -175,7 +261,20 @@ def deep_transcribe(title: str, artist: str = "", lang: str | None = None,
         audio, canon = _download_audio(query, tmp)
         if not audio:
             return None
-        # Prefer REAL lyrics reachable via the canonical title before by-ear work.
+        # 1) The video's OWN manual caption track — exact official lyrics WITH the
+        #    video's exact timing (perfect sync, no offset). Strictly best.
+        caps = _captions_from_dir(tmp, lang)
+        if caps:
+            clines, clang = caps
+            try:
+                import fetch_lyrics as F
+                F.annotate(clines, clang, translate=True)
+            except Exception:
+                pass
+            log.info("deep: using OFFICIAL caption track — %d %s lines (exact video timing)",
+                     len(clines), clang)
+            return clines, clang, {"source": "youtube-captions"}
+        # 2) REAL provider lyrics reachable via the canonical title.
         real = _real_from_canonical(canon, artist)
         if real:
             return real
