@@ -76,16 +76,21 @@ real-time alignment uses chroma + phonetic features. ([EasyLRC enhanced LRC](htt
 **Plan:** tighten the Shazam offset recal cadence on unstable songs; interpolate
 word-fill across each line (already partial); overlaps TICKET-003.
 
-## TICKET-008 — Multi-monitor: move to a display + mirror on all 🔴 (feature)
-**Symptom/request:** send the overlay to a chosen display; mirror on ALL displays.
-**Research:** Tkinter can't enumerate monitors — use the **`screeninfo`** library
-(resolution + x/y position + primary). Position via `geometry('+x+y')` (negative x =
-monitor to the left); watch **DPI scaling**. Mirror = one Toplevel per monitor.
-([wikiPython multi-screen](https://www.wikipython.com/tkinter-ttk-tix/gui-demos/a-tkinter-multi-screen-strategy-demo/),
-[PySimpleGUI multi-monitor](https://docs.pysimplegui.com/en/latest/cookbook/original/multi_monitor/))
-**Plan:** add `screeninfo`; tray "Display" submenu (each monitor + "All displays");
-reposition the band to the chosen monitor's bounds; for "All", spawn mirror overlays.
-*(Only 1 display connected now — buildable, but needs a 2nd screen to validate.)*
+## TICKET-008 — Multi-monitor: move / scroll-across / mirror 🟡 (feature)
+**Request:** move the overlay to a chosen display; **scroll lyrics continuously ACROSS
+all** displays; **mirror** the same lyrics on every display.
+**Done (built):** `_monitors()` via Win32 `EnumDisplayMonitors` (no new dep — `screeninfo`
+would need PyInstaller bundling); tray **"Display"** submenu (each screen + "Scroll across
+ALL screens"); `set_display('primary' | 'mon:N' | 'span')` repositions the
+W-parameterized band (span = one band over the whole virtual desktop, so lyrics scroll
+through every screen). The `primary` default is **unchanged** (verified safe on 1 display).
+**Remaining:** **MIRROR** (same lyrics on every screen at once) needs one Toplevel+canvas
+per monitor sharing the render — a render-target refactor. The menu is built once at
+startup, so hot-plugging a display needs a restart to refresh.
+**Validation:** all multi-screen modes need a **2nd display connected** to test (only 1
+attached now: 1920×1080). Research: [wikiPython](https://www.wikipython.com/tkinter-ttk-tix/gui-demos/a-tkinter-multi-screen-strategy-demo/),
+[PySimpleGUI](https://docs.pysimplegui.com/en/latest/cookbook/original/multi_monitor/).
+**Status:** 🟡 move + scroll-across shipped; mirror + live validation pending a 2nd screen.
 
 ## TICKET-009 — Use the master-tracks library DB for matching/verification 🔴 (feature)
 **Idea:** `Music-Migrator/data/master_tracks.json` (ISRC → track/artist/album/

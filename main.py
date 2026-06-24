@@ -720,6 +720,44 @@ def _work_area():
     return None
 
 
+def _monitors():
+    """Every connected monitor as a list of dicts with FULL bounds (x,y,w,h) and the
+    WORK area (wx,wy,ww,wh = bounds minus that monitor's taskbar) plus `primary`.
+    Tkinter can't enumerate monitors, so use Win32 EnumDisplayMonitors. Primary
+    first, then left-to-right. Falls back to a single primary entry on failure."""
+    mons = []
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        proc = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HMONITOR, wintypes.HDC,
+                                  ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+        def _cb(hmon, hdc, lprc, lparam):
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                m, w = mi.rcMonitor, mi.rcWork
+                mons.append({"x": m.left, "y": m.top, "w": m.right - m.left,
+                             "h": m.bottom - m.top, "wx": w.left, "wy": w.top,
+                             "ww": w.right - w.left, "wh": w.bottom - w.top,
+                             "primary": bool(mi.dwFlags & 1)})
+            return 1
+        user32.EnumDisplayMonitors(0, 0, proc(_cb), 0)
+    except Exception:
+        mons = []
+    if not mons:
+        l, t, r, b = _work_area() or (0, 0, 1920, 1032)
+        mons = [{"x": l, "y": t, "w": r - l, "h": b - t, "wx": l, "wy": t,
+                 "ww": r - l, "wh": b - t, "primary": True}]
+    mons.sort(key=lambda d: (not d["primary"], d["x"]))
+    return mons
+
+
 # ── Overlay ──────────────────────────────────────────────────────────
 
 class Overlay:
@@ -753,6 +791,7 @@ class Overlay:
         s = _load_settings()
         self.opacity = float(s.get("opacity", 1.0))
         self.position = s.get("position", "bottom")   # 'top' | 'bottom'
+        self.display = s.get("display", "primary")     # 'primary' | 'mon:N' | 'span'
         self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'|'lr'|'rl'
         self.scroll_speed = float(s.get("scroll_speed", SCROLL_SPEED))
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
@@ -1457,7 +1496,7 @@ class Overlay:
             self._generating = False
         self._mark_verified()
         self._relayout_song()           # size lanes/blocks to this song's rows
-        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
         if not keep_idx:
             self.idx = -1
@@ -2010,7 +2049,7 @@ class Overlay:
         self.root.attributes("-alpha", self.opacity)
         self._apply_perf()
         self._apply_scale()
-        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
         self._cancel_anim(); self._clear_stream(); self.cv.delete("all")
         self._kara, self.idx = [], -1
@@ -2156,7 +2195,8 @@ class Overlay:
                         "scroll_speed": self.scroll_speed, "perf": self.perf,
                         "recal_secs": self.recal_secs, "git_sync": self.git_sync,
                         "character": self.character_on, "api": self.api_on,
-                        "boundary": self.boundary_on, "generate": self.generate_on})
+                        "boundary": self.boundary_on, "generate": self.generate_on,
+                        "display": self.display})
 
     def set_generate(self, on):
         """Toggle the last-resort Whisper lyric generation."""
@@ -2171,15 +2211,61 @@ class Overlay:
 
     def set_position(self, p):
         self.position = p
-        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
         self.root.update_idletasks()   # apply the move immediately
+        self._persist()
+
+    def _place_window(self):
+        """(Re)position the overlay band at its current monitor / span coordinates."""
+        self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
+        self.root.attributes("-topmost", True)
+
+    def _apply_display(self):
+        """Place the overlay per ``self.display``: 'primary', 'mon:N' (a specific
+        monitor), or 'span' (ONE band across the whole virtual desktop so lyrics
+        scroll continuously through every screen). Reuses the W-parameterized layout
+        — just recompute the band's width / position / scale for the target."""
+        mons = _monitors()
+        if self.display == "span" and len(mons) > 1:
+            left = min(m["wx"] for m in mons)
+            right = max(m["wx"] + m["ww"] for m in mons)
+            prim = next((m for m in mons if m["primary"]), mons[0])
+            self.work_left, self.W = left, right - left
+            self.work_top, self.work_bottom = prim["wy"], prim["wy"] + prim["wh"]
+        else:
+            idx = 0
+            if isinstance(self.display, str) and self.display.startswith("mon:"):
+                try:
+                    idx = int(self.display[4:])
+                except ValueError:
+                    idx = 0
+            m = mons[idx] if 0 <= idx < len(mons) else mons[0]
+            self.work_left, self.W = m["wx"], m["ww"]
+            self.work_top, self.work_bottom = m["wy"], m["wy"] + m["wh"]
+        self.work_h = self.work_bottom - self.work_top
+        self.H = self.work_h
+        self._auto_scale = min(2.5, max(0.7, self.work_h / 1000.0))
+        self._bottom_clear = max(56, round(self.work_h * 0.10))
+        self._apply_scale()          # re-font + re-layout for the new width/height
+        self._place_window()
+        self.root.update_idletasks()
+
+    def set_display(self, d):
+        """Tray 'Display' submenu → move the overlay to a monitor, or span all."""
+        self.display = d
+        try:
+            self._apply_display()
+        except Exception as e:
+            log.info("display switch failed: %s", e)
+        if getattr(self, "idx", -1) >= 0 and getattr(self, "lines", None):
+            self._render(self.lines[self.idx])
         self._persist()
 
     def set_scroll(self, d):
         self.scroll_dir = d
         self._apply_scale()                # scroll mode is a taller, laned window
-        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
         self._cancel_anim()
         self._clear_stream()
@@ -2282,7 +2368,7 @@ class Overlay:
     def set_font_scale(self, v):
         self.font_scale = max(0.25, min(2.0, v))
         self._apply_scale()
-        self.root.geometry(f"{self.W}x{self.H}+0+{self._geom_y()}")
+        self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
         self.root.update_idletasks()
         if self.idx >= 0 and self.lines:        # re-render current line at new size
@@ -2455,6 +2541,21 @@ def main():
         _pos_item("Top of screen", "top"),
         _pos_item("Bottom of screen", "bottom"),
     )
+
+    # ── Display (multi-monitor) ──────────────────────────────────────────
+    def _disp_item(label, key):
+        return pystray.MenuItem(
+            label, lambda *_: ov.root.after(0, lambda: ov.set_display(key)),
+            radio=True, checked=lambda i, key=key: ov.display == key)
+    _disp = []
+    for _i, _m in enumerate(_monitors()):
+        _key = "primary" if _i == 0 else f"mon:{_i}"
+        _tag = "  ·  primary" if _m["primary"] else ""
+        _disp.append(_disp_item(f"Screen {_i + 1}  ({_m['w']}×{_m['h']}){_tag}", _key))
+    if len(_disp) > 1:          # span/mirror only make sense with 2+ screens
+        _disp.append(pystray.Menu.SEPARATOR)
+        _disp.append(_disp_item("Scroll across ALL screens  (one continuous band)", "span"))
+    display_menu = pystray.Menu(*_disp)
     scroll_menu = pystray.Menu(
         _scr_item("Stationary (appear in place)", "none"),
         _scr_item("Slide in from left", "left"),
@@ -2615,6 +2716,7 @@ def main():
         pystray.MenuItem("Opacity", opacity_menu),
         pystray.MenuItem("Font size", font_menu),
         pystray.MenuItem("Position", position_menu),
+        pystray.MenuItem("Display", display_menu),
         pystray.MenuItem("Scroll-in", scroll_menu),
         pystray.MenuItem("Scroll-through speed", speed_menu),
         pystray.MenuItem("Performance", perf_menu),
