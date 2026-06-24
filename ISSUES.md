@@ -280,6 +280,45 @@ title OR one contains the other) AND requires the title to be **distinctive**
 over. Deleted the stale generated `regloss_feelingradation.json` (kept the real
 `feelingradation.json`) and the old `dist/` build so the latest code runs.
 
+## TICKET-029 — Sync redesign: RESET is the first-line defense; add/drop time only on sonic confirmation 🟢
+**Request:** "I just reset to get me back to proper place but that should happen
+automatically. Make the reset the first line of defense against desync; only when sonic
+markers indicate the lyrics are wrong should the system drop/add time. Improve logs so the
+desync is visible."
+**Insight:** digital playback has **no clock drift** — the player position is exact — so the
+correct offset is almost always **0**, and a *chased* non-zero offset is the usual cause of
+desync. Reset, not nudging, is the right default.
+**Fix (v1.0.19, `_consume_async`):** the Shazam-read handler now:
+1. **AUTO-RESETs to 0** the moment the audio implies ~no offset (`|corr|≤0.8`) while we're
+   showing one — the manual "reset to 0 and it's fixed", made automatic and the first-line
+   defense.
+2. **Drops/adds time ONLY when corroborated** — two independent reads agree (`|corr−pending|
+   <2.0`) before any non-zero offset is applied (sonic markers confirm a real mis-timing).
+3. **Never disturbs a correct offset on noise** — absurd reads (≥ duration cap) and single
+   uncorroborated reads are ignored/held, so a confirmed MV-intro offset survives Shazam's
+   ±1–2 s jitter. Verified by a 7-scenario decision simulation.
+4. **Re-verifies a live offset fast** — recal cadence drops to ≤12 s whenever `|offset|>0.8`,
+   so a bad offset is reset within seconds, not a full slow cycle.
+**Logging:** every read now emits `sync-read: drift=±Xs audio_off=… shown_off=… pos=… line#…`
+so a developing desync is visible in `/logs`; `/status` gains `sync_drift`, `sync_drift_age`,
+`sync_pending`. Supersedes the eager-correction behavior behind TICKET-015/026.
+
+## TICKET-028 — Generated lyrics cached then served FOREVER (popular songs "keep generating") 🟢
+**Symptom:** popular songs that providers DO have kept showing AI-generated lyrics on every
+replay.
+**Root cause:** a cache hit short-circuits the matcher — once a song got a `generated` file
+(from a one-time transient fetch failure or a since-fixed cleaning bug), `LyricsIndex.match`
+served it on every future play and **never re-fetched** the real lyrics. The audit found 66
+such files.
+**Fix (v1.0.19):** (a) **runtime upgrade** — a generated cache hit now shows instantly *and*
+kicks off a background real-fetch; `load()` supersedes it the moment real lyrics arrive, and a
+generated hit no longer title-locks. (b) **`audit_cache.py`** — a reusable cache accuracy
+auditor (meta, romaji↔furigana, language, timing gaps, duplicates) with `--upgrade-generated`
+to re-fetch the backlog **in place** (same filename, no slug duplicates). Audit of 492 files:
+66 generated · 216 missing duration · 1 benign duplicate. (The romaji↔furigana check is
+informational only — deriving romaji from furigana regresses 287 files via a compound-verb
+doubling bug, so the stored cutlet romaji is kept.)
+
 ## TICKET-026 — Absurd Shazam offset desynced a song (シンメトリー +160s) 🟢
 **Symptom:** "messing up on this ReGLOSS song again" (シンメトリー). The LYRICS were correct
 (`heard 'シンメトリー' | loaded 'シンメトリー' | match=True`, 51-line cache); the SYNC was the

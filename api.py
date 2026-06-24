@@ -92,6 +92,13 @@ def _status(app):
         "position": round(st.get("position", 0.0), 2),
         "duration": st.get("duration"),
         "sync_offset": round(app.offset, 2),
+        # last audio-vs-display drift (+ve ⇒ lyrics late) and its age in seconds —
+        # lets a watcher see desync without parsing the log; None if never measured.
+        "sync_drift": getattr(app, "_last_drift", None),
+        "sync_drift_age": (round(time.time() - app._last_drift_t, 1)
+                           if getattr(app, "_last_drift_t", 0) else None),
+        "sync_pending": (round(app._pending_corr, 2)
+                         if getattr(app, "_pending_corr", 1e9) < 1e8 else None),
         "matched_title": app.meta.get("title"),
         "matched_artist": app.meta.get("artist"),
         "lang": app.meta.get("lang"),

@@ -948,6 +948,8 @@ class Overlay:
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
         self._pending_corr = 1e9      # a large sound offset awaiting a 2nd confirming read
+        self._last_drift = 0.0        # last audio-vs-display drift measured (sync telemetry)
+        self._last_drift_t = 0.0      # when that drift was measured (time.time)
         self._pending_switch = None   # a contradicting heard song awaiting a 2nd confirming read
         self._fast_calib = 0          # remaining quick re-locks after a song change
         self._recal_after = None      # pending recalibrate timer id
@@ -996,6 +998,7 @@ class Overlay:
         self._track_seq += 1
         self._generating = False
         self._gen_defers = 0       # fresh defer budget for this track's fetch
+        self._fetch_key = None     # let this track re-attempt a real fetch (upgrade path)
         log.info("track change: %r / %r (dur %s)", title, artist, duration)
 
         self._live_mode = is_live_or_compilation(title, duration)
@@ -1029,15 +1032,28 @@ class Overlay:
                 # over. Containment is robust to that. LOCK only a DISTINCTIVE name
                 # (confidence.py): a COMMON title ('Awake'/'BANG'/'Lucky Star') stays
                 # UNLOCKED so the heard AUDIO decides (the "Awake" rule).
+                # A GENERATED cache hit is a stopgap, NOT ground truth — it must
+                # never lock, and it should try to upgrade itself to real lyrics.
+                gen = (self.meta.get("source") or "").startswith("generated")
                 pt, ct = _norm_title(title), _norm_title(self.meta.get("title", ""))
                 matched = bool(pt and ct and (pt == ct or pt in ct or ct in pt))
                 distinct = confidence.title_distinctiveness(title)
                 self._title_locked = bool(
-                    matched and distinct >= 0.40
+                    matched and distinct >= 0.40 and not gen
                     and not is_mv_version(title) and not _is_generic_title(title))
                 if matched and not self._title_locked:
-                    log.info("title %r not locked (distinctiveness %.2f) → audio decides",
-                             title, distinct)
+                    log.info("title %r not locked (distinctiveness %.2f, gen=%s) → audio decides",
+                             title, distinct, gen)
+                # Show the generated lines instantly (no dead air), but ALSO
+                # re-fetch in the background: a real version may exist now, or the
+                # original generation was a transient miss / since-fixed cleaning
+                # bug. load() supersedes the generated lines the moment real ones
+                # arrive. Fixes the "popular song keeps generating" trap where one
+                # generation stuck forever because a cache hit never re-fetched.
+                if gen:
+                    log.info("cache hit for %r is GENERATED → background real-fetch to upgrade", title)
+                    self._start_fetch(artist, title, duration,
+                                      cover=self._is_cover, strict=self._clean_source())
             else:
                 self.lines, self._lyrics_path, self.idx = [], None, -1
                 self._kara = []
@@ -1298,6 +1314,11 @@ class Overlay:
                         # sound yet (each listen is ~4s of audio — the floor)
                         unconfirmed = (not self._verified) or self._sound_song is None
                         nxt = max(4, min(self.recal_secs, 4) if unconfirmed else self.recal_secs)
+                    # A non-zero offset is the main desync risk (a bad correction that
+                    # stuck). Re-verify SOON so the reset-first logic snaps it back within
+                    # seconds instead of a full slow cycle.
+                    if abs(self.offset) > 0.8:
+                        nxt = min(nxt, 12)
         finally:
             self._arm_recal(nxt)
 
@@ -1460,38 +1481,61 @@ class Overlay:
                         st = self.media.get()
                         if st and st.get("status") == PLAYING:
                             true_now = offset + (time.time() - t_cap) * st.get("rate", 1.0)
-                            corr = true_now - st["position"]
-                            diff = corr - self.offset
-                            # Shazam's per-read timing is NOISY (±~1s, worse on niche
-                            # tracks) and digital playback has NO clock drift — the
-                            # player's own position is exact. So fine, single-read
-                            # corrections only CHASE that noise and desync a baseline
-                            # that was already right (the "auto-sync made it worse →
-                            # reset to 0 fixes it" report). Move the offset ONLY for a
-                            # correction that is (a) outside a dead-band where the
-                            # player clock is the better authority, AND (b) CONFIRMED
-                            # by a second reading that agrees — a real seek / long
-                            # intro re-confirms within seconds; random noise does not.
-                            DEADBAND = 0.8      # ≤ this ⇒ trust the player clock, leave it
-                            AGREE = 2.5         # two reads this close ⇒ a real offset
-                            # SANITY CAP: a re-sync correction can't sensibly be a large
-                            # chunk of the song. A huge |corr| (e.g. +160s on a 3-min
-                            # song — シンメトリー) means Shazam matched a DIFFERENT
-                            # recording/segment, NOT a real seek; applying it would
-                            # desync the whole song. Reject AND clear the pending value
-                            # so two consistent bad reads can't "confirm" each other.
+                            corr = true_now - st["position"]   # offset the AUDIO implies
+                            diff = corr - self.offset          # how far the DISPLAY is off NOW
                             dur = self._cur_duration or st.get("duration") or 0
                             cap = min(120.0, max(45.0, 0.4 * dur)) if dur else 75.0
+                            # Digital playback has NO clock drift — the player's own
+                            # position is EXACT — so the correct offset is almost always
+                            # 0, and a wrong offset (a chased noisy read) is the usual
+                            # cause of desync. Policy (per user direction):
+                            #   1) RESET to the player clock is the first-line defense —
+                            #      whenever the audio says ~no offset is needed but we're
+                            #      showing one, or a read is absurd/uncorroborated, snap
+                            #      straight back to 0 (the manual "reset to 0", automatic).
+                            #   2) Only DROP/ADD time when sonic markers CONFIRM a real,
+                            #      stable offset — two independent reads that agree.
+                            DEADBAND = 0.8      # within this the exact player clock wins
+                            AGREE = 2.0         # two reads this close ⇒ a corroborated offset
+                            # SYNC TELEMETRY — log EVERY read so a developing desync is
+                            # visible: drift = how far the shown lyrics are from where the
+                            # audio says they should be (+ve ⇒ lyrics are LATE).
+                            cur_t = (self.lines[self.idx].start
+                                     if 0 <= self.idx < len(self.lines) else -1.0)
+                            self._last_drift = round(diff, 2)
+                            self._last_drift_t = time.time()
+                            log.info("sync-read: drift=%+.2fs audio_off=%+.2f shown_off=%+.2f "
+                                     "pos=%.1f line#%d@%.1f pend=%s", diff, corr, self.offset,
+                                     st["position"], self.idx, cur_t,
+                                     ("%+.2f" % self._pending_corr) if self._pending_corr < 1e8 else "-")
                             if abs(corr) >= cap:
-                                self._pending_corr = 1e9      # absurd read — ignore + clear
-                            elif abs(diff) <= DEADBAND:
-                                self._pending_corr = 1e9      # in sync; drop any pending jump
-                            elif abs(corr - self._pending_corr) < AGREE:
-                                self.offset = round(corr, 2)  # confirmed seek / real intro
+                                # Shazam matched a DIFFERENT recording/segment (e.g. +160s
+                                # on a 3-min song) — never a real seek, and NO information
+                                # about whether our current offset is right → just ignore.
                                 self._pending_corr = 1e9
-                                log.info("sync: applied confirmed offset %+.2fs", corr)
+                            elif abs(diff) <= DEADBAND:
+                                self._pending_corr = 1e9      # already in sync — leave it
+                            elif abs(corr) <= DEADBAND:
+                                # Audio says NO offset is needed, yet we're showing one →
+                                # we've drifted onto a bad offset. FIRST-LINE DEFENSE: reset
+                                # to the exact player clock now (the manual "reset to 0 and
+                                # it's fixed", made automatic).
+                                self._pending_corr = 1e9
+                                log.info("sync: audio_off≈0 but showing %+.2fs → AUTO-RESET to 0", self.offset)
+                                self.offset = 0.0
+                            elif abs(corr - self._pending_corr) < AGREE:
+                                # A real non-zero offset CORROBORATED by a 2nd agreeing read
+                                # (sonic markers confirm the lyrics are genuinely mis-timed)
+                                # → only NOW is it justified to drop/add time.
+                                self.offset = round(corr, 2)
+                                self._pending_corr = 1e9
+                                log.info("sync: CONFIRMED offset %+.2fs (two reads agree) → applied", corr)
                             else:
-                                self._pending_corr = corr     # first sighting — hold, don't apply
+                                # A non-zero offset proposed by ONE read — a real intro/seek
+                                # or just noise. Don't apply (await a 2nd agreeing read) and
+                                # don't disturb a possibly-correct current offset; a genuinely
+                                # WRONG one is caught by the audio≈0 reset above.
+                                self._pending_corr = corr
                                 log.info("sync: holding %+.2fs pending a 2nd agreeing read", corr)
                 elif self._title_locked:
                     # The lyrics came from a confident EXACT match on a clean
