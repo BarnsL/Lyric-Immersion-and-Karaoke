@@ -724,7 +724,7 @@ def _title_variants(title: str) -> list:
 
 
 def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
-              cover: bool = False):
+              cover: bool = False, strict: bool = False):
     """Return (lrc_string, meta) of a VERIFIED match, or (None, None).
     Widens the search across artist variants while guarding false positives.
     Prefers ORIGINAL-script lyrics: a romaji-only result is stashed and used only
@@ -734,7 +734,14 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     ``cover=True`` (a 歌ってみた / cover upload) means the supplied ``artist`` is the
     COVERING channel, not the song's artist — the lyrics are the ORIGINAL song's,
     so they're looked up by TITLE (trusting the cover marker) before the
-    artist-keyed queries that would otherwise miss the original."""
+    artist-keyed queries that would otherwise miss the original.
+
+    ``strict=True`` means the ``artist`` is AUTHORITATIVE (a clean source — Spotify
+    or a YT-Music "- Topic" channel — told us exactly who it is). Then the
+    artist-unconfirmed title-only last resort is SKIPPED: for a generic title like
+    "Lucky Star" that catalog has many different songs under, an artist-unconfirmed
+    title hit is almost always the WRONG one ("Twinkle Twinkle"), so returning
+    nothing (→ generate by ear from the real audio) beats showing a different song."""
     t, a = title.strip(), artist.strip()
     arts = split_artists(a)
     romaji_fallback = [None]   # (lrc, meta) — used only if nothing original-script
@@ -837,8 +844,13 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
                 if r:
                     return r
 
-    # 4. title-only — last resort, strict guard against same-title wrong songs
-    if t:
+    # 4. title-only — last resort, guarded against same-title wrong songs. SKIPPED
+    # when strict=True: a CLEAN source (Spotify / YT-Music "- Topic") gives an
+    # authoritative artist, so an artist-unconfirmed title-only hit for a generic
+    # title (the "Lucky Star" → "Twinkle Twinkle" trap) is almost certainly a
+    # DIFFERENT same-title song — better to return nothing and let generation
+    # transcribe the REAL audio than to display the wrong song.
+    if t and not strict:
         lrc = _try(t)
         if lrc and verify_lrc(lrc, t, duration) and _strict_ok(lrc, t, duration):
             r = take(lrc, {"source": "syncedlyrics/title", "artist": a or None,
@@ -1050,13 +1062,13 @@ def validate_file(path, duration: float | None = None) -> tuple[bool, str]:
 
 def fetch_and_save(title: str, artist: str = "", translate: bool = False,
                    duration: float | None = None, interactive: bool = False,
-                   cover: bool = False) -> Path | None:
+                   cover: bool = False, strict: bool = False) -> Path | None:
     # Don't cache a song under a "title" that's just the artist/channel name
     # (e.g. a mangled YouTube title) — it indexes garbage that then false-matches
     # every other video by that artist. Sound ID will find the real song instead.
     if artist and _norm(title) and _norm(title) == _norm(artist):
         return None
-    lrc, meta = fetch_lrc(title, artist, duration, cover=cover)
+    lrc, meta = fetch_lrc(title, artist, duration, cover=cover, strict=strict)
     if not lrc:
         return None
     lines = parse_lrc_text(lrc)

@@ -300,6 +300,7 @@ class MediaWatcher:
                     st = {
                         "title": info.title or "",
                         "artist": info.artist or "",
+                        "album": (getattr(info, "album_title", "") or ""),
                         "status": status,
                         "position": max(0.0, pos),
                         "duration": tl.end_time.total_seconds(),
@@ -984,7 +985,8 @@ class Overlay:
                 self._verified = False
                 self._title_locked = False
                 self._hint(f"♪ {title} — identifying…")
-                self._start_fetch(artist, title, duration, cover=self._is_cover)
+                self._start_fetch(artist, title, duration, cover=self._is_cover,
+                                  strict=self._clean_source())
 
         # MV / cinematic dead-space intro: for an MV-titled video, hold the lyrics
         # through the leading intro (see _tick); for ANY unaligned track, anchor
@@ -1037,9 +1039,25 @@ class Overlay:
         # YouTube/browser report the VIDEO length (intro/outro) which differs
         # from the audio track — using it to match/verify rejects correct
         # lyrics. Only trust duration from real audio players (Spotify, etc.).
+        # EXCEPTION: a YT-Music "- Topic" channel is an audio-only upload, so its
+        # length IS the track length — trust it (helps same-title disambiguation).
         if any(h in state.get("source", "") for h in BROWSER_HINTS):
+            if (state.get("artist") or "").strip().lower().endswith("- topic"):
+                return state.get("duration")
             return None
         return state.get("duration")
+
+    def _clean_source(self):
+        """True when the now-playing metadata is AUTHORITATIVE — a real audio app
+        (Spotify, etc.) or a YT-Music "- Topic" channel (official audio upload).
+        Then the supplied artist is trustworthy, so the lyric search runs STRICT:
+        it skips artist-unconfirmed title-only matches that would grab a wrong
+        same-title song ("Lucky Star" → a nursery-rhyme "Twinkle Twinkle")."""
+        src = self._last_src or ""
+        rawa = self._last_artist or ""
+        if any(h in src for h in BROWSER_HINTS):
+            return rawa.strip().lower().endswith("- topic")
+        return bool(src)
 
     def _mark_verified(self):
         md = self.meta.get("duration")
@@ -1089,7 +1107,7 @@ class Overlay:
         if need_rm or (want_en and have_en < len(want_en) * 0.5):
             self._start_translate(self._lyrics_path)
 
-    def _start_fetch(self, artist, title, duration=None, cover=False):
+    def _start_fetch(self, artist, title, duration=None, cover=False, strict=False):
         key = (artist, title)
         if self._fetch_key == key:
             return
@@ -1100,7 +1118,7 @@ class Overlay:
             try:
                 from fetch_lyrics import fetch_and_save
                 p = fetch_and_save(title, artist, translate=False, duration=duration,
-                                   cover=cover)
+                                   cover=cover, strict=strict)
             except Exception:
                 p = None
             self._fetch_result = (key, p)
@@ -1370,7 +1388,8 @@ class Overlay:
                         self._maybe_translate()
                     else:
                         log.info("correcting -> fetching %r / %r", f_title, f_artist)
-                        self._start_fetch(f_artist, f_title, self._cur_duration)
+                        self._start_fetch(f_artist, f_title, self._cur_duration,
+                                          strict=self._clean_source())
 
     # ── last-resort lyric GENERATION (transcribe the audio) ──
     def _begin_generation(self):
