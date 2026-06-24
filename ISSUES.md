@@ -159,6 +159,46 @@ Verified: both titles clean to the song and fetch real lyrics; concerts ("Live T
 stay sound-driven; apostrophes ("Don't Stop Me Now") + covers unaffected. Bad generated
 caches deleted.
 
+## TICKET-015 — Auto re-sync by sound over-corrects a baseline that was already good 🟢
+**Symptom:** "sometimes auto sync makes it more out of sync, so I reset to -0.0 and it's
+good again." The periodic Shazam recal drifted a correctly-synced song OUT of sync.
+**Root cause:** the recal eased the offset by `0.8*diff` on every reading where
+`diff > 0.15s`. But Shazam's per-read timing is noisy (±~1s, worse on niche tracks) and
+digital playback has **no clock drift** (the player's position is exact), so it kept
+chasing that noise away from a good baseline.
+**Research:** sync is a **constant offset, not drift**, for digital playback; the fix is
+a **filtered/dead-banded** estimate, not per-read chasing. ([AudioEdit constant-vs-drift](https://audioedit.io/blog/how-to-fix-audio-out-of-sync),
+[Acrovid drift correction](https://www.acrovid.com/audio_video_sync_drift_correction.htm))
+**Fix (pushed fc6cabe):** move the offset ONLY when a correction is (a) outside a **0.8s
+dead-band** (inside it the player clock is the better authority — leave it), AND (b)
+**confirmed by a 2nd reading** agreeing within 2.5s. A real seek / long intro re-confirms
+in seconds; random noise never does. Removed the 0.15s/0.8-gain easing. Verified in sim:
+noise around 0 stays 0, single spikes ignored, real +30/+5 offsets still apply,
+disagreeing spikes rejected. (On-demand "Sync by listening" already gates on a match
+ratio, so it was left as-is.)
+
+## TICKET-016 — Read music-source context: trust Spotify / YT-Topic, strict same-title fetch 🟢
+**Request:** read the source context (esp. Spotify) so the app knows the ONE song actually
+playing and doesn't grab a wrong same-title song, a cover's wrong version, or a whole
+concert. Example: "Lucky Star" by Kaneko Lumi (VOID, 3:41 — Spotify/YT-Topic).
+**Root cause:** Kaneko Lumi's "Lucky Star" isn't on the lyric providers, so the
+artist-unconfirmed **title-only last resort** grabbed a DIFFERENT same-title song
+("Twinkle Twinkle Lucky Star") — even with the artist + duration passed (the provider hit
+carried no duration, so the guard couldn't reject it).
+**Research:** verify against an **authoritative source** (the player's own clean metadata)
+and don't trust a title-only hit; duration/album disambiguates same-title songs
+(TICKET-002/009). The app already reads SMTC (`GlobalSystemMediaTransportControls`), which
+carries Spotify/Topic title+artist+album+duration.
+**Fix (pushed 19ebafa):** a `_clean_source()` signal — a real audio app (Spotify) or a
+YT-Music "- Topic" channel is AUTHORITATIVE. When clean, `fetch_lrc(strict=True)` skips
+the artist-unconfirmed title-only last resort: a generic title that misses the
+artist-keyed queries returns nothing → **generate by ear from the real audio** instead of
+showing the wrong song. Also: Topic-channel **duration is now trusted** (audio-only upload
+= track length) and SMTC **album_title** is read, both for same-title disambiguation.
+Covers (歌ってみた) + messy YouTube uploads are unaffected (not a clean source → loose path).
+Verified: Lucky Star strict→None (no Twinkle Twinkle); 世惑い子/Lemon/Driver's License still
+fetch real lyrics; 地球儀 cover still correct; source-classification unit-tested.
+
 ---
 
 ### Research summary (cross-cutting)
