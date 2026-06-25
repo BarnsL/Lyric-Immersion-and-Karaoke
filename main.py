@@ -1100,10 +1100,10 @@ class Overlay:
             "agree_live":            4.0,   # live-arrangement agreement window
             "spread_reset":         20.0,   # chorus-ambiguity spread threshold
             "reset_offset_max":      5.0,   # only reset when |offset| < this
-            "drift_fastpath":        4.0,   # integral → apply single-read corr
+            "drift_fastpath":        3.0,   # integral → apply single-read corr
             "drift_align_trigger":   6.0,   # integral → trigger auto-align
             "drift_min_for_accum":   0.8,   # |drift| > this contributes to integral
-            "drift_fastpath_cap":    5.0,   # |diff| < this for fast-path safety
+            "drift_fastpath_cap":    8.0,   # |diff| < this for fast-path safety
             "auto_align_cooldown":  25.0,   # min s between auto-aligns
             "auto_align_min_pos":   12.0,   # min player pos before auto-align
             "shazam_lock_grace":    30.0,   # auto-align skipped within N s of lock

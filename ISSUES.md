@@ -599,6 +599,21 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-042 — Karaoke version drift cap was too tight (Niconico Marine) 🟢
+**Live test:** Watching the Niconico Ahoy!! karaoke video, drift hit +7.85s
+(legitimate — karaoke version is offset ~7s vs studio). Auto-sync's fast-path
+refused to apply because `drift_fastpath_cap` was 5.0s. The convergence still
+worked via the 2-read confirmation path eventually, but slowly.
+**Iteration via `/tune` (no rebuild):**
+1. Raised `drift_fastpath_cap` 5.0 → 10.0 to allow karaoke-version corrections.
+2. Lowered `drift_fastpath` 4.0 → 2.0 — was too aggressive (1-read momentary
+   spikes would have applied).
+3. After convergence to drift 0.02s, settled on `{drift_fastpath: 3.0,
+   drift_fastpath_cap: 8.0}` — handles real karaoke-version offsets (up to
+   8s) without applying single momentary chorus-ambiguity reads.
+**Fix (pushed, v1.0.31):** promoted those tuned values to code defaults.
+This is exactly what `/tune` is for — try values live, ship the winners.
+
 ## TICKET-041 — Live-tunable sync params via /tune API (no rebuild needed) 🟢
 **Request:** allow adjusting sync tuning constants on the fly without rebuilding —
 iterating on `DEADBAND`/`AGREE`/spread thresholds/drift integrals took 5-minute
