@@ -2345,8 +2345,14 @@ class Overlay:
             # title-only search grabbed a same-titled DIFFERENT song.
             self._is_cover = is_cover_title(rawt)
             if self._is_cover:
-                orig_a, _ = extract_cover_original(rawt, self._clean_artist_cache)
+                orig_a, song = extract_cover_original(rawt, self._clean_artist_cache)
                 self._cover_original_artist = orig_a
+                # If the cover parse found the bare song name ("Coffee" out of
+                # "[COVER] Coffee - A!ka | Kaneko Lumi"), use it — clean_title's
+                # generic rules leave the "- Artist | Channel" tail on, which
+                # makes the lyric search messier than it needs to be.
+                if song and len(song) >= 2 and len(song) < len(self._clean_title_cache):
+                    self._clean_title_cache = song
             else:
                 self._cover_original_artist = None
         track = (self._clean_artist_cache, self._clean_title_cache)
