@@ -1770,11 +1770,17 @@ class Overlay:
             self._fetch_result = None
             if key == self._fetch_key:
                 if p:
-                    self.index.add(p)
-                    self.load(Path(p))
-                    self._start_translate(Path(p))
-                    if self.git_sync:           # back up the new song if opted in
-                        self.git_backup()
+                    # If captions (video-locked ground truth) already loaded for
+                    # this song, a slower LRC fetch must NOT overwrite them.
+                    if (self.meta.get("source") or "") == "youtube-captions":
+                        log.info("keeping YouTube captions over LRC %s", Path(p).name)
+                        self.index.add(p)
+                    else:
+                        self.index.add(p)
+                        self.load(Path(p))
+                        self._start_translate(Path(p))
+                        if self.git_sync:           # back up the new song if opted in
+                            self.git_backup()
                 elif self._identifying:
                     pass                       # sound-ID running → wait for it
                 elif self._sound_song is None:
@@ -3863,6 +3869,8 @@ class Overlay:
         # captions win over any LRC / generation for this song
         self._gen_token += 1
         self._deep_token += 1
+        self._fetch_key = None      # cancel a still-pending LRC fetch result so it
+        self._fetch_result = None   # can't overwrite the captions a moment later
         self._generating = False
         self.load(out, keep_idx=True)
         self.idx = -1                               # force re-render over the hint
