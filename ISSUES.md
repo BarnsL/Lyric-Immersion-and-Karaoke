@@ -524,11 +524,120 @@ line is already at/after the onset (`first_start >= vpos-2`), the LRC is absolut
 anchor. This makes the user's manual "reset to 0" automatic and correct. Verified across
 fetched-with-intro / generated / relative / at-onset cases. Clione lyrics confirmed correct.
 
+## TICKET-032 — Display persistence + mirror/cycle modes + 4s sample default 🟢
+**Request:** chosen display falls back to primary too easily; need to mirror lyrics to ALL
+screens or cycle through each; make 4-second sample for lyric sync the default (was 10s).
+**Root cause (display fallback):** stored `display="mon:N"` was an INDEX into the current
+enumeration. After a monitor sleep/wake/replug, indices renumber → the saved index pointed
+nowhere → `_apply_display` silently fell back to primary.
+**Fix (pushed, v1.0.26):** added monitor fingerprinting (`_mon_fingerprint` = "x,y,wxh")
+saved alongside the index, with index fallback then primary fallback (each logged).
+Watchdog (`_check_monitors`) re-enumerates every 3 s and re-applies the display if the
+topology changed. Added "Mirror on ALL screens" (transparent Toplevel clones rendering
+the current line via simplified `_create_mirrors` / `_update_mirrors`) and "Cycle through
+screens" (rotates `_cycle_idx` on each `_render`). `recal_secs` default lowered from 10
+to 4.
+
+## TICKET-033 — Maneki-neko dancing character (cuteness rebuild) 🟢
+**Request:** turn the dancing character into a maneki-neko — beckoning paw, red collar
+with bell, gold koban; first attempt looked "kinda fucked up."
+**Fix (pushed, v1.0.26):** complete redesign of `_draw_chibi` in `character.py` matching
+classic kawaii proportions researched online (CLIP STUDIO chibi tutorial, DeviantArt
+Maneki-Neko tutorial): big head (~60% of figure), small round body, raised right paw
+that waves with `math.sin(phase * 3.2)`, calico patches themed to artist colors, koban
+coin with 福 kanji in left paw, red collar arc + gold bell, happy closed-crescent eyes
+(the signature kawaii expression), pink nose + ‿ smile, cheek blush with stipple, music
+notes while playing. Clean tkinter primitives (oval/polygon/arc/line), no ugly triple-
+line arm hack.
+
+## TICKET-034 — Cover lyrics: search by ORIGINAL artist, not covering channel 🟢
+**Symptom:** "[COVER] Coffee - Alka | Kaneko Lumi" loaded the wrong Lumi song; reporting
+wrong-song never recovered. The covering channel (Lumi) was searched as the artist
+instead of the original artist (Alka), so Shazam couldn't disambiguate either.
+**Root cause:** `_COVER_RE` matched `(cover)` and 歌ってみた but NOT `[COVER]` (square
+brackets). Generic bracket-strip in `clean_title` then ate the cover marker entirely, so
+`_is_cover` was False — no title-first cover path, no original-artist extraction.
+**Fix (pushed, v1.0.26):**
+1. Added `\[\s*cover\s*\]` to `_COVER_RE` so square-bracket covers are recognized.
+2. Added `extract_cover_original(raw_title, cover_channel)` that parses common cover
+   patterns ("Song - OrigArtist | CoverChannel", "Song - OrigArtist / CoverChannel") and
+   returns the original artist. Identifies which side is the cover channel by lowercase
+   normalised-substring match against the cleaned artist.
+3. `_on_track_change` uses `_cover_original_artist` as the `fetch_artist` for both index
+   lookup and `_start_fetch` when set, falling back to the channel name otherwise.
+4. `report_wrong` (user-driven correction) ALSO re-fetches by the original artist for
+   covers before falling back to sound ID (which often fails on covers).
+**Research:** lyric finders verify artist + don't trust the first match (TICKET-002).
+This applies the same principle to the cover artist token.
+
+## TICKET-035 — Long instrumental intros desync (Grimes "Genesis") 🟢
+**Symptom:** "Grimes - Genesis" video is 5:32 but the song's first vocal is at ~1:10
+(~70 s instrumental intro). Lyrics started showing at video time 0 and ran ahead of
+singing until Shazam mid-song fingerprinted a vocal phrase to calibrate (often half the
+song later).
+**Root cause:** `_mv_mode` only triggered on titles containing MV/PV/Music Video/Official
+markers — "Grimes - Genesis" has none. And the existing `_on_song_onset` only fires on a
+quiet→music transition (a leading silent gap), which YouTube videos don't have — music
+plays from frame 0.
+**Fix (pushed, v1.0.26):**
+1. Added **vocal-band onset detection** to `SongChangeDetector`: tracks the ratio of
+   spectral energy in 200-3000 Hz (vocal range) to total energy via cheap real FFT on
+   each 0.2 s block (~0.5 ms per check). Learns the instrumental baseline for the first
+   ~5 s of music, then fires `on_vocal()` when ratio runs 1.4× baseline (or > 0.55
+   absolute) sustained for 1 s.
+2. New `_on_vocal_onset` handler in main.py calibrates `offset = first_line.start -
+   player_position` when fired, jumping the displayed lyrics to line 1 the instant
+   singing starts. Guarded: only when vpos > 8 s, first line < 8 s, new offset in
+   (-120, 0).
+3. `load()` auto-enables MV mode when LRC duration > 15 s shorter than the YouTube
+   duration AND first line starts before 5 s — catches Grimes-class uploads with no
+   MV markers in the title.
+4. Bumped the MV intro-hold timeout from 50 s → 100 s (most MV intros are under 90 s)
+   now that vocal-onset can release it precisely.
+**Research:** Silero VAD and webrtcvad were rejected (both miss singing in polyphonic
+music). HPSS + mid-band energy ratio is the lightweight robust approach
+([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
+[Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
+
+## TICKET-036 — "Always listening" continuous auto-sync 🟢
+**Request:** Niconico karaoke video (`【ニコカラHD】 Ahoy!! 我ら宝鐘海賊団`) showed lyrics ~10 s
+ahead with no auto-correction. User wants the app to "always be listening and trying to
+sync lyric to place in song" — Shazam can't fingerprint an off-vocal karaoke cut, so the
+existing pipeline never locks the offset.
+**Root cause:** sync-by-listening (`align_by_listening`) was opt-in only — needed a
+manual /align trigger. And the lean .exe ships without faster-whisper (1+ GB extra), so
+even if it ran it would no-op.
+**Fix (pushed, v1.0.26) — two-tier continuous auto-sync:**
+1. **Background Whisper align** (when faster-whisper is available):
+   - Auto-aligns ~25 s into each new track (after vocal-onset gap)
+   - Background heartbeat every 45 s re-checks silently
+   - Drift trigger: when Shazam reports persistent drift (>1.5 s, 3 consecutive reads),
+     triggers immediately — catches karaoke / live / off-vocal cuts Shazam can't lock
+   - Silent UI: "🎤 Auto-synced (+X.Xs)" only when a meaningful correction lands
+2. **Whisper-free fallback via vocal-energy correlation** (the default lean build):
+   - `SongChangeDetector` keeps a rolling 60 s buffer of `(t_wall, vocal_ratio)` per
+     0.2 s block (already computed for vocal-onset detection in TICKET-035).
+   - Main thread builds a binary "vocals on/off" mask from the buffer (ratio above
+     1.25× learned baseline), and a matching LRC mask for each candidate offset in
+     [-15, +15] s at 0.2 s precision.
+   - Picks the offset with the highest agreement score. Requires the peak to lift
+     ≥0.10 above the median of all candidates — sparse / flat masks fail this check
+     and the offset isn't touched.
+   - Same triggers as the Whisper path. Whisper preferred when available.
+**Conservative gates** (no churn, no UI spam): skips if Shazam locked within 30 s, skips
+within 25 s of last align, skips while paused / in live mode, requires ≥12 s of buffer,
+≥4 vocal blocks captured, new offset within 60 s, change ≥0.4 s. State (`_last_align_t`,
+`_last_sound_lock_t`, `_align_drift_strikes`) resets per track.
+
 ---
 
 ### Research summary (cross-cutting)
-- **Matching:** verify artist + duration, don't trust the first hit (TICKET-002/009).
+- **Matching:** verify artist + duration, don't trust the first hit (TICKET-002/009/034).
 - **Sync:** forced alignment / vocal separation; auto sync-by-listening (TICKET-003/007).
+  Whisper-free fallback via vocal-band energy cross-correlation (TICKET-036).
+- **Intros:** vocal-onset via band-energy ratio (not VAD) for songs with long instrumental
+  intros (TICKET-035).
 - **Generation:** `condition_on_previous_text=False`, RMS-VAD, overlap chunks (TICKET-005).
 - **Rendering:** full-coverage CJK font + fallback to kill tofu (TICKET-006).
-- **Multi-monitor:** `screeninfo` + per-monitor Toplevels (TICKET-008).
+- **Multi-monitor:** fingerprint-based persistence + topology watchdog (TICKET-032).
+- **Covers:** original-artist extraction from title beats channel-as-artist (TICKET-034).
