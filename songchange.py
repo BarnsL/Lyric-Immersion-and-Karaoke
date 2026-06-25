@@ -97,6 +97,7 @@ class SongChangeDetector(threading.Thread):
         self._live_rms = 0.0
         self._live_vr = None
         self._live_silent = True
+        self._live_flatness = None    # spectral flatness of vocal band (noise indicator)
         self._live_t = 0.0
         self._blocks_seen = 0
 
@@ -298,6 +299,8 @@ class SongChangeDetector(threading.Thread):
             "vocal_ratio": round(self._live_vr, 3) if self._live_vr is not None else None,
             "vocal_detected_now": (self._live_vr is not None and thresh is not None
                                    and self._live_vr >= thresh),
+            "band_flatness": round(self._live_flatness, 3) if self._live_flatness is not None else None,
+            "noise_like": (self._live_flatness is not None and self._live_flatness > 0.55),
             "window_on_blocks": on,
             "window_off_blocks": off,
             "window_thresh": round(thresh, 3) if thresh is not None else None,
@@ -309,8 +312,20 @@ class SongChangeDetector(threading.Thread):
         }
 
     def _vocal_ratio(self, np, data):
-        """Fraction of spectral energy in the vocal band (200-3000 Hz).
-        Cheap real FFT (~0.5 ms on a 0.2 s @ 16 kHz block)."""
+        """A NOISE-ROBUST "vocalness" score for the 200-3000 Hz band.
+
+        Plain band-energy fraction can't tell SINGING from GAME NOISE — gunfire,
+        explosions and UI clicks dump energy into the vocal band too, and on the
+        system loopback (which hears the game AND the music) that would create
+        false "vocal" blocks and corrupt the sync correlation.
+
+        The discriminator is TONALITY: a sung/spoken voice (and pitched music)
+        is harmonic — energy concentrated at a few frequencies → LOW spectral
+        flatness. Broadband game SFX is noise-like → HIGH spectral flatness. So
+        we scale the band-energy fraction down when the band looks broadband,
+        keeping the vocal mask clean while a game is playing.
+
+        Cheap: one real FFT + a flatness ratio (~0.6 ms on a 0.2 s @ 16 kHz block)."""
         try:
             flat = data.flatten() if hasattr(data, "flatten") else data
             n = len(flat)
@@ -319,8 +334,19 @@ class SongChangeDetector(threading.Thread):
             spec = np.abs(np.fft.rfft(flat * np.hanning(n)))
             total = spec.sum() + 1e-9
             freqs = np.fft.rfftfreq(n, d=1.0 / self.sr)
-            band = spec[(freqs >= 200) & (freqs <= 3000)].sum()
-            return float(band / total)
+            bandmask = (freqs >= 200) & (freqs <= 3000)
+            band_spec = spec[bandmask]
+            ratio = float(band_spec.sum() / total)
+            # spectral flatness of the vocal band: geometric/arithmetic mean of
+            # the power spectrum. ~0 = pure tone, ~1 = white noise. Voice/music
+            # sit low (~0.1-0.35); broadband SFX sits high (~0.5+).
+            ps = (band_spec * band_spec) + 1e-12
+            flatness = float(np.exp(np.mean(np.log(ps))) / np.mean(ps))
+            self._live_flatness = flatness
+            # Tonality gate: full weight while tonal, ramping to zero as the band
+            # turns broadband (game noise). 1.0 at flatness≤0.35, 0 at ≥0.65.
+            tonal = max(0.0, min(1.0, (0.65 - flatness) / 0.30))
+            return ratio * tonal
         except Exception:
             return None
 

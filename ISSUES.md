@@ -599,6 +599,30 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-051 — Game noise must not corrupt sync / recognition 🟢
+**Concern:** the overlay is built to run WHILE gaming (there's a "Gaming" preset), but
+the sync + recognition listen to the **system loopback**, which mixes the music with
+GAME AUDIO — gunfire, explosions, UI clicks. Those dump energy into the 200-3000 Hz
+vocal band, which would create false "vocal" blocks and corrupt the energy-correlation
+sync (and could false-trigger vocal-onset detection).
+**Fix (pushed, v1.0.40) — tonality gate on vocal detection:**
+The discriminator between SINGING and game NOISE is **tonality**. A voice (and pitched
+music) is harmonic — energy concentrated at a few frequencies → LOW spectral flatness.
+Broadband SFX is noise-like → HIGH spectral flatness. `_vocal_ratio` now computes the
+vocal band's spectral flatness (geometric/arithmetic mean of the power spectrum) and
+scales the band-energy score by a tonality weight: full weight at flatness ≤0.35,
+ramping to ZERO at ≥0.65. So a gunshot/explosion block contributes ~nothing to the
+vocal mask, keeping the sync correlation clean while a game plays. Cheap (one extra
+flatness ratio on the FFT already computed).
+**Other layers already robust:** Shazam mis-IDs from noise can't switch songs without
+a 2nd confirming read (TICKET-anti-churn); the energy correlator's small-shift prior +
+uniqueness + lift floor (TICKET-049) make a noisy correlation DECLINE to act (player
+clock carries sync) rather than jump.
+**Diagnostics:** `/audio` now reports `band_flatness` and a `noise_like` flag, so a
+game-noise period is visible in the listener view.
+**Verified:** on the Marine song the vocal band's flatness stays low (vocals still
+detected normally); a broadband-noise block reads high flatness and is gated out.
+
 ## TICKET-050 — Diagnostic views: source / audio listener / lyric-state analyzer 🟢
 **Request:** add a video/music source view, an audio listener, and a lyric current-state
 analyzer to the diagnostics API "and anything else that may help."
