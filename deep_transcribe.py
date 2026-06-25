@@ -248,6 +248,11 @@ def fetch_captions_only(query: str, lang: str | None = None):
     """FAST path: download ONLY the caption track (no audio, no Whisper) for the
     top YouTube hit for `query`, parse it to timed lines → (lines, lang) or None.
 
+    `query` may be a TITLE (→ ytsearch1, the top hit) OR an exact YouTube URL /
+    11-char video id. The exact-video form is strictly better — a title search
+    can land on a DIFFERENT upload (lyric video vs official MV) whose intro
+    length differs, so its caption timing wouldn't match the playing video.
+
     For a YouTube video the caption track is strictly better than a provider LRC:
     it's THIS video's own text AND timing, so there's no wrong-transcription and
     no cross-version drift (the "white balance" case where syncedlyrics returned
@@ -285,11 +290,19 @@ def fetch_captions_only(query: str, lang: str | None = None):
         }
         if _sh.which("node"):
             opts["js_runtimes"] = {"node": {}}
+        # Exact URL / 11-char video id → fetch THAT video; else search by title.
+        q = query.strip()
+        if re.match(r"https?://", q):
+            target = q
+        elif re.fullmatch(r"[\w-]{11}", q):
+            target = f"https://www.youtube.com/watch?v={q}"
+        else:
+            target = f"ytsearch1:{q}"
         try:
             with yt_dlp.YoutubeDL(opts) as y:
-                y.extract_info(f"ytsearch1:{query}", download=True)
+                y.extract_info(target, download=True)
         except Exception as e:
-            log.info("captions: fetch failed for %r: %s", query, str(e)[:140])
+            log.info("captions: fetch failed for %r: %s", target, str(e)[:140])
             return None
         res = _captions_from_dir(tmp, lang)
         if res:

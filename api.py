@@ -69,7 +69,8 @@ _ROUTES = {
         "/nudge": "shift sync by ?s=2.5 seconds (+ = lyrics later)",
         "/reset": "reset the sync offset to 0",
         "/align": "sync by listening — transcribe the audio + match to lyrics (needs faster-whisper)",
-        "/captions": "pull THIS video's YouTube caption track (accurate text+timing) and use it (needs yt-dlp)",
+        "/captions": "pull THIS video's caption track (accurate text+timing); ?url=<exact video> beats a title search",
+        "/nowplaying": "browser pushes the exact current video URL (?url=...) so auto-captions hit the right upload",
         "/tune": "set sync param: ?key=drift_fastpath&value=3.0 (one per call); or POST JSON {k:v,...}",
         "/reindex": "rescan the local library",
         "/import/csv": "start a playlist CSV import: ?path=C:\\path\\to\\file.csv [&translate=1] [&force=1]",
@@ -274,8 +275,14 @@ def make_handler(app, log_file, token):
                     self._run(app.align_by_listening)
                     self._send(200, {"ok": True, "action": "syncing by listening (transcribe + match)"})
                 elif path == "/captions":
-                    self._run(app.load_youtube_captions)
-                    self._send(200, {"ok": True, "action": "pulling the video's YouTube caption track"})
+                    u = q.get("url", [""])[0].strip() or None
+                    self._run(lambda: app.load_youtube_captions(url=u))
+                    self._send(200, {"ok": True, "action": "pulling the video's YouTube caption track",
+                                     "url": u})
+                elif path == "/nowplaying":
+                    u = q.get("url", [""])[0].strip()
+                    self._run(lambda: app.set_now_url(u))
+                    self._send(200, {"ok": True, "action": "current video URL set", "url": u})
                 elif path == "/tune":
                     # Accept either ?key=X&value=Y OR a JSON body {k1: v1, k2: v2}.
                     # Returns the resulting tune dict + any per-key errors.

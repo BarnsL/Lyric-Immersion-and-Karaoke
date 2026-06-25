@@ -1023,6 +1023,7 @@ class Overlay:
         self._cover_original_artist = None   # original artist extracted from a cover title
         self._last_caption_t = 0.0   # throttle YouTube caption fetches (rate-limit guard)
         self._caption_song = None    # (artist,title) we last attempted captions for
+        self._now_url = None         # exact current video URL (browser-pushed, for captions)
         self._frame_ms = 0.0         # EWMA of render-frame interval (ms) → /status render_fps
         self._last_tick_t = None
         self._render_frame = False
@@ -2164,6 +2165,11 @@ class Overlay:
             self._generating = False
             self.load(out, keep_idx=True)
             self._hint("✨ Found the real lyrics" if real else "✨ Upgraded to full transcription")
+            # The hint cleared the canvas, but load(keep_idx=True) left self.idx on
+            # the current line — so the tick loop, seeing the index unchanged,
+            # would NOT redraw the line and the hint would stay stuck with no
+            # lyrics until the line changed. Force the next tick to re-render.
+            self.idx = -1
 
     def _generate_loop(self, token):
         """Capture the song in chunks, transcribe each, annotate, accumulate.
@@ -3405,6 +3411,19 @@ class Overlay:
         self.captions_on = bool(on)
         self._persist()
 
+    def set_now_url(self, url):
+        """The browser tells us the EXACT video URL currently playing, so the
+        caption fetch hits that exact upload (not a fuzzy title search). A new
+        URL re-arms the per-song caption fetch."""
+        url = (url or "").strip() or None
+        if url and url != self._now_url:
+            self._now_url = url
+            self._caption_song = None        # re-fetch captions for the exact video
+            if (self.captions_on and self._track and not self._live_mode
+                    and (self.meta.get("source") or "") != "youtube-captions"):
+                self.root.after(300,
+                                lambda t=self._track_seq: self._maybe_fetch_captions(t))
+
     def _click_through(self):
         """(Re)assert the overlay's click-through window style.
 
@@ -3746,14 +3765,18 @@ class Overlay:
         self._hint("🎧 Listening to identify the song…")
         self._start_identify()
 
-    def load_youtube_captions(self, silent=False):
+    def load_youtube_captions(self, silent=False, url=None):
         """Pull THIS video's YouTube caption track (accurate text + perfect
         timing, locked to the video) and use it INSTEAD of the provider LRC.
         For a browser video this is the most accurate source — it fixes both
         wrong-transcription LRCs (the "white balance" case, where syncedlyrics
         returned different words than the video sings) and cross-version timing
         drift. Runs in the background; no-ops if yt-dlp isn't available or the
-        video has no caption track."""
+        video has no caption track.
+
+        `url` (or the browser-pushed `self._now_url`) fetches the EXACT playing
+        video — strictly better than a title search, which can land on a
+        different upload whose intro length (and thus caption timing) differs."""
         try:
             import deep_transcribe
             if not deep_transcribe.available():
@@ -3765,7 +3788,8 @@ class Overlay:
         if not self._track:
             return
         artist, title = self._track
-        raw = self._last_raw_title or title       # raw title → best YouTube match
+        # exact video URL (param > browser-pushed) beats a fuzzy title search
+        query = url or self._now_url or self._last_raw_title or title
         lang = self.meta.get("lang", "ja")
         self._deep_token += 1
         token = self._deep_token
@@ -3775,7 +3799,7 @@ class Overlay:
         def work():
             res = None
             try:
-                res = deep_transcribe.fetch_captions_only(raw, lang=lang)
+                res = deep_transcribe.fetch_captions_only(query, lang=lang)
             except Exception as e:
                 log.info("captions error: %s", e)
             if not res:
