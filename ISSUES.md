@@ -599,6 +599,24 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-037 — Niconico (and other video-site) tab suffix taken as song title 🟢
+**Symptom:** Niconico karaoke video showed lyrics ~10 s out of sync no matter what.
+`/status` showed `matched_title: "ニコニコ動画"` and `matched_artist: "Ahoy!! 我ら宝鐘海賊団☆"` —
+the LRC fetched was the **wrong song entirely**, under "ニコニコ動画" as the title.
+**Root cause:** `clean_title` only stripped `" - YouTube"` from browser tab titles. For
+Niconico the tab is "Ahoy!! 我ら宝鐘海賊団☆ - ニコニコ動画". Unstripped, the empty-artist
+split in `_on_track_change` (`if not artist and " - " in title:`) made
+artist="Ahoy!!…" and title="ニコニコ動画" — then fetched whatever same-title hit existed.
+Auto-sync had nothing right to lock onto.
+**Fix (pushed, v1.0.27):** broaden the browser-suffix stripper to include
+ニコニコ動画 / niconico / nicovideo / Vimeo / Bilibili / Dailymotion / Twitch / SoundCloud /
+Bandcamp / TikTok alongside YouTube. Deleted the two wrong cached LRCs
+(`ニコニコ動画.json`, `ahoy_我ら宝鐘海賊団_ニコニコ動画.json`).
+**Verified:** post-rebuild `/status` shows `matched_title: "Ahoy!! 我ら宝鐘海賊団☆"`,
+`matched_artist: "Houshou Marine"`, `heard_by_sound: [same]` (Shazam confirmed),
+`sync_offset: -7.14`, `sync_drift: 0.05` — tight sync. The Whisper-free auto-sync
+(TICKET-036) was working all along; it just needed real lyrics to sync against.
+
 ## TICKET-036 — "Always listening" continuous auto-sync 🟢
 **Request:** Niconico karaoke video (`【ニコカラHD】 Ahoy!! 我ら宝鐘海賊団`) showed lyrics ~10 s
 ahead with no auto-correction. User wants the app to "always be listening and trying to

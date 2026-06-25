@@ -476,7 +476,16 @@ def clean_title(title, source="", artist=""):
     is_mv = bool(re.search(r"\b(?:Official|MV|PV|Music\s*Video|"
                            r"Performance\s*Video|Lyric\s*Video)\b", t, re.I))
     if any(h in source for h in BROWSER_HINTS):
-        t = re.sub(r"\s*[-–—|]\s*YouTube\s*$", "", t, flags=re.I)
+        # Strip the video-site tab suffix: browsers append " - <SiteName>" to
+        # tab titles, and an unstripped suffix makes the empty-artist split in
+        # _on_track_change treat the suffix as the title (the real bug:
+        # "Ahoy!! 我ら宝鐘海賊団☆ - ニコニコ動画" → artist="Ahoy!!…", title="ニコニコ動画",
+        # fetched the wrong song under that title).
+        t = re.sub(
+            r"\s*[-–—|]\s*(?:YouTube|ニコニコ動画|niconico|nicovideo|"
+            r"Vimeo|Bilibili|bilibili|Dailymotion|Twitch|SoundCloud|"
+            r"Bandcamp|TikTok)\s*$",
+            "", t, flags=re.I)
 
     # The song is the 「…」 content if present; otherwise a 『…』 that is NOT a
     # work-name tie-in (i.e. not '『Anime』OPテーマ') — that covers '『水星』' = the song.
