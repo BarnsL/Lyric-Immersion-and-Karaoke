@@ -39,8 +39,8 @@ class SongChangeDetector(threading.Thread):
     must be *preceded by music*; after firing, it stays quiet for `debounce`
     seconds (no song flips twice in a breath)."""
 
-    def __init__(self, on_change, *, on_onset=None, block=0.2, samplerate=16000,
-                 min_gap=0.30, min_music=1.2, debounce=5.0,
+    def __init__(self, on_change, *, on_onset=None, on_vocal=None, block=0.2,
+                 samplerate=16000, min_gap=0.30, min_music=1.2, debounce=5.0,
                  abs_silence=3.0e-3, rel_silence=0.10,
                  min_quiet=1.5, min_sustain=0.6):
         super().__init__(daemon=True)
@@ -51,6 +51,14 @@ class SongChangeDetector(threading.Thread):
         # quiet→music, so it catches a *leading* intro that no music preceded. The
         # overlay uses it to anchor lyric timing for songs Shazam can't ID.
         self.on_onset = on_onset
+        # on_vocal(): fired when SINGING starts — band-energy in 200-3000 Hz
+        # (the vocal range) rises and sustains. Catches "instrumental intro →
+        # vocals start" transitions that on_onset misses (no silent gap before
+        # the intro, music plays throughout). The overlay uses this to calibrate
+        # offset for music videos with long instrumental intros (Grimes Genesis
+        # has ~70s intro; without this the lyrics start showing at video time
+        # 0:01 even though singing doesn't begin until 1:10).
+        self.on_vocal = on_vocal
         self.block = block
         self.sr = int(samplerate)
         self.min_gap = min_gap
@@ -62,6 +70,7 @@ class SongChangeDetector(threading.Thread):
         self.min_sustain = min_sustain    # music must hold this long (s) to be an onset
 
         self._enabled = True
+        self._vocal_enabled = True        # turned off after firing once per track
         self._stop_evt = threading.Event()
         # rolling state
         self._loud_ema = 0.0       # EMA of RMS during music — the "loud" level
@@ -72,6 +81,11 @@ class SongChangeDetector(threading.Thread):
         self._last_fire = 0.0
         self._pre_quiet = 0.0      # length of the quiet stretch the current music followed
         self._onset_fired = False  # onset already fired for the current music run
+        # vocal-onset state
+        self._vocal_for = 0.0      # seconds of sustained vocal-band dominance
+        self._vocal_fired = False  # vocal onset already fired for the current track
+        self._vocal_baseline = 0.0 # baseline vocal-band ratio from instrumental-only
+        self._vocal_samples = 0    # samples seen for baseline establishment
 
     # ── control ──
     def set_enabled(self, on: bool):
@@ -89,6 +103,18 @@ class SongChangeDetector(threading.Thread):
         self._in_gap = False
         self._pre_quiet = 0.0
         self._onset_fired = False
+        self._vocal_for = 0.0
+        self._vocal_baseline = 0.0
+        self._vocal_samples = 0
+
+    def reset_vocal(self):
+        """Re-arm vocal-onset detection for a new track. The baseline rebuilds
+        from the next instrumental block."""
+        self._vocal_enabled = True
+        self._vocal_fired = False
+        self._vocal_for = 0.0
+        self._vocal_baseline = 0.0
+        self._vocal_samples = 0
 
     # ── the loop ──
     def run(self):
@@ -182,6 +208,53 @@ class SongChangeDetector(threading.Thread):
                 self._fire_onset()
             if self._music_for >= self.min_music:
                 self._had_music = True
+            # ── VOCAL onset detection ──
+            # Watch the vocal-band energy ratio: vocals add strong harmonic
+            # content in 200-3000 Hz. During an instrumental intro the ratio is
+            # set by the instrumentation (bass-heavy electronic, mid-heavy
+            # piano), so we learn the BASELINE for the first ~5 s of music and
+            # only fire when the ratio rises significantly above it for long
+            # enough — this distinguishes "vocals just started" from "loud
+            # synth section". Lets the karaoke overlay calibrate offset for
+            # videos with long instrumental intros (e.g. Grimes "Genesis").
+            if self.on_vocal and self._vocal_enabled and not self._vocal_fired:
+                vr = self._vocal_ratio(np, data)
+                if vr is not None:
+                    # Build the baseline from the first ~5 s (25 blocks @ 0.2 s)
+                    # of music — instrumental-only by assumption (well before
+                    # vocals come in for any track with a real intro).
+                    if self._vocal_samples < 25:
+                        self._vocal_samples += 1
+                        self._vocal_baseline = (
+                            (self._vocal_baseline * (self._vocal_samples - 1) + vr)
+                            / self._vocal_samples)
+                    else:
+                        # Fire when ratio runs 1.4x the baseline (or > 0.55
+                        # absolute) for at least 1.0 s — vocals just entered.
+                        thresh = max(0.55, self._vocal_baseline * 1.4)
+                        if vr >= thresh:
+                            self._vocal_for += dt
+                            if self._vocal_for >= 1.0:
+                                self._vocal_fired = True
+                                self._fire_vocal()
+                        else:
+                            self._vocal_for = max(0.0, self._vocal_for - dt)
+
+    def _vocal_ratio(self, np, data):
+        """Fraction of spectral energy in the vocal band (200-3000 Hz).
+        Cheap real FFT (~0.5 ms on a 0.2 s @ 16 kHz block)."""
+        try:
+            flat = data.flatten() if hasattr(data, "flatten") else data
+            n = len(flat)
+            if n < 256:
+                return None
+            spec = np.abs(np.fft.rfft(flat * np.hanning(n)))
+            total = spec.sum() + 1e-9
+            freqs = np.fft.rfftfreq(n, d=1.0 / self.sr)
+            band = spec[(freqs >= 200) & (freqs <= 3000)].sum()
+            return float(band / total)
+        except Exception:
+            return None
 
     def _fire(self):
         now = time.time()
@@ -199,5 +272,12 @@ class SongChangeDetector(threading.Thread):
         real leading intro from a brief mid-song breakdown. Best-effort."""
         try:
             self.on_onset(self._pre_quiet)
+        except Exception:
+            pass
+
+    def _fire_vocal(self):
+        """Vocals just started — sustained vocal-band energy rise. Best-effort."""
+        try:
+            self.on_vocal()
         except Exception:
             pass

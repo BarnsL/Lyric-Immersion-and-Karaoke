@@ -1210,6 +1210,13 @@ class Overlay:
         self._mv_mode = is_mv_version(title) and not self._live_mode
         self._intro_anchored = False
         self._track_t0 = time.time()
+        # Re-arm vocal-onset detection for the new track (lets us calibrate the
+        # offset on songs with long instrumental intros — see _on_vocal_onset).
+        if self._boundary:
+            try:
+                self._boundary.reset_vocal()
+            except Exception:
+                pass
 
         # PRIMARY signal: identify by sound and let it decide the real song.
         self._start_identify(seconds=6, attempts=2)
@@ -2000,6 +2007,27 @@ class Overlay:
             self._kara = []
             self._clear_stream()
             self.cv.delete("all")
+        # Auto-enable MV mode when the LRC is much shorter than the video — the
+        # video has an instrumental intro and/or outro the studio LRC doesn't
+        # know about (Grimes "Genesis" video is 5:32; the song is ~4:20 with
+        # ~70 s of intro). Without this signal, lyrics scroll ahead of the
+        # actual singing until vocal-onset detection catches up. Skip for live
+        # mode (whole-event title) and tracks already aligned by Shazam.
+        try:
+            st = self.media.get() or {}
+            vdur = float(st.get("duration") or 0.0)
+            lrc_end = self.lines[-1].end if self.lines else 0.0
+            first_start = self.lines[0].start if self.lines else 0.0
+            if (vdur > 0 and lrc_end > 0 and not self._live_mode
+                    and vdur - lrc_end > 15.0 and first_start < 5.0
+                    and self._sound_song is None):
+                if not self._mv_mode:
+                    log.info("LRC %.0fs < video %.0fs (1st line @%.1fs) → MV intro mode",
+                             lrc_end, vdur, first_start)
+                self._mv_mode = True
+                self._intro_anchored = False
+        except Exception:
+            pass
 
     # ── monitor topology watchdog ──
 
@@ -2077,14 +2105,17 @@ class Overlay:
 
         # MV / cinematic dead-space: for an MV-titled, not-yet-aligned song, hold
         # the lyrics through the leading intro so they don't run ahead of the song.
-        # _on_song_onset clears _intro_anchored at the real onset; a ~50s timeout
-        # releases it if no clear dead-space turns up (then lyrics run normally).
+        # _on_vocal_onset / _on_song_onset clear _intro_anchored when vocals
+        # actually start (band-energy rise) or music kicks in after a quiet
+        # stretch. The 100 s timeout backs that up if neither fires (very long
+        # intro, oddly mastered audio): Grimes "Genesis" has a ~70 s intro,
+        # most MV intros are under 90 s.
         if (self._mv_mode and not self._intro_anchored
                 and self._sound_song is None):
-            if state["position"] > 50.0 or (time.time() - self._track_t0) > 50.0:
+            if state["position"] > 100.0 or (time.time() - self._track_t0) > 100.0:
                 self._intro_anchored = True
             else:
-                self._hint("🎬 Cinematic intro — waiting for the song…")
+                self._hint("🎬 Instrumental intro — waiting for vocals…")
                 self.idx = -1
                 self.root.after(90, self._tick)
                 return
@@ -2611,7 +2642,8 @@ class Overlay:
         try:
             from songchange import SongChangeDetector
             self._boundary = SongChangeDetector(self._fire_boundary,
-                                                on_onset=self._fire_onset_event)
+                                                on_onset=self._fire_onset_event,
+                                                on_vocal=self._fire_vocal_event)
             self._boundary.set_enabled(self.boundary_on)
             self._boundary.start()
             log.info("song-change detector on")
@@ -2648,6 +2680,64 @@ class Overlay:
             self.root.after(0, lambda q=pre_quiet: self._on_song_onset(q))
         except Exception:
             pass
+
+    def _fire_vocal_event(self):
+        """Detector thread heard vocals start (band-energy rise) → Tk thread."""
+        try:
+            self.root.after(0, self._on_vocal_onset)
+        except Exception:
+            pass
+
+    def _on_vocal_onset(self):
+        """Vocals just started — singing rose above the instrumental floor. Used
+        to calibrate offset for music videos with long instrumental intros where
+        the LRC starts at ~0 s but vocals don't begin until 1:00+ into the video
+        (Grimes "Genesis" being the canonical case). Shazam can't fingerprint an
+        instrumental intro, so without this signal the lyrics start scrolling at
+        video time 0 even though singing is 70 s away. By anchoring lyric time
+        to the actual first vocal moment, the karaoke catches up the moment
+        singing kicks in instead of waiting for Shazam to find a vocal phrase
+        mid-song (which can take half the song).
+
+        Only fires once per track and only when Shazam hasn't already calibrated.
+        Conservative: needs lyrics loaded with a first line near 0 s AND a
+        meaningful gap between player position and that first line — otherwise
+        the song just started at 0 (no intro) and this is the wrong correction.
+        """
+        if self._sound_song is not None or not self.lines:
+            return
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING):
+            return
+        vpos = float(st.get("position") or 0.0)
+        first_start = self.lines[0].start if self.lines else 0.0
+        # Need a real intro: vocal-onset must be at least 8 s in (a song that
+        # starts immediately with vocals has nothing to calibrate), the LRC's
+        # first vocal line must be near 0 (a relative/song-only LRC, NOT one
+        # that already has the intro baked in), and we need a meaningful gap
+        # between video position and lyric start.
+        if vpos < 8.0:
+            log.info("vocal onset @%.1fs — too early to be a long intro, ignored", vpos)
+            return
+        if first_start > 8.0:
+            log.info("vocal onset @%.1fs — LRC already has intro baked in (1st @%.1fs)",
+                     vpos, first_start)
+            self._intro_anchored = True
+            return
+        # Calibrate: lyrics' first vocal line should align to NOW (the moment
+        # vocals were heard). offset shifts lyric time to player time.
+        # current_displayed_lyric_time = player_pos + offset
+        # We want first_start = vpos, so offset = first_start - vpos.
+        new_off = round(first_start - vpos, 2)
+        # Sanity cap: a YouTube video with an instrumental intro is typically
+        # 5-90 s of intro; bigger and something's off.
+        if -120.0 < new_off < 0.0:
+            self._intro_anchored = True
+            self.offset = new_off
+            self.idx = -1
+            log.info("vocal onset @%.1fs (1st line @%.1fs) → calibrated offset %+.1fs",
+                     vpos, first_start, new_off)
+            self._hint("🎤 Vocals — synced")
 
     def _on_song_onset(self, pre_quiet=0.0):
         """The audio just kicked in after a leading quiet stretch — the end of an
