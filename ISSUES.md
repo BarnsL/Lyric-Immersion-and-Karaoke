@@ -599,6 +599,60 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-047 — Scroll-through stutter: Windows timer granularity (+ GIL) 🟢
+**Symptom:** scroll-through ("lr"/"rl") modes "very stuttery", "has been suffering."
+**Diagnosis (via the new /diag, TICKET-048):** `recent_ms` frame history showed the
+belt alternating between **16 ms and 30 ms even with ZERO render work** (spawns and
+repaints disabled live via /tune). That pattern is the giveaway: Windows' default
+system timer granularity is ~15.6 ms, so Tk's `after(16)` for a 60 fps loop fires at
+EITHER ~15.6 ms OR ~31.2 ms unpredictably — an uneven cadence the eye reads as stutter.
+**Root cause (primary):** system timer resolution. **(secondary):**
+`_run_energy_correlation` ran a 151-iteration Python loop holding the GIL on a
+background thread every 15 s, adding periodic hitches.
+**Fix (pushed, v1.0.36):**
+1. `ctypes.windll.winmm.timeBeginPeriod(1)` at startup → raises timer resolution to
+   1 ms so `after(16)` is accurate. **Result: steady frames went 16/30 ms (jitter
+   ~10 ms) → solid ~16 ms (jitter ~1 ms), render 48–60 fps.**
+2. Vectorized the energy-correlation shift search — LRC mask built once on a 0.2 s
+   grid, all 151 shifts evaluated with one numpy gather (`(151, nblocks)`, C-level,
+   no GIL hold). Removes the periodic background hitch.
+3. Time-budgeted the heavy ticker section (`heavy_budget_ms`, default 10) + made
+   `fill_skip`/`spawn_budget`/`repaint_budget` live-tunable via /tune, so a slow PIL
+   paste can't stall the belt and the knobs can be tuned without a rebuild.
+
+## TICKET-048 — Deep diagnostics API (/diag) + FPS/frame-timing metrics 🟢
+**Request:** "include those functions in the app so you can diagnose better" +
+"include fps in diagnostics api." Iterating on sync/perf needed observability
+without rebuilding.
+**Fix (pushed, v1.0.36):**
+- `GET /diag` returns the full sync state machine (offset, drift, drift_integral,
+  pending_corr, last_audio_off + age, sound_song, sound_title_alias, title_locked,
+  effective_song_time, showing_idx vs should_show_idx, in_sync flag), the last
+  energy-correlation result (best_shift/score/median/lift, vocal-block counts), and
+  FPS/frame-timing (target, render, frame_ms, worst_ms, jitter_ms, recent 60-frame
+  history, perf_mode, scroll_dir).
+- `_tick` now tracks frame jitter (EWMA of |frame − target|) and worst-frame ms
+  over a 120-frame ring buffer — the stutter metrics.
+- `/status` gained `frame_jitter_ms` + `frame_worst_ms` for at-a-glance checks.
+
+## TICKET-046 — Cross-language load broke Shazam calibration → -23.7s drift 🟢
+**Symptom:** after TICKET-045 made the Marine song load the correct Japanese cache,
+a QA pass found the offset had silently drifted to **-23.7s**. The lyrics were right
+but the timing was badly off.
+**Root cause:** the loaded Japanese cache title ("Ahoy!! 我ら宝鐘海賊団☆") never
+string-matches Shazam's romanized heard title ("Ahoy!! We are Houshou Pirates"), so
+`loaded_ok` was always False → the Shazam timing-calibration block (`if loaded_ok:`)
+never ran → `_last_audio_off` stayed stale → the energy correlator's chorus-guard
+(TICKET-043, which needs a recent Shazam reading to compare against) couldn't fire,
+and the correlator locked onto a chorus-repetition match (-23.7s). The CJK-preference
+fix (045) fixed the lyrics but orphaned the calibration path.
+**Fix (pushed, v1.0.35):** added `_sound_title_alias`. When the sound-correction
+path loads a cache whose title doesn't match the romanized heard title, it records
+that heard title as an alias. `loaded_ok` now also passes when the heard title
+matches the alias — so Shazam calibrates the song's timing normally, keeping
+`_last_audio_off` fresh and the chorus-guard armed. Reset on track change.
+**QA-verified:** part of a full button/setting + all-tabs audit (see below).
+
 ## TICKET-045 — Romanized Shazam title loaded English lyrics for a JP song 🟢
 **Symptom:** after TICKET-044 fixed identification, the Niconico Marine "Ahoy!!"
 karaoke synced correctly (drift -0.01) but showed **English** lyrics ("A black sky

@@ -57,6 +57,7 @@ _ROUTES = {
         "/logs": "recent log lines (?n=200) — the matching decisions",
         "/lyrics": "the full loaded lyric lines",
         "/tune": "live sync-tuning parameters (drift_fastpath, agree, spread_reset, …)",
+        "/diag": "deep diagnostics: full sync state machine, last energy-correlation, FPS/frame-timing",
         "/import/status": "current playlist import state: state, done, total, ok, skipped, failed_count",
     },
     "POST": {
@@ -112,6 +113,8 @@ def _status(app):
         "fps_target": (round(1000.0 / app._fps) if getattr(app, "_fps", 0) else None),
         "render_fps": (round(1000.0 / app._frame_ms)
                        if getattr(app, "_frame_ms", 0) else None),
+        "frame_jitter_ms": round(getattr(app, "_frame_jitter", 0.0), 1),
+        "frame_worst_ms": round(getattr(app, "_frame_worst", 0.0), 1),
         "line_count": len(app.lines),
         "current_line": _current_line(app),
     }
@@ -200,6 +203,11 @@ def make_handler(app, log_file, token):
                 elif path == "/tune":
                     try:
                         self._send(200, {"ok": True, "tune": app.get_tune()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/diag":
+                    try:
+                        self._send(200, {"ok": True, **app.get_diag()})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/import/status":

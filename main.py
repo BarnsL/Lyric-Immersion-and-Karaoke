@@ -1023,6 +1023,9 @@ class Overlay:
         self._frame_ms = 0.0         # EWMA of render-frame interval (ms) → /status render_fps
         self._last_tick_t = None
         self._render_frame = False
+        self._frame_worst = 0.0      # worst (longest) render-frame interval in the window
+        self._frame_jitter = 0.0     # EWMA of |frame - target| — stutter metric
+        self._frame_hist = []        # ring buffer of recent frame intervals (ms)
         self._spawn_budget = 1       # max scroll blocks to PIL-render per heavy frame
                                      # (1: spawning a block allocates a new image +
                                      # PhotoImage — the priciest op; off-screen, so
@@ -1082,6 +1085,8 @@ class Overlay:
         self._last_align_t = 0.0      # wall-clock of last auto-align finish
         self._last_audio_off = None   # Shazam-implied absolute offset, for correlator sanity
         self._last_audio_off_t = 0.0  # wall-clock of last audio_off update
+        self._sound_title_alias = None  # romanized heard-title we loaded a CJK cache for
+        self._last_energy = None      # last energy-correlation result (for /diag)
         self._auto_align_after = None # pending auto-align timer id
         self._last_sound_lock_t = 0.0 # wall-clock of last confirmed Shazam offset
         # ── Algorithmic offset state (continuous, no strike counters) ──
@@ -1113,6 +1118,13 @@ class Overlay:
             "energy_apply_min":      0.4,   # min |new-old| to apply correlation
             "energy_lift_floor":     0.10,  # min peak-vs-median lift to accept
             "energy_max_offset":    60.0,   # |new_off| < this for sanity
+            # ── render perf knobs (scroll-through smoothness) ──
+            # heavy_budget_ms caps the per-frame spawn/repaint work so a PIL
+            # paste can't stall the scroll belt; 0 disables the cap.
+            "heavy_budget_ms":      10.0,   # max ms of spawn+repaint work per heavy frame
+            "repaint_budget":        2.0,   # max PIL karaoke-fill pastes per heavy frame
+            "spawn_budget":          1.0,   # max block PIL-renders per heavy frame
+            "fill_skip":             3.0,   # heavy work runs every Nth frame
         }
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
@@ -1194,6 +1206,7 @@ class Overlay:
         self._last_sound_lock_t = 0.0   # no Shazam lock yet on the new song
         self._last_audio_off = None     # no Shazam read yet for new song
         self._last_audio_off_t = 0.0
+        self._sound_title_alias = None  # clear cross-language alias for new song
         self._drift_integral = 0.0      # fresh drift accumulation for new song
         self._live_arrangement = is_live_arrangement(title)  # LIVE/short/alt → follow offset
         log.info("track change: %r / %r (dur %s)%s", title, artist, duration,
@@ -1767,8 +1780,17 @@ class Overlay:
                                  g_title, title)
                 heard = (f_title, f_artist)
                 # Does the song we HEARD match the lyrics currently loaded?
-                loaded_ok = bool(self.lines) and self._titles_match(
-                    self.meta.get("title", ""), f_title)
+                # Title match OR the romanized-title alias: when we loaded an
+                # original-script (CJK) cache for a romanized heard title (e.g.
+                # Japanese "Ahoy!! 我ら宝鐘海賊団☆" for Shazam's "Ahoy!! We are
+                # Houshou Pirates"), the titles won't string-match — but it IS
+                # the same song, so Shazam must still CALIBRATE its timing.
+                # Without this, _last_audio_off stays stale and the energy
+                # correlator drifts onto a chorus-repetition match (-23.7s bug).
+                loaded_ok = bool(self.lines) and (
+                    self._titles_match(self.meta.get("title", ""), f_title)
+                    or (self._sound_title_alias is not None
+                        and self._titles_match(self._sound_title_alias, f_title)))
                 log.info("heard %r / %r | loaded %r | match=%s",
                          f_title, f_artist, self.meta.get("title", ""), loaded_ok)
                 if loaded_ok:
@@ -1956,6 +1978,13 @@ class Overlay:
                         if cached != self._lyrics_path:
                             log.info("correcting -> cached %s", cached.name)
                             self.load(cached)
+                        # If the loaded cache title doesn't string-match the heard
+                        # (romanized) title, remember the alias so future Shazam
+                        # reads still calibrate this song's timing (see loaded_ok).
+                        if not self._titles_match(self.meta.get("title", ""), f_title):
+                            self._sound_title_alias = f_title
+                            log.info("aliased heard title %r → loaded %r for calibration",
+                                     f_title, self.meta.get("title", ""))
                         self._maybe_translate()
                     else:
                         log.info("correcting -> fetching %r / %r", f_title, f_artist)
@@ -2265,6 +2294,16 @@ class Overlay:
             if 0.0 < dt < 500.0:
                 self._frame_ms = (dt if self._frame_ms <= 0
                                   else 0.9 * self._frame_ms + 0.1 * dt)
+                # Stutter metrics: jitter = how far each frame strays from the
+                # target interval (a smooth belt has near-zero jitter); worst =
+                # the longest stall in the recent window. Both surface in /diag.
+                jit = abs(dt - self._fps)
+                self._frame_jitter = (jit if self._frame_jitter <= 0
+                                      else 0.9 * self._frame_jitter + 0.1 * jit)
+                self._frame_hist.append(round(dt, 1))
+                if len(self._frame_hist) > 120:
+                    del self._frame_hist[:len(self._frame_hist) - 120]
+                self._frame_worst = max(self._frame_hist)
         self._last_tick_t = now
         self._render_frame = False
 
@@ -2678,7 +2717,7 @@ class Overlay:
         # two of spawn latency is invisible) and a fill sweeping at ~20fps looks
         # identical — so do it every Nth frame, keeping the belt at full rate.
         self._tick_n += 1
-        if self._tick_n % self._fill_skip:
+        if self._tick_n % int(self._tune.get("fill_skip", self._fill_skip) or 1):
             return
 
         want = {}
@@ -2689,13 +2728,22 @@ class Overlay:
         if want:
             self.cv.delete("hint")        # real lyrics showing → drop any stale hint
         have = {b["idx"] for b in self._stream}
-        # Spawn missing blocks, but only a couple per pass — each spawn PIL-renders
-        # an image (the costliest op), so creating several at once is what spiked
-        # frame time. Blocks appear 1200px off-screen, so a frame or two of spawn
-        # latency is invisible; render the nearest-to-centre (most imminent) first.
+        # Time-budget the heavy work: a PIL spawn/paste can take tens of ms, and
+        # several in one frame is what stalls the scroll belt (the "stutter").
+        # Track elapsed and stop issuing more PIL ops once we've spent the budget
+        # — deferred spawns appear a frame later (invisible, 1200px off-screen)
+        # and deferred fills catch up next heavy frame. Belt stays smooth.
+        t_heavy = time.perf_counter()
+        budget_ms = self._tune.get("heavy_budget_ms", 10.0)
+        def _over_budget():
+            return budget_ms > 0 and (time.perf_counter() - t_heavy) * 1000.0 > budget_ms
+        # Spawn missing blocks, nearest-to-centre (most imminent) first.
         missing = sorted((i for i in want if i not in have),
                          key=lambda i: abs(want[i] - center))
-        for i in missing[:self._spawn_budget]:
+        spawn_budget = int(self._tune.get("spawn_budget", self._spawn_budget))
+        for i in missing[:spawn_budget]:
+            if _over_budget():
+                break
             cx = want[i]
             ln = self.lines[i]
             dur = ln.end - ln.start
@@ -2703,11 +2751,10 @@ class Overlay:
             b = self._spawn_block(i, frac)
             self.cv.move(b["tag"], (cx - b["w"] / 2) - b["x"], 0)
             self._stream.append(b)
-        # Despawn off-screen blocks, and advance karaoke fills — but cap PIL-paste
-        # repaints per pass (the other heavy op). Only blocks whose sung-count
-        # actually changed need it, and usually just the one line currently singing.
+        # Despawn off-screen blocks, and advance karaoke fills — capped per pass.
         now = time.time()
         repaints = 0
+        repaint_budget = int(self._tune.get("repaint_budget", self._repaint_budget))
         for b in self._stream[:]:
             if b["idx"] not in want:
                 self.cv.delete(b["tag"])
@@ -2718,12 +2765,12 @@ class Overlay:
             frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
             if b.get("img"):
                 n = int(frac * b["nchars"] + 0.5)
-                # Each fill repaint is a ~50ms PhotoImage paste, so cap BOTH the
-                # repaints per frame AND each block's repaint rate — a karaoke
-                # sweep at ~5fps reads fine, while per-character pastes were what
-                # stalled the belt. Idle (not-currently-sung) blocks never repaint.
-                if (n != b["sung_n"] and repaints < self._repaint_budget
-                        and now - b.get("paint_t", 0.0) >= self._fill_interval):
+                # Each fill repaint is a costly PhotoImage paste, so cap the
+                # repaints per frame, each block's repaint rate, AND the total
+                # heavy-frame time — a karaoke sweep at ~5fps reads fine.
+                if (n != b["sung_n"] and repaints < repaint_budget
+                        and now - b.get("paint_t", 0.0) >= self._fill_interval
+                        and not _over_budget()):
                     b["sung_n"] = n
                     b["paint_t"] = now
                     # paste into the existing PhotoImage (no new allocation) —
@@ -2794,6 +2841,69 @@ class Overlay:
     def get_tune(self):
         """Snapshot of the live-tunable sync parameters (for GET /tune)."""
         return dict(self._tune)
+
+    def get_diag(self):
+        """Rich diagnostics snapshot for GET /diag — everything needed to
+        understand a desync or a stutter without rebuilding: the full sync
+        state machine, the last energy-correlation result, and frame-timing /
+        FPS metrics. Read-only and cheap."""
+        st = self.media.get() or {}
+        pos = st.get("position")
+        eff = (pos + self.offset) if isinstance(pos, (int, float)) else None
+        # which line SHOULD be showing at the effective time, and which IS
+        want_idx, want_line = -1, None
+        if eff is not None:
+            for i, ln in enumerate(self.lines):
+                if ln.start <= eff < ln.end:
+                    want_idx, want_line = i, ln.jp[:50]
+                    break
+        target_fps = round(1000.0 / self._fps) if self._fps else None
+        render_fps = round(1000.0 / self._frame_ms) if self._frame_ms > 0 else None
+        hist = self._frame_hist[-60:]
+        return {
+            "sync": {
+                "offset": round(self.offset, 2),
+                "drift": getattr(self, "_last_drift", None),
+                "drift_age_s": (round(time.time() - self._last_drift_t, 1)
+                                if getattr(self, "_last_drift_t", 0) else None),
+                "drift_integral": round(getattr(self, "_drift_integral", 0.0), 2),
+                "pending_corr": (round(self._pending_corr, 2)
+                                 if getattr(self, "_pending_corr", 1e9) < 1e8 else None),
+                "last_audio_off": (round(self._last_audio_off, 2)
+                                   if self._last_audio_off is not None else None),
+                "last_audio_off_age_s": (round(time.time() - self._last_audio_off_t, 1)
+                                         if self._last_audio_off_t else None),
+                "sound_song": self._sound_song,
+                "sound_title_alias": self._sound_title_alias,
+                "title_locked": self._title_locked,
+                "live_arrangement": self._live_arrangement,
+                "effective_song_time": round(eff, 2) if eff is not None else None,
+                "showing_idx": self.idx,
+                "should_show_idx": want_idx,
+                "should_show_line": want_line,
+                # In scroll-through (lr/rl) the BELT position (driven by `pos`)
+                # is the sync indicator, not `idx` (which stays -1) — so judge
+                # sync by the measured drift there; in line mode use idx match.
+                "in_sync": (abs(self._last_drift) < 1.0
+                            if self.scroll_dir in ("lr", "rl")
+                            and getattr(self, "_last_drift", None) is not None
+                            else ((self.idx == want_idx) if want_idx >= 0 else None)),
+                "scroll_mode": self.scroll_dir in ("lr", "rl"),
+            },
+            "energy_align": self._last_energy,
+            "fps": {
+                "target": target_fps,
+                "render": render_fps,
+                "frame_ms": round(self._frame_ms, 1),
+                "worst_ms": round(self._frame_worst, 1),
+                "jitter_ms": round(self._frame_jitter, 1),
+                "recent_ms": hist,
+                "perf_mode": self.perf,
+                "scroll_dir": self.scroll_dir,
+            },
+            "aligning": self._aligning,
+            "identifying": self._identifying,
+        }
 
     def set_tune(self, key, value):
         """Set one live-tunable sync parameter. Returns (ok, message). Coerces
@@ -3267,6 +3377,9 @@ class Overlay:
             _OUTLINE = _OUTLINE_FULL     # 5 items/char, 60fps
             self._fps = 16
             self._fill_skip = 3          # belt moves at 60fps; fills/spawns at ~20fps
+        # mirror into the live-tune dict so /tune reflects the mode's defaults
+        if hasattr(self, "_tune"):
+            self._tune["fill_skip"] = float(self._fill_skip)
 
     def set_quality(self, mode):
         self.perf = mode
@@ -3517,6 +3630,7 @@ class Overlay:
             log.info("auto-align: not enough vocal-mask history (%d blocks)", len(history))
             return
 
+        self._energy_reason = reason
         def work():
             try:
                 self._aligning = True
@@ -3553,35 +3667,46 @@ class Overlay:
         if audio_v.sum() < 4:    # too little vocal activity captured
             log.info("energy-align: insufficient vocal activity (%d blocks)", int(audio_v.sum()))
             return
-        # Build the LRC mask sampled at the same block grid: for each block's
-        # song-time t, is t inside a line's [start, end] window?
-        # (use a small expansion since lines often have gaps within phrases)
+        # Build the LRC active-mask on a fixed 0.2 s grid spanning the audio
+        # window ±16 s (room for the ±15 s shift search), then evaluate ALL
+        # candidate shifts at once with a single vectorized gather. The old
+        # 151-iteration Python loop (searchsorted per shift) held the GIL long
+        # enough on a background thread to STUTTER the scroll belt — this
+        # numpy-only version runs the whole search in C in microseconds.
         lines = self.lines
         starts = np.array([ln.start for ln in lines])
         ends = np.array([max(ln.end, ln.start + 1.0) for ln in lines])
-        # Slide the LRC mask by candidate offsets in [-15, +15] s (covers
-        # typical karaoke / cut drift). Step 0.2 s for precision.
-        best_shift, best_score = 0.0, -1.0
-        scores = []
-        for shift_steps in range(-75, 76):    # -15 .. +15 in 0.2 s steps
-            shift = shift_steps * block_dt
-            shifted_t = audio_t + shift   # what song-time the LRC says this block is
-            # in_lrc[i] = 1 if shifted_t[i] is inside any LRC line
-            idx = np.searchsorted(starts, shifted_t, side="right") - 1
-            in_lrc = np.zeros_like(audio_v)
-            valid = (idx >= 0) & (idx < len(lines))
-            in_lrc[valid] = (shifted_t[valid] <= ends[idx[valid]]).astype(float)
-            # score = overlap minus mismatch (so flat constant masks don't win)
-            agree = float((audio_v * in_lrc).sum() + ((1 - audio_v) * (1 - in_lrc)).sum())
-            score = agree / len(audio_v)
-            scores.append((shift, score))
-            if score > best_score:
-                best_score = score
-                best_shift = shift
-        # Confidence: peak must beat the median by a clear margin.
-        all_scores = np.array([s for (_, s) in scores])
-        median = float(np.median(all_scores))
+        g0 = float(np.floor(audio_t.min() - 16.0))
+        g1 = float(np.ceil(audio_t.max() + 16.0))
+        ngrid = int(round((g1 - g0) / block_dt)) + 1
+        if ngrid < 8 or ngrid > 100000:
+            log.info("energy-align: grid size %d out of range — skipped", ngrid)
+            return
+        grid_t = g0 + np.arange(ngrid) * block_dt
+        li = np.searchsorted(starts, grid_t, side="right") - 1
+        lrc_grid = np.zeros(ngrid)
+        gv = (li >= 0) & (li < len(lines))
+        lrc_grid[gv] = (grid_t[gv] <= ends[li[gv]]).astype(float)
+        # grid index of each audio block at shift 0
+        base = np.round((audio_t - g0) / block_dt).astype(int)
+        S = np.arange(-75, 76)                       # ±15 s in 0.2 s steps
+        idx = base[None, :] + S[:, None]             # (151, nblocks)
+        inrange = (idx >= 0) & (idx < ngrid)
+        lrc_vals = np.where(inrange, lrc_grid[np.clip(idx, 0, ngrid - 1)], 0.0)
+        # agreement per shift = fraction of blocks where audio mask == LRC mask
+        agree = (audio_v[None, :] == lrc_vals).sum(axis=1) / float(len(audio_v))
+        best_i = int(np.argmax(agree))
+        best_shift = float(S[best_i] * block_dt)
+        best_score = float(agree[best_i])
+        median = float(np.median(agree))
         peak_lift = best_score - median
+        self._last_energy = {
+            "best_shift": round(best_shift, 2), "best_score": round(best_score, 3),
+            "median": round(median, 3), "lift": round(peak_lift, 3),
+            "blocks": int(len(audio_v)), "vocal_blocks": int(audio_v.sum()),
+            "reason": getattr(self, "_energy_reason", "?"),
+            "t": time.time(),
+        }
         if peak_lift < self._tune["energy_lift_floor"]:
             log.info("energy-align: weak peak (best %.3f, median %.3f, lift %.3f) — no change",
                      best_score, median, peak_lift)
@@ -3735,6 +3860,16 @@ def _is_only_instance():
 def main():
     if not _is_only_instance():
         return                 # another Desktop Karaoke is already running
+    # Windows' default system timer granularity is ~15.6 ms, so Tk's after(16)
+    # for a 60 fps loop actually fires at either ~15.6 ms or ~31.2 ms — that
+    # uneven cadence is exactly the scroll "stutter" (diagnosed via /diag:
+    # frame intervals alternating 16/30 ms even with zero render work).
+    # Raising the timer resolution to 1 ms makes after() accurate and the belt
+    # smooth. Costs a little power; fine for a foreground media app.
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
     offset = 0.0
     args = sys.argv[1:]
     for i, a in enumerate(args):
