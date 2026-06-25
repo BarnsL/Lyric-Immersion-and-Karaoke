@@ -374,13 +374,84 @@ def _is_generic_title(s):
 _COVER_RE = re.compile(
     r"歌ってみた|うたってみた|歌わせて|踊ってみた|おどってみた"
     r"|演奏してみた|弾いてみた|叩いてみた|covered?\s+by"
-    r"|\(\s*cover\s*\)|[/／]\s*cover\b", re.I)
+    r"|\(\s*cover\s*\)|\[\s*cover\s*\]|[/／]\s*cover\b", re.I)
 
 
 def is_cover_title(title):
     """True if a media title marks a 歌ってみた / cover. Drives a title-first lyric
     fetch — the original song's lyrics fit the cover (see fetch_lrc cover=)."""
     return bool(_COVER_RE.search(title or ""))
+
+
+def extract_cover_original(raw_title, cover_channel=""):
+    """Parse a cover video title to find the ORIGINAL artist.
+
+    Returns (original_artist, song_title) when it can identify the original
+    artist from the title; (None, None) when it can't.
+
+    Common patterns:
+      [COVER] Coffee - Alka | Kaneko Lumi   → ("Alka", "Coffee")
+      Song - OrigArtist / CoverArtist       → ("OrigArtist", "Song")
+      Song (cover) / CoverArtist            → (None, "Song")
+    """
+    if not raw_title or not is_cover_title(raw_title):
+        return None, None
+    t = raw_title.strip()
+    # strip cover markers and brackets containing them
+    t = re.sub(r"\[\s*cover\s*\]", "", t, flags=re.I).strip()
+    t = re.sub(r"\(\s*cover\s*\)", "", t, flags=re.I).strip()
+    t = re.sub(r"\s*(?:[/／]|を)?\s*(?:歌ってみた|うたってみた|歌わせて|踊ってみた|おどってみた|"
+               r"演奏してみた|弾いてみた|叩いてみた).*$", "", t, flags=re.I).strip()
+    t = re.sub(r"\s*\bcovered?\s+by\b.*$", "", t, flags=re.I).strip()
+    t = re.sub(r"\s*[/／]\s*cover\b.*$", "", t, flags=re.I).strip()
+    if not t:
+        return None, None
+    # normalise the cover channel name for matching
+    ch = re.sub(r"[^0-9a-z぀-鿿]", "", (cover_channel or "").lower())
+    def _ch_match(part):
+        pn = re.sub(r"[^0-9a-z぀-鿿]", "", part.lower())
+        if not pn or not ch:
+            return False
+        return pn in ch or ch in pn
+    # split by | (pipe — YouTube cover titles like "Song - Orig | CoverCh")
+    if "|" in t:
+        sides = [s.strip() for s in t.split("|", 1)]
+        if len(sides) == 2 and sides[0] and sides[1]:
+            if _ch_match(sides[1]):
+                # right side is the cover channel → left has song + original artist
+                left = sides[0]
+            elif _ch_match(sides[0]):
+                left = sides[1]
+            else:
+                left = sides[0]    # default: first side is song+artist
+            # "Song - OrigArtist" → split by " - "
+            if " - " in left:
+                song, _, orig = left.partition(" - ")
+                return orig.strip() or None, song.strip() or None
+            return None, left.strip() or None
+    # "Song - OrigArtist / CoverArtist" (slash separator)
+    for sep in (r"\s*/\s*", r"\s*／\s*"):
+        parts = re.split(sep, t, 1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            if _ch_match(parts[1]):
+                left = parts[0].strip()
+                if " - " in left:
+                    song, _, orig = left.partition(" - ")
+                    return orig.strip() or None, song.strip() or None
+                return None, left
+            elif _ch_match(parts[0]):
+                right = parts[1].strip()
+                if " - " in right:
+                    song, _, orig = right.partition(" - ")
+                    return orig.strip() or None, song.strip() or None
+                return None, right
+    # plain "Song - OrigArtist" with no cover channel separator
+    if " - " in t:
+        parts = t.split(" - ", 1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            if not _ch_match(parts[1]):
+                return parts[1].strip(), parts[0].strip()
+    return None, None
 
 
 def clean_title(title, source="", artist=""):
@@ -806,9 +877,29 @@ def _work_area():
     return None
 
 
+def _click_through_hwnd(win):
+    """Make any Toplevel window click-through (input passes to whatever is behind)."""
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetAncestor(win.winfo_id(), 2) or win.winfo_id()
+        GWL_EXSTYLE = -20
+        WS_EX = 0x08000000 | 0x00000080 | 0x00080000 | 0x00000020
+        ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX)
+    except Exception:
+        pass
+
+
+def _mon_fingerprint(m):
+    """Stable identity for a monitor: position + resolution.  Survives
+    enumeration-order changes across sleep/wake and GPU driver reloads."""
+    return f"{m['x']},{m['y']},{m['w']}x{m['h']}"
+
+
 def _monitors():
     """Every connected monitor as a list of dicts with FULL bounds (x,y,w,h) and the
-    WORK area (wx,wy,ww,wh = bounds minus that monitor's taskbar) plus `primary`.
+    WORK area (wx,wy,ww,wh = bounds minus that monitor's taskbar) plus `primary`
+    and a stable `fp` fingerprint.
     Tkinter can't enumerate monitors, so use Win32 EnumDisplayMonitors. Primary
     first, then left-to-right. Falls back to a single primary entry on failure."""
     mons = []
@@ -841,6 +932,8 @@ def _monitors():
         mons = [{"x": l, "y": t, "w": r - l, "h": b - t, "wx": l, "wy": t,
                  "ww": r - l, "wh": b - t, "primary": True}]
     mons.sort(key=lambda d: (not d["primary"], d["x"]))
+    for m in mons:
+        m["fp"] = _mon_fingerprint(m)
     return mons
 
 
@@ -878,11 +971,14 @@ class Overlay:
         self.opacity = float(s.get("opacity", 1.0))
         self.position = s.get("position", "bottom")   # 'top' | 'bottom'
         self.display = s.get("display", "primary")     # 'primary' | 'mon:N' | 'span'
+        self._display_fp = s.get("display_fp")         # fingerprint for monitor identity
+        self._mon_snapshot = ()                         # current monitor topology
+        self._last_mon_check = 0.0                     # throttle for _check_monitors
         self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'|'lr'|'rl'
         self.scroll_speed = float(s.get("scroll_speed", SCROLL_SPEED))
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
         self.perf = s.get("perf", "smooth")            # 'smooth' | 'fast'
-        self.recal_secs = int(s.get("recal_secs", 10))  # re-check by sound often (0=off)
+        self.recal_secs = int(s.get("recal_secs", 4))   # re-check by sound often (0=off)
         self.git_sync = bool(s.get("git_sync", False))  # push new songs to git
         self.character_on = bool(s.get("character", False))  # dancing companion
         self.api_on = bool(s.get("api", True))         # local agent-control API
@@ -914,6 +1010,7 @@ class Overlay:
         self._clean_title_cache = ""
         self._clean_artist_cache = ""
         self._is_cover = False       # current title is a 歌ってみた / cover (title-first fetch)
+        self._cover_original_artist = None   # original artist extracted from a cover title
         self._frame_ms = 0.0         # EWMA of render-frame interval (ms) → /status render_fps
         self._last_tick_t = None
         self._render_frame = False
@@ -951,6 +1048,9 @@ class Overlay:
 
         self.cv = tk.Canvas(self.root, bg=TRANSPARENT, highlightthickness=0)
         self.cv.pack(fill="both", expand=True)
+
+        self._mirrors: list[tk.Toplevel] = []    # mirror-mode clone windows
+        self._cycle_idx = 0                      # cycle-mode: current monitor index
 
         self.lines: list[Line] = []
         self.meta: dict = {}
@@ -1045,6 +1145,15 @@ class Overlay:
         log.info("track change: %r / %r (dur %s)%s", title, artist, duration,
                  " [live-arrangement]" if self._live_arrangement else "")
 
+        # For covers, use the original artist (extracted from the title) for
+        # lyric search instead of the covering channel — "Coffee - Alka | Lumi"
+        # should search "Coffee" by "Alka", not by "Lumi".
+        fetch_artist = artist
+        if self._is_cover and self._cover_original_artist:
+            fetch_artist = self._cover_original_artist
+            log.info("cover: using original artist %r instead of channel %r",
+                     fetch_artist, artist)
+
         self._live_mode = is_live_or_compilation(title, duration)
         if self._live_mode:
             # A concert / live / festival / compilation: the title is the EVENT,
@@ -1059,29 +1168,14 @@ class Overlay:
         else:
             # Provisional: show the title/artist match instantly (so there's no
             # dead air) — but AUDIO is primary and confirms/overrides it below.
-            path = self.index.match(artist, title, duration)
+            # Try original artist first for covers, then fall back to channel.
+            path = self.index.match(fetch_artist, title, duration)
+            if not path and fetch_artist != artist:
+                path = self.index.match(artist, title, duration)
             if path and self._file_valid(path, duration):
                 if path != self._lyrics_path:
                     self.load(path)
                 self._maybe_translate()
-                # LOCK to this match if it's an EXACT title match on a clean,
-                # official song name (not an MV/generic/live title): then a Shazam
-                # mis-ID of a *different* song by the same artist can't override it
-                # (the feelingradation → SKAVLA bug). Messy titles stay unlocked so
-                # sound still corrects them.
-                # MATCH = equal OR one contains the other. The old EXACT-string check
-                # was brittle: cleaning the player title ('ReGLOSS - feelingradation' →
-                # 'feelingradation') no longer string-equals a cache stored under the
-                # longer name, so the lock broke and a Shazam mis-ID (→ SKAVLA) took
-                # over. Containment is robust to that. LOCK only a DISTINCTIVE name
-                # (confidence.py): a COMMON title ('Awake'/'BANG'/'Lucky Star') stays
-                # UNLOCKED so the heard AUDIO decides (the "Awake" rule).
-                # A GENERATED or ROMANIZED-only cache hit is a stopgap, NOT ground
-                # truth — it must never lock, and it should upgrade itself. The
-                # romaji→kanji hunt can miss transiently (or by searching the cover
-                # channel as artist), and the stale romaji then sticks forever:
-                # Blue Bird showed only romaji with no JP/EN even though NetEase has
-                # the kanji original.
                 gen = (self.meta.get("source") or "").startswith("generated")
                 romaji_only = (self.meta.get("lang") or "").endswith("-romaji")
                 stale = gen or romaji_only
@@ -1094,14 +1188,10 @@ class Overlay:
                 if matched and not self._title_locked:
                     log.info("title %r not locked (distinctiveness %.2f, stale=%s) → audio decides",
                              title, distinct, stale)
-                # Show the cached lines instantly (no dead air) but re-fetch in the
-                # background to upgrade; load() supersedes them the moment real lyrics
-                # arrive. Romaji-only uploads are usually COVERS (wrong artist), so
-                # hunt by TITLE (cover-style) to reach the kanji/kana original.
                 if stale:
                     why = "GENERATED" if gen else "ROMAJI-only"
                     log.info("cache hit for %r is %s → background upgrade-fetch", title, why)
-                    self._start_fetch(artist, title, duration,
+                    self._start_fetch(fetch_artist, title, duration,
                                       cover=(self._is_cover or romaji_only),
                                       strict=(self._clean_source() and not romaji_only))
             else:
@@ -1110,7 +1200,7 @@ class Overlay:
                 self._verified = False
                 self._title_locked = False
                 self._hint(f"♪ {title} — identifying…")
-                self._start_fetch(artist, title, duration, cover=self._is_cover,
+                self._start_fetch(fetch_artist, title, duration, cover=self._is_cover,
                                   strict=self._clean_source())
 
         # MV / cinematic dead-space intro: for an MV-titled video, hold the lyrics
@@ -1911,6 +2001,25 @@ class Overlay:
             self._clear_stream()
             self.cv.delete("all")
 
+    # ── monitor topology watchdog ──
+
+    def _check_monitors(self, now):
+        """Every ~3 seconds, re-enumerate monitors and re-apply the display
+        setting if the topology changed (monitor plugged/unplugged, sleep/wake
+        re-enumeration, resolution change).  Cheap: just compares fingerprints."""
+        if now - getattr(self, "_last_mon_check", 0) < 3.0:
+            return
+        self._last_mon_check = now
+        cur = tuple(m["fp"] for m in _monitors())
+        if cur == self._mon_snapshot:
+            return
+        log.info("monitor topology changed: %s → %s; re-applying display=%s",
+                 self._mon_snapshot, cur, self.display)
+        try:
+            self._apply_display()
+        except Exception as e:
+            log.info("display re-apply after topology change failed: %s", e)
+
     # ── main loop ──
 
     def _tick(self):
@@ -1927,6 +2036,7 @@ class Overlay:
         self._render_frame = False
 
         self._consume_async()
+        self._check_monitors(now)
         state = self.media.get()
 
         if not state or not state["title"]:
@@ -1944,14 +2054,16 @@ class Overlay:
             self._last_raw_title, self._last_src, self._last_artist = rawt, src, rawa
             self._clean_title_cache = clean_title(rawt, src, rawa)
             self._clean_artist_cache = clean_artist(rawa)
-            # Only EXPLICIT covers (歌ってみた / "covered by") take the loose
-            # title-first path. Routing VTuber-channel uploads through it too was
-            # WRONG: for a generic title like "Lucky Star" the title-only search
-            # grabbed a same-titled DIFFERENT song (a Cantonese one, then a
-            # "Twinkle Twinkle" one) instead of letting generate-by-ear transcribe
-            # the actual audio — and these niche EP tracks usually have NO synced
-            # lyrics anywhere, so generation is the correct result.
+            # Only EXPLICIT covers (歌ってみた / "covered by" / [COVER]) take
+            # the loose title-first path. Routing VTuber-channel uploads through
+            # it too was WRONG: for a generic title like "Lucky Star" the
+            # title-only search grabbed a same-titled DIFFERENT song.
             self._is_cover = is_cover_title(rawt)
+            if self._is_cover:
+                orig_a, _ = extract_cover_original(rawt, self._clean_artist_cache)
+                self._cover_original_artist = orig_a
+            else:
+                self._cover_original_artist = None
         track = (self._clean_artist_cache, self._clean_title_cache)
         if track != self._track:
             self._track = track
@@ -2055,6 +2167,14 @@ class Overlay:
               else max(self._win_margin, self.work_h - cur_y - self._bottom_clear))
         self.cv.move("cur", 0, dy)
         self._animate_in()
+        if self._mirrors:
+            self._update_mirrors(ln)
+        if self.display == "cycle" and len(_monitors()) > 1:
+            self._cycle_idx = (self._cycle_idx + 1) % len(_monitors())
+            try:
+                self._apply_display()
+            except Exception:
+                pass
 
     def _wrap_row(self, text, y, font, color, pad, max_w):
         """Draw a text row, wrapping overflow onto lines underneath.
@@ -2424,6 +2544,8 @@ class Overlay:
         self._clear_stream()
         draw_text(self.cv, self.pad, self.H // 2, msg, self.HINT_FONT, DIM,
                   anchor="w", tags="hint")
+        if self._mirrors:
+            self._update_mirrors(None)
 
     # ── tray hooks ──
 
@@ -2618,7 +2740,8 @@ class Overlay:
                         "character": self.character_on, "api": self.api_on,
                         "boundary": self.boundary_on, "generate": self.generate_on,
                         "concert_ocr": self.concert_ocr,
-                        "display": self.display})
+                        "display": self.display,
+                        "display_fp": getattr(self, "_display_fp", None)})
 
     def set_generate(self, on):
         """Toggle the last-resort Whisper lyric generation."""
@@ -2674,32 +2797,113 @@ class Overlay:
         self.root.update_idletasks()   # apply the move immediately
         self._persist()
 
+    # ── mirror-mode clone windows ──
+
+    def _destroy_mirrors(self):
+        for w in self._mirrors:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._mirrors = []
+
+    def _create_mirrors(self, mons, active_fp):
+        """Create transparent, click-through Toplevel clones on every monitor
+        except the one the main overlay sits on."""
+        self._destroy_mirrors()
+        for m in mons:
+            if m["fp"] == active_fp:
+                continue
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.configure(bg=TRANSPARENT)
+            win.attributes("-topmost", True)
+            win.attributes("-transparentcolor", TRANSPARENT)
+            win.attributes("-alpha", self.opacity)
+            wh = m["wh"]
+            win.geometry(f"{m['ww']}x{wh}+{m['wx']}+{m['wy']}")
+            cv = tk.Canvas(win, bg=TRANSPARENT, highlightthickness=0)
+            cv.pack(fill="both", expand=True)
+            win._mirror_cv = cv
+            win._mirror_mon = m
+            _click_through_hwnd(win)
+            self._mirrors.append(win)
+
+    def _update_mirrors(self, ln):
+        """Render the current line's text on each mirror canvas."""
+        for win in self._mirrors:
+            cv = win._mirror_cv
+            cv.delete("all")
+            if ln is None:
+                continue
+            m = win._mirror_mon
+            cw, ch = m["ww"], m["wh"]
+            cy = (self._win_margin + 40 if self.position == "top"
+                  else ch - self._bottom_clear - 40)
+            if ln.jp:
+                draw_text(cv, cw // 2, cy, ln.jp, self.JP_FONT, WHITE)
+                cy += 36
+            if ln.rm:
+                draw_text(cv, cw // 2, cy, ln.rm, self.ROMAJI_FONT, ROMAJI_C)
+                cy += 28
+            if ln.en:
+                draw_text(cv, cw // 2, cy, ln.en, self.EN_FONT, EN_C)
+
     def _place_window(self):
         """(Re)position the overlay band at its current monitor / span coordinates."""
         self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
         self._click_through()      # a display move can reset the exstyle → re-assert
 
+    def _resolve_monitor(self, mons):
+        """Find the monitor matching ``self.display``, preferring fingerprint over
+        index so the choice survives monitor re-enumeration after sleep/wake."""
+        if self.display == "primary":
+            return next((m for m in mons if m["primary"]), mons[0])
+        if isinstance(self.display, str) and self.display.startswith("mon:"):
+            fp = getattr(self, "_display_fp", None)
+            if fp:
+                hit = next((m for m in mons if m["fp"] == fp), None)
+                if hit:
+                    return hit
+                log.info("saved monitor fp %s not found; trying index", fp)
+            try:
+                idx = int(self.display[4:])
+            except ValueError:
+                idx = 0
+            if 0 <= idx < len(mons):
+                return mons[idx]
+            log.info("monitor index %s out of range (%d connected); falling back to primary", idx, len(mons))
+        return next((m for m in mons if m["primary"]), mons[0])
+
     def _apply_display(self):
-        """Place the overlay per ``self.display``: 'primary', 'mon:N' (a specific
-        monitor), or 'span' (ONE band across the whole virtual desktop so lyrics
-        scroll continuously through every screen). Reuses the W-parameterized layout
-        — just recompute the band's width / position / scale for the target."""
+        """Place the overlay per ``self.display``: 'primary', 'mon:N', 'span',
+        'mirror' (same lyrics on every screen), or 'cycle' (rotate screens per
+        line). Recomputes the band's width / position / scale for the target."""
         mons = _monitors()
+        self._mon_snapshot = tuple(m["fp"] for m in mons)
+        self._destroy_mirrors()
         if self.display == "span" and len(mons) > 1:
             left = min(m["wx"] for m in mons)
             right = max(m["wx"] + m["ww"] for m in mons)
             prim = next((m for m in mons if m["primary"]), mons[0])
             self.work_left, self.W = left, right - left
             self.work_top, self.work_bottom = prim["wy"], prim["wy"] + prim["wh"]
+        elif self.display == "mirror" and len(mons) > 1:
+            m = next((m for m in mons if m["primary"]), mons[0])
+            self._display_fp = m["fp"]
+            self.work_left, self.W = m["wx"], m["ww"]
+            self.work_top, self.work_bottom = m["wy"], m["wy"] + m["wh"]
+            self._create_mirrors(mons, m["fp"])
+        elif self.display == "cycle" and len(mons) > 1:
+            self._cycle_idx = self._cycle_idx % len(mons)
+            m = mons[self._cycle_idx]
+            self._display_fp = m["fp"]
+            self.work_left, self.W = m["wx"], m["ww"]
+            self.work_top, self.work_bottom = m["wy"], m["wy"] + m["wh"]
         else:
-            idx = 0
-            if isinstance(self.display, str) and self.display.startswith("mon:"):
-                try:
-                    idx = int(self.display[4:])
-                except ValueError:
-                    idx = 0
-            m = mons[idx] if 0 <= idx < len(mons) else mons[0]
+            m = self._resolve_monitor(mons)
+            self._display_fp = m["fp"]
             self.work_left, self.W = m["wx"], m["ww"]
             self.work_top, self.work_bottom = m["wy"], m["wy"] + m["wh"]
         self.work_h = self.work_bottom - self.work_top
@@ -2717,6 +2921,7 @@ class Overlay:
             self._apply_display()
         except Exception as e:
             log.info("display switch failed: %s", e)
+        log.info("display set to %s (fp=%s)", d, getattr(self, "_display_fp", None))
         if getattr(self, "idx", -1) >= 0 and getattr(self, "lines", None):
             self._render(self.lines[self.idx])
         self._persist()
@@ -2850,7 +3055,8 @@ class Overlay:
             self._on_track_change(self._track, self._cur_duration)
 
     def report_wrong(self):
-        """User-driven correction: bin the wrong lyrics and identify by SOUND."""
+        """User-driven correction: bin the wrong lyrics and identify by SOUND.
+        For covers, also re-fetch using the original artist from the title."""
         if self._lyrics_path:
             try:
                 Path(self._lyrics_path).unlink(missing_ok=True)
@@ -2862,7 +3068,17 @@ class Overlay:
         self.lines, self.idx, self._kara = [], -1, []
         self._sound_song = None
         self._title_locked = False     # let sound override after a manual reject
-        self._hint("🎧 Listening to identify the song…")
+        # For covers, try re-fetching with the original artist from the title
+        # before falling back to sound (which often fails on covers)
+        if self._is_cover and self._cover_original_artist and self._track:
+            artist, title = self._track
+            log.info("wrong-song on cover: re-fetching %r by original artist %r",
+                     title, self._cover_original_artist)
+            self._hint(f"🔄 Re-fetching as {self._cover_original_artist} — {title}…")
+            self._start_fetch(self._cover_original_artist, title,
+                              self._cur_duration, cover=True)
+        else:
+            self._hint("🎧 Listening to identify the song…")
         self._start_identify()
 
     def identify_by_sound(self):
@@ -2931,6 +3147,7 @@ class Overlay:
         self._hint(f"Synced by ear ({offset:+.1f}s)")
 
     def quit(self):
+        self._destroy_mirrors()
         if self._boundary is not None:
             try:
                 self._boundary.stop()
@@ -3052,8 +3269,10 @@ def main():
         _key = "primary" if _i == 0 else f"mon:{_i}"
         _tag = "  ·  primary" if _m["primary"] else ""
         _disp.append(_disp_item(f"Screen {_i + 1}  ({_m['w']}×{_m['h']}){_tag}", _key))
-    if len(_disp) > 1:          # span/mirror only make sense with 2+ screens
+    if len(_disp) > 1:
         _disp.append(pystray.Menu.SEPARATOR)
+        _disp.append(_disp_item("Mirror on ALL screens", "mirror"))
+        _disp.append(_disp_item("Cycle through screens  (rotate per line)", "cycle"))
         _disp.append(_disp_item("Scroll across ALL screens  (one continuous band)", "span"))
     display_menu = pystray.Menu(*_disp)
     scroll_menu = pystray.Menu(

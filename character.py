@@ -205,38 +205,134 @@ class Character:
 
     def _draw_chibi(self, cx, base_y, lean, phase, body, dark, hair):
         cv = self.cv
-        # legs (alternating step)
-        step = math.sin(phase) * (12 if self.playing else 2)
+        # ── kawaii maneki-neko (招き猫) ──
+        # big head : small body ratio for maximum cuteness
+        WHITE = "#fefcf9"
+        CREAM = "#fff5e6"
+        OL = "#5c4033"
+        RED = "#e63946"
+        GOLD = "#f0c040"
+        GOLD_D = "#b8860b"
+        PINK = "#ffaec0"
+        BLUSH = "#ffc0cb"
+        S1, S2 = body, dark       # artist-themed calico spots
+
+        # anchor: head center high, body below — head is 60% of figure
+        hx = cx + lean * 0.25
+        hy = base_y - 52
+
+        # ── stubby tail (behind body) ──
+        tw = math.sin(phase * 1.8) * (10 if self.playing else 3)
+        cv.create_line(cx + 18, base_y + 8, cx + 30 + tw, base_y - 6,
+                       cx + 26 + tw * 0.6, base_y - 18,
+                       fill=S1, width=8, capstyle="round", smooth=True)
+
+        # ── body (small, round, sits below the big head) ──
+        cv.create_oval(cx - 24, base_y - 16, cx + 24, base_y + 26,
+                       fill=WHITE, outline=OL, width=2)
+        # calico spot on tummy
+        cv.create_oval(cx - 14, base_y - 4, cx + 4, base_y + 16,
+                       fill=S1, outline="")
+
+        # ── little feet ──
         for sgn in (-1, 1):
-            cv.create_line(cx + sgn * 10, base_y, cx + sgn * 14 + sgn * step,
-                           base_y + 46, fill=dark, width=10, capstyle="round")
-        # body
-        cv.create_oval(cx - 28, base_y - 50, cx + 28, base_y + 14,
-                       fill=body, outline=dark, width=2)
-        # arms (swing opposite to legs; raise while playing)
-        raise_a = -26 if self.playing else -6
+            fx = cx + sgn * 14
+            cv.create_oval(fx - 7, base_y + 18, fx + 7, base_y + 30,
+                           fill=WHITE, outline=OL, width=1.5)
+            cv.create_oval(fx - 3, base_y + 22, fx + 3, base_y + 27,
+                           fill=PINK, outline="")
+
+        # ── left paw (resting on tummy, holds koban) ──
+        lx, ly = cx - 16, base_y + 2
+        cv.create_oval(lx - 8, ly, lx + 8, ly + 12,
+                       fill=WHITE, outline=OL, width=1.5)
+        cv.create_oval(lx - 6, ly + 1, lx + 6, ly + 11,
+                       fill=GOLD, outline=GOLD_D, width=1)
+        cv.create_text(lx, ly + 6, text="福", fill=GOLD_D,
+                       font=("Yu Gothic", 6, "bold"))
+
+        # ── right paw (beckoning wave!) ──
+        wave = math.sin(phase * (3.2 if self.playing else 1.0))
+        rx = cx + 20
+        # arm — simple rounded rectangle, no ugly triple-line hack
+        ay_top = base_y - 10
+        ay_end = base_y - 38 - (6 if self.playing else 0)
+        cv.create_oval(rx - 7, ay_end - 4, rx + 9, ay_top + 4,
+                       fill=WHITE, outline=OL, width=1.5)
+        # paw circle at the end (tilts with wave)
+        px = rx + 1 + wave * 5
+        py = ay_end - 2
+        cv.create_oval(px - 7, py - 7, px + 7, py + 7,
+                       fill=WHITE, outline=OL, width=1.5)
+        # paw pad
+        cv.create_oval(px - 3, py - 2, px + 3, py + 3,
+                       fill=PINK, outline="")
+
+        # ── collar (red band across body-head junction) ──
+        cv.create_arc(cx - 22, base_y - 22, cx + 22, base_y - 6,
+                      start=200, extent=140, style="arc",
+                      outline=RED, width=4)
+        # bell
+        cv.create_oval(cx - 5, base_y - 16, cx + 5, base_y - 6,
+                       fill=GOLD, outline=GOLD_D, width=1)
+        cv.create_line(cx, base_y - 12, cx, base_y - 7,
+                       fill=GOLD_D, width=1)
+
+        # ── head (BIG — the cute factor) ──
+        cv.create_oval(hx - 36, hy - 32, hx + 36, hy + 30,
+                       fill=WHITE, outline=OL, width=2)
+
+        # calico spot on forehead
+        cv.create_oval(hx + 4, hy - 26, hx + 24, hy - 10,
+                       fill=S1, outline="")
+
+        # ── ears (rounded triangles, big) ──
         for sgn in (-1, 1):
-            ax = math.sin(phase + math.pi) * sgn * 14
-            cv.create_line(cx + sgn * 22, base_y - 34,
-                           cx + sgn * 40 + ax, base_y + raise_a + ax,
-                           fill=body, width=9, capstyle="round")
-        # head
-        hy = base_y - 78 + lean * 0.2
-        cv.create_oval(cx - 30 + lean, hy - 30, cx + 30 + lean, hy + 30,
-                       fill=hair, outline=dark, width=2)
-        cv.create_oval(cx - 24 + lean, hy - 18, cx + 24 + lean, hy + 26,
-                       fill="#ffe8d6", outline="")
-        # eyes
+            ex = hx + sgn * 26
+            cv.create_polygon(ex - 12, hy - 24, ex + 12, hy - 24,
+                              ex + sgn * 3, hy - 52,
+                              fill=WHITE, outline=OL, width=2)
+            cv.create_polygon(ex - 7, hy - 26, ex + 7, hy - 26,
+                              ex + sgn * 2, hy - 43,
+                              fill=PINK, outline="")
+        # calico spot on right ear
+        cv.create_polygon(hx + 22, hy - 26, hx + 32, hy - 26,
+                          hx + 29, hy - 40, fill=S2, outline="")
+
+        # ── eyes (big happy crescents ◠◠) ──
         for sgn in (-1, 1):
-            cv.create_oval(cx + sgn * 11 - 4 + lean, hy - 2, cx + sgn * 11 + 4 + lean,
-                           hy + 8, fill="#1f2937", outline="")
-        # cheeks + smile
-        cv.create_arc(cx - 10 + lean, hy + 4, cx + 10 + lean, hy + 20,
-                      start=200, extent=140, style="arc", outline=dark, width=2)
-        # floating music notes while playing
+            ex = hx + sgn * 14
+            # thick happy arc — the signature kawaii expression
+            cv.create_arc(ex - 8, hy - 6, ex + 8, hy + 10,
+                          start=0, extent=180,
+                          style="arc", outline=OL, width=3)
+
+        # ── nose (tiny pink bean) ──
+        cv.create_oval(hx - 3, hy + 10, hx + 3, hy + 15,
+                       fill=PINK, outline="")
+
+        # ── mouth (‿ smile) ──
+        cv.create_arc(hx - 7, hy + 12, hx + 7, hy + 22,
+                      start=200, extent=140,
+                      style="arc", outline=OL, width=1.5)
+
+        # ── whiskers (delicate) ──
+        for sgn in (-1, 1):
+            for dy in (-2, 3):
+                cv.create_line(hx + sgn * 20, hy + 10 + dy,
+                               hx + sgn * 40, hy + 8 + dy * 1.5,
+                               fill=OL, width=0.8)
+
+        # ── cheek blush (soft pink circles) ──
+        for sgn in (-1, 1):
+            bx = hx + sgn * 22
+            cv.create_oval(bx - 7, hy + 6, bx + 7, hy + 16,
+                           fill=BLUSH, outline="", stipple="gray50")
+
+        # ── music notes while playing ──
         if self.playing:
             for k in range(2):
-                nx = cx + 44 + 10 * math.sin(phase + k)
-                ny = hy - 10 - ((phase * 8 + k * 30) % 60)
-                cv.create_text(nx, ny, text="♪", fill=body,
-                               font=("Segoe UI", 16, "bold"))
+                nx = cx + 44 + 8 * math.sin(phase + k * 1.5)
+                ny = hy - 20 - ((phase * 7 + k * 28) % 55)
+                cv.create_text(nx, ny, text="♪", fill=GOLD,
+                               font=("Segoe UI", 14, "bold"))
