@@ -1376,6 +1376,41 @@ class Overlay:
         short, lng = sorted((na, nb), key=len)
         return short in lng and len(short) / max(1, len(lng)) >= 0.6
 
+    @staticmethod
+    def _titles_share_content(a, b):
+        """Looser overlap check: do two titles share ANY meaningful content?
+        Returns False when the titles are completely unrelated (different
+        songs/videos), True for any plausibly-related pair. Used to detect
+        when the player's reported title is stale/wrong vs. Shazam's heard
+        title — they MUST share something to be the same song.
+
+        Two layers: (1) normalized-title contains substring of ≥4 chars,
+        (2) shared CJK n-grams of ≥2 chars (handles ローマ字 vs. CJK mismatches).
+        """
+        na, nb = _norm_title(a), _norm_title(b)
+        if not na or not nb:
+            return False
+        if na == nb or na in nb or nb in na:
+            return True
+        # 4-char substring overlap in normalised form
+        short, lng = sorted((na, nb), key=len)
+        if len(short) >= 4:
+            for i in range(len(short) - 3):
+                if short[i:i + 4] in lng:
+                    return True
+        # CJK n-gram overlap: any shared 2-char CJK sequence
+        cjk_a = re.findall(r"[぀-ヿ一-鿿]{2,}", a or "")
+        cjk_b = re.findall(r"[぀-ヿ一-鿿]{2,}", b or "")
+        for ga in cjk_a:
+            for gb in cjk_b:
+                if len(ga) >= 2 and len(gb) >= 2:
+                    if ga in gb or gb in ga:
+                        return True
+                    for i in range(len(ga) - 1):
+                        if ga[i:i + 2] in gb:
+                            return True
+        return False
+
     def _maybe_translate(self):
         # Self-heal a loaded song in the background: add romaji to any
         # Japanese/CJK line missing it, and translate any line that should have
@@ -1670,13 +1705,23 @@ class Overlay:
                 self._intro_anchored = True   # Shazam can align this → drop the MV dead-space guess
                 # SOUND IS THE AUTHORITY. Shazam often romanizes JP titles
                 # ("Kira" for 綺羅), so when the player's own title is CJK keep
-                # that original script for fetching/matching.
+                # that original script for fetching/matching — UNLESS the player
+                # title and Shazam's title share no content at all (Niconico's
+                # sidebar / recommended-video session can leak a totally
+                # unrelated CJK title like "Space Marine 2 プレイ動画 #35" while
+                # the actual Marine song plays — trust Shazam in that case).
                 g_artist, g_title = (self._track or ("", ""))
+                same_song = self._titles_share_content(g_title, title)
                 if (_has_cjk(g_title) and not _has_cjk(title)
-                        and not _is_generic_title(g_title) and not self._live_mode):
+                        and not _is_generic_title(g_title) and not self._live_mode
+                        and same_song):
                     f_artist, f_title = (g_artist or artist), g_title
                 else:
                     f_artist, f_title = artist, title
+                    if _has_cjk(g_title) and not same_song:
+                        log.info("player title %r and Shazam title %r share no content "
+                                 "— trusting Shazam (player session likely stale)",
+                                 g_title, title)
                 heard = (f_title, f_artist)
                 # Does the song we HEARD match the lyrics currently loaded?
                 loaded_ok = bool(self.lines) and self._titles_match(

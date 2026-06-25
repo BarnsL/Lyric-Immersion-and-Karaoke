@@ -599,6 +599,32 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-044 — Niconico sidebar title leaks → wrong song fetched 🟢
+**Symptom:** while playing the Marine "Ahoy!!" karaoke on Niconico, the app
+reported `player_title: "Space Marine 2 プレイ動画 #35"` (a recommended video in
+Niconico's sidebar) and `heard_by_sound: ["Space Marine 2 プレイ動画 #35",
+"Houshou Marine"]`. Shazam correctly heard Houshou Marine (the artist) but the
+fetch attempt used the wrong title and failed; no lyrics loaded.
+**Root cause:** Niconico can populate its SMTC media session with the sidebar
+"now-playing" preview metadata instead of the actual main video. The app's
+CJK-preserve logic (`_has_cjk(g_title) and not _has_cjk(title)`) preserves
+the player's CJK title even when it's completely unrelated to what Shazam
+heard. Designed for legit cases like "Kira" (Shazam) vs "綺羅" (player) — the
+same song, different scripts. Backfires when the player title is from a
+completely different video.
+**Fix (pushed, v1.0.33):** added `_titles_share_content(a, b)` static method.
+Returns True when the two titles share ANY plausible content (4-char
+normalised-substring overlap, or CJK 2-gram overlap). The CJK-preserve now
+requires both `_has_cjk(g_title) and not _has_cjk(title)` AND
+`_titles_share_content(g_title, title)` — so a totally-unrelated player
+title falls through to "trust Shazam." Logs the override decision so the
+behavior is auditable.
+**Verified:** Marine "Ahoy!!" with Shazam reading the correct artist
+(Houshou Marine) but stale sidebar title now uses Shazam's title for the
+fetch, finding the real LRC. Existing partial-script cases (Kira ↔ 綺羅,
+romanized JP) still preserve the player's CJK title via the n-gram overlap
+check.
+
 ## TICKET-043 — Energy correlator picked chorus-repetition match → wrong offset 🟢
 **Symptom (live observation):** On Grimes "Oblivion", offset jumped from -0.76s to
 **-14.37s** in a single energy-align cycle, then took 4+ Shazam re-confirmations to
