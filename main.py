@@ -1087,6 +1087,8 @@ class Overlay:
         self._last_audio_off_t = 0.0  # wall-clock of last audio_off update
         self._sound_title_alias = None  # romanized heard-title we loaded a CJK cache for
         self._last_energy = None      # last energy-correlation result (for /diag)
+        self._offset_hist = []        # ring buffer of (wall_t, offset) — catches jumps
+        self._offset_hist_last = None # last offset recorded (only log on change)
         self._auto_align_after = None # pending auto-align timer id
         self._last_sound_lock_t = 0.0 # wall-clock of last confirmed Shazam offset
         # ── Algorithmic offset state (continuous, no strike counters) ──
@@ -1118,6 +1120,8 @@ class Overlay:
             "energy_apply_min":      0.4,   # min |new-old| to apply correlation
             "energy_lift_floor":     0.10,  # min peak-vs-median lift to accept
             "energy_max_offset":    60.0,   # |new_off| < this for sanity
+            "energy_shift_penalty":  0.012, # per-second penalty for large offset changes (small-shift prior)
+            "energy_peak_margin":    0.06,  # reject if a distant rival peak is within this of the best
             # ── render perf knobs (scroll-through smoothness) ──
             # heavy_budget_ms caps the per-frame spawn/repaint work so a PIL
             # paste can't stall the scroll belt; 0 disables the cap.
@@ -2307,6 +2311,15 @@ class Overlay:
         self._last_tick_t = now
         self._render_frame = False
 
+        # Record offset CHANGES (with a coarse source guess) so /diag can show
+        # exactly when and how far the sync jumped — the key to diagnosing a
+        # "massive desync" after the fact instead of having to catch it live.
+        if self.offset != self._offset_hist_last:
+            self._offset_hist.append((round(now, 1), round(self.offset, 2)))
+            if len(self._offset_hist) > 40:
+                del self._offset_hist[:len(self._offset_hist) - 40]
+            self._offset_hist_last = self.offset
+
         self._consume_async()
         self._check_monitors(now)
         state = self.media.get()
@@ -2889,6 +2902,7 @@ class Overlay:
                             and getattr(self, "_last_drift", None) is not None
                             else ((self.idx == want_idx) if want_idx >= 0 else None)),
                 "scroll_mode": self.scroll_dir in ("lr", "rl"),
+                "offset_history": self._offset_hist[-20:],
             },
             "energy_align": self._last_energy,
             "fps": {
@@ -3652,20 +3666,30 @@ class Overlay:
         # we're aligning the displayed lyric time, not the absolute clock).
         now_wall = history[-1][0]
         now_song = float(st_snap.get("position") or 0.0)
-        # Build the audio mask: per-block "are vocals active right now?" using
-        # the learned baseline as the floor.
-        try:
-            baseline = self._boundary.vocal_baseline() or 0.0
-        except Exception:
-            baseline = 0.0
-        thresh = max(0.50, baseline * 1.25)
-        # Per-block song-time (each block = 0.2 s, going back from now_song).
-        # Constrain to vocals-only region of the song.
+        # Build the audio mask: per-block "are vocals active right now?".
+        # ADAPTIVE threshold (per-window), not an absolute floor: the vocal-band
+        # ratio's absolute level varies hugely by song (bass-heavy electronic vs
+        # piano ballad), so a fixed 0.50 floor either missed quiet vocals or
+        # flagged everything. Instead split at the window's own median + half the
+        # upper spread — vocals (higher band ratio) rise above it, instrumental
+        # stays below — so the on/off PATTERN is captured on any song. (The
+        # absolute baseline still guards against an all-instrumental window.)
         block_dt = 0.2
+        ratios = np.array([r for (_, r) in history])
+        med = float(np.median(ratios))
+        hi = float(np.percentile(ratios, 75))
+        spread = hi - med
+        thresh = med + 0.5 * spread
         audio_t = np.array([now_song - (now_wall - t) for (t, _) in history])
-        audio_v = np.array([(1.0 if r >= thresh else 0.0) for (_, r) in history])
-        if audio_v.sum() < 4:    # too little vocal activity captured
-            log.info("energy-align: insufficient vocal activity (%d blocks)", int(audio_v.sum()))
+        audio_v = (ratios >= thresh).astype(float)
+        # Need genuine on/off CONTRAST: enough vocal blocks AND enough silent
+        # blocks. A near-constant mask (all-vocal or all-silent) has no pattern
+        # to align and would match any shift equally (flat agreement → no info).
+        n_on = int(audio_v.sum())
+        n_off = int(len(audio_v) - n_on)
+        if spread < 0.02 or n_on < 6 or n_off < 6:
+            log.info("energy-align: low vocal contrast (on=%d off=%d spread=%.3f) — no change",
+                     n_on, n_off, spread)
             return
         # Build the LRC active-mask on a fixed 0.2 s grid spanning the audio
         # window ±16 s (room for the ±15 s shift search), then evaluate ALL
@@ -3695,14 +3719,39 @@ class Overlay:
         lrc_vals = np.where(inrange, lrc_grid[np.clip(idx, 0, ngrid - 1)], 0.0)
         # agreement per shift = fraction of blocks where audio mask == LRC mask
         agree = (audio_v[None, :] == lrc_vals).sum(axis=1) / float(len(audio_v))
-        best_i = int(np.argmax(agree))
-        best_shift = float(S[best_i] * block_dt)
+        shifts_s = S * block_dt                          # candidate offset CHANGE (s)
+        # SMALL-SHIFT PRIOR: a repetitive song (la-la-la chorus) produces an
+        # equally-tall agreement peak one chorus away — the bug where the offset
+        # jumped -14.8 s onto a chorus. The TRUE offset rarely jumps far between
+        # checks (continuity), so penalize large offset changes: a far shift must
+        # beat the no-change score by penalty·|shift| to win. This makes the
+        # correlator prefer "keep the current sync" unless the evidence is
+        # overwhelming. (Score-following literature calls this a transition prior.)
+        penalty = self._tune.get("energy_shift_penalty", 0.012)
+        scored = agree - penalty * np.abs(shifts_s)
+        best_i = int(np.argmax(scored))
+        best_shift = float(shifts_s[best_i])
         best_score = float(agree[best_i])
         median = float(np.median(agree))
         peak_lift = best_score - median
+        # PEAK UNIQUENESS: mask a ±2 s window around the winner and find the next
+        # best raw-agreement peak elsewhere. If a DISTANT shift scores almost as
+        # high, the match is ambiguous (chorus repetition) → don't trust it.
+        win = 10                                         # ±2 s in 0.2 s steps
+        lo, hi = max(0, best_i - win), min(len(S), best_i + win + 1)
+        masked = agree.copy()
+        masked[lo:hi] = -1.0
+        rival_i = int(np.argmax(masked))
+        rival_score = float(masked[rival_i])
+        rival_shift = float(shifts_s[rival_i]) if rival_score >= 0 else None
+        margin = self._tune.get("energy_peak_margin", 0.06)
+        ambiguous = rival_score >= 0 and (best_score - rival_score) < margin
         self._last_energy = {
             "best_shift": round(best_shift, 2), "best_score": round(best_score, 3),
             "median": round(median, 3), "lift": round(peak_lift, 3),
+            "rival_shift": round(rival_shift, 2) if rival_shift is not None else None,
+            "rival_score": round(rival_score, 3) if rival_score >= 0 else None,
+            "ambiguous": bool(ambiguous),
             "blocks": int(len(audio_v)), "vocal_blocks": int(audio_v.sum()),
             "reason": getattr(self, "_energy_reason", "?"),
             "t": time.time(),
@@ -3710,6 +3759,12 @@ class Overlay:
         if peak_lift < self._tune["energy_lift_floor"]:
             log.info("energy-align: weak peak (best %.3f, median %.3f, lift %.3f) — no change",
                      best_score, median, peak_lift)
+            return
+        if ambiguous:
+            log.info("energy-align: ambiguous — best %+.1fs (%.3f) vs rival %+.1fs (%.3f), "
+                     "margin %.3f < %.3f → no change (chorus repetition)",
+                     best_shift, best_score, rival_shift, rival_score,
+                     best_score - rival_score, margin)
             return
         # best_shift is the offset to ADD to audio_t so the audio mask aligns
         # to the LRC. Since the displayed song-time = player_pos + self.offset,

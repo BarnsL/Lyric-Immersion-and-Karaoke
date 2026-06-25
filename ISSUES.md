@@ -599,6 +599,47 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-049 — Energy correlator chorus-repetition phantom (small-shift prior) 🟢
+**Symptom:** intermittent MASSIVE desyncs (offset jumping ~15s). /diag caught the
+mechanism live: on "Coffee - A!ka | Kaneko Lumi" the energy correlator persistently
+reported `best_shift=-14.8, lift=0.262` while the song was actually in sync at
+offset 0. That -14.8 s is a CHORUS-REPETITION match — the vocal on/off pattern one
+chorus away looks identical, so the cross-correlation has a near-equal peak there.
+Whenever Shazam couldn't provide a fresh anchor (its agreement-guard, TICKET-043,
+needs a recent reading), the phantom could win and yank the offset 15 s → the
+"massive desync."
+**Research (score-following literature, ICASSP 2024 real-time lyrics alignment;
+Dixon OLTW):** production systems use a TRANSITION PRIOR — the true position rarely
+jumps far between updates — and reject ambiguous matches rather than treating the
+global-best peak as truth.
+**Fix (pushed, v1.0.37):**
+1. **Small-shift prior:** `scored = agree − penalty·|shift|` (penalty 0.012/s,
+   tunable). A distant shift must beat the no-change score by `penalty·|shift|` to
+   win, so the correlator prefers KEEPING the current sync unless evidence is
+   overwhelming. Directly kills the -14.8 phantom (it scored ~0.14 over no-change,
+   under the 14.8×0.012≈0.18 it needed).
+2. **Peak-uniqueness rejection:** mask ±2 s around the winner, find the next-best
+   distant peak; if it's within `energy_peak_margin` (0.06) of the best, the match
+   is ambiguous (chorus) → no change. Both knobs live-tunable via /tune.
+3. **Adaptive vocal threshold:** the old absolute floor `max(0.50, baseline*1.25)`
+   left the correlator BLIND on many songs ("insufficient vocal activity, 0 blocks")
+   because the vocal-band ratio's absolute level varies hugely by genre. Replaced
+   with a per-window split at `median + 0.5·(p75−median)` + a contrast gate
+   (need ≥6 on AND ≥6 off blocks, spread ≥0.02). Result: 0 → 57 vocal blocks
+   detected on the Marine cover, so the correlator can actually evaluate it (and
+   then correctly reject the ambiguous chorus rival rather than jumping).
+4. **Diagnostics:** /diag energy_align now reports `rival_shift`, `rival_score`,
+   `ambiguous`; sync block adds `offset_history` (last 20 offset changes with
+   timestamps) so a jump is visible after the fact.
+**Live-verified:** Niconico Marine "Ahoy!!" cover now frame-matches the video's
+burned-in karaoke ("ヨーソロー！ついておいで 共に Yo-Ho…"), drift 0.02, with the
+correlator logging `best=0.0(0.38) rival=-15.0(0.38) ambiguous=True → no change`
+— the exact phantom that used to cause the -15 s jump, now correctly rejected.
+**Note:** the deeper fix the research points to (OLTW over chroma + a
+constant-velocity Kalman filter with innovation gating, replacing the whole
+ad-hoc reconciliation) is logged as future work — the prior+uniqueness is the
+high-leverage 80% with far less risk.
+
 ## TICKET-047 — Scroll-through stutter: Windows timer granularity (+ GIL) 🟢
 **Symptom:** scroll-through ("lr"/"rl") modes "very stuttery", "has been suffering."
 **Diagnosis (via the new /diag, TICKET-048):** `recent_ms` frame history showed the
