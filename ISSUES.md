@@ -599,6 +599,34 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-053 — Overlay FROZE on the old song (the real "hella bad") 🟢🟢🟢
+**Symptom:** caught live — the SMTC title had changed to a new song
+("【歌ってみた】林檎売りの泡沫少女") but the app was STUCK showing the previous song's
+lyrics ("Break Into My Heart", 53 lines), its clock running 357 s past their end,
+showing nothing. `/diag` confirmed `render_fps: None` — the render loop was DEAD.
+**Root cause:** a `NameError` I introduced in v1.0.42. The auto-caption scheduling
+block added to `_on_track_change` referenced a variable `src` that isn't in that
+method's scope. So **every track change raised NameError**, which propagated out of
+`_tick` — and since `_tick` is a self-rescheduling `root.after` loop, the exception
+stopped it from rescheduling. The loop DIED while the OS media kept advancing, so the
+overlay froze on whatever was last loaded. (Other timers — auto-align, monitors —
+survived independently, which is why the app looked half-alive.) This single bug
+explains a huge share of the "stuck / wrong song / no lyrics / hella bad" reports.
+**Fix (pushed, v1.0.44-46):**
+1. **Crash-proof the render loop (v1.0.44):** wrapped `_tick` so ANY frame exception
+   is logged and the loop ALWAYS reschedules. One bad frame can never freeze the
+   overlay again — it self-heals and logs the cause.
+2. **Fixed the NameError (v1.0.45):** use the cached `self._last_src` (the source IS
+   tracked in the tick loop) instead of the undefined `src`.
+3. **Captions now actually apply (v1.0.46):** the caption fetch logged "76 lines
+   fetched" but `src` stayed `lrclib` — `_apply_deep`'s `_deep_token` check discarded
+   them because generation / a title re-report bumped that shared token during the
+   ~20 s yt-dlp fetch. Added `_apply_captions` guarded by `_track_seq` (bumped ONLY on
+   a real song change), so captions apply as long as the same song is still playing.
+**Verified live end-to-end:** track changes no longer freeze; `西憂花『ふわふわhazy』` →
+"captions: 64 ja lines" → "captions: applied 64 lines" → src `youtube-captions`,
+drift 0.0, in_sync. The found-real-lyrics hint also no longer sticks (force re-render).
+
 ## TICKET-052 — YouTube caption track = accurate lyrics + perfect sync 🟢🟢
 **The big one.** Watching live, the app showed WRONG TEXT for KizunaAI "white balance":
 app LRC said "未来 未開 見たことない…" (mirai mikai mita koto nai) while the song actually

@@ -1319,8 +1319,9 @@ class Overlay:
         # exact video (no wrong-transcription LRC, no cross-version drift). Fetch
         # it in the background a few seconds in (after the LRC has shown something)
         # and prefer it. Throttled + once-per-song so a fast playlist can't 429.
+        # `src` isn't a param here — use the cached source from the tick loop.
         if (self.captions_on and not self._live_mode
-                and any(h in (src or "") for h in BROWSER_HINTS)):
+                and any(h in (self._last_src or "") for h in BROWSER_HINTS)):
             self.root.after(4000,
                             lambda t=self._track_seq: self._maybe_fetch_captions(t))
 
@@ -2328,6 +2329,23 @@ class Overlay:
     # ── main loop ──
 
     def _tick(self):
+        # CRASH-PROOF render loop: the overlay's whole life is this self-
+        # rescheduling loop, so ANY unhandled exception in a frame (a bad LRC, a
+        # PIL edge case, a font glyph) used to kill it silently — the loop stopped
+        # rescheduling while the OS media kept advancing, so the overlay FROZE on
+        # the old song forever (the "stuck on the previous song / no lyrics" bug).
+        # Wrap every frame: log the error and ALWAYS reschedule, so one bad frame
+        # can never stop the loop.
+        try:
+            self._tick_body()
+        except Exception as e:
+            log.info("tick error (recovered): %s: %s", type(e).__name__, e)
+            try:
+                self.root.after(80, self._tick)
+            except Exception:
+                pass
+
+    def _tick_body(self):
         # Measure the interval between consecutive RENDER frames (only) for the
         # /status render_fps readout — paused/no-music frames use a slower cadence
         # and would skew it, so they're excluded.
@@ -3791,8 +3809,12 @@ class Overlay:
         # exact video URL (param > browser-pushed) beats a fuzzy title search
         query = url or self._now_url or self._last_raw_title or title
         lang = self.meta.get("lang", "ja")
-        self._deep_token += 1
-        token = self._deep_token
+        # Guard by _track_seq (bumped ONLY on a real song change), NOT _deep_token
+        # — generation / a title re-report bump _deep_token mid-fetch and would
+        # wrongly discard the captions even though the SAME song is still playing
+        # (the "76 lines fetched but not applied" bug). Captions are ground truth,
+        # so they apply as long as the song hasn't actually changed.
+        seq = self._track_seq
         if not silent:
             self._hint("📥 Pulling the video's caption track…")
 
@@ -3806,19 +3828,45 @@ class Overlay:
                 if not silent:
                     self.root.after(0, lambda: self._hint("No caption track found for this video"))
                 return
-            if token != self._deep_token:
-                return
+            if seq != self._track_seq:
+                return                              # the song actually changed
             lines, clang = res
             try:
                 from fetch_lyrics import annotate
                 annotate(lines, clang or lang, translate=True)
             except Exception:
                 pass
-            if token == self._deep_token:
-                self.root.after(0, lambda: self._apply_deep(
-                    token, title, artist, lines, clang or lang, "youtube-captions"))
+            if seq == self._track_seq:
+                self.root.after(0, lambda: self._apply_captions(
+                    seq, title, artist, lines, clang or lang))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _apply_captions(self, seq, title, artist, lines, lang):
+        """(Tk thread) save + load a YouTube caption track as the lyrics. Guarded
+        by _track_seq (the song), so generation / deep-token churn can't discard
+        it. Captions are ground truth → they replace whatever LRC was showing."""
+        if seq != self._track_seq or not lines:
+            return
+        from fetch_lyrics import slugify
+        try:
+            out = LYRICS_DIR / f"{slugify(title)}.json"
+            data = {"meta": {"title": title, "artist": artist, "lang": lang,
+                             "duration": self._cur_duration, "source": "youtube-captions"},
+                    "lines": lines}
+            out.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+            self.index.add(out)
+            log.info("captions: applied %d lines -> %s", len(lines), out.name)
+        except Exception as e:
+            log.info("captions save failed: %s", e)
+            return
+        # captions win over any LRC / generation for this song
+        self._gen_token += 1
+        self._deep_token += 1
+        self._generating = False
+        self.load(out, keep_idx=True)
+        self.idx = -1                               # force re-render over the hint
+        self._hint("✨ Synced to the video's captions")
 
     # ── sync by listening (align cached lyrics to the HEARD audio) ──
     def _align_pos(self):
