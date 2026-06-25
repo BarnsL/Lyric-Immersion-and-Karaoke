@@ -599,6 +599,30 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-043 — Energy correlator picked chorus-repetition match → wrong offset 🟢
+**Symptom (live observation):** On Grimes "Oblivion", offset jumped from -0.76s to
+**-14.37s** in a single energy-align cycle, then took 4+ Shazam re-confirmations to
+recover. Log evidence: `energy-align: offset -0.76s → -14.37s (α=0.91, score 0.255,
+lift 0.221)` — the correlator's "sharp peak" was actually a chorus-repetition match,
+not the true offset. Shazam was simultaneously reading `audio_off=-0.47` (the correct
+value).
+**Root cause:** songs with repeated patterns ("la la la" choruses, repetitive hooks)
+produce sharp correlation peaks at MULTIPLE candidate shifts because the vocal-mask
+pattern repeats periodically. `peak_lift > 0.10` alone can't distinguish "I found the
+right alignment" from "I found a chorus that looks like the previous chorus." The
+correlator picked the latter and the auto-sync chased a false offset.
+**Fix (pushed, v1.0.32):**
+1. Track Shazam's absolute implied offset (`_last_audio_off` + `_last_audio_off_t`)
+   on every Shazam read — separate from `_last_drift` which is relative.
+2. In `_run_energy_correlation`, before applying a candidate offset, sanity-check
+   against the last Shazam reading (within 60s):
+   - If `|new_off - _last_audio_off| > 4.0s` → reject the candidate as a probable
+     chorus-repetition match.
+3. Reset `_last_audio_off` on track change so it doesn't leak across songs.
+**Why the band is 4s:** Shazam itself can read +/-2s due to chorus ambiguity, so
+allowing 4s deviation absorbs that noise while catching the gross mismatches
+(13.6s in this case). Tunable via `/tune` if needed.
+
 ## TICKET-042 — Karaoke version drift cap was too tight (Niconico Marine) 🟢
 **Live test:** Watching the Niconico Ahoy!! karaoke video, drift hit +7.85s
 (legitimate — karaoke version is offset ~7s vs studio). Auto-sync's fast-path

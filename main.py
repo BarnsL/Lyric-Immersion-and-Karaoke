@@ -1080,6 +1080,8 @@ class Overlay:
         self._identifying = False
         self._aligning = False        # sync-by-listening (Whisper) in progress
         self._last_align_t = 0.0      # wall-clock of last auto-align finish
+        self._last_audio_off = None   # Shazam-implied absolute offset, for correlator sanity
+        self._last_audio_off_t = 0.0  # wall-clock of last audio_off update
         self._auto_align_after = None # pending auto-align timer id
         self._last_sound_lock_t = 0.0 # wall-clock of last confirmed Shazam offset
         # ── Algorithmic offset state (continuous, no strike counters) ──
@@ -1188,9 +1190,11 @@ class Overlay:
         self._gen_defers = 0       # fresh defer budget for this track's fetch
         self._fetch_key = None     # let this track re-attempt a real fetch (upgrade path)
         self._recent_corr = []     # reset ambiguity history for the new song
-        self._align_drift_strikes = 0   # reset drift counter for the new song
         self._last_align_t = 0.0        # let auto-align run early on the new song
         self._last_sound_lock_t = 0.0   # no Shazam lock yet on the new song
+        self._last_audio_off = None     # no Shazam read yet for new song
+        self._last_audio_off_t = 0.0
+        self._drift_integral = 0.0      # fresh drift accumulation for new song
         self._live_arrangement = is_live_arrangement(title)  # LIVE/short/alt → follow offset
         log.info("track change: %r / %r (dur %s)%s", title, artist, duration,
                  " [live-arrangement]" if self._live_arrangement else "")
@@ -1722,6 +1726,11 @@ class Overlay:
                                      if 0 <= self.idx < len(self.lines) else -1.0)
                             self._last_drift = round(diff, 2)
                             self._last_drift_t = time.time()
+                            # Track the absolute Shazam-implied offset so the
+                            # energy correlator can sanity-check its result
+                            # against it (rejects chorus-repetition mismatches).
+                            self._last_audio_off = corr
+                            self._last_audio_off_t = self._last_drift_t
                             log.info("sync-read: drift=%+.2fs audio_off=%+.2f shown_off=%+.2f "
                                      "mode=%s spread=%.1f pos=%.1f line#%d@%.1f pend=%s",
                                      diff, corr, self.offset, "live" if live else "studio",
@@ -3496,6 +3505,20 @@ class Overlay:
             log.info("energy-align: drift %+.2fs within tolerance — no change",
                      new_off - self.offset)
             return
+        # SANITY CHECK against Shazam: songs with repeated patterns (la-la-la
+        # choruses, repetitive hooks) produce sharp correlation peaks at MULTIPLE
+        # shift candidates — picking a chorus-repetition match instead of the
+        # true offset is what made Oblivion's offset jump to -14.37 in one
+        # go. If Shazam has read the offset recently, reject correlation
+        # candidates that differ from it by more than this band.
+        if (self._last_audio_off is not None
+                and time.time() - self._last_audio_off_t < 60.0):
+            disagreement = abs(new_off - self._last_audio_off)
+            if disagreement > 4.0:
+                log.info("energy-align: candidate %+.2fs disagrees with Shazam %+.2fs "
+                         "(Δ=%.1fs) — likely chorus-repetition match, rejected",
+                         new_off, self._last_audio_off, disagreement)
+                return
         self.root.after(0, lambda: self._apply_energy_align(new_off, best_score, peak_lift))
 
     def _apply_energy_align(self, new_off, score, lift):
