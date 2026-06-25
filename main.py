@@ -1090,6 +1090,28 @@ class Overlay:
         # actually is over time.
         self._drift_integral = 0.0
         self._drift_integral_t = 0.0  # wall-clock when last updated
+        # ── Live-tunable sync parameters (no rebuild needed) ──
+        # Exposed via GET/POST /tune so the values can be adjusted at runtime
+        # while watching live behavior. Defaults below are the values that
+        # shipped — overrides reset to these on restart.
+        self._tune = {
+            "deadband":              0.8,   # |drift| below this is left alone
+            "agree":                 2.0,   # 2-read agreement window (s)
+            "agree_live":            4.0,   # live-arrangement agreement window
+            "spread_reset":         20.0,   # chorus-ambiguity spread threshold
+            "reset_offset_max":      5.0,   # only reset when |offset| < this
+            "drift_fastpath":        4.0,   # integral → apply single-read corr
+            "drift_align_trigger":   6.0,   # integral → trigger auto-align
+            "drift_min_for_accum":   0.8,   # |drift| > this contributes to integral
+            "drift_fastpath_cap":    5.0,   # |diff| < this for fast-path safety
+            "auto_align_cooldown":  25.0,   # min s between auto-aligns
+            "auto_align_min_pos":   12.0,   # min player pos before auto-align
+            "shazam_lock_grace":    30.0,   # auto-align skipped within N s of lock
+            "continuous_recal_ms": 15000,   # background correlation cadence
+            "energy_apply_min":      0.4,   # min |new-old| to apply correlation
+            "energy_lift_floor":     0.10,  # min peak-vs-median lift to accept
+            "energy_max_offset":    60.0,   # |new_off| < this for sanity
+        }
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
         self._pending_corr = 1e9      # a large sound offset awaiting a 2nd confirming read
@@ -1670,8 +1692,8 @@ class Overlay:
                             corr = true_now - st["position"]   # offset the AUDIO implies
                             diff = corr - self.offset          # how far the DISPLAY is off NOW
                             dur = self._cur_duration or st.get("duration") or 0
-                            DEADBAND = 0.8      # within this the exact player clock wins
-                            AGREE = 2.0         # two reads this close ⇒ a corroborated offset
+                            DEADBAND = self._tune["deadband"]      # within this the exact player clock wins
+                            AGREE = self._tune["agree"]            # two reads this close ⇒ a corroborated offset
                             # MODE decides the whole strategy. A STUDIO track has an EXACT
                             # player clock, so its true offset is ~0 and big readings are
                             # artifacts (Shazam matching a repeated chorus) to distrust →
@@ -1715,7 +1737,7 @@ class Overlay:
                                 # when large, smoothing toward it to ride tempo drift without
                                 # jitter, and keep following (pending stays set so each read
                                 # nudges the offset).
-                                AGREE_LIVE = 4.0
+                                AGREE_LIVE = self._tune["agree_live"]
                                 if abs(corr - self._pending_corr) < AGREE_LIVE:
                                     new = (corr if abs(self.offset) < DEADBAND
                                            else 0.6 * corr + 0.4 * self.offset)
@@ -1726,7 +1748,7 @@ class Overlay:
                                 else:
                                     self._pending_corr = corr
                                     log.info("sync(live): holding %+.2fs for a 2nd read", corr)
-                            elif spread > 20.0 and abs(self.offset) < 5.0:
+                            elif spread > self._tune["spread_reset"] and abs(self.offset) < self._tune["reset_offset_max"]:
                                 # STUDIO with AMBIGUOUS reads (repeated choruses): the player
                                 # clock is exact, so do NOT chase these contradictory offsets —
                                 # reset (fixes サクラミラージュ's -10s/-70s chorus jumps).
@@ -1755,7 +1777,8 @@ class Overlay:
                                 log.info("sync: CONFIRMED offset %+.2fs (two reads agree) → applied", corr)
                                 self._last_sound_lock_t = time.time()
                                 self._drift_integral = 0.0
-                            elif self._drift_integral > 4.0 and abs(diff) < 5.0:
+                            elif (self._drift_integral > self._tune["drift_fastpath"]
+                                  and abs(diff) < self._tune["drift_fastpath_cap"]):
                                 # Drift has been accumulating without confirmation. Apply the
                                 # current single-read correction now — waiting for two agreeing
                                 # reads costs the user 10+ s of wrong sync, and the drift
@@ -1786,12 +1809,12 @@ class Overlay:
                                 dt_last = (min(15.0, now_t - self._drift_integral_t)
                                            if self._drift_integral_t > 0 else 4.0)
                                 self._drift_integral_t = now_t
-                                if abs(diff) > 0.8:
+                                if abs(diff) > self._tune["drift_min_for_accum"]:
                                     self._drift_integral += abs(diff) * dt_last
                                 else:
                                     # decay quickly when drift drops back into the deadband
                                     self._drift_integral *= 0.5
-                                if self._drift_integral > 6.0:
+                                if self._drift_integral > self._tune["drift_align_trigger"]:
                                     log.info("drift integral %.1f crossed threshold → auto-aligning by ear",
                                              self._drift_integral)
                                     self._drift_integral = 0.0
@@ -2667,6 +2690,25 @@ class Overlay:
     def reset_offset(self):
         self.offset = 0.0
 
+    def get_tune(self):
+        """Snapshot of the live-tunable sync parameters (for GET /tune)."""
+        return dict(self._tune)
+
+    def set_tune(self, key, value):
+        """Set one live-tunable sync parameter. Returns (ok, message). Coerces
+        the value to the existing type. Only known keys accepted — silent reject
+        of unknowns is a footgun for tuning."""
+        if key not in self._tune:
+            return False, f"unknown tune key {key!r}"
+        try:
+            old = self._tune[key]
+            new = type(old)(value)
+        except Exception as e:
+            return False, f"can't coerce {value!r} to {type(self._tune[key]).__name__}: {e}"
+        self._tune[key] = new
+        log.info("tune: %s %r → %r", key, old, new)
+        return True, f"{key}: {old} → {new}"
+
     # ── appearance (persisted) ──
 
     def _geom_y(self):
@@ -3324,16 +3366,16 @@ class Overlay:
         if not (st and st.get("status") == PLAYING):
             return
         now = time.time()
-        # Don't run if Shazam locked the offset in the last 30 s — its
-        # recent confirmation is more authoritative than re-checking by ear.
-        if reason != "drift" and now - self._last_sound_lock_t < 30.0:
+        # Don't run if Shazam locked the offset recently — its confirmation
+        # is more authoritative than re-checking by ear.
+        if reason != "drift" and now - self._last_sound_lock_t < self._tune["shazam_lock_grace"]:
             return
-        # Don't run within 25 s of the previous auto-align (CPU budget).
-        if now - self._last_align_t < 25.0:
+        # Don't run within the cooldown of the previous auto-align (CPU budget).
+        if now - self._last_align_t < self._tune["auto_align_cooldown"]:
             return
         # Need to be reasonably into the track so there are vocals to match.
         vpos = float(st.get("position") or 0.0)
-        if vpos < 12.0:
+        if vpos < self._tune["auto_align_min_pos"]:
             return
         self._last_align_t = now
         # Prefer Whisper alignment when it's bundled — its transcript match is
@@ -3439,7 +3481,7 @@ class Overlay:
         all_scores = np.array([s for (_, s) in scores])
         median = float(np.median(all_scores))
         peak_lift = best_score - median
-        if peak_lift < 0.10:
+        if peak_lift < self._tune["energy_lift_floor"]:
             log.info("energy-align: weak peak (best %.3f, median %.3f, lift %.3f) — no change",
                      best_score, median, peak_lift)
             return
@@ -3447,10 +3489,10 @@ class Overlay:
         # to the LRC. Since the displayed song-time = player_pos + self.offset,
         # the new offset becomes (current offset + best_shift).
         new_off = round(self.offset + best_shift, 2)
-        if abs(new_off) > 60.0:
+        if abs(new_off) > self._tune["energy_max_offset"]:
             log.info("energy-align: candidate offset %+.1fs out of range — skipped", new_off)
             return
-        if abs(new_off - self.offset) < 0.4:
+        if abs(new_off - self.offset) < self._tune["energy_apply_min"]:
             log.info("energy-align: drift %+.2fs within tolerance — no change",
                      new_off - self.offset)
             return
@@ -3486,7 +3528,8 @@ class Overlay:
         try:
             self._maybe_auto_align(reason="periodic")
         finally:
-            self._auto_align_after = self.root.after(15000, self._periodic_auto_align)
+            self._auto_align_after = self.root.after(
+                int(self._tune["continuous_recal_ms"]), self._periodic_auto_align)
 
     def _apply_align(self, res):
         self._aligning = False

@@ -56,6 +56,7 @@ _ROUTES = {
         "/status": "now-playing + matched song + sync + current line",
         "/logs": "recent log lines (?n=200) — the matching decisions",
         "/lyrics": "the full loaded lyric lines",
+        "/tune": "live sync-tuning parameters (drift_fastpath, agree, spread_reset, …)",
         "/import/status": "current playlist import state: state, done, total, ok, skipped, failed_count",
     },
     "POST": {
@@ -64,6 +65,7 @@ _ROUTES = {
         "/nudge": "shift sync by ?s=2.5 seconds (+ = lyrics later)",
         "/reset": "reset the sync offset to 0",
         "/align": "sync by listening — transcribe the audio + match to lyrics (needs faster-whisper)",
+        "/tune": "set sync param: ?key=drift_fastpath&value=3.0 (one per call); or POST JSON {k:v,...}",
         "/reindex": "rescan the local library",
         "/import/csv": "start a playlist CSV import: ?path=C:\\path\\to\\file.csv [&translate=1] [&force=1]",
     },
@@ -195,6 +197,11 @@ def make_handler(app, log_file, token):
                     except Exception:
                         lines = []
                     self._send(200, {"ok": True, "lines": lines[-n:]})
+                elif path == "/tune":
+                    try:
+                        self._send(200, {"ok": True, "tune": app.get_tune()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/import/status":
                     self._send(200, {"ok": True, **_import_status()})
                 elif path == "/":
@@ -207,7 +214,14 @@ def make_handler(app, log_file, token):
 
         def do_POST(self):
             try:
-                self._drain_body()
+                # Capture body for JSON-bearing endpoints BEFORE draining it.
+                try:
+                    n = int(self.headers.get("Content-Length", 0) or 0)
+                except Exception:
+                    n = 0
+                body = b""
+                if n > 0:
+                    body = self.rfile.read(min(n, _MAX_BODY))
                 if not self._authed():
                     return self._err(401, "missing or bad X-API-Token")
                 path = urlparse(self.path).path.rstrip("/") or "/"
@@ -232,6 +246,30 @@ def make_handler(app, log_file, token):
                 elif path == "/align":
                     self._run(app.align_by_listening)
                     self._send(200, {"ok": True, "action": "syncing by listening (transcribe + match)"})
+                elif path == "/tune":
+                    # Accept either ?key=X&value=Y OR a JSON body {k1: v1, k2: v2}.
+                    # Returns the resulting tune dict + any per-key errors.
+                    updates = {}
+                    if "key" in q:
+                        updates[q.get("key", [""])[0]] = q.get("value", [""])[0]
+                    if body:
+                        try:
+                            parsed = json.loads(body.decode("utf-8") or "{}")
+                            if isinstance(parsed, dict):
+                                updates.update(parsed)
+                        except Exception as e:
+                            return self._err(400, f"bad JSON body: {e}")
+                    if not updates:
+                        return self._err(400, "no updates: send ?key=X&value=Y or JSON body")
+                    # Apply on the Tk thread (writing to the tune dict is fine
+                    # without a lock — only the main loop reads it during the
+                    # next sync tick).
+                    results = []
+                    for k, v in updates.items():
+                        ok, msg = app.set_tune(k, v)
+                        results.append({"key": k, "ok": ok, "msg": msg})
+                    self._send(200, {"ok": all(r["ok"] for r in results),
+                                     "results": results, "tune": app.get_tune()})
                 elif path == "/reindex":
                     self._run(app.index.refresh)
                     self._send(200, {"ok": True, "action": "library rescanned"})

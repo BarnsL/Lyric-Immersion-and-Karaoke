@@ -599,6 +599,37 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-041 — Live-tunable sync params via /tune API (no rebuild needed) 🟢
+**Request:** allow adjusting sync tuning constants on the fly without rebuilding —
+iterating on `DEADBAND`/`AGREE`/spread thresholds/drift integrals took 5-minute
+rebuild cycles each.
+**Fix (pushed, v1.0.30):**
+1. Lifted all sync constants to a `self._tune` dict on Overlay (15 parameters
+   covering Shazam confirmation gates, drift integral, energy correlation, and
+   auto-align cadence). Defaults match what shipped.
+2. Replaced every hardcoded literal in `_consume_async` + `_maybe_auto_align`
+   + `_run_energy_correlation` + `_periodic_auto_align` with `self._tune[key]`
+   lookups.
+3. Added Overlay methods `get_tune()` (snapshot dict) and `set_tune(key, value)`
+   (type-coercing setter with logging).
+4. Added two API endpoints:
+   - `GET /tune` → current state of every parameter
+   - `POST /tune?key=X&value=Y` OR `POST /tune` with JSON body `{k: v, …}` →
+     update one or many; returns per-key results + full new state
+**Tunable keys** (defaults in parens):
+- `deadband` (0.8), `agree` (2.0), `agree_live` (4.0) — Shazam confirmation gates
+- `spread_reset` (20), `reset_offset_max` (5) — chorus-ambiguity reset thresholds
+- `drift_fastpath` (4.0), `drift_align_trigger` (6.0), `drift_min_for_accum` (0.8),
+  `drift_fastpath_cap` (5.0) — drift integral mechanics
+- `auto_align_cooldown` (25), `auto_align_min_pos` (12), `shazam_lock_grace` (30) —
+  auto-align gating
+- `continuous_recal_ms` (15000) — background correlation cadence
+- `energy_apply_min` (0.4), `energy_lift_floor` (0.10), `energy_max_offset` (60) —
+  energy correlation acceptance thresholds
+**Verified live:** `curl GET /tune` returns all values; `curl POST /tune?key=K&value=V`
+updates one; `curl POST /tune -d '{"agree":2.5}'` updates many; new values apply
+immediately on the next sync tick (no restart).
+
 ## TICKET-040 — Live-tested on Grimes "Oblivion": chorus reset + slow confirmation hurt sync 🟢
 **Symptom (observed live):** Grimes "Oblivion" started ~15 s desynced (lyrics ahead).
 Energy correlation pulled drift to ~2.4 s, but it stuck there — the offset never fully
