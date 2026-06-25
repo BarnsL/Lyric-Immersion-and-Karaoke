@@ -1070,6 +1070,10 @@ class Overlay:
         self._health_attempts = 0
         self._identifying = False
         self._aligning = False        # sync-by-listening (Whisper) in progress
+        self._last_align_t = 0.0      # wall-clock of last auto-align finish
+        self._align_drift_strikes = 0 # consecutive Shazam reads that disagreed → trigger Whisper
+        self._auto_align_after = None # pending auto-align timer id
+        self._last_sound_lock_t = 0.0 # wall-clock of last confirmed Shazam offset
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
         self._pending_corr = 1e9      # a large sound offset awaiting a 2nd confirming read
@@ -1105,6 +1109,11 @@ class Overlay:
         self.root.after(7000, self._health_check)
         self.root.after(4000, self._viewport_watchdog)
         self._arm_recal(max(4, self.recal_secs or 30))
+        # Background sync-by-listening heartbeat: when faster-whisper is
+        # available, re-checks alignment every ~45s in idle moments. Keeps
+        # lyrics tight on cuts Shazam can't fingerprint (karaoke versions,
+        # live arrangements, off-vocal mixes — Niconico karaoke videos).
+        self._auto_align_after = self.root.after(45000, self._periodic_auto_align)
 
     # ── per-track ──
 
@@ -1141,6 +1150,9 @@ class Overlay:
         self._gen_defers = 0       # fresh defer budget for this track's fetch
         self._fetch_key = None     # let this track re-attempt a real fetch (upgrade path)
         self._recent_corr = []     # reset ambiguity history for the new song
+        self._align_drift_strikes = 0   # reset drift counter for the new song
+        self._last_align_t = 0.0        # let auto-align run early on the new song
+        self._last_sound_lock_t = 0.0   # no Shazam lock yet on the new song
         self._live_arrangement = is_live_arrangement(title)  # LIVE/short/alt → follow offset
         log.info("track change: %r / %r (dur %s)%s", title, artist, duration,
                  " [live-arrangement]" if self._live_arrangement else "")
@@ -1231,6 +1243,14 @@ class Overlay:
         if self.generate_on and not self._live_mode:
             self.root.after(11000,
                             lambda t=self._track_seq: self._maybe_generate(t))
+        # Schedule an early auto-align ~25 s into the track — by then vocals
+        # have had a chance to start (covers Grimes "Genesis"-class intros)
+        # and Shazam has had a couple of attempts. If Shazam locked it, the
+        # auto-align silently no-ops; if not, this catches off-vocal /
+        # karaoke / live cuts Shazam can't fingerprint.
+        if not self._live_mode:
+            self.root.after(25000,
+                            lambda t=self._track_seq: self._track_start_auto_align(t))
 
     def _maybe_generate(self, track_seq):
         """Deadline fallback: still no lyrics for this track → generate by ear.
@@ -1705,16 +1725,33 @@ class Overlay:
                                 self._pending_corr = 1e9
                                 log.info("sync: audio_off≈0 but showing %+.2fs → AUTO-RESET to 0", self.offset)
                                 self.offset = 0.0
+                                self._last_sound_lock_t = time.time()
+                                self._align_drift_strikes = 0
                             elif abs(corr - self._pending_corr) < AGREE:
                                 # real non-zero offset CORROBORATED by a 2nd agreeing read → apply.
                                 self.offset = round(corr, 2)
                                 self._pending_corr = 1e9
                                 log.info("sync: CONFIRMED offset %+.2fs (two reads agree) → applied", corr)
+                                self._last_sound_lock_t = time.time()
+                                self._align_drift_strikes = 0
                             else:
                                 # one-read non-zero offset — hold for confirmation; don't disturb
                                 # a possibly-correct current offset (audio≈0 reset handles a wrong one).
                                 self._pending_corr = corr
                                 log.info("sync: holding %+.2fs pending a 2nd agreeing read", corr)
+                                # Whisper-align fallback: Shazam keeps reading a
+                                # non-trivial drift but won't confirm (repeated
+                                # choruses, karaoke version, off-vocal cut). After
+                                # 3 such reads, trigger a Whisper alignment in
+                                # the background — its transcript-based matching
+                                # works when Shazam fingerprinting can't.
+                                if abs(diff) > 1.5:
+                                    self._align_drift_strikes += 1
+                                    if self._align_drift_strikes >= 3:
+                                        self._align_drift_strikes = 0
+                                        log.info("persistent Shazam drift %+.2fs → auto-aligning by ear",
+                                                 diff)
+                                        self._maybe_auto_align(reason="drift")
                 elif self._title_locked:
                     # The lyrics came from a confident EXACT match on a clean
                     # official title, but Shazam heard a DIFFERENT song — almost
@@ -3183,11 +3220,15 @@ class Overlay:
         st = self.media.get() or {}
         return float(st.get("position") or 0.0)
 
-    def align_by_listening(self):
+    def align_by_listening(self, silent=False):
         """On-demand: transcribe a few seconds of the live vocals and match them
         to the loaded lyrics to set the sync offset — fixes timing when Shazam
         can't identify the exact cut. Opt-in, runs once in a background thread,
-        and no-ops gracefully if faster-whisper isn't installed."""
+        and no-ops gracefully if faster-whisper isn't installed.
+
+        ``silent=True`` suppresses hints for the background auto-align that runs
+        periodically — the user shouldn't see "Listening to sync…" every minute
+        when nothing's wrong."""
         if self._aligning:
             return
         try:
@@ -3196,14 +3237,18 @@ class Overlay:
         except Exception as e:
             ok, err = False, str(e)
         if not ok:
-            self._hint("Sync-by-listening needs faster-whisper — see the README")
+            if not silent:
+                self._hint("Sync-by-listening needs faster-whisper — see the README")
             log.info("align requested but faster-whisper not available: %s", err)
             return
         if not self.lines:
-            self._hint("Play a recognised song first, then sync by listening")
+            if not silent:
+                self._hint("Play a recognised song first, then sync by listening")
             return
         self._aligning = True
-        self._hint("🎧 Listening to sync the lyrics…")
+        self._auto_align_silent = silent
+        if not silent:
+            self._hint("🎧 Listening to sync the lyrics…")
         lines, lang = self.lines, self.meta.get("lang", "ja")
 
         def work():
@@ -3216,10 +3261,59 @@ class Overlay:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _track_start_auto_align(self, track_seq):
+        """Fires once ~25 s into a new track, IF this is still that track. A
+        quick early sync-by-ear catches cuts Shazam can't fingerprint right
+        when the song settles in, instead of waiting for the periodic loop."""
+        if track_seq != self._track_seq:
+            return
+        self._maybe_auto_align(reason="track-start")
+
+    def _maybe_auto_align(self, reason="periodic"):
+        """Background, automatic sync-by-listening. Runs only when conditions are
+        right: lyrics loaded, song playing, no other alignment in flight, not in
+        live mode (whole event), and Shazam hasn't locked the offset very
+        recently. Cheap to call — no-ops when conditions aren't met."""
+        if self._aligning or not self.lines or self._live_mode:
+            return
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING):
+            return
+        now = time.time()
+        # Don't run if Shazam locked the offset in the last 30 s — its
+        # recent confirmation is more authoritative than re-checking by ear.
+        if reason != "drift" and now - self._last_sound_lock_t < 30.0:
+            return
+        # Don't run within 25 s of the previous auto-align (CPU budget).
+        if now - self._last_align_t < 25.0:
+            return
+        # Need to be reasonably into the track so there are vocals to match.
+        vpos = float(st.get("position") or 0.0)
+        if vpos < 12.0:
+            return
+        self._last_align_t = now
+        log.info("auto-align (%s) — checking sync by ear", reason)
+        self.align_by_listening(silent=True)
+
+    def _periodic_auto_align(self):
+        """Background heartbeat: every ~45 s, if Shazam hasn't locked the offset
+        recently and we have lyrics, transcribe a quick clip and re-align. Keeps
+        sync tight even on songs/cuts Shazam can't fingerprint (karaoke versions,
+        live arrangements, off-vocal mixes). The user wanted "always listening"
+        — this is it, but at a CPU-friendly cadence."""
+        try:
+            self._maybe_auto_align(reason="periodic")
+        finally:
+            # Re-schedule, jittered to avoid synchronizing with other timers.
+            self._auto_align_after = self.root.after(45000, self._periodic_auto_align)
+
     def _apply_align(self, res):
         self._aligning = False
+        silent = getattr(self, "_auto_align_silent", False)
+        self._auto_align_silent = False
         if not res:
-            self._hint("Couldn't hear the lyrics clearly — try again")
+            if not silent:
+                self._hint("Couldn't hear the lyrics clearly — try again")
             return
         offset, ratio, _start = res
         # A BIG alignment offset on a song whose player clock is already accurate is
@@ -3228,13 +3322,24 @@ class Overlay:
         # the match is strong; otherwise snap back to 0 (the player position), which
         # is right far more often than a low-confidence big jump.
         if abs(offset) > 6.0 and ratio < 0.72:
-            self.offset = 0.0
-            log.info("align: large offset %.1fs at low match %.2f → reset to 0", offset, ratio)
-            self._hint("Couldn't sync confidently — reset to 0")
+            if not silent:
+                self.offset = 0.0
+                log.info("align: large offset %.1fs at low match %.2f → reset to 0",
+                         offset, ratio)
+                self._hint("Couldn't sync confidently — reset to 0")
+            return
+        # Background auto-align: only apply when the new offset DIFFERS meaningfully
+        # from the current one. A tiny correction is noise — don't churn the offset.
+        if silent and abs(offset - self.offset) < 0.6:
+            log.info("auto-align: drift %+.2fs within tolerance — no change", offset - self.offset)
             return
         self.offset = round(offset, 2)
-        log.info("aligned by listening: offset=%.2fs (match %.2f)", offset, ratio)
-        self._hint(f"Synced by ear ({offset:+.1f}s)")
+        log.info("aligned by listening: offset=%.2fs (match %.2f)%s",
+                 offset, ratio, " [auto]" if silent else "")
+        if not silent:
+            self._hint(f"Synced by ear ({offset:+.1f}s)")
+        else:
+            self._hint(f"🎤 Auto-synced ({offset:+.1f}s)")
 
     def quit(self):
         self._destroy_mirrors()
