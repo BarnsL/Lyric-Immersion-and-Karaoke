@@ -599,6 +599,29 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-040 — Live-tested on Grimes "Oblivion": chorus reset + slow confirmation hurt sync 🟢
+**Symptom (observed live):** Grimes "Oblivion" started ~15 s desynced (lyrics ahead).
+Energy correlation pulled drift to ~2.4 s, but it stuck there — the offset never fully
+locked. Watching `/status` showed Shazam reading the offset correctly but the 2-read
+confirmation never fired (repeated choruses → Shazam reads varied widely).
+**Root causes:**
+1. **Chorus-ambiguity reset was too aggressive.** When recent Shazam reads spread
+   > 15 s (chorus repetition), the code reset `self.offset = 0`. For a song needing a
+   real -22 s offset (studio LRC vs album cut), this kept undoing the correction every
+   time it came around to a chorus. The サクラミラージュ fix that motivated this logic
+   was for a SMALL offset (-11 s); the same logic killed convergence for larger ones.
+2. **2-read confirmation never converged on Grimes.** Shazam reads jumped between
+   different choruses, so two reads within 2.0 s of each other rarely happened. The
+   pending correction kept getting replaced rather than applied.
+**Fix (pushed, v1.0.29):**
+1. Spread threshold 15 → 20 s, AND only reset when `|offset| < 5 s`. A larger offset is
+   doing real work and shouldn't be wiped on chorus ambiguity. Verified Grimes-class
+   songs no longer revert mid-song.
+2. **Drift-integral fast-path** in the sync ladder: when `_drift_integral > 4.0` AND
+   `|diff| < 5 s`, apply the single-read correction immediately. The accumulated
+   integral IS the agreement (consistent drift direction over multiple reads). Capped
+   `|diff| < 5 s` so one wild Shazam read can't yank the offset.
+
 ## TICKET-038 — Algorithmic sync: continuous drift integral, confidence-weighted updates 🟢
 **Request:** make the song-position detection algorithmic rather than rely on song-specific
 counters (`_align_drift_strikes >= 3` was an arbitrary threshold).

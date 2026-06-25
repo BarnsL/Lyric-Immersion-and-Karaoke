@@ -1726,14 +1726,19 @@ class Overlay:
                                 else:
                                     self._pending_corr = corr
                                     log.info("sync(live): holding %+.2fs for a 2nd read", corr)
-                            elif spread > 15.0:
+                            elif spread > 20.0 and abs(self.offset) < 5.0:
                                 # STUDIO with AMBIGUOUS reads (repeated choruses): the player
                                 # clock is exact, so do NOT chase these contradictory offsets —
-                                # reset to 0 (fixes サクラミラージュ's -10s/-70s chorus jumps).
+                                # reset (fixes サクラミラージュ's -10s/-70s chorus jumps).
+                                # But ONLY when the current offset is small (< 5 s). A larger
+                                # offset is doing real work (Grimes "Oblivion" needs ~-22 s for
+                                # the studio LRC vs the album cut) and resetting it on chorus
+                                # ambiguity made sync lurch back to wrong every chorus. Spread
+                                # threshold raised 15 → 20 for the same reason.
                                 self._pending_corr = 1e9
                                 if abs(self.offset) > DEADBAND:
-                                    log.info("sync: ambiguous reads (spread %.0fs — repeated "
-                                             "sections) → RESET to 0", spread)
+                                    log.info("sync: ambiguous reads (spread %.0fs, small offset "
+                                             "%+.2fs) → backing off to 0", spread, self.offset)
                                     self.offset = 0.0
                             elif abs(corr) <= DEADBAND:
                                 # audio says NO offset needed but we're showing one → drifted →
@@ -1748,6 +1753,19 @@ class Overlay:
                                 self.offset = round(corr, 2)
                                 self._pending_corr = 1e9
                                 log.info("sync: CONFIRMED offset %+.2fs (two reads agree) → applied", corr)
+                                self._last_sound_lock_t = time.time()
+                                self._drift_integral = 0.0
+                            elif self._drift_integral > 4.0 and abs(diff) < 5.0:
+                                # Drift has been accumulating without confirmation. Apply the
+                                # current single-read correction now — waiting for two agreeing
+                                # reads costs the user 10+ s of wrong sync, and the drift
+                                # integral being high IS the agreement (consistent direction
+                                # over time). Cap |diff| < 5 s so a wild single read can't yank.
+                                self.offset = round(corr, 2)
+                                self._pending_corr = 1e9
+                                log.info("sync: applying %+.2fs via drift-integral fast-path "
+                                         "(integral=%.1f, drift=%+.2fs)",
+                                         corr, self._drift_integral, diff)
                                 self._last_sound_lock_t = time.time()
                                 self._drift_integral = 0.0
                             else:
