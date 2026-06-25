@@ -1080,9 +1080,16 @@ class Overlay:
         self._identifying = False
         self._aligning = False        # sync-by-listening (Whisper) in progress
         self._last_align_t = 0.0      # wall-clock of last auto-align finish
-        self._align_drift_strikes = 0 # consecutive Shazam reads that disagreed → trigger Whisper
         self._auto_align_after = None # pending auto-align timer id
         self._last_sound_lock_t = 0.0 # wall-clock of last confirmed Shazam offset
+        # ── Algorithmic offset state (continuous, no strike counters) ──
+        # `_drift_integral` accumulates |drift| × time between Shazam reads:
+        # 1.5s drift for 4s = 6.0 integral. Triggers auto-align when it
+        # crosses 6.0 (≈ a 1s drift held for 6s, or a 3s drift held for 2s).
+        # No arbitrary count threshold — proportional to how wrong the sync
+        # actually is over time.
+        self._drift_integral = 0.0
+        self._drift_integral_t = 0.0  # wall-clock when last updated
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
         self._pending_corr = 1e9      # a large sound offset awaiting a 2nd confirming read
@@ -1735,32 +1742,42 @@ class Overlay:
                                 log.info("sync: audio_off≈0 but showing %+.2fs → AUTO-RESET to 0", self.offset)
                                 self.offset = 0.0
                                 self._last_sound_lock_t = time.time()
-                                self._align_drift_strikes = 0
+                                self._drift_integral = 0.0
                             elif abs(corr - self._pending_corr) < AGREE:
                                 # real non-zero offset CORROBORATED by a 2nd agreeing read → apply.
                                 self.offset = round(corr, 2)
                                 self._pending_corr = 1e9
                                 log.info("sync: CONFIRMED offset %+.2fs (two reads agree) → applied", corr)
                                 self._last_sound_lock_t = time.time()
-                                self._align_drift_strikes = 0
+                                self._drift_integral = 0.0
                             else:
-                                # one-read non-zero offset — hold for confirmation; don't disturb
-                                # a possibly-correct current offset (audio≈0 reset handles a wrong one).
+                                # one-read non-zero offset — hold for confirmation.
                                 self._pending_corr = corr
                                 log.info("sync: holding %+.2fs pending a 2nd agreeing read", corr)
-                                # Whisper-align fallback: Shazam keeps reading a
-                                # non-trivial drift but won't confirm (repeated
-                                # choruses, karaoke version, off-vocal cut). After
-                                # 3 such reads, trigger a Whisper alignment in
-                                # the background — its transcript-based matching
-                                # works when Shazam fingerprinting can't.
-                                if abs(diff) > 1.5:
-                                    self._align_drift_strikes += 1
-                                    if self._align_drift_strikes >= 3:
-                                        self._align_drift_strikes = 0
-                                        log.info("persistent Shazam drift %+.2fs → auto-aligning by ear",
-                                                 diff)
-                                        self._maybe_auto_align(reason="drift")
+                                # ── Continuous drift-integral fallback ──
+                                # When Shazam reads a non-trivial drift but won't
+                                # confirm, accumulate |drift|·dt over time. Trigger
+                                # the energy correlator / Whisper align when the
+                                # integral crosses 6.0 — proportional to how wrong
+                                # the sync actually is, not an arbitrary count of
+                                # reads. A 1.5s drift held for 4s ≈ integral 6;
+                                # a 3s drift held for 2s ≈ integral 6; either way
+                                # the correction fires when warranted, not on a
+                                # hardcoded strike threshold.
+                                now_t = time.time()
+                                dt_last = (min(15.0, now_t - self._drift_integral_t)
+                                           if self._drift_integral_t > 0 else 4.0)
+                                self._drift_integral_t = now_t
+                                if abs(diff) > 0.8:
+                                    self._drift_integral += abs(diff) * dt_last
+                                else:
+                                    # decay quickly when drift drops back into the deadband
+                                    self._drift_integral *= 0.5
+                                if self._drift_integral > 6.0:
+                                    log.info("drift integral %.1f crossed threshold → auto-aligning by ear",
+                                             self._drift_integral)
+                                    self._drift_integral = 0.0
+                                    self._maybe_auto_align(reason="drift-integral")
                 elif self._title_locked:
                     # The lyrics came from a confident EXACT match on a clean
                     # official title, but Shazam heard a DIFFERENT song — almost
@@ -3422,24 +3439,36 @@ class Overlay:
         self.root.after(0, lambda: self._apply_energy_align(new_off, best_score, peak_lift))
 
     def _apply_energy_align(self, new_off, score, lift):
+        # Confidence-weighted update: a sharp correlation peak (high `lift`)
+        # snaps to the measurement; a marginal peak blends conservatively
+        # toward it via EMA. Avoids yanking the offset on noisy detections
+        # while still converging quickly when the signal is strong.
+        # alpha=1.0 when lift≥0.30, falls linearly to 0.3 at the 0.10 floor.
+        alpha = max(0.3, min(1.0, (lift - 0.10) / 0.20 + 0.3))
         prev = self.offset
-        self.offset = new_off
+        blended = (1.0 - alpha) * prev + alpha * new_off
+        self.offset = round(blended, 2)
         self.idx = -1
-        log.info("energy-align: offset %+.2fs → %+.2fs (score %.3f, lift %.3f)",
-                 prev, new_off, score, lift)
-        self._hint(f"🎤 Auto-synced ({new_off:+.1f}s)")
+        # Update drift integral state — a successful correction zeros it.
+        self._drift_integral = 0.0
+        log.info("energy-align: offset %+.2fs → %+.2fs (α=%.2f, score %.3f, lift %.3f)",
+                 prev, self.offset, alpha, score, lift)
+        self._hint(f"🎤 Auto-synced ({self.offset:+.1f}s)")
 
     def _periodic_auto_align(self):
-        """Background heartbeat: every ~45 s, if Shazam hasn't locked the offset
-        recently and we have lyrics, transcribe a quick clip and re-align. Keeps
-        sync tight even on songs/cuts Shazam can't fingerprint (karaoke versions,
-        live arrangements, off-vocal mixes). The user wanted "always listening"
-        — this is it, but at a CPU-friendly cadence."""
+        """Continuous algorithmic sync heartbeat: every ~15 s, check the
+        energy correlation against the LRC. Replaces the old strike-counter
+        approach — every correlation reading is treated as a measurement and
+        either applied (if the peak is sharp and the change is meaningful) or
+        discarded silently. No song-specific thresholds.
+
+        15 s cadence is a balance: tight enough to catch drift within a stanza,
+        loose enough that Shazam-confirmed offsets don't get churned and the
+        rolling vocal buffer (60 s) builds enough new signal between runs."""
         try:
             self._maybe_auto_align(reason="periodic")
         finally:
-            # Re-schedule, jittered to avoid synchronizing with other timers.
-            self._auto_align_after = self.root.after(45000, self._periodic_auto_align)
+            self._auto_align_after = self.root.after(15000, self._periodic_auto_align)
 
     def _apply_align(self, res):
         self._aligning = False

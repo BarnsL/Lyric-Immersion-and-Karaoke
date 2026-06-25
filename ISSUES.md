@@ -599,6 +599,58 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-038 — Algorithmic sync: continuous drift integral, confidence-weighted updates 🟢
+**Request:** make the song-position detection algorithmic rather than rely on song-specific
+counters (`_align_drift_strikes >= 3` was an arbitrary threshold).
+**Fix (pushed, v1.0.28):**
+1. **Drift integral** replaces the strike counter. Each Shazam read where the drift
+   exceeds 0.8s contributes `|drift| × time_since_last_read` to `_drift_integral`; the
+   integral decays by ×0.5 when drift drops into the deadband. When it crosses 6.0
+   (e.g. 1.5s drift held for 4s, or 3s drift held for 2s), auto-align triggers. Cleanly
+   proportional to "how wrong the sync actually is over time," not a hardcoded count of
+   reads.
+2. **Continuous correlation cadence** lowered from 45s → 15s. Energy correlation is now
+   the primary continuous sync source; runs every 15s in the background. The 60s vocal
+   buffer keeps building enough new signal between runs.
+3. **Confidence-weighted application** in `_apply_energy_align`: alpha is computed from
+   correlation peak lift (sharper peak → snap to measurement; marginal peak → blend
+   conservatively via EMA). Avoids yanking the offset on noisy detections while still
+   converging quickly when the signal is strong. `α = max(0.3, min(1.0, (lift-0.10)/0.20 + 0.3))`.
+4. A successful energy-align zeros the drift integral (clean state for next round).
+
+## TICKET-039 — Wide-range future fixes (researched, not yet implemented) 🔴
+**Findings from web research (June 2026) — high-impact, low-risk additions for a future pass:**
+
+- **YouTube CC track fast-path** via `youtube-transcript-api` (pure Python, no
+  yt-dlp/ffmpeg). Many official lyric videos / K-pop / J-pop MVs ship MANUAL caption
+  tracks containing the actual lyrics with millisecond timing — bypasses LRC providers
+  entirely. Auto-captions on music are unreliable (often `[Music]`), but manual tracks
+  are ground truth. Needs a URL-from-browser-tab extraction step.
+
+- **QQ Music / KuGou** via `syncedlyrics_aio` (async fork of existing dep) — adds
+  Tencent provider as a drop-in. KuGou via `ll-kugou-lyric-api` or direct endpoint
+  closes the Mandopop gap. Together cover ~70% of Chinese market.
+
+- **Phonetic matching with `jellyfish`** (pure-Rust wheel, no compiler) for Whisper
+  alignment. Currently uses raw `difflib.SequenceMatcher`; switching to Double Metaphone
+  + Jaro-Winkler would handle ASR noise (silent letters, homophones) far better. Big
+  win when faster-whisper is bundled.
+
+- **ytmdesktop Companion Server** at `localhost:9863/api/v1` with Socket.IO real-time
+  state. Push-based sub-second `videoProgress` beats Windows Media Transport polling
+  for YouTube Music Desktop users specifically. Optional listener, no harm if absent.
+
+- **`silero-vad`** (ONNX, ~1MB) for vocal-section gating. Outperforms `webrtcvad` on
+  music-mixed audio. Could improve Shazam capture hit rate by fingerprinting only
+  during vocal-active windows.
+
+- **Highlighted-line + word-wipe UI with 3-dot lookahead** (UltraStar Deluxe pattern).
+  Tolerates more drift than continuous scrolling because the eye locks to the active
+  word. MIREX-standard tolerance is ±300ms; current scrolling exposes drift at ~150ms.
+
+Status: 🔴 documented as future work after the user asked for "wide-range" benefits.
+None blocking, all additive.
+
 ## TICKET-037 — Niconico (and other video-site) tab suffix taken as song title 🟢
 **Symptom:** Niconico karaoke video showed lyrics ~10 s out of sync no matter what.
 `/status` showed `matched_title: "ニコニコ動画"` and `matched_artist: "Ahoy!! 我ら宝鐘海賊団☆"` —
