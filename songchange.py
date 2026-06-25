@@ -93,6 +93,12 @@ class SongChangeDetector(threading.Thread):
         # isn't bundled (the karaoke .exe is lean by default).
         self._vocal_buf = []       # list of (t_wall, ratio) — last ~60 s
         self._buf_lock = threading.Lock()
+        # latest per-block values, for the live audio-listener diagnostic
+        self._live_rms = 0.0
+        self._live_vr = None
+        self._live_silent = True
+        self._live_t = 0.0
+        self._blocks_seen = 0
 
     # ── control ──
     def set_enabled(self, on: bool):
@@ -184,6 +190,10 @@ class SongChangeDetector(threading.Thread):
 
         floor = max(self.abs_silence, self.rel_silence * self._loud_ema)
         is_silent = rms < floor
+        self._live_rms = rms
+        self._live_silent = bool(is_silent)
+        self._live_t = time.time()
+        self._blocks_seen += 1
 
         if is_silent:
             self._silent_for += dt
@@ -222,6 +232,7 @@ class SongChangeDetector(threading.Thread):
             vr = self._vocal_ratio(np, data)
             if vr is not None:
                 tnow = time.time()
+                self._live_vr = vr
                 with self._buf_lock:
                     self._vocal_buf.append((tnow, vr))
                     # keep the last ~60 s (300 blocks @ 0.2 s)
@@ -257,6 +268,45 @@ class SongChangeDetector(threading.Thread):
         """Instrumental-only baseline ratio learned at the start of the track.
         0.0 if not yet established."""
         return self._vocal_baseline
+
+    def live_audio(self):
+        """Live audio-listener snapshot: what the loopback is hearing RIGHT NOW.
+        Lets the diagnostics show whether audio is even flowing, the current
+        loudness, and the live vocal-band ratio + on/off classification — so a
+        sync problem can be traced to 'no audio', 'all silence', or 'vocals not
+        detected' rather than guessing."""
+        now = time.time()
+        with self._buf_lock:
+            buf = self._vocal_buf[-30:]                # last ~6 s
+        ratios = [r for (_, r) in buf]
+        # adaptive on/off split, mirrors the correlator's logic
+        on = off = 0
+        thresh = None
+        if len(ratios) >= 4:
+            sr = sorted(ratios)
+            med = sr[len(sr) // 2]
+            p75 = sr[int(0.75 * (len(sr) - 1))]
+            thresh = med + 0.5 * (p75 - med)
+            on = sum(1 for r in ratios if r >= thresh)
+            off = len(ratios) - on
+        return {
+            "capturing": (now - self._live_t) < 2.0 if self._live_t else False,
+            "age_s": round(now - self._live_t, 2) if self._live_t else None,
+            "rms": round(self._live_rms, 5),
+            "loud_ema": round(self._loud_ema, 5),
+            "is_silent": self._live_silent,
+            "vocal_ratio": round(self._live_vr, 3) if self._live_vr is not None else None,
+            "vocal_detected_now": (self._live_vr is not None and thresh is not None
+                                   and self._live_vr >= thresh),
+            "window_on_blocks": on,
+            "window_off_blocks": off,
+            "window_thresh": round(thresh, 3) if thresh is not None else None,
+            "vocal_baseline": round(self._vocal_baseline, 3),
+            "buffer_len": len(self._vocal_buf),
+            "blocks_seen": self._blocks_seen,
+            "music_for_s": round(self._music_for, 2),
+            "silent_for_s": round(self._silent_for, 2),
+        }
 
     def _vocal_ratio(self, np, data):
         """Fraction of spectral energy in the vocal band (200-3000 Hz).

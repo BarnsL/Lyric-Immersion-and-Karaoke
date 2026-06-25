@@ -58,6 +58,9 @@ _ROUTES = {
         "/lyrics": "the full loaded lyric lines",
         "/tune": "live sync-tuning parameters (drift_fastpath, agree, spread_reset, …)",
         "/diag": "deep diagnostics: full sync state machine, last energy-correlation, FPS/frame-timing",
+        "/source": "video/music source view: raw SMTC data + what the app derived from it",
+        "/audio": "audio listener: live loudness + vocal-band ratio + recent on/off pattern",
+        "/lyricstate": "lyric current-state analyzer: current/prev/next lines, fill, structural checks",
         "/import/status": "current playlist import state: state, done, total, ok, skipped, failed_count",
     },
     "POST": {
@@ -208,6 +211,21 @@ def make_handler(app, log_file, token):
                 elif path == "/diag":
                     try:
                         self._send(200, {"ok": True, **app.get_diag()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/source":
+                    try:
+                        self._send(200, {"ok": True, **app.get_source()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/audio":
+                    try:
+                        self._send(200, {"ok": True, **app.get_audio()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/lyricstate":
+                    try:
+                        self._send(200, {"ok": True, **app.get_lyric_state()})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/import/status":

@@ -599,6 +599,31 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-050 — Diagnostic views: source / audio listener / lyric-state analyzer 🟢
+**Request:** add a video/music source view, an audio listener, and a lyric current-state
+analyzer to the diagnostics API "and anything else that may help."
+**Fix (pushed, v1.0.38) — three new GET endpoints:**
+- **`/source`** — the RAW Windows SMTC data the app receives (title, artist, album,
+  status, position, duration, rate, source_app) AND what it derived (clean_title,
+  clean_artist, track_tuple, is_cover, cover_original_artist, trusted_duration,
+  live_mode, mv_mode, intro_anchored) + media_error. Traces a desync to the SOURCE
+  (wrong title leaking, stale position, paused) before blaming sync logic.
+- **`/audio`** — live audio LISTENER from the loopback recorder: capturing flag +
+  age, rms, loud_ema, is_silent, live vocal_ratio, vocal_detected_now, window on/off
+  block counts + adaptive threshold, vocal_baseline, buffer_len, blocks_seen,
+  music_for/silent_for. Plus a `recent_pattern` ASCII strip (█/· for the last ~6 s
+  of vocal on/off). Confirms audio is flowing and vocals are being detected.
+- **`/lyricstate`** — current/prev/next lines with timings, karaoke fill_fraction,
+  between_lines flag, lrc_span vs video_duration, and structural anomaly checks
+  (LRC past video end, low coverage, big gaps). Surfaces "lyrics don't fit the song"
+  problems that masquerade as desync.
+Implemented `SongChangeDetector.live_audio()` (latest rms/vocal_ratio/silence) and
+`Overlay.get_source()/get_audio()/get_lyric_state()`.
+**Already paid off:** `/source` revealed the Coffee cover's clean_title still carries
+the "- A!ka | Kaneko Lumi" suffix (cover_original_artist extracts "A!ka" fine, but the
+title isn't fully reduced) — a real title-cleaning gap to tighten. `/lyricstate`
+confirmed that cover is healthily matched (span 180.6 vs video 186.2, no anomalies).
+
 ## TICKET-049 — Energy correlator chorus-repetition phantom (small-shift prior) 🟢
 **Symptom:** intermittent MASSIVE desyncs (offset jumping ~15s). /diag caught the
 mechanism live: on "Coffee - A!ka | Kaneko Lumi" the energy correlator persistently

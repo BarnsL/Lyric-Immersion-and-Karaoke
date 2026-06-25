@@ -2919,6 +2919,122 @@ class Overlay:
             "identifying": self._identifying,
         }
 
+    def get_source(self):
+        """Video/music SOURCE view (GET /source): the RAW media-session data the
+        app receives from Windows SMTC, and what it derived from it. Lets a sync
+        problem be traced to the SOURCE (wrong title leaking, stale position,
+        rate change, no session) before blaming the sync logic."""
+        st = self.media.get() or {}
+        STATUS = {0: "closed", 1: "opened", 2: "changing", 3: "stopped",
+                  4: "playing", 5: "paused"}
+        return {
+            "raw": {
+                "title": st.get("title"),
+                "artist": st.get("artist"),
+                "album": st.get("album"),
+                "status": STATUS.get(st.get("status"), st.get("status")),
+                "position": round(st.get("position", 0.0), 2) if st else None,
+                "duration": st.get("duration"),
+                "rate": st.get("rate"),
+                "source_app": st.get("source"),
+            },
+            "derived": {
+                "clean_title": self._clean_title_cache,
+                "clean_artist": self._clean_artist_cache,
+                "track_tuple": list(self._track) if self._track else None,
+                "is_cover": self._is_cover,
+                "cover_original_artist": self._cover_original_artist,
+                "trusted_duration": self._trusted_duration(st) if st else None,
+                "live_mode": self._live_mode,
+                "mv_mode": self._mv_mode,
+                "intro_anchored": self._intro_anchored,
+            },
+            "media_error": getattr(self.media, "error", None),
+        }
+
+    def get_audio(self):
+        """Audio LISTENER view (GET /audio): what the loopback recorder is
+        hearing right now — loudness, the live vocal-band ratio + on/off
+        classification, and a compact recent on/off pattern. Confirms audio is
+        flowing and whether vocals are being detected (the correlator's input)."""
+        live = {}
+        try:
+            if self._boundary:
+                live = self._boundary.live_audio()
+        except Exception as e:
+            live = {"error": str(e)}
+        # compact recent vocal on/off pattern (last ~6 s) as a string
+        pattern = None
+        try:
+            hist = self._boundary.vocal_history(6.0) if self._boundary else []
+            if hist:
+                rs = [r for (_, r) in hist]
+                srt = sorted(rs)
+                med = srt[len(srt) // 2]
+                p75 = srt[int(0.75 * (len(srt) - 1))]
+                th = med + 0.5 * (p75 - med)
+                pattern = "".join("█" if r >= th else "·" for r in rs[-40:])
+        except Exception:
+            pass
+        return {"live": live, "recent_pattern": pattern,
+                "boundary_on": self.boundary_on}
+
+    def get_lyric_state(self):
+        """Lyric CURRENT-STATE analyzer (GET /lyricstate): where we are in the
+        loaded lyrics right now, the surrounding lines with their timings, the
+        karaoke-fill fraction, and structural sanity checks (LRC span vs song
+        duration, gaps, lines past the end). Surfaces 'lyrics don't fit the
+        song' problems that look like desync."""
+        st = self.media.get() or {}
+        pos = st.get("position")
+        eff = (pos + self.offset) if isinstance(pos, (int, float)) else None
+        n = len(self.lines)
+        cur = -1
+        if eff is not None:
+            for i, ln in enumerate(self.lines):
+                if ln.start <= eff < ln.end:
+                    cur = i
+                    break
+        def _line(i):
+            if 0 <= i < n:
+                ln = self.lines[i]
+                return {"i": i, "start": round(ln.start, 2), "end": round(ln.end, 2),
+                        "jp": ln.jp[:60], "rm": (ln.rm or "")[:50], "en": (ln.en or "")[:50]}
+            return None
+        # if between lines, find the next upcoming line
+        nxt = cur + 1 if cur >= 0 else next(
+            (i for i, ln in enumerate(self.lines) if eff is not None and ln.start > eff), -1)
+        fill = None
+        if cur >= 0 and eff is not None:
+            ln = self.lines[cur]
+            dur = ln.end - ln.start
+            fill = round(max(0.0, min(1.0, (eff - ln.start) / dur)), 2) if dur > 0 else None
+        span = self.lines[-1].end if self.lines else 0.0
+        vdur = st.get("duration") or 0.0
+        # structural checks
+        anomalies = []
+        if vdur and span and span > vdur + 15:
+            anomalies.append(f"LRC ends {span - vdur:.0f}s PAST video end")
+        if vdur and span and span < vdur * 0.6:
+            anomalies.append(f"LRC covers only {span / vdur * 100:.0f}% of the video")
+        gaps = sum(1 for a, b in zip(self.lines, self.lines[1:]) if b.start - a.end > 8)
+        if gaps:
+            anomalies.append(f"{gaps} gap(s) >8s between lines")
+        return {
+            "line_count": n,
+            "effective_song_time": round(eff, 2) if eff is not None else None,
+            "current": _line(cur),
+            "prev": _line(cur - 1) if cur > 0 else None,
+            "next": _line(nxt),
+            "fill_fraction": fill,
+            "between_lines": cur < 0 and eff is not None,
+            "lrc_span": round(span, 1),
+            "video_duration": round(vdur, 1) if vdur else None,
+            "span_vs_video": round(span - vdur, 1) if vdur and span else None,
+            "meta": {k: self.meta.get(k) for k in ("title", "artist", "lang", "source", "duration")},
+            "anomalies": anomalies,
+        }
+
     def set_tune(self, key, value):
         """Set one live-tunable sync parameter. Returns (ok, message). Coerces
         the value to the existing type. Only known keys accepted — silent reject
