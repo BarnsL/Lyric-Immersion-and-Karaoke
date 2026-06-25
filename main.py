@@ -1411,6 +1411,49 @@ class Overlay:
                             return True
         return False
 
+    def _prefer_cjk_cache(self, artist, heard_title, duration=None):
+        """When Shazam returns a ROMANIZED/English title for a CJK song (e.g.
+        "Ahoy!! We are Houshou Pirates" for 宝鐘マリン's "Ahoy!! 我ら宝鐘海賊団☆"),
+        the English title fetches/loads English lyrics even though the video is
+        the original Japanese. If a CJK-script cache by the SAME artist exists
+        and shares the leading song token, prefer it — the same "original script
+        wins" rule fetch_lrc uses for romaji vs kanji.
+
+        Returns a Path to a better CJK cache, or None. Only fires when the heard
+        title has no CJK itself (so a real English song is never redirected)."""
+        if _has_cjk(heard_title):
+            return None
+        qa = _norm_title(artist)
+        if not qa:
+            return None
+        # leading Latin token of the heard title (e.g. "ahoy" from
+        # "Ahoy!! We are Houshou Pirates") — the shared anchor across languages.
+        toks = [t for t in re.split(r"[^0-9a-z]+", (heard_title or "").lower()) if len(t) >= 3]
+        if not toks:
+            return None
+        lead = toks[0]
+        best, best_dur = None, None
+        for e in self.index.entries:
+            if not _has_cjk(e.get("title") or ""):
+                continue
+            if _norm_title(e.get("artist") or "") != qa:
+                continue
+            # the CJK title's Latin remnant must contain the same leading token
+            # ("ahoy" survives in "Ahoy!! 我ら宝鐘海賊団☆")
+            etoks = [t for t in re.split(r"[^0-9a-z]+", (e.get("title") or "").lower())
+                     if len(t) >= 3]
+            if lead not in etoks:
+                continue
+            # prefer a duration-consistent candidate when we know the duration
+            if duration and e.get("dur") and abs(e["dur"] - duration) > 12:
+                continue
+            best, best_dur = e["path"], e.get("dur")
+            break
+        if best:
+            log.info("preferring original-script cache %s over romanized title %r",
+                     best.name, heard_title)
+        return best
+
     def _maybe_translate(self):
         # Self-heal a loaded song in the background: add romaji to any
         # Japanese/CJK line missing it, and translate any line that should have
@@ -1904,7 +1947,11 @@ class Overlay:
                     self.offset = 0.0
                     self._fast_calib = max(self._fast_calib, 2)
                     self._arm_recal(7)
-                    cached = self.index.match(f_artist, f_title, self._cur_duration)
+                    # Prefer an original-script (CJK) cache over a romanized title
+                    # — fixes Shazam's English title loading English lyrics for a
+                    # Japanese song (Niconico Marine "Ahoy!!").
+                    cached = self._prefer_cjk_cache(f_artist, f_title, self._cur_duration) \
+                        or self.index.match(f_artist, f_title, self._cur_duration)
                     if cached and self._file_valid(cached, self._cur_duration):
                         if cached != self._lyrics_path:
                             log.info("correcting -> cached %s", cached.name)

@@ -599,6 +599,29 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-045 — Romanized Shazam title loaded English lyrics for a JP song 🟢
+**Symptom:** after TICKET-044 fixed identification, the Niconico Marine "Ahoy!!"
+karaoke synced correctly (drift -0.01) but showed **English** lyrics ("A black sky
+above / Die in the waves...") with `lang: "de"` — while the video is the Japanese
+"On vocal" karaoke. The correct Japanese cache (`ahoy_我ら宝鐘海賊団.json`, 65 lines)
+already existed from an earlier session.
+**Root cause:** with the player title leaked (TICKET-044), the app trusts Shazam's
+title — but Shazam returns the ROMANIZED/English title "Ahoy!! We are Houshou
+Pirates". `index.match` then exact-matched a wrong English-lyrics LRC (and saved
+it as a new cache), instead of the Japanese original whose title only shares the
+leading token "Ahoy". Same class as the romaji-vs-kanji problem fetch_lrc already
+solves for fetching — but it wasn't applied to the local cache match.
+**Fix (pushed, v1.0.34):** added `Overlay._prefer_cjk_cache(artist, heard_title,
+duration)`. When the heard title is pure-Latin (no CJK) but a cached entry by the
+SAME artist HAS CJK script and shares the leading Latin token (e.g. "ahoy"
+survives in "Ahoy!! 我ら宝鐘海賊団☆"), prefer that original-script cache. Wired into
+the sound-correction path BEFORE `index.match`. Deleted the wrong English cache.
+**Verified (live, title still leaking):** log shows the full chain —
+`share no content → trusting Shazam` → `preferring original-script cache
+ahoy_我ら宝鐘海賊団.json over romanized title` → `correcting -> cached`. App now
+shows 「あん、神様ぁ、いつかこのマリンを本物の海賊に…」 with furigana + romaji + English,
+matching the video's burned-in karaoke line frame-by-frame. drift -0.02.
+
 ## TICKET-044 — Niconico sidebar title leaks → wrong song fetched 🟢
 **Symptom:** while playing the Marine "Ahoy!!" karaoke on Niconico, the app
 reported `player_title: "Space Marine 2 プレイ動画 #35"` (a recommended video in
