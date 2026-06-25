@@ -3292,8 +3292,133 @@ class Overlay:
         if vpos < 12.0:
             return
         self._last_align_t = now
-        log.info("auto-align (%s) — checking sync by ear", reason)
-        self.align_by_listening(silent=True)
+        # Prefer Whisper alignment when it's bundled — its transcript match is
+        # more authoritative than energy correlation. Fall back to the
+        # Whisper-free correlator otherwise (the lean .exe ships without
+        # faster-whisper to keep the download small).
+        try:
+            import align
+            whisper_ok = align.available()
+        except Exception:
+            whisper_ok = False
+        if whisper_ok:
+            log.info("auto-align (%s) — checking sync by Whisper", reason)
+            self.align_by_listening(silent=True)
+        else:
+            log.info("auto-align (%s) — checking sync by energy correlation", reason)
+            self._auto_align_by_energy(reason)
+
+    def _auto_align_by_energy(self, reason):
+        """Whisper-free sync correction: cross-correlate the recent audio's
+        vocal-band energy mask against the LRC's expected line-active intervals.
+        The offset that maximizes overlap is the drift correction.
+
+        Works on karaoke / off-vocal / live cuts that Shazam can't fingerprint
+        AND when faster-whisper isn't installed. Conservative: requires a clear
+        correlation peak (best score > 1.5x the runner-up's neighborhood mean)
+        before applying, so noisy or sparse vocals don't yank the offset."""
+        if not self._boundary or not self.lines:
+            return
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING):
+            return
+        try:
+            history = self._boundary.vocal_history(30.0)
+        except Exception:
+            return
+        if len(history) < 60:    # need at least 12 s of buffer
+            log.info("auto-align: not enough vocal-mask history (%d blocks)", len(history))
+            return
+
+        def work():
+            try:
+                self._aligning = True
+                self._run_energy_correlation(history, st)
+            except Exception as e:
+                log.info("energy-align error: %s", e)
+            finally:
+                self._aligning = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _run_energy_correlation(self, history, st_snap):
+        """The actual correlation work (runs in a background thread)."""
+        import numpy as np
+        # The history is a list of (t_wall, vocal_ratio). Each entry is one
+        # 0.2 s block. Map wall-time → song-time using the player position
+        # at the time of the latest entry: that entry corresponds to NOW, and
+        # NOW's song-time is st_snap["position"] (plus current offset, since
+        # we're aligning the displayed lyric time, not the absolute clock).
+        now_wall = history[-1][0]
+        now_song = float(st_snap.get("position") or 0.0)
+        # Build the audio mask: per-block "are vocals active right now?" using
+        # the learned baseline as the floor.
+        try:
+            baseline = self._boundary.vocal_baseline() or 0.0
+        except Exception:
+            baseline = 0.0
+        thresh = max(0.50, baseline * 1.25)
+        # Per-block song-time (each block = 0.2 s, going back from now_song).
+        # Constrain to vocals-only region of the song.
+        block_dt = 0.2
+        audio_t = np.array([now_song - (now_wall - t) for (t, _) in history])
+        audio_v = np.array([(1.0 if r >= thresh else 0.0) for (_, r) in history])
+        if audio_v.sum() < 4:    # too little vocal activity captured
+            log.info("energy-align: insufficient vocal activity (%d blocks)", int(audio_v.sum()))
+            return
+        # Build the LRC mask sampled at the same block grid: for each block's
+        # song-time t, is t inside a line's [start, end] window?
+        # (use a small expansion since lines often have gaps within phrases)
+        lines = self.lines
+        starts = np.array([ln.start for ln in lines])
+        ends = np.array([max(ln.end, ln.start + 1.0) for ln in lines])
+        # Slide the LRC mask by candidate offsets in [-15, +15] s (covers
+        # typical karaoke / cut drift). Step 0.2 s for precision.
+        best_shift, best_score = 0.0, -1.0
+        scores = []
+        for shift_steps in range(-75, 76):    # -15 .. +15 in 0.2 s steps
+            shift = shift_steps * block_dt
+            shifted_t = audio_t + shift   # what song-time the LRC says this block is
+            # in_lrc[i] = 1 if shifted_t[i] is inside any LRC line
+            idx = np.searchsorted(starts, shifted_t, side="right") - 1
+            in_lrc = np.zeros_like(audio_v)
+            valid = (idx >= 0) & (idx < len(lines))
+            in_lrc[valid] = (shifted_t[valid] <= ends[idx[valid]]).astype(float)
+            # score = overlap minus mismatch (so flat constant masks don't win)
+            agree = float((audio_v * in_lrc).sum() + ((1 - audio_v) * (1 - in_lrc)).sum())
+            score = agree / len(audio_v)
+            scores.append((shift, score))
+            if score > best_score:
+                best_score = score
+                best_shift = shift
+        # Confidence: peak must beat the median by a clear margin.
+        all_scores = np.array([s for (_, s) in scores])
+        median = float(np.median(all_scores))
+        peak_lift = best_score - median
+        if peak_lift < 0.10:
+            log.info("energy-align: weak peak (best %.3f, median %.3f, lift %.3f) — no change",
+                     best_score, median, peak_lift)
+            return
+        # best_shift is the offset to ADD to audio_t so the audio mask aligns
+        # to the LRC. Since the displayed song-time = player_pos + self.offset,
+        # the new offset becomes (current offset + best_shift).
+        new_off = round(self.offset + best_shift, 2)
+        if abs(new_off) > 60.0:
+            log.info("energy-align: candidate offset %+.1fs out of range — skipped", new_off)
+            return
+        if abs(new_off - self.offset) < 0.4:
+            log.info("energy-align: drift %+.2fs within tolerance — no change",
+                     new_off - self.offset)
+            return
+        self.root.after(0, lambda: self._apply_energy_align(new_off, best_score, peak_lift))
+
+    def _apply_energy_align(self, new_off, score, lift):
+        prev = self.offset
+        self.offset = new_off
+        self.idx = -1
+        log.info("energy-align: offset %+.2fs → %+.2fs (score %.3f, lift %.3f)",
+                 prev, new_off, score, lift)
+        self._hint(f"🎤 Auto-synced ({new_off:+.1f}s)")
 
     def _periodic_auto_align(self):
         """Background heartbeat: every ~45 s, if Shazam hasn't locked the offset

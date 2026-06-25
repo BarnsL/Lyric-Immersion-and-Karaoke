@@ -86,6 +86,13 @@ class SongChangeDetector(threading.Thread):
         self._vocal_fired = False  # vocal onset already fired for the current track
         self._vocal_baseline = 0.0 # baseline vocal-band ratio from instrumental-only
         self._vocal_samples = 0    # samples seen for baseline establishment
+        # rolling vocal-activity buffer: (wall_time, vocal_ratio) per block. The
+        # main thread reads this to cross-correlate the audio's "vocals on/off"
+        # pattern against the LRC's expected line-active intervals — a
+        # Whisper-free auto-sync that catches drift even when faster-whisper
+        # isn't bundled (the karaoke .exe is lean by default).
+        self._vocal_buf = []       # list of (t_wall, ratio) — last ~60 s
+        self._buf_lock = threading.Lock()
 
     # ── control ──
     def set_enabled(self, on: bool):
@@ -208,29 +215,27 @@ class SongChangeDetector(threading.Thread):
                 self._fire_onset()
             if self._music_for >= self.min_music:
                 self._had_music = True
-            # ── VOCAL onset detection ──
-            # Watch the vocal-band energy ratio: vocals add strong harmonic
-            # content in 200-3000 Hz. During an instrumental intro the ratio is
-            # set by the instrumentation (bass-heavy electronic, mid-heavy
-            # piano), so we learn the BASELINE for the first ~5 s of music and
-            # only fire when the ratio rises significantly above it for long
-            # enough — this distinguishes "vocals just started" from "loud
-            # synth section". Lets the karaoke overlay calibrate offset for
-            # videos with long instrumental intros (e.g. Grimes "Genesis").
-            if self.on_vocal and self._vocal_enabled and not self._vocal_fired:
-                vr = self._vocal_ratio(np, data)
-                if vr is not None:
-                    # Build the baseline from the first ~5 s (25 blocks @ 0.2 s)
-                    # of music — instrumental-only by assumption (well before
-                    # vocals come in for any track with a real intro).
+            # ── VOCAL band-energy ratio (always computed) ──
+            # Stored in the rolling buffer for auto-sync cross-correlation;
+            # also used for one-shot vocal-onset detection during instrumental
+            # intros (see Grimes "Genesis" notes above).
+            vr = self._vocal_ratio(np, data)
+            if vr is not None:
+                tnow = time.time()
+                with self._buf_lock:
+                    self._vocal_buf.append((tnow, vr))
+                    # keep the last ~60 s (300 blocks @ 0.2 s)
+                    if len(self._vocal_buf) > 300:
+                        del self._vocal_buf[: len(self._vocal_buf) - 300]
+                if self.on_vocal and self._vocal_enabled and not self._vocal_fired:
+                    # Baseline from the first ~5 s (25 blocks @ 0.2 s) — assume
+                    # instrumental-only at the very start of a track.
                     if self._vocal_samples < 25:
                         self._vocal_samples += 1
                         self._vocal_baseline = (
                             (self._vocal_baseline * (self._vocal_samples - 1) + vr)
                             / self._vocal_samples)
                     else:
-                        # Fire when ratio runs 1.4x the baseline (or > 0.55
-                        # absolute) for at least 1.0 s — vocals just entered.
                         thresh = max(0.55, self._vocal_baseline * 1.4)
                         if vr >= thresh:
                             self._vocal_for += dt
@@ -239,6 +244,19 @@ class SongChangeDetector(threading.Thread):
                                 self._fire_vocal()
                         else:
                             self._vocal_for = max(0.0, self._vocal_for - dt)
+
+    def vocal_history(self, seconds=30.0):
+        """Snapshot of the recent vocal-band ratio: list of (t_wall, ratio).
+        The auto-sync correlator uses this to align audio's vocal-mask to
+        the LRC's expected line-active intervals without Whisper."""
+        now = time.time()
+        with self._buf_lock:
+            return [(t, r) for (t, r) in self._vocal_buf if now - t <= seconds]
+
+    def vocal_baseline(self):
+        """Instrumental-only baseline ratio learned at the start of the track.
+        0.0 if not yet established."""
+        return self._vocal_baseline
 
     def _vocal_ratio(self, np, data):
         """Fraction of spectral energy in the vocal band (200-3000 Hz).
