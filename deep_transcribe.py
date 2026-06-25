@@ -244,6 +244,62 @@ def _captions_from_dir(dest: Path, lang: str | None):
     return (lines, clang) if len(lines) >= 6 else None
 
 
+def fetch_captions_only(query: str, lang: str | None = None):
+    """FAST path: download ONLY the caption track (no audio, no Whisper) for the
+    top YouTube hit for `query`, parse it to timed lines → (lines, lang) or None.
+
+    For a YouTube video the caption track is strictly better than a provider LRC:
+    it's THIS video's own text AND timing, so there's no wrong-transcription and
+    no cross-version drift (the "white balance" case where syncedlyrics returned
+    different words than the video sings). Grabs manual subs first, then YouTube
+    auto-captions (ASR) as a fallback. Seconds, not the minute deep_transcribe
+    takes (which downloads the whole audio and runs Whisper)."""
+    if not available():
+        return None
+    import tempfile
+    import shutil as _sh
+    import yt_dlp
+    tmp = Path(tempfile.mkdtemp(prefix="dk_caps_"))
+    try:
+        # Request ONLY the song's language (plus a close fallback). Asking for
+        # all CJK langs at once fired 5× the sub requests → YouTube 429s, and one
+        # lang's error aborted the whole fetch. ignoreerrors keeps a single
+        # rate-limited lang from killing the others.
+        if lang in ("ja", "ko"):
+            langs = [lang]
+        elif lang == "zh":
+            langs = ["zh-Hans", "zh-Hant", "zh"]
+        else:
+            langs = ["ja", "ko", "en"]
+        opts = {
+            "quiet": True, "no_warnings": True, "noplaylist": True,
+            "default_search": "ytsearch1", "skip_download": True,
+            "ignoreerrors": True,
+            "outtmpl": str(tmp / "c.%(ext)s"), "retries": 2, "socket_timeout": 30,
+            "match_filter": yt_dlp.utils.match_filter_func(f"duration < {_MAX_DUR}"),
+            # manual subs (exact lyrics) AND auto-captions (ASR) — many MVs only
+            # have the latter; both are locked to the video's real timing.
+            "writesubtitles": True, "writeautomaticsub": True,
+            "subtitleslangs": langs,
+            "subtitlesformat": "vtt",
+        }
+        if _sh.which("node"):
+            opts["js_runtimes"] = {"node": {}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as y:
+                y.extract_info(f"ytsearch1:{query}", download=True)
+        except Exception as e:
+            log.info("captions: fetch failed for %r: %s", query, str(e)[:140])
+            return None
+        res = _captions_from_dir(tmp, lang)
+        if res:
+            log.info("captions: %d %s lines from YouTube caption track for %r",
+                     len(res[0]), res[1], query)
+        return res
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 def deep_transcribe(title: str, artist: str = "", lang: str | None = None,
                     size: str = _DEEP_SIZE):
     """Full pipeline: search + download the source audio, then FIRST try REAL

@@ -34,6 +34,10 @@ for pkg in ("winsdk", "soundcard", "shazamio", "pykakasi", "jaconv",
             "fugashi", "unidic_lite", "cutlet", "mojimoji",
             "pypinyin", "hangul_romanize", "deep_translator", "syncedlyrics",
             "pystray", "spotipy", "aiohttp", "aiosignal", "pydub", "numpy",
+            # yt-dlp: pulls a YouTube video's own caption track (accurate lyrics
+            # + perfect timing, locked to the video) — strictly better than a
+            # provider LRC for browser videos. ~10 MB, pure Python.
+            "yt_dlp",
             # The faster-whisper stack is appended only when ./.deps exists.
             *(("faster_whisper", "ctranslate2", "av", "tokenizers",
                "huggingface_hub", "onnxruntime") if WHISPER else ())):

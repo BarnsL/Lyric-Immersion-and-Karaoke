@@ -599,6 +599,41 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-052 — YouTube caption track = accurate lyrics + perfect sync 🟢🟢
+**The big one.** Watching live, the app showed WRONG TEXT for KizunaAI "white balance":
+app LRC said "未来 未開 見たことない…" (mirai mikai mita koto nai) while the song actually
+sings "未来 見たい 君の傍で…" (mirai mitai kimi no katawara de). syncedlyrics returned a
+different/worse transcription than the video — and even with perfect timing, wrong WORDS
+read as "hella bad." Provider LRCs also drift because their timing is for a different cut.
+**Root insight:** a YouTube video's OWN caption track is the ground truth — correct words
+AND timing locked to THIS exact video. (The user's other agent proved it: "pulled the
+caption track, 35 lines, perfectly timestamped.")
+**Fix (pushed, v1.0.42):**
+1. **Bundled yt-dlp** into the build (it was never included → deep_transcribe AND captions
+   silently no-op'd). Added `yt_dlp` to the spec's collect_all.
+2. **`fetch_captions_only(query, lang)`** in deep_transcribe — a FAST subs-only yt-dlp
+   pull (no audio download, no Whisper): manual subs first, then YouTube auto-captions
+   (ASR), parsed to timed lines. Requests ONLY the song's language (asking all 5 CJK
+   langs at once → YouTube 429) with `ignoreerrors` so one rate-limited lang can't abort.
+3. **`Overlay.load_youtube_captions()`** annotates (furigana/romaji/translation) + saves
+   as source `youtube-captions` (real → replaces a wrong LRC), upgrades the overlay live.
+4. **Auto for browser videos:** `_on_track_change` schedules a background caption fetch
+   ~4 s in for any browser (YouTube) source, throttled (≥8 s between yt-dlp calls,
+   once per song) so a fast playlist can't 429. Tray toggle "Use YouTube captions" +
+   "Get captions for this video now"; `POST /captions`; setting `captions` (default on).
+**Verified end-to-end live:** `Reol - 'ミュータント' Music Video` → log "captions: 43 ja
+lines from YouTube caption track" → saved → source `youtube-captions`, drift 0.0,
+in_sync True, "✨ Found the real lyrics". This replaces the approximate
+LRC+Shazam+correlation stack with the video's own ground-truth lyrics for YouTube.
+
+## TICKET-047b — Scroll fill: layer-composite to kill per-fill glyph render 🟢
+**After the timer fix (047), ~10% of frames still spiked 27-44 ms** — the karaoke fill
+re-rendered every glyph WITH stroke outlines (8-9 draws/char) ~5×/s per singing line.
+**Fix (pushed, v1.0.41):** render the block's base layer once at spawn and the fully-sung
+layer LAZILY on first-sing; the per-fill step now just composites the two via a cheap
+rectangle mask (no glyph render). Steady state went to a solid ~16 ms (60 fps). Splitting
+the sung layer to first-sing (not spawn) avoids doubling the spawn cost into one big hitch.
+
 ## TICKET-051 — Game noise must not corrupt sync / recognition 🟢
 **Concern:** the overlay is built to run WHILE gaming (there's a "Gaming" preset), but
 the sync + recognition listen to the **system loopback**, which mixes the music with

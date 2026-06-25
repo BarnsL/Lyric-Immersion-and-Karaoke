@@ -993,6 +993,7 @@ class Overlay:
         self.api_on = bool(s.get("api", True))         # local agent-control API
         self.boundary_on = bool(s.get("boundary", True))  # fast song-change detect
         self.generate_on = bool(s.get("generate", True))  # generate lyrics by ear
+        self.captions_on = bool(s.get("captions", True))   # prefer YouTube caption track for browser videos
         self.concert_ocr = bool(s.get("concert_ocr", True))  # read the on-screen song banner in concerts
         self._last_ocr_t = 0.0        # throttle the concert OCR check
         self._ocr_song = None         # last song the banner OCR confidently read
@@ -1020,6 +1021,8 @@ class Overlay:
         self._clean_artist_cache = ""
         self._is_cover = False       # current title is a 歌ってみた / cover (title-first fetch)
         self._cover_original_artist = None   # original artist extracted from a cover title
+        self._last_caption_t = 0.0   # throttle YouTube caption fetches (rate-limit guard)
+        self._caption_song = None    # (artist,title) we last attempted captions for
         self._frame_ms = 0.0         # EWMA of render-frame interval (ms) → /status render_fps
         self._last_tick_t = None
         self._render_frame = False
@@ -1310,6 +1313,36 @@ class Overlay:
         if not self._live_mode:
             self.root.after(25000,
                             lambda t=self._track_seq: self._track_start_auto_align(t))
+        # YOUTUBE CAPTIONS: for a browser video, the video's OWN caption track is
+        # the most accurate lyric source — correct words AND timing locked to this
+        # exact video (no wrong-transcription LRC, no cross-version drift). Fetch
+        # it in the background a few seconds in (after the LRC has shown something)
+        # and prefer it. Throttled + once-per-song so a fast playlist can't 429.
+        if (self.captions_on and not self._live_mode
+                and any(h in (src or "") for h in BROWSER_HINTS)):
+            self.root.after(4000,
+                            lambda t=self._track_seq: self._maybe_fetch_captions(t))
+
+    def _maybe_fetch_captions(self, track_seq):
+        """Background: pull this YouTube video's caption track and prefer it over
+        the provider LRC. Throttled (min gap between yt-dlp calls) and once per
+        song, so a rapidly-advancing playlist can't rate-limit us."""
+        if track_seq != self._track_seq or self._live_mode:
+            return
+        if self._track == self._caption_song:
+            return                                   # already tried this song
+        now = time.time()
+        if now - self._last_caption_t < 8.0:
+            # too soon after the last fetch — retry a bit later (still this track)
+            self.root.after(4000,
+                            lambda t=track_seq: self._maybe_fetch_captions(t))
+            return
+        # already on captions for this song? nothing to do.
+        if (self.meta.get("source") or "") == "youtube-captions":
+            return
+        self._last_caption_t = now
+        self._caption_song = self._track
+        self.load_youtube_captions(silent=True)
 
     def _maybe_generate(self, track_seq):
         """Deadline fallback: still no lyrics for this track → generate by ear.
@@ -2586,8 +2619,8 @@ class Overlay:
 
     def _paint_block_img(self, spec, frac):
         """Render the block to a PIL image with the sung portion highlighted.
-        Returns the PIL image (not a PhotoImage) so the caller can paste it into
-        an existing PhotoImage — avoiding a fresh allocation every fill-step."""
+        Used by the non-scroll render path. Returns the PIL image (not a
+        PhotoImage). The scroll path uses the cheaper layer composite below."""
         img = Image.new("RGBA", (max(1, spec["w"]), max(1, spec["h"])), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         sw = max(1, round(2 * self.font_scale * self._auto_scale))
@@ -2602,16 +2635,69 @@ class Overlay:
                        stroke_width=sw, stroke_fill=INK)
         return img
 
+    def _paint_one_layer(self, spec, color):
+        """Render the block once, all glyphs in `color` (None = each row's own
+        base color), plus furigana. One layer of the karaoke composite."""
+        w, h = max(1, spec["w"]), max(1, spec["h"])
+        sw = max(1, round(2 * self.font_scale * self._auto_scale))
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        for text, cx in spec["furi"]:
+            d.text((cx, spec["furi_y"]), text, font=spec["furi_font"], fill=FURI_C,
+                   anchor="mm", stroke_width=1, stroke_fill=INK)
+        for row in spec["rows"]:
+            col = color if color is not None else row["base"]
+            for ch, cx in row["chars"]:
+                d.text((cx, row["y"]), ch, font=row["font"], fill=col, anchor="lm",
+                       stroke_width=sw, stroke_fill=INK)
+        return img
+
+    def _sung_layer(self, b):
+        """Lazily render (and cache) the fully-sung layer for a block — only when
+        the line actually starts singing. Rendering base+sung TOGETHER at spawn
+        doubled the spawn cost into a visible 100-150 ms hitch; deferring the
+        sung layer to first-fill spreads the two renders so they never coincide
+        (and a block that scrolls by without ever being the current line never
+        pays for its sung layer at all)."""
+        if b.get("sung") is None:
+            b["sung"] = self._paint_one_layer(b["spec"], SUNG)
+        return b["sung"]
+
+    def _composite_fill(self, base, sung, spec, frac):
+        """Cheap karaoke fill: build a mask that's opaque up to each row's sung
+        boundary, then composite the sung layer over the base. No glyph render."""
+        w, h = base.size
+        mask = Image.new("L", (w, h), 0)
+        md = ImageDraw.Draw(mask)
+        for row in spec["rows"]:
+            chars = row["chars"]
+            if not chars:
+                continue
+            n = int(frac * len(chars) + 0.5)
+            if n <= 0:
+                continue
+            x_sung = w if n >= len(chars) else int(chars[n][1])
+            fs = getattr(row["font"], "size", 30)
+            md.rectangle([0, int(row["y"] - fs), x_sung, int(row["y"] + fs * 0.4)],
+                         fill=255)
+        out = base.copy()
+        out.paste(sung, (0, 0), mask)
+        return out
+
     def _render_img_block(self, i, frac):
         self._blk_seq += 1
         tag = f"blk{self._blk_seq}"
         spec = self._block_spec(i)
-        photo = ImageTk.PhotoImage(self._paint_block_img(spec, frac))
+        base = self._paint_one_layer(spec, None)     # base only; sung is lazy
+        b = {"idx": i, "tag": tag, "x": 0.0, "w": spec["w"], "img": True,
+             "spec": spec, "photo": None, "sung_n": -1, "base": base, "sung": None,
+             "nchars": max((len(r["chars"]) for r in spec["rows"]), default=0)}
+        # only build the sung layer + composite if it's already singing at spawn
+        img = base if frac <= 0 else self._composite_fill(base, self._sung_layer(b), spec, frac)
+        b["photo"] = photo = ImageTk.PhotoImage(img)
         lane_y = self._lane_y0 + (i % self._lanes) * self._lane_gap
         self.cv.create_image(0, lane_y, image=photo, anchor="nw", tags=(tag, "strm"))
-        return {"idx": i, "tag": tag, "x": 0.0, "w": spec["w"], "img": True,
-                "spec": spec, "photo": photo, "sung_n": -1,
-                "nchars": max((len(r["chars"]) for r in spec["rows"]), default=0)}
+        return b
 
     # ── continuous scroll-through ticker (multiple lines on screen) ──
 
@@ -2792,9 +2878,14 @@ class Overlay:
                         and not _over_budget()):
                     b["sung_n"] = n
                     b["paint_t"] = now
-                    # paste into the existing PhotoImage (no new allocation) —
-                    # the canvas reflects it without an itemconfig call
-                    b["photo"].paste(self._paint_block_img(b["spec"], frac))
+                    # CHEAP fill: composite the (lazily-built) sung layer over
+                    # base via a mask (no glyph re-rendering), paste into the
+                    # existing PhotoImage. This removed the karaoke-fill spikes.
+                    if b.get("base") is not None:
+                        b["photo"].paste(self._composite_fill(
+                            b["base"], self._sung_layer(b), b["spec"], frac))
+                    else:
+                        b["photo"].paste(self._paint_block_img(b["spec"], frac))
                     repaints += 1
             else:
                 self._highlight_block(b, frac)
@@ -3299,6 +3390,7 @@ class Overlay:
                         "recal_secs": self.recal_secs, "git_sync": self.git_sync,
                         "character": self.character_on, "api": self.api_on,
                         "boundary": self.boundary_on, "generate": self.generate_on,
+                        "captions": self.captions_on,
                         "concert_ocr": self.concert_ocr,
                         "display": self.display,
                         "display_fp": getattr(self, "_display_fp", None)})
@@ -3306,6 +3398,11 @@ class Overlay:
     def set_generate(self, on):
         """Toggle the last-resort Whisper lyric generation."""
         self.generate_on = bool(on)
+        self._persist()
+
+    def set_captions(self, on):
+        """Toggle auto-using a YouTube video's caption track for browser videos."""
+        self.captions_on = bool(on)
         self._persist()
 
     def _click_through(self):
@@ -3648,6 +3745,56 @@ class Overlay:
         self._sound_song = None
         self._hint("🎧 Listening to identify the song…")
         self._start_identify()
+
+    def load_youtube_captions(self, silent=False):
+        """Pull THIS video's YouTube caption track (accurate text + perfect
+        timing, locked to the video) and use it INSTEAD of the provider LRC.
+        For a browser video this is the most accurate source — it fixes both
+        wrong-transcription LRCs (the "white balance" case, where syncedlyrics
+        returned different words than the video sings) and cross-version timing
+        drift. Runs in the background; no-ops if yt-dlp isn't available or the
+        video has no caption track."""
+        try:
+            import deep_transcribe
+            if not deep_transcribe.available():
+                if not silent:
+                    self._hint("YouTube captions need yt-dlp — see the README")
+                return
+        except Exception:
+            return
+        if not self._track:
+            return
+        artist, title = self._track
+        raw = self._last_raw_title or title       # raw title → best YouTube match
+        lang = self.meta.get("lang", "ja")
+        self._deep_token += 1
+        token = self._deep_token
+        if not silent:
+            self._hint("📥 Pulling the video's caption track…")
+
+        def work():
+            res = None
+            try:
+                res = deep_transcribe.fetch_captions_only(raw, lang=lang)
+            except Exception as e:
+                log.info("captions error: %s", e)
+            if not res:
+                if not silent:
+                    self.root.after(0, lambda: self._hint("No caption track found for this video"))
+                return
+            if token != self._deep_token:
+                return
+            lines, clang = res
+            try:
+                from fetch_lyrics import annotate
+                annotate(lines, clang or lang, translate=True)
+            except Exception:
+                pass
+            if token == self._deep_token:
+                self.root.after(0, lambda: self._apply_deep(
+                    token, title, artist, lines, clang or lang, "youtube-captions"))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ── sync by listening (align cached lyrics to the HEARD audio) ──
     def _align_pos(self):
@@ -4167,6 +4314,8 @@ def main():
     def _toggle_api(*_):   ov.root.after(0, lambda: ov.set_api(not ov.api_on))
     def _toggle_bound(*_): ov.root.after(0, lambda: ov.set_boundary(not ov.boundary_on))
     def _toggle_gen(*_):   ov.root.after(0, lambda: ov.set_generate(not ov.generate_on))
+    def _toggle_caps(*_):  ov.root.after(0, lambda: ov.set_captions(not ov.captions_on))
+    def _get_caps(*_):     ov.root.after(0, ov.load_youtube_captions)
 
     # ── Optional GPU acceleration ────────────────────────────────────────
     # Transcription runs on the CPU by default (fine — 16s clip in ~2s). On an
@@ -4269,6 +4418,9 @@ def main():
         pystray.MenuItem("🎤  Sync by listening  (match lyrics to the audio)", _align),
         pystray.MenuItem("Fast song-change detect (compilations)", _toggle_bound,
                          checked=lambda i: ov.boundary_on),
+        pystray.MenuItem("Use YouTube captions (accurate, for browser videos)", _toggle_caps,
+                         checked=lambda i: ov.captions_on),
+        pystray.MenuItem("⬇  Get captions for this video now", _get_caps),
         pystray.MenuItem("Generate lyrics by ear when none found (AI, ***)", _toggle_gen,
                          checked=lambda i: ov.generate_on),
         pystray.MenuItem(_gpu_label, _on_gpu,
