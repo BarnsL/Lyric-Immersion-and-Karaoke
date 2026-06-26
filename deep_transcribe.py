@@ -280,7 +280,10 @@ def fetch_captions_only(query: str, lang: str | None = None):
             "quiet": True, "no_warnings": True, "noplaylist": True,
             "default_search": "ytsearch1", "skip_download": True,
             "ignoreerrors": True,
-            "outtmpl": str(tmp / "c.%(ext)s"), "retries": 2, "socket_timeout": 30,
+            # keep it LIGHT — this runs while music plays. 1 retry, short timeout,
+            # and cap extractor work so a slow/blocked fetch can't burn CPU for
+            # long (a pile-up of these stuttered the audio).
+            "outtmpl": str(tmp / "c.%(ext)s"), "retries": 1, "socket_timeout": 15,
             "match_filter": yt_dlp.utils.match_filter_func(f"duration < {_MAX_DUR}"),
             # manual subs (exact lyrics) AND auto-captions (ASR) — many MVs only
             # have the latter; both are locked to the video's real timing.

@@ -1052,6 +1052,7 @@ class Overlay:
         self._cover_original_artist = None   # original artist extracted from a cover title
         self._last_caption_t = 0.0   # throttle YouTube caption fetches (rate-limit guard)
         self._caption_song = None    # (artist,title) we last attempted captions for
+        self._captions_fetching = False  # single-flight: one yt-dlp caption fetch at a time
         self._now_url = None         # exact current video URL (browser-pushed, for captions)
         self._frame_ms = 0.0         # EWMA of render-frame interval (ms) → /status render_fps
         self._last_tick_t = None
@@ -3843,6 +3844,14 @@ class Overlay:
             return
         if not self._track:
             return
+        # SINGLE-FLIGHT: only ONE yt-dlp caption fetch at a time. A fast playlist
+        # would otherwise spawn a new (heavy: network + node JS runtime) fetch
+        # every track while the previous ones still ran — they pile up and
+        # SATURATE THE CPU, which stutters the audio AND the overlay. yt-dlp runs
+        # to completion in its thread even when the result will be discarded, so
+        # the guard is essential, not just an optimization.
+        if getattr(self, "_captions_fetching", False):
+            return
         artist, title = self._track
         # exact video URL (param > browser-pushed) beats a fuzzy title search
         query = url or self._now_url or self._last_raw_title or title
@@ -3853,6 +3862,7 @@ class Overlay:
         # (the "76 lines fetched but not applied" bug). Captions are ground truth,
         # so they apply as long as the song hasn't actually changed.
         seq = self._track_seq
+        self._captions_fetching = True
         if not silent:
             self._hint("📥 Pulling the video's caption track…")
 
@@ -3862,6 +3872,8 @@ class Overlay:
                 res = deep_transcribe.fetch_captions_only(query, lang=lang)
             except Exception as e:
                 log.info("captions error: %s", e)
+            finally:
+                self._captions_fetching = False
             if not res:
                 if not silent:
                     self.root.after(0, lambda: self._hint("No caption track found for this video"))
@@ -3970,6 +3982,11 @@ class Overlay:
         live mode (whole event), and Shazam hasn't locked the offset very
         recently. Cheap to call — no-ops when conditions aren't met."""
         if self._aligning or not self.lines or self._live_mode:
+            return
+        # YouTube captions are already locked to the video's own timing — running
+        # the energy correlator against them is wasted CPU (and risks nudging a
+        # perfect sync). Skip it for caption-sourced lyrics.
+        if (self.meta.get("source") or "") == "youtube-captions":
             return
         st = self.media.get()
         if not (st and st.get("status") == PLAYING):
