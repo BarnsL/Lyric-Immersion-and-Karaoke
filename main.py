@@ -1091,6 +1091,16 @@ class Overlay:
         self._scroll_x = self._scroll_start = self._scroll_end = 0
         self._stream = []          # scroll-through ticker: live line blocks
         self._blk_seq = 0
+        # PERF-102: cache each line's rendered base/sung BITMAP keyed by line idx.
+        # Rendering a long 1.5×-scaled furigana block is ~150-450 ms (hundreds of
+        # stroked-glyph draws); a line re-enters constantly (repeated choruses, edge
+        # despawn/respawn, lane churn), so rendering it ONCE and reusing the bitmap
+        # turns each repeat from a frame-killing spike into a cheap PhotoImage wrap.
+        # Insertion-ordered dict used as an LRU; cleared on song load / scale change.
+        self._block_cache = {}
+        self._block_cache_max = 32
+        self._cache_lock = threading.Lock()   # _block_cache shared with the prewarm thread
+        self._prewarm_token = 0               # bumped on song load to cancel a stale prewarm
         self._pil_fonts = {}       # cache of PIL fonts for image blocks
         self._use_img = True       # image scroll blocks. Measured: a text-item block is
                                    # FAR worse here — cv.move of a full stream (~7k text
@@ -1161,12 +1171,18 @@ class Overlay:
             "deadband":              0.8,   # |drift| below this is left alone
             "agree":                 2.0,   # 2-read agreement window (s)
             "agree_live":            4.0,   # live-arrangement agreement window
+            # ── two-point sound-verification timing (TICKET-056) ──
+            # hold a candidate offset, hesitate this long, then take a confirming
+            # listen; the 2nd read must land within "agree" of the 1st to commit.
+            # A LONGER hold separates the two reads by more song time, so two
+            # different instances of a repeated chorus can't both be read at the
+            # same offset and falsely "agree" ("All The Things She Said" symptom).
+            "sync_confirm_hold_ms": 2600,   # hesitation before the confirming listen
+            "sync_confirm_listen_s": 5.0,   # confirming-listen capture length
             "spread_reset":         20.0,   # chorus-ambiguity spread threshold
             "reset_offset_max":      5.0,   # only reset when |offset| < this
-            "drift_fastpath":        3.0,   # integral → apply single-read corr
             "drift_align_trigger":   6.0,   # integral → trigger auto-align
             "drift_min_for_accum":   0.8,   # |drift| > this contributes to integral
-            "drift_fastpath_cap":    8.0,   # |diff| < this for fast-path safety
             "auto_align_cooldown":  25.0,   # min s between auto-aligns
             "auto_align_min_pos":   12.0,   # min player pos before auto-align
             "shazam_lock_grace":    30.0,   # auto-align skipped within N s of lock
@@ -1180,9 +1196,14 @@ class Overlay:
             # heavy_budget_ms caps the per-frame spawn/repaint work so a PIL
             # paste can't stall the scroll belt; 0 disables the cap.
             "heavy_budget_ms":      10.0,   # max ms of spawn+repaint work per heavy frame
-            "repaint_budget":        2.0,   # max PIL karaoke-fill pastes per heavy frame
+            "repaint_budget":        4.0,   # max karaoke-fill SLIVER pastes per heavy frame (cheap now)
             "spawn_budget":          1.0,   # max block PIL-renders per heavy frame
-            "fill_skip":             3.0,   # heavy work runs every Nth frame
+            "fill_skip":             2.0,   # heavy work runs every Nth frame (fills are sliver-cheap)
+            # PERF-102 — scroll bitmap-area controls (the dominant scroll cost):
+            "scroll_max_lanes":      3,     # stacked scrolling lines (capped to what fits on screen)
+            "scroll_spawn_margin": 1100,    # px off-screen a block is pre-rendered (avoid pop-in)
+            # MV/cinematic intro hold backstop (primary release is the vocal poll):
+            "mv_intro_timeout":     75.0,   # s before the intro card releases regardless
         }
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
@@ -1471,7 +1492,30 @@ class Overlay:
         try:
             from fetch_lyrics import validate_file
             ok, _ = validate_file(path, duration)
-            return ok
+            if not ok:
+                return False
+            # PROVENANCE GUARD (wrong-song defense, TICKET-055). A cache produced
+            # by a WEAK provider path — title-only or cover-fallback — is only
+            # trustworthy for a song we'd still fetch that way. For a CLEAN source
+            # (Spotify / "- Topic", authoritative artist) that is NOT a cover,
+            # current rules FORBID those paths: a bare-title match grabs the most
+            # popular same-title song (Ludacris "The Potion" for a VTuber's
+            # "Potion" — durations coincided at 3:43 so every duration gate passed).
+            # Such a cache is stale/low-confidence → reject so we re-fetch under
+            # today's strict rules (which return the right song or nothing, not the
+            # wrong one). Genuine artist-keyed caches ("syncedlyrics"/"lrclib"/…)
+            # and generated/caption caches are untouched.
+            if self._clean_source() and not self._is_cover:
+                try:
+                    src = (json.loads(Path(path).read_text("utf-8"))
+                           .get("meta", {}).get("source") or "")
+                except Exception:
+                    src = ""
+                if src in ("syncedlyrics/cover", "syncedlyrics/title"):
+                    log.info("cache %s came from weak path %r but source is clean & "
+                             "non-cover → distrust, re-fetch", Path(path).name, src)
+                    return False
+            return True
         except Exception:
             return True
 
@@ -1631,14 +1675,16 @@ class Overlay:
         most once per pending; cancelled on track change / when sync settles."""
         if self._sync_confirm_after is not None:
             return                              # a confirm listen is already pending
+        listen_s = float(self._tune.get("sync_confirm_listen_s", 5.0))
         def _confirm():
             self._sync_confirm_after = None
             # Only re-listen if a candidate is still waiting and we're not mid-ID.
             if self._pending_corr < 1e8 and not self._identifying:
-                log.info("sync: 2s hesitation up → confirming listen")
-                self._start_identify(seconds=4, attempts=1)
+                log.info("sync: hesitation up → confirming listen (%.1fs)", listen_s)
+                self._start_identify(seconds=listen_s, attempts=1)
         try:
-            self._sync_confirm_after = self.root.after(2000, _confirm)
+            hold_ms = int(self._tune.get("sync_confirm_hold_ms", 2600))
+            self._sync_confirm_after = self.root.after(hold_ms, _confirm)
         except Exception:
             self._sync_confirm_after = None
 
@@ -2348,6 +2394,8 @@ class Overlay:
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
         self._lyrics_path = Path(path)
+        self._block_cache.clear()      # PERF-102: line idx → bitmap cache is per-song
+        self._prewarm_token += 1       # cancel any prewarm still running for the old song
         if not (self.meta.get("source") or "").startswith("generated"):
             # REAL lyrics supersede ALL generation. Cancel BOTH the realtime
             # best-effort (_gen_token) AND the background deep transcription
@@ -2360,6 +2408,12 @@ class Overlay:
             self._gen_lines = []
         self._mark_verified()
         self._relayout_song()           # size lanes/blocks to this song's rows
+        # PERF-102: hold the whole song's bitmaps so a line renders at most ONCE
+        # (repeats/choruses are free). NB: background prewarm was tried and reverted
+        # — Pillow text holds the GIL, so a prewarm thread stalls the single Tk
+        # scroll loop (LP-005). Each unique line still renders inline on first
+        # appearance; the cost per render is what we minimise instead (cheap stroke).
+        self._block_cache_max = max(32, min(72, len(self.lines) + 2))
         self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
         if not keep_idx:
@@ -2521,20 +2575,33 @@ class Overlay:
 
         # MV / cinematic dead-space: for an MV-titled, not-yet-aligned song, hold
         # the lyrics through the leading intro so they don't run ahead of the song.
-        # _on_vocal_onset / _on_song_onset clear _intro_anchored when vocals
-        # actually start (band-energy rise) or music kicks in after a quiet
-        # stretch. The 100 s timeout backs that up if neither fires (very long
-        # intro, oddly mastered audio): Grimes "Genesis" has a ~70 s intro,
-        # most MV intros are under 90 s.
+        # THREE release paths, fastest wins: (1) the live vocal-energy poll below
+        # (_vocals_active_now — the reliable primary), (2) the one-shot
+        # _on_vocal_onset / _on_song_onset events (band-energy rise / music after a
+        # quiet stretch), (3) Shazam aligning (sets _sound_song). The tunable
+        # `mv_intro_timeout` (default 75 s) is a last-ditch backstop for a very long
+        # or oddly-mastered intro where none fire — Grimes "Genesis" has a ~70 s intro.
         if (self._mv_mode and not self._intro_anchored
                 and self._sound_song is None):
-            if state["position"] > 100.0 or (time.time() - self._track_t0) > 100.0:
-                self._intro_anchored = True
-            else:
-                self._hint("🎬 Instrumental intro — waiting for vocals…")
-                self.idx = -1
-                self.root.after(90, self._tick)
-                return
+            # RELEASE the moment singing actually starts. The one-shot vocal-onset
+            # EVENT (_fire_vocal_event) can silently fail to fire, which left the
+            # lyrics stuck on the intro card for the WHOLE song (the "lyrics never
+            # started" bug). Poll the always-on vocal-band buffer here too — a
+            # robust second path reusing the live energy the sync already tracks.
+            if self._vocals_active_now():
+                self._on_vocal_onset()           # calibrate the offset if applicable
+                self._intro_anchored = True      # vocals are here → stop holding
+            mv_to = float(self._tune.get("mv_intro_timeout", 75.0))
+            if not self._intro_anchored:
+                if state["position"] > mv_to or (time.time() - self._track_t0) > mv_to:
+                    self._intro_anchored = True   # backstop: very long / oddly-mastered intro
+                else:
+                    # MUSIC VIDEO ⇒ "Cinematic" (visual dead-space, often dialogue);
+                    # a plain audio instrumental lead-in keeps the "Instrumental" wording.
+                    self._hint("🎬 Cinematic intro — waiting for vocals…")
+                    self.idx = -1
+                    self.root.after(90, self._tick)
+                    return
 
         pos = state["position"] + self.offset
 
@@ -2743,7 +2810,7 @@ class Overlay:
         PhotoImage). The scroll path uses the cheaper layer composite below."""
         img = Image.new("RGBA", (max(1, spec["w"]), max(1, spec["h"])), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        sw = max(1, round(2 * self.font_scale * self._auto_scale))
+        sw = self._stroke_w()
         for text, cx in spec["furi"]:
             d.text((cx, spec["furi_y"]), text, font=spec["furi_font"], fill=FURI_C,
                    anchor="mm", stroke_width=1, stroke_fill=INK)
@@ -2759,7 +2826,7 @@ class Overlay:
         """Render the block once, all glyphs in `color` (None = each row's own
         base color), plus furigana. One layer of the karaoke composite."""
         w, h = max(1, spec["w"]), max(1, spec["h"])
-        sw = max(1, round(2 * self.font_scale * self._auto_scale))
+        sw = self._stroke_w()
         img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         for text, cx in spec["furi"]:
@@ -2780,7 +2847,12 @@ class Overlay:
         (and a block that scrolls by without ever being the current line never
         pays for its sung layer at all)."""
         if b.get("sung") is None:
-            b["sung"] = self._paint_one_layer(b["spec"], SUNG)
+            sung = self._paint_one_layer(b["spec"], SUNG)   # render outside the lock
+            b["sung"] = sung
+            with self._cache_lock:
+                ce = self._block_cache.get(b["idx"])         # cache so a repeated line reuses it
+                if ce is not None and ce.get("sig") == self._block_sig():
+                    ce["sung"] = sung
         return b["sung"]
 
     def _composite_fill(self, base, sung, spec, frac):
@@ -2789,7 +2861,7 @@ class Overlay:
         w, h = base.size
         mask = Image.new("L", (w, h), 0)
         md = ImageDraw.Draw(mask)
-        sw = max(1, round(2 * self.font_scale * self._auto_scale))
+        sw = self._stroke_w()
         for row in spec["rows"]:
             chars = row["chars"]
             if not chars:
@@ -2815,16 +2887,100 @@ class Overlay:
         out.paste(sung, (0, 0), mask)
         return out
 
+    def _advance_fill(self, b, frac):
+        """Karaoke fill without the whole-block recomposite. We keep a persistent
+        composited surface `b["composited"]` and paste ONLY the newly-sung per-row
+        strip into it (PIL Image.paste supports a box+mask — cheap), then do ONE
+        upload to the PhotoImage. This drops the costly part of the old fill —
+        `base.copy()` + a full-size mask + a full paste, ~85 ms for a long
+        1.5×-scale block — leaving just the single blit. The fill grows
+        monotonically within a line; a seek-back (frac < last) rebuilds in full so
+        the highlight can recede correctly."""
+        comp, spec, photo = b["composited"], b["spec"], b["photo"]
+        w, h = comp.size
+        old_frac = b.get("fill_frac", 0.0)
+        if frac < old_frac - 1e-6:                        # seek-back → full rebuild
+            comp = self._composite_fill(b["base"], self._sung_layer(b), spec, frac)
+            b["composited"] = comp
+            photo.paste(comp)
+            b["fill_frac"] = frac
+            return
+        sung = self._sung_layer(b)
+        sw = self._stroke_w()
+        changed = False
+        for row in spec["rows"]:
+            chars = row["chars"]
+            if not chars:
+                continue
+            on = int(old_frac * len(chars) + 0.5)
+            nn = int(frac * len(chars) + 0.5)
+            if nn <= on:
+                continue                                  # this row gained no chars
+            x0 = max(0, (w if on >= len(chars) else int(chars[on][1])) - sw)
+            x1 = w if nn >= len(chars) else int(chars[nn][1]) + sw
+            if x1 <= x0:
+                continue
+            try:
+                asc, desc = row["font"].getmetrics()
+                half = (asc + desc) / 2.0 + sw + 3
+            except Exception:
+                half = getattr(row["font"], "size", 30) * 0.9
+            y0, y1 = max(0, int(row["y"] - half)), min(h, int(row["y"] + half))
+            crop = sung.crop((x0, y0, x1, y1))
+            comp.paste(crop, (x0, y0), crop)              # sung glyphs over base, in-strip
+            changed = True
+        if changed:
+            photo.paste(comp)                             # single full blit
+        b["fill_frac"] = frac
+
+    def _block_sig(self):
+        """Layout signature: anything that changes a line's rendered bitmap. A
+        font/scale change flips this so cached blocks are re-rendered; line TEXT is
+        fixed within a song (the cache is cleared on song load), so idx is enough."""
+        return (round(self.font_scale, 3), round(self._auto_scale, 3), self._block_h)
+
+    def _stroke_w(self):
+        """Outline width for image-block glyphs. CAPPED at 2: Pillow's per-glyph
+        stroke is the dominant block-render cost (python-pillow #6618), and a 3 px
+        stroke at font_scale 1.5 nearly doubled the first-appearance render for
+        little readability gain over 2 px. Must be identical at every call site so
+        the sliver fill's x-offsets line up with the rendered glyphs."""
+        return max(1, min(2, round(1.6 * self.font_scale * self._auto_scale)))
+
     def _render_img_block(self, i, frac):
         self._blk_seq += 1
         tag = f"blk{self._blk_seq}"
-        spec = self._block_spec(i)
-        base = self._paint_one_layer(spec, None)     # base only; sung is lazy
-        b = {"idx": i, "tag": tag, "x": 0.0, "w": spec["w"], "img": True,
-             "spec": spec, "photo": None, "sung_n": -1, "base": base, "sung": None,
-             "nchars": max((len(r["chars"]) for r in spec["rows"]), default=0)}
+        # Reuse the cached layout + base bitmap when this line has been rendered
+        # before at the current scale — the costly _block_spec measure pass and
+        # _paint_one_layer glyph render are skipped entirely (PERF-102).
+        sig = self._block_sig()
+        with self._cache_lock:
+            ce = self._block_cache.get(i)
+            hit = ce is not None and ce["sig"] == sig
+            if hit:
+                self._block_cache[i] = self._block_cache.pop(i)        # mark recently used
+        if not hit:
+            # MISS: the background prewarm hasn't reached this line yet → render it
+            # inline. The render runs OUTSIDE the lock so prewarm and the scroll
+            # thread never block each other on the ~150 ms glyph pass.
+            spec = self._block_spec(i)
+            base = self._paint_one_layer(spec, None)     # base only; sung is lazy
+            ce = {"sig": sig, "spec": spec, "base": base, "w": spec["w"], "sung": None,
+                  "nchars": max((len(r["chars"]) for r in spec["rows"]), default=0)}
+            with self._cache_lock:
+                self._block_cache[i] = ce
+                while len(self._block_cache) > self._block_cache_max:
+                    self._block_cache.pop(next(iter(self._block_cache)))   # evict oldest (LRU)
+        b = {"idx": i, "tag": tag, "x": 0.0, "w": ce["w"], "img": True,
+             "spec": ce["spec"], "photo": None, "sung_n": -1,
+             "base": ce["base"], "sung": ce["sung"], "nchars": ce["nchars"],
+             "fill_frac": max(0.0, frac)}   # baseline for the sliver fill (_advance_fill)
         # only build the sung layer + composite if it's already singing at spawn
-        img = base if frac <= 0 else self._composite_fill(base, self._sung_layer(b), spec, frac)
+        img = ce["base"] if frac <= 0 else self._composite_fill(
+            ce["base"], self._sung_layer(b), ce["spec"], frac)
+        # persistent surface the sliver fill mutates — a COPY so the shared cached
+        # base is never written to (frac>0 already returns a fresh composite).
+        b["composited"] = ce["base"].copy() if frac <= 0 else img
         b["photo"] = photo = ImageTk.PhotoImage(img)
         lane_y = self._lane_y0 + (i % self._lanes) * self._lane_gap
         self.cv.create_image(0, lane_y, image=photo, anchor="nw", tags=(tag, "strm"))
@@ -2956,10 +3112,14 @@ class Overlay:
         if self._tick_n % int(self._tune.get("fill_skip", self._fill_skip) or 1):
             return
 
+        # The spawn window must be wide enough that the widest block (a long
+        # English line ≈ 1500 px) is fully ready before it scrolls on-screen, or
+        # it pops in mid-frame. Live-tunable via /tune `scroll_spawn_margin`.
+        spawn_margin = self._tune.get("scroll_spawn_margin", 1100)
         want = {}
         for i, ln in enumerate(self.lines):
             cx = center + d * v * ((ln.start + ln.end) / 2 - pos)
-            if -1200 < cx < self.W + 1200:
+            if -spawn_margin < cx < self.W + spawn_margin:
                 want[i] = cx
         if want:
             self.cv.delete("hint")        # real lyrics showing → drop any stale hint
@@ -2992,7 +3152,18 @@ class Overlay:
         repaints = 0
         repaint_budget = int(self._tune.get("repaint_budget", self._repaint_budget))
         for b in self._stream[:]:
-            if b["idx"] not in want:
+            cxb = want.get(b["idx"])
+            # Despawn when outside the want window OR fully past the EXIT edge by
+            # the block's REAL width. The old centre-only ±margin kept a 1500px
+            # block alive ~500px (≈0.5 s) after it had fully left the screen — pure
+            # wasted re-composite. Cull direction-aware: rl exits left, lr exits right.
+            if cxb is None:
+                gone = True
+            elif d == 1:
+                gone = cxb + b["w"] / 2 < -40
+            else:
+                gone = cxb - b["w"] / 2 > self.W + 40
+            if gone:
                 self.cv.delete(b["tag"])
                 self._stream.remove(b)
                 continue
@@ -3009,12 +3180,14 @@ class Overlay:
                         and not _over_budget()):
                     b["sung_n"] = n
                     b["paint_t"] = now
-                    # CHEAP fill: composite the (lazily-built) sung layer over
-                    # base via a mask (no glyph re-rendering), paste into the
-                    # existing PhotoImage. This removed the karaoke-fill spikes.
+                    # SLIVER fill (PERF-102): paste ONLY the strip that newly
+                    # became sung — O(changed pixels), not a whole-block
+                    # recomposite. The fill only ever grows, so re-compositing the
+                    # entire 1.5×-scale block every step was pure waste and the
+                    # dominant remaining scroll spike (~85 ms each). _advance_fill
+                    # falls back to a full composite on a seek-back.
                     if b.get("base") is not None:
-                        b["photo"].paste(self._composite_fill(
-                            b["base"], self._sung_layer(b), b["spec"], frac))
+                        self._advance_fill(b, frac)
                     else:
                         b["photo"].paste(self._paint_block_img(b["spec"], frac))
                     repaints += 1
@@ -3379,6 +3552,31 @@ class Overlay:
             self.root.after(0, self._on_vocal_onset)
         except Exception:
             pass
+
+    def _vocals_active_now(self, min_secs=1.2):
+        """True when the live vocal-band energy has stayed clearly above the
+        learned instrumental baseline for ~min_secs — i.e. singing has really
+        started. Polled during the MV intro hold as a ROBUST release signal: the
+        one-shot _fire_vocal_event can miss, so this reuses the always-on vocal
+        buffer the sync correlator already maintains, so the lyrics aren't left
+        stranded on the intro card."""
+        b = getattr(self, "_boundary", None)
+        if not b:
+            return False
+        try:
+            hist = b.vocal_history(min_secs + 0.8)
+            base = b.vocal_baseline() or 0.0
+        except Exception:
+            return False
+        recent = [r for (_, r) in hist]
+        if len(recent) < 4:
+            return False
+        # vocals = ratio meaningfully over the instrumental floor (relative when a
+        # baseline was learned, else an absolute fallback), sustained across MOST
+        # of the window so a single instrumental stab can't trip the release.
+        thresh = max(0.20, base * 1.5) if base > 0 else 0.24
+        above = sum(1 for r in recent if r >= thresh)
+        return above >= max(3, int(0.6 * len(recent)))
 
     def _on_vocal_onset(self):
         """Vocals just started — singing rose above the instrumental floor. Used
@@ -3823,7 +4021,14 @@ class Overlay:
         self._lane_gap = self._block_h + round(14 * s)
         usable = self.work_h - 2 * self._win_margin
         fit = 1 + max(0, (usable - self._lane_top - self._block_h) // self._lane_gap)
-        self._lanes = max(1, min(4, int(fit)))     # up to 4 when blocks are short
+        # PERF: each lane is another full row of wide furigana image-blocks that
+        # Tkinter re-composites EVERY frame (the dominant scroll cost — see
+        # PERF-102). Cap the lanes hard: more lanes = more simultaneous big
+        # bitmaps = fewer fps. Default 2 (current + next line) instead of 4 —
+        # halves the per-frame bitmap area for tall 4-row blocks. Live-tunable via
+        # /tune `scroll_max_lanes` so it can be dialled per machine without a rebuild.
+        cap = int(getattr(self, "_tune", {}).get("scroll_max_lanes", 2) or 2)
+        self._lanes = max(1, min(cap, int(fit)))
         # First-lane Y inside the fixed window: top-anchored or bottom-anchored.
         stack = self._block_h + self._lane_gap * (self._lanes - 1)
         if self.position == "top":

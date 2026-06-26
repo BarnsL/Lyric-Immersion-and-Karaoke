@@ -8,6 +8,71 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-057 — MV intro hold never released → lyrics never started 🟢
+**Symptom:** a music video (V.W.P 電脳) sat on "Instrumental intro — waiting for
+vocals…" for the WHOLE song; lyrics never appeared even after singing clearly began.
+**Root cause:** the MV intro hold only released on (a) the one-shot
+`_fire_vocal_event` (a detector-thread band-energy-rise event that can simply never
+fire), (b) Shazam setting `_sound_song` (fails when the song isn't fingerprinted),
+or (c) a **100 s** hard timeout. With (a) and (b) both silent, the user faced a
+~100 s stall — effectively "never started".
+**Fix (this build):**
+  - **Vocal-energy POLL** (`_vocals_active_now`) inside the hold: release the
+    instant the live vocal-band ratio stays clearly above the learned instrumental
+    baseline for ~1.2 s. Reuses the always-on vocal buffer the sync correlator keeps,
+    so it doesn't depend on the flaky one-shot event. Calls `_on_vocal_onset` to
+    calibrate the offset, then anchors.
+  - Timeout backstop made tunable (`mv_intro_timeout`, default 75 s).
+**Also (per request):** the MV hold card now reads **"🎬 Cinematic intro — waiting
+for vocals…"** (a music video's lead-in is cinematic dead-space, often dialogue) —
+distinct from a plain audio "Instrumental intro".
+
+## TICKET-055 — Wrong song: Ludacris "The Potion" shown for Michiru Shisui's "Potion" 🟢
+**Symptom:** Spotify playing **Potion — Michiru Shisui** (a Japanese Phase-Connect
+VTuber's debut original). Overlay showed **English gangsta-rap** lines — "What up aye
+shawty what it is", "Lil' buddy what you want? Some violent shit", "Tell yo' momma
+I'm a ghet-to su-per-star". Those are **Ludacris — "The Potion"**, a different song.
+**Diagnosis (via API):** `/lyricstate` meta = `source: "syncedlyrics/cover"`,
+`lang: "es"` (Spanish tag on English text = garbage). `/diag` energy_align
+`ambiguous, lift 0.02, rival 0.673 > best 0.592`; `offset_history` thrashing
+0→-15→-27→0 — the words never line up with the audio.
+**Root cause:** two compounding bugs.
+  1. The two "Potion"s are **both 3:43** (223 s). That rare duration coincidence
+     beat **every** duration gate (`verify_lrc`, `_strict_ok`, `validate_file`).
+  2. The cache file `potion.json` was written by the **weak title-only "cover"
+     fallback** in an older build. Today's code fetches this clean Spotify track
+     with `cover=False, strict=True`, which already SKIPS both weak paths — but the
+     app **trusted the stale cache forever** without re-checking its provenance.
+The kana/hangul language guards don't fire (Latin title "Potion", romaji artist).
+**Fix (this build):**
+  - **Provenance guard** (`main.py:_file_valid`): a cache whose `meta.source` is
+    `syncedlyrics/cover` or `syncedlyrics/title` is REJECTED for a clean,
+    non-cover source → re-fetch under strict rules (returns the right song or
+    nothing, never the wrong one). Duration-independent.
+  - **Artist cross-check** (`fetch_lyrics._lrc_artist_conflict`): parse the LRC's
+    own `[ar:]` tag; reject a cover-fallback hit whose tagged artist is a different
+    script or shares no token with the requested artist (`[ar:Ludacris]` ≠ Michiru
+    Shisui). Conservative — a missing/near-match tag never rejects.
+  - Purged the stale `potion.json`.
+**Defense principle:** when we have an AUTHORITATIVE artist (clean source, not a
+cover), never trust a bare-title provider match — no matter how well the duration
+matches. Sound/energy can't save a rap song (continuous vocals → flat energy mask).
+
+## TICKET-056 — TPVR commits the wrong chorus on "All The Things She Said" 🟡
+**Symptom:** two-point sound-verification "constantly gets the wrong chorus then
+runs with it." A repeated chorus is acoustically identical each time, so read 1 and
+the confirming read 2 can both match a chorus instance and report the SAME offset,
+falsely "agreeing" → a wrong offset commits and sticks.
+**Change (this build):** the hesitation-before-confirm and the confirming-listen
+length are now **/tune knobs** (`sync_confirm_hold_ms` default 2600,
+`sync_confirm_listen_s` default 5.0) so the timing can be dialled in live without a
+rebuild. A LONGER hold separates the two reads by more song time, so two different
+instances of one chorus are less likely to both read at the same offset.
+**Open:** live-test a few songs (esp. "All The Things She Said") to find the
+hold/listen pair that hits **≥80 %** correct-commit. Candidate further work: require
+the two reads' implied song-position to be self-consistent with the player-clock
+advance (a true lock advances by exactly Δt; a re-matched chorus does not).
+
 ## TICKET-001 — Dance/play covers generate instead of fetching real lyrics 🟢
 **Symptom:** "Breaking Dimensions を踊ってみた", hololive covers, sit on "Generating…"
 and never load real lyrics (slow, spotty, wrong language).

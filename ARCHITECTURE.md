@@ -1,169 +1,141 @@
-# Architecture
+# Desktop Karaoke — Architecture
 
-How Desktop Karaoke is put together, module by module. Every public function is
-listed so you can find your way around. Source files also carry docstrings and
-inline notes (especially `fetch_lyrics.py`'s header: sources + problems solved).
+The authoritative map of the app's parts. Each subsystem below lists its
+**methods** and how each lands on a **confidence score** that decides whether the
+app acts on it. This supersedes the old module-by-module listing and scattered
+notes; per-function detail lives in source docstrings.
+
+Doc map:
+- **ARCHITECTURE.md** (this file) — the parts, methods, confidence model.
+- **ISSUES.md** — numbered behaviour tickets (matching / sync / rendering).
+- **PERFORMANCE.md** — rendering / CPU / audio-stutter tickets (PERF-###).
+- **RESEARCH.md** — background research that informed the design.
+- **docs/** — deep dives (CONCERT_DETECTION.md, GENERATION.md).
+
+The app is ONE process: a Tkinter transparent overlay (`main.py:Overlay`) plus
+background worker threads, with a local HTTP API (`api.py`) for inspection.
 
 ```
-play audio ──▶ MediaWatcher (winsdk)        ─┐
-                 position / title / status    │
-YouTube/Spotify                               ├─▶ Overlay (tkinter, transparent)
-                 recognize.py (Shazam) ───────┘     renders synced lyrics
-                 fetch_lyrics.py (providers) ──▶ lyrics/*.json  (cache)
+play audio ─▶ MediaWatcher (winsdk)  ─┐
+              position/title/status    │
+              recognize.py (Shazam) ───┼─▶ Overlay (tkinter, transparent)
+              fetch_lyrics / captions ─┘     renders synced lyrics
+                      └─▶ lyrics/*.json cache
 ```
 
-## main.py — the overlay app
+---
 
-The whole UI/runtime. A transparent, click-through, always-on-top Tk window
-plus a `pystray` tray menu.
+## 1. Song Identification — "what is playing?"
+**Modules:** `main.py` (MediaWatcher, clean_title/clean_artist, `_on_track_change`,
+`_consume_async`), `recognize.py` (Shazam), `concert_ocr.py`, `confidence.py`.
 
-- **`MediaWatcher`** — background thread polling Windows
-  `GlobalSystemMediaTransportControls` for `{title, artist, status, position,
-  duration, source}`; extrapolates position between polls. `.get()` / `.stop()`.
-- **`clean_title(title, source)`** — strip "- YouTube", brackets, "Official MV"…
-- **`LyricsIndex`** — in-memory index of `lyrics/*.json`. `.match(artist, title,
-  duration)` is **title-driven and paranoid**: a candidate is accepted only on an
-  exact or ≥60%-overlap title match (never a loose substring), so a different
-  song by the same artist is never grabbed; returns None when unsure → the caller
-  identifies by **sound**. `.refresh()`, `.add()`.
-- **Logging** — `log` (rotating `karaoke.log`) records every track change, the
-  title-vs-sound match, corrections, and sync adjustments. Readable via the API's
-  `/logs` so a human or agent can see *why* a song/lyric was chosen.
-- **`load_lyrics` / `split_furigana` / `draw_text` / `measure_text`** — IO &
-  rendering helpers. `draw_text` honours the perf mode's outline weight.
-- **Fonts (`_PIL_FONTS`, `_TK_MAIN_FONT`, `_script_of`)** — per-script so text
-  never renders as boxes (□): Yu Gothic has no Hangul, so Korean uses **Malgun
-  Gothic** and Chinese uses **Microsoft YaHei**; bare kanji follows the song's
-  language. The main row's font is chosen per line by its script.
-- **`_work_area`** — desktop work area (screen minus taskbar). The overlay is a
-  **fixed, full-work-area, click-through** window (added `WS_EX_TRANSPARENT`):
-  it never moves or resizes, which is the **root fix for lyrics drifting down**
-  (it used to resize per song and re-anchor to the bottom; backfill adding rows
-  mid-song made it jump). Content is positioned *inside* via `_lane_y0`.
-- **`Character`** (`character.py`) — optional tray-toggled dancing companion
-  themed to the detected artist (see that file's header).
-- **`api.py`** — optional localhost HTTP API (`127.0.0.1:8765`) for agents:
-  `GET /health` · `/status` · `/logs` · `/lyrics`, `POST /identify` · `/wrong` ·
-  `/nudge` · `/reset` · `/reindex`. Hardened for unattended driving — every
-  handler is wrapped (a bad request returns clean JSON, never crashes the app),
-  responses share an `{"ok": …}` shape, bodies are size-capped, mutations are
-  marshalled onto the Tk thread, it binds 127.0.0.1 only, and an optional
-  `KARAOKE_API_TOKEN` gates access.
-- All `subprocess` calls (git, PowerShell, pip) run with `CREATE_NO_WINDOW` so no
-  console window flashes.
-- **`Overlay`** — the window. Notable methods:
-  - lifecycle: `__init__`, `run`, `quit`, `_tick` (the ~60fps loop)
-  - matching/fetch: `_on_track_change`, `_start_fetch`, `_consume_async`,
-    `_file_valid`, `_maybe_translate`, `load`
-  - **audio**: `_start_identify(seconds, attempts)` (short captures re-sync
-    fast, long ones detect reliably), `_recalibrate_loop` + `_arm_recal`
-    (adaptive cadence — a 3-shot fast burst ~8s apart right after a song starts
-    so the offset locks in ~25s, then relaxes; once a song is **confirmed and
-    the boundary detector is on**, the blind poll relaxes further to a slow
-    safety heartbeat so a long compilation isn't Shazam-polled every few seconds),
-    `_health_check`, `_suspect`. Correction snaps to a clearly-real offset (>2s,
-    e.g. an MV intro) and otherwise eases 0.8× toward it, smoothing Shazam's
-    sub-second noise.
-  - **song-change detector**: `_start_boundary` spins up `songchange.py`'s
-    `SongChangeDetector`; `_on_boundary` (marshalled to the Tk thread via
-    `_fire_boundary`) fires when a track flip is heard inside one long video and
-    pulls an immediate re-identify in — the seamless switcher for compilations.
-    Throttled (ignores a boundary if one fired <4s ago or an identify is in
-    flight); `set_boundary` toggles it.
-  - rendering: `_render`, `_karaoke`, `_render_block`/`_ticker_update`
-    (scroll-through ticker), `_animate_in`/`_anim_step`, `_hint`
-  - **scroll layout**: `_relayout_song` sizes blocks + lane count to the rows
-    the current song uses (a 1-row Latin song → short blocks → up to 4 lanes;
-    a furigana+romaji+English song → tall blocks → fewer). `_compute_scroll_floor`
-    picks a per-song minimum scroll speed so dense/fast songs don't overlap
-    (same-lane lines sit `speed × Δtime` apart) while slow songs keep the
-    user's comfortable pace.
-  - **fixed window + placement**: `_relayout_song` no longer resizes the window
-    — it computes `_lane_y0` (where the lane stack sits inside the fixed window:
-    top-anchored, or bottom-anchored growing upward). `_viewport_watchdog` (~3s)
-    just re-asserts the fixed geometry/topmost and, as a backstop, trims a lane
-    if content ever overflows — **without moving the window**.
-  - **responsive sizing**: `_auto_scale` (from the work-area height, ≈1.0 on
-    1080p) multiplies the user's font %, so a 1440p/4K display or big TV gets
-    proportionally larger lyrics automatically.
-  - settings (all persisted via `_persist`): `set_opacity`, `set_position`,
-    `set_scroll`, `set_scroll_speed`, `set_font_scale`, `set_quality`,
-    `set_recal`, `apply_preset`, `set_git_sync`, `git_backup`, `set_startup`
-  - layout: `_apply_scale` (fonts + **font-aware lane count**), `_apply_perf`
-- **module helpers**: `_load_settings`/`_save_settings`, `startup_enabled`/
-  `set_startup`, `make_icon`, `main`.
+The player title is a HINT; **sound is the authority**. Methods → confidence:
 
-Data is **portable**: `_DATA` = the folder next to the .exe (or the source
-dir), holding `lyrics/` and `settings.json`.
+| Method | Source | Confidence signal |
+|---|---|---|
+| **Player metadata** (SMTC) | MediaWatcher (winsdk) | `confidence.title_distinctiveness()` 0–1: generic ("Awake","Lucky Star")→low→don't lock; distinctive→high→may `_title_locked` |
+| **Sound fingerprint** | `recognize.py`→shazamio | a (title,artist,offset) hit is high, but one read needs the 2-read agreement gate before it overrides a locked title |
+| **Concert banner OCR** | `concert_ocr.py` (Windows.Media.Ocr) | fuzzy match on-screen song→library; accept only `score ≥ 0.85` |
+| **Title cleaning** | clean_title/clean_artist, extract_cover_original | pulls the real song out of MV/cover/bilingual titles; covers route to the original artist |
 
-## fetch_lyrics.py — get & annotate lyrics (see its header for sources)
+**Reconciliation:** in `_consume_async`, a heard song matching the loaded lyrics →
+calibrate timing; a heard *different* song needs a 2nd confirming read to switch;
+a `_title_locked` distinctive title ignores a one-off Shazam mis-ID of a
+same-artist track. Reels/site audio (bare site name, no artist) → suppressed
+(`is_non_music_source`).
 
-- **`detect_lang(text)`** → `ja|ko|zh|ru|es|de|other` (script + Spanish/German
-  markers). **`_looks_romaji(text)`** flags *romanized* Japanese (mora-shaped
-  words + unmistakable JP tokens) so the original script can be preferred.
-- **`fetch_lrc(title, artist, duration)`** → verified timed LRC. LRCLIB
-  duration-exact first, then scored search, then `syncedlyrics` (Musixmatch/
-  NetEase/…) with a guarded title-only last resort. `verify_lrc` rejects
-  wrong-language / wrong-duration matches. **Prefers original script over
-  romaji**: a romaji-only hit is stashed and `_synced_cjk` tries to upgrade it to
-  the kanji/kana original (NetEase-first) — so a Japanese song shows real furigana
-  + romaji + translation, not a bare romaji upload; only if no original exists
-  anywhere is the romaji kept (and still translated, via the `ja-romaji` tag).
-- **Romanization**: `to_furigana` + `romanize(text, lang)` use **fugashi +
-  UniDic** (via **cutlet** for romaji) for Japanese — a real morphological
-  analyzer that segments correctly (今生きて → 今(いま)生き), with **pykakasi** as
-  an automatic fallback. Chinese uses `pypinyin`, Korean `hangul-romanize`.
-  **Katakana English** is recovered as English: `_segment_katakana` splits
-  run-together loanwords using **`gairaigo.py`** (an extensible katakana→English
-  table) so ベイビーアイラブユー → "baby I love you", not "beibiiairabuyuu".
-- **Translation**: `_translate_lines` translates in **context windows** — each
-  block of lines is sent with a couple of neighbouring lines before/after, so a
-  line is translated in the flow of the song. DeepL when `DEEPL_API_KEY` is set,
-  else Google. `backfill_file` self-heals a cached song (romaji + translation)
-  the first time it plays.
-- **`split_artists`**, `parse_lrc_text` (strips stacked `[mm:ss]`/`<..>` tags &
-  credit lines), `annotate`,
-  `_translate_lines`/`translate_file`, **`fetch_and_save(...)`** (writes JSON
-  with provenance: `lang/duration/source`), **`validate_file`**.
+---
 
-## recognize.py — identify by sound
+## 2. Lyric Sourcing — "get the right words + timing"
+**Modules:** `fetch_lyrics.py` (providers + verify), `deep_transcribe.py`
+(captions + by-ear), `main.py` (`load_youtube_captions`, `_begin_generation`).
 
-- **`recognize_playing(seconds, attempts)`** → `(title, artist, offset, t_cap)`.
-  Captures system audio (`soundcard` WASAPI loopback) and asks Shazam
-  (`shazamio`). `offset` = seconds into the song; `t_cap` = capture timestamp,
-  so the overlay can align its clock to the true position.
+Ordered by trust; each step is a confidence gate:
+1. **YouTube caption track** (`fetch_captions_only`, yt-dlp) — the video's OWN
+   words + timing. **Highest trust for a browser video.** Auto-fetched per song,
+   single-flight, preferred over any LRC (`_apply_captions`).
+2. **Provider LRC** (`fetch_lrc`): LRCLIB duration-exact → LRCLIB scored search →
+   syncedlyrics (artist-keyed → cover title-only → title-only last resort).
+   Gates: `verify_lrc` (length, **language-vs-title script**, duration window),
+   `_strict_ok` for generic titles, romaji→kanji upgrade.
+3. **Generation by ear** (`deep_transcribe`/`_generate_loop`, Whisper) — LAST
+   resort; marked `***` (AI); heavy CPU.
 
-## songchange.py — detect a track flip inside one long video
+---
 
-- **`SongChangeDetector(on_change, …)`** — a daemon thread with a cheap RMS
-  loudness meter on the WASAPI loopback (short, low-rate blocks → a few wake-ups
-  a second, negligible CPU). It fires `on_change()` on the tell-tale shape of a
-  track boundary: a stretch of music → a brief near-silent **gap** → music
-  returning. Conservative by design (silence judged against both an absolute
-  floor and a fraction of the recent loud level; the gap must persist `min_gap`
-  and be preceded by real music; `debounce` after each fire) so a quiet musical
-  passage doesn't false-trigger. `set_enabled(on)` / `stop()`. Only loudness is
-  analysed — no audio is stored, fingerprinted, or sent anywhere. A *crossfaded*
-  compilation (no gap) won't trip it; the overlay's slow Shazam heartbeat is the
-  backstop for that.
+## 3. Lyric Translation & Annotation
+**Modules:** `fetch_lyrics.py` (`annotate`, romanizers), `gairaigo.py`.
 
-## Tools (run from a terminal)
+Per line by language: **furigana** (fugashi+cutlet, literary-reading fixes,
+katakana-English recovery), **romaji** (Hepburn), **pinyin**, **romaja**,
+Cyrillic **transliteration**, English **translation** (deep-translator/DeepL).
+Accuracy hinges on the morphological analyzer's segmentation (今生きて→今/生きて).
 
-- **`preload.py`** — bulk-fetch a curated `SONGS` list into the library.
-- **`reannotate.py`** — rebuild furigana/romaji for cached Japanese files with
-  the current analyzer (use after a romanizer change; `--dry` to preview).
-- **`sync_playlists.py`** — Spotify OAuth-PKCE → all playlists → fetch.
-- **`youtube_music.py`** — YouTube Music playlists via yt-dlp cookies → CSV + fetch.
-- **`validate.py`** — scan the cache for bad/mismatched files (`--purge`).
+---
 
-## Lyrics JSON schema
+## 4. Sync by Sound — "line up lyrics to the audio"
+**Modules:** `main.py` (Shazam calibration in `_consume_async`, energy correlation,
+`_schedule_sync_confirm`), `align.py` (Whisper), `songchange.py` (vocal energy).
 
-```json
-{ "meta": {"title","artist","lang","duration","source"},
-  "lines": [ {"t":[start,end], "jp":"漢字(かな)…", "rm":"reading", "en":"english"} ] }
-```
+| Method | How | Confidence gate before it moves the offset |
+|---|---|---|
+| **Shazam offset** | shazamio returns position-into-song | **Two-point verification**: a non-zero offset is HELD, then a confirming listen ~2 s later must AGREE before committing (anti-chorus). Deadband; studio-vs-live mode; ambiguity-spread reset. |
+| **Energy correlation** | cross-correlate audio vocal-band on/off mask vs LRC line intervals | small-shift prior, peak **uniqueness** (reject near-equal distant rival = chorus), lift-vs-median floor, agree-with-Shazam band. The cheap, always-on automatic method. |
+| **Whisper align** | transcribe a clip, fuzzy-match lyric lines | match-ratio floor scaled by jump size. HEAVY → **explicit "Sync by listening" button + last-resort generation only**, never the automatic loop. |
 
-See **[AGENTS.md](AGENTS.md)** to add songs/sources, **[USAGE.md](USAGE.md)** for
-the tray/settings reference, and **[RESEARCH.md](RESEARCH.md)** for the
-subsystem-by-subsystem investigation behind recent changes (lyric sources,
-word-level timing, sync, performance, translation).
+Player clock carries between corrections; captions are video-locked so the
+correlator is skipped for them.
+
+---
+
+## 5. Wrong-Song Rejection (cross-cutting)
+By failure mode:
+- **Same-title, wrong language** → §2 language guards: **kana title = JA** (reject
+  zh/ko), **hangul = KO** (reject zh/ja), **CJK artist ≠ European**.
+- **Generic title** → `title_distinctiveness` + `_strict_ok` (don't lock "Lucky Star").
+- **Same-artist Shazam mis-ID** → `_title_locked` containment match.
+- **Wrong cut / stale generated cache** → captions override; `/wrong` deletes the
+  cache + re-identifies; covers re-fetch by original artist.
+- **Site/Reel audio** → `is_non_music_source`.
+
+---
+
+## 6. Music-Video & Concert Detection
+**Modules:** `main.py` (`is_mv_version`, `is_live_or_compilation`, MV-intro hold,
+`_on_vocal_onset`), `songchange.py`, `concert_ocr.py`.
+
+- **MV intro** — title `is_mv_version` OR auto (LRC ≪ video, first line near 0) →
+  hold lyrics through the instrumental intro until the **vocal-onset** detector
+  (band-energy rise) or quiet→music onset fires.
+- **Concert / compilation** — `is_live_or_compilation` → ignore the event title,
+  drive each song by SOUND; song-change detector fires an immediate re-ID on a
+  silent gap; **concert OCR** reads the on-screen banner.
+
+---
+
+## 7. Rendering & Performance
+**Modules:** `main.py` (`_tick`/`_ticker_update`, layer-composite fill),
+`character.py`; see **PERFORMANCE.md**. Tkinter canvas (CPU). Scroll = `canvas.move`
+of pre-rendered PIL blocks; karaoke fill = composite a sung layer over base via a
+full-glyph mask. Open: PERF-101 single-strip, PERF-100 moderngl GPU overlay.
+
+---
+
+## 8. Diagnostics API (`api.py`, 127.0.0.1:8765)
+`/status` `/diag` (sync state machine + FPS) `/source` `/audio` `/lyricstate`
+`/tune` (live sync constants) `/captions` `/align` `/identify` `/wrong` `/nudge`
+`/reset` `/logs`.
+
+---
+
+## Appendix — what "energy" means here
+"**Energy**" = the **acoustic loudness / spectral energy of the audio**, used two ways:
+1. **Vocal-band energy ratio** (`songchange.py:_vocal_ratio`) — the fraction of an
+   audio block's spectral energy in the **200–3000 Hz vocal band** (one FFT per
+   0.2 s block). High ratio + low spectral **flatness** (tonal, not broadband game
+   noise) = "vocals are sounding now" → a per-block **vocals on/off** mask.
+2. **Energy correlation** (§4) — slide that on/off mask against the LRC's
+   line-active intervals; the shift of best overlap is the sync offset. "Sync by
+   energy" = aligning *when there's singing* to *when the lyrics say there should
+   be* — no transcription, no network, cheap enough to run continuously. The
+   Whisper-free workhorse of §4.

@@ -734,6 +734,33 @@ def _strict_ok(lrc: str, title: str, duration: float | None) -> bool:
     return False                           # Latin title, no duration → don't risk it
 
 
+def _lrc_artist_conflict(lrc: str, want_artist: str) -> bool:
+    """(TICKET-055) True when the LRC's own ``[ar:]`` metadata names an artist that clearly is
+    NOT the one we asked for — a DURATION-INDEPENDENT wrong-song signal for the
+    weak title-only / cover-fallback paths. A bare-title search for a common title
+    can return a famous unrelated same-title song (Ludacris "The Potion" for a
+    VTuber's "Potion"); when that file carries ``[ar:Ludacris]`` and we wanted
+    "Michiru Shisui" we reject it even though the 3:43 durations coincided and beat
+    every duration gate. Conservative: fires ONLY when an ``[ar:]`` tag is present
+    AND the two artists are a different script OR share no token — a missing tag or
+    a near-match never rejects a correct file."""
+    m = re.search(r"\[ar:([^\]]+)\]", lrc, re.I)
+    if not m or not want_artist:
+        return False
+    got = m.group(1).strip()
+    if not got:
+        return False
+    def _norm(s):
+        return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s.lower())).strip()
+    ng, nw = _norm(got), _norm(want_artist)
+    if not ng or not nw or ng == nw or ng in nw or nw in ng:
+        return False
+    cjk = lambda s: bool(_KANA.search(s) or _HAN.search(s) or _HANGUL.search(s))
+    if cjk(got) != cjk(want_artist):
+        return True                        # one CJK, one Latin ⇒ different artist
+    return not (set(ng.split()) & set(nw.split()))   # same script: no shared token
+
+
 def _synced_cjk(title, artist, duration):
     """Search syncedlyrics across providers that carry ORIGINAL-script lyrics and
     return (lrc, provider) for the first synced result that actually contains CJK
@@ -823,6 +850,14 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     # SAME-TITLE COLLISION (a German song also called "Beyond the Way" outranked the
     # Japanese cover, which lives on NetEase under a romanized name we can't derive).
     exp_cjk = bool(a and (_KANA.search(a) or _HAN.search(a) or _HANGUL.search(a)))
+    # The TITLE's script pins the SONG's language even when the ARTIST is
+    # romanized (Sakura Miko, Kizuna AI…). KANA (hiragana/katakana) is unique to
+    # Japanese, HANGUL to Korean — so a kana title is a Japanese song and a
+    # Chinese/Korean same-title hit is a COLLISION ("ファッションビート" by Sakura Miko
+    # pulled a Chinese "Fashion Beat"). HAN-only is ambiguous (shared JA/ZH), so
+    # it doesn't pin a language.
+    title_ja = bool(_KANA.search(t))
+    title_ko = bool(_HANGUL.search(t))
 
     def take(lrc, meta):
         """Accept this match now — unless it's romanized Japanese (stash + keep
@@ -830,6 +865,11 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
         body = re.sub(r"\[[^\]]*\]", "", lrc)
         if exp_cjk and detect_lang(body) in ("de", "es", "ru", "fr", "it", "pt"):
             return None   # CJK artist + European-language lyrics → collision, skip
+        body_lang = detect_lang(body)
+        if title_ja and body_lang in ("zh", "ko"):
+            return None   # kana title = Japanese song; zh/ko hit is a collision
+        if title_ko and body_lang in ("zh", "ja"):
+            return None   # hangul title = Korean song; zh/ja hit is a collision
         if _looks_romaji(body):
             if romaji_fallback[0] is None:
                 romaji_fallback[0] = (lrc, {**meta, "romaji": True})
@@ -918,7 +958,8 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     if cover and t:
         for tt in (_title_variants(t) or [t]):
             lrc = _try(tt)
-            if lrc and verify_lrc(lrc, t, duration):
+            if (lrc and verify_lrc(lrc, t, duration)
+                    and not _lrc_artist_conflict(lrc, a)):
                 r = take(lrc, {"source": "syncedlyrics/cover", "artist": a or None,
                                "duration": duration})
                 if r:

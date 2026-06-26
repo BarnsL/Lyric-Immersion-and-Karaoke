@@ -71,6 +71,38 @@ on Windows. Dear PyGui / Kivy can't do per-pixel-alpha click-through overlays.
 Sources: GLFW window guide; moderngl; Tk Performance wiki; swharden scrolling.
 **Decision:** only pursue if the quick wins (PERF-101) can't hold 60 fps.
 
+## PERF-102 — Many furigana lines crawled at 10-15 fps (lane + offscreen bloat) 🟡
+**Symptom:** a dense Japanese MV (V.W.P 変身 — kanji + furigana + romaji + English on
+long lines) scrolled at **10-15 fps**.
+**Root cause:** the scroll belt stacks up to **4 lanes**, each a wide RGBA
+image-block (a long line ≈ 1500 px × ~280 px for 4 rows). Tkinter re-composites
+EVERY live block every frame (a horizontal `cv.move` dirties the whole lane band),
+so cost = `lanes × block_w × block_h`. Four lanes of full-height furigana blocks is
+a huge per-frame alpha-blit. Worse, the spawn/keep test was centre-only
+`-1200 < cx < W+1200`, so a 1500 px block stayed live ~500 px (≈0.5 s) AFTER fully
+leaving the screen — pure wasted re-composite.
+**Measured (`/diag`):** render 9 fps, frame_ms 115, worst 473, BUT
+`recent_ms = [32, 33, 148, 32, 33, 454, 33, 32]` — the steady belt is **32-33 ms
+(30 fps, fine)**; it's **periodic 150-450 ms SPIKES** that tank the average. The
+spike is one giant block being RE-RENDERED: a long line at the user's `font_scale
+1.5` is ~2500×420 px with hundreds of stroked-glyph draws ≈ 450 ms, and it re-renders
+every time the line re-enters (repeated choruses, edge despawn/respawn, lane churn).
+**Fix (this build):**
+  - **Per-line bitmap CACHE (the main fix):** `_block_cache` keyed by line idx +
+    scale signature stores each line's base (and sung) bitmap. A re-entering line is
+    now a cheap PhotoImage wrap instead of a 450 ms render. LRU-capped (32), cleared
+    on song load / scale change. Kills the recurring spikes → steady 30 fps after a
+    line's first appearance.
+  - **Cap lanes** `min(4→2, fit)`, live-tunable `scroll_max_lanes` — halves
+    per-frame bitmap area for tall blocks; also de-clutters.
+  - **Cull by real width, direction-aware** (rl→left, lr→right) using `cx ± w/2` —
+    drops trailing live blocks ~0.5 s sooner.
+  - **Tunable spawn margin** `scroll_spawn_margin` (1100).
+**Note:** the FIRST appearance of each unique line still renders once (a single
+spike), worst at high `font_scale`. If that's still visible: lower `font_scale`, or
+escalate to PERF-101 (single composited strip) / PERF-100 (GPU). The cache removes
+the *recurring* spikes, which were the bulk of the 9 fps.
+
 ## PERF-101 — Single-strip Tkinter render (quick win, medium effort) 🔴
 Research's top low-effort win: pre-render each lyric line to ONE wide PhotoImage
 and move that single canvas item, instead of a belt of many per-block images

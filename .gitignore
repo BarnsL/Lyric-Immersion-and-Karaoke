@@ -9,6 +9,8 @@ env/
 # Build / logs
 *.log
 preload.log
+build_*.exit
+build_*.log
 
 # Spotify auth — local secrets / tokens, never commit
 spotify_config.json
