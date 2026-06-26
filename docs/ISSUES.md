@@ -19,7 +19,10 @@ back to 20 s and stays fast while misses continue, `inconclusive` holds. The che
 energy correlation gives the verdict when it reads a clear peak; when it's **blind on a
 song** (flat/ambiguous — the off-vocal ReGLOSS 'サクラミラージュ' case, `_energy_blind`)
 the tier escalates to a short **Whisper listen** (`_tier_listen_now`, 6 s capture),
-**two-point verified** for any large jump before it can move sync. Whisper CPU is capped
+**two-point verified** for any large jump before it can move sync. A song we genuinely
+**can't read** (Whisper keeps returning `inconclusive`) is NOT hammered at 3×/min — two
+blind checks **back the cadence off** one notch toward 1×/min, so a futile check can't
+cost a stutter (only a detected MISS keeps it fast). Whisper CPU is capped
 (`cpu_threads=4` in `align.py`) so the transcribe can't stutter the overlay. Knobs:
 `sync_tier_fast_s` / `_mid_s` / `_slow_s` / `_ok_drift` / `_listen_s`. Telemetry in
 `/diag.sync`: `tier_interval_s`, `tier_good_streak`, `tier_miss_streak`,

@@ -1260,6 +1260,7 @@ class Overlay:
         self._sync_tier_interval = 20.0  # current verify cadence (s): 20=fast(3×/min) … 60=relaxed(1×/min)
         self._sync_good_streak = 0    # consecutive in-sync confirmations (drives de-escalation)
         self._sync_miss_streak = 0    # consecutive out-of-sync checks (telemetry / stay-fast)
+        self._sync_incon_streak = 0   # consecutive unreadable checks → back off (don't hammer)
         self._energy_blind = 0        # consecutive energy checks with no usable peak → escalate to Whisper
         self._tier_tpvr = None        # held 1st Whisper-read offset for two-point confirm
         self._tier_tpvr_until = 0.0   # deadline for the confirming 2nd tier read
@@ -1353,6 +1354,7 @@ class Overlay:
         # New song → start in fast-verify (3×/min) and re-judge from scratch.
         self._sync_tier_interval = self._tune.get("sync_tier_fast_s", 20.0)
         self._sync_good_streak = self._sync_miss_streak = self._energy_blind = 0
+        self._sync_incon_streak = 0
         self._tier_tpvr = None
         self._tier_listen = False
         self._live_arrangement = is_live_arrangement(title)  # LIVE/short/alt → follow offset
@@ -3615,6 +3617,7 @@ class Overlay:
                 "tier_interval_s": round(self._sync_tier_interval, 1),
                 "tier_good_streak": self._sync_good_streak,
                 "tier_miss_streak": self._sync_miss_streak,
+                "tier_incon_streak": self._sync_incon_streak,
                 "tier_energy_blind": self._energy_blind,
                 "tier_listening": self._tier_listen,
             },
@@ -4898,15 +4901,23 @@ class Overlay:
         slow = self._tune.get("sync_tier_slow_s", 60.0)
         if verdict == "insync":
             self._sync_good_streak += 1
-            self._sync_miss_streak = 0
+            self._sync_miss_streak = self._sync_incon_streak = 0
             # one good check halves the rate; a second relaxes fully to 1×/min
             self._sync_tier_interval = mid if self._sync_good_streak < 2 else slow
         elif verdict == "corrected":
             self._sync_miss_streak += 1
-            self._sync_good_streak = 0
+            self._sync_good_streak = self._sync_incon_streak = 0
             self._sync_tier_interval = fast        # escalate; keep fast while missing
         else:
-            return                                  # inconclusive: cadence unchanged
+            # inconclusive = couldn't get a reading (NOT a detected desync). A song we
+            # can't verify must NOT be hammered at 3×/min — that only costs CPU (and
+            # risks a stutter) for nothing. Back the cadence off one notch after two
+            # blind checks so we settle toward 1×/min instead of churning Whisper.
+            self._sync_incon_streak += 1
+            if self._sync_incon_streak < 2:
+                return                              # one-off blip: hold cadence
+            self._sync_incon_streak = 0
+            self._sync_tier_interval = mid if self._sync_tier_interval <= fast else slow
         log.info("sync-tier: %s → verify every %.0fs (good=%d miss=%d)",
                  verdict, self._sync_tier_interval, self._sync_good_streak,
                  self._sync_miss_streak)
