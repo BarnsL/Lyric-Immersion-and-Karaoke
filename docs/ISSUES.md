@@ -8,15 +8,21 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
-## TICKET-070 — feelingradation (ReGLOSS) always fails to fetch → baked in 🟢
-**Symptom:** "ReGLOSS - feelingradation OFFICIAL MV" always failed to get real lyrics
-and fell back to a poor Whisper transcription.
-**Cause:** the app searches under the verbose channel "hololive DEV_IS ReGLOSS", which
-every provider misses; the real synced LRC exists under "feelingradation ReGLOSS".
-**Fix:** a `bundled_lyrics/` dir SHIPS with the app (PyInstaller datas); at startup
-`_seed_bundled_lyrics()` copies it into the runtime cache, overwriting a weaker
-generated cache. feelingradation is baked in (54 lines, furigana + romaji + translation,
-`source: bundled`). Any always-failing song can now be added the same way.
+## TICKET-070 — ReGLOSS songs always wrong (feelingradation, サクラミラージュ) → baked in 🟢
+**Symptom:** "feelingradation" and "サクラミラージュ Performance Video" (hololive DEV_IS
+ReGLOSS) were always wrong — feelingradation fell back to a poor Whisper transcription;
+サクラミラージュ loaded a totally unrelated song ("Daybreak Frontline", then "Mumei").
+**Cause (two layers):** (1) the app searches under the verbose channel "hololive DEV_IS
+ReGLOSS", which every provider misses (the real LRCs are under "ReGLOSS"). (2) These
+MMD/"Performance Video" cuts can't be Shazam-fingerprinted, so Shazam keeps mis-ID'ing
+them as random other tracks and SOUND OVERRODE the title, loading the wrong lyrics.
+**Fix:** (1) a `bundled_lyrics/` dir SHIPS with the app (PyInstaller datas); at startup
+`_seed_bundled_lyrics()` copies it into the runtime cache over a weaker cache. Both songs
+are baked in (`source: bundled`, full furigana/romaji/translation). (2) a baked cache is
+now **authoritative**: the heard-handling ignores a contradicting Shazam read for a
+`source: bundled` song (no switch, no strikes) so a mis-ID can't override ground truth.
+Any always-failing song can be added the same way (generate via the providers' working
+search term, drop the JSON in `bundled_lyrics/`).
 
 ## TICKET-069 — "Cinematic intro" shown while the song is already singing 🟢
 **Symptom:** the "🎬 Cinematic intro — waiting for vocals…" card stuck on screen for a
