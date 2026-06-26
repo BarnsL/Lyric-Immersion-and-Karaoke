@@ -205,6 +205,26 @@ SCROLL_SPEED = 220.0  # px/sec — constant, comfortable scroll-through pace
 BROWSER_HINTS = ("youtube", "brave", "chrome", "msedge", "edge", "firefox", "opera", "mozilla")
 _CJK_RE = re.compile(r"[一-鿿㐀-䶿ぁ-んァ-ヶー가-힣]")
 
+# Social / short-video platforms whose browser tab reports the SITE NAME as the
+# SMTC "title" (with no artist) when you scroll Reels/Shorts/clips — that's NOT a
+# song, so the karaoke overlay must not switch on and slap a same-named song's
+# lyrics over it (an Instagram Reel matched the song "Instagram"). YouTube is
+# deliberately ABSENT — its tabs report the real video title.
+_NON_MUSIC_TITLES = {
+    "instagram", "tiktok", "facebook", "x", "twitter", "reddit", "snapchat",
+    "threads", "tumblr", "linkedin", "pinterest", "discord", "whatsapp",
+    "telegram", "messenger", "twitch", "vimeo", "dailymotion", "bilibili",
+    "新しいタブ", "new tab",
+}
+
+
+def is_non_music_source(title, artist):
+    """True when the media title is just a social/short-video SITE NAME with no
+    artist — a Reel/Short/clip, not a song. Then the overlay stays off."""
+    t = re.sub(r"\s*[-–—|]\s*(reels?|shorts?|video)\s*$", "", (title or "").strip(), flags=re.I)
+    t = t.strip().lower()
+    return bool(t in _NON_MUSIC_TITLES and not (artist or "").strip())
+
 
 def _has_cjk(s):
     """True if the string contains any CJK or Hangul character."""
@@ -2425,6 +2445,20 @@ class Overlay:
                 self._track = None
                 self._hint("Waiting for music…")
             self.root.after(120, self._tick)
+            return
+
+        # Scrolling Instagram/TikTok/etc. Reels: the tab reports the SITE NAME as
+        # the title (no artist). That's not a song — keep the overlay OFF so it
+        # doesn't match a same-named song and slap lyrics over the clip.
+        if is_non_music_source(state["title"], state.get("artist", "")):
+            if self._track is not None or self.lines:
+                self._track = None
+                self.lines, self.idx, self._kara = [], -1, []
+                self._lyrics_path = None
+                self.cv.delete("all")
+                self._clear_stream()
+                self._hint("")        # nothing — don't cover the reel
+            self.root.after(200, self._tick)
             return
 
         # clean_title() runs several regexes; the raw title rarely changes, so
