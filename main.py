@@ -4323,6 +4323,41 @@ def main():
         ctypes.windll.winmm.timeBeginPeriod(1)
     except Exception:
         pass
+    # CPU AFFINITY: keep this app OFF the first core(s). Windows runs the audio
+    # engine and most device interrupts (DPC/ISR) on core 0, so a CPU-busy app
+    # sharing core 0 shows up as a STATIC STUTTER in playing audio. Pinning our
+    # threads to the LATER cores (upper half, never core 0) leaves the audio
+    # path clean on a typical 4+ core machine; on 2-3 cores we just avoid core 0.
+    # Best-effort and reversible by the user via Task Manager.
+    try:
+        import os as _os
+        k32 = ctypes.windll.kernel32
+        # 64-bit-correct signatures — without these ctypes truncates the pseudo
+        # handle (-1) and the DWORD_PTR mask to 32 bits and the call no-ops.
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        k32.SetProcessAffinityMask.restype = ctypes.c_int
+        k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        n = _os.cpu_count() or 1
+        if n >= 4:
+            mask = 0
+            for c in range(n // 2, n):       # upper half: cores N/2 … N-1
+                mask |= (1 << c)
+        elif n >= 2:
+            mask = ((1 << n) - 1) & ~1        # all cores except core 0
+        else:
+            mask = 1
+        h = k32.GetCurrentProcess()
+        ok = k32.SetProcessAffinityMask(h, mask)
+        # Below-normal priority so we yield to the foreground game/player.
+        k32.SetPriorityClass(h, 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
+        log.info("cpu affinity: %d cores → mask 0x%x (set=%s), priority below-normal",
+                 n, mask, bool(ok))
+    except Exception as e:
+        try:
+            log.info("cpu affinity set failed: %s", e)
+        except Exception:
+            pass
     offset = 0.0
     args = sys.argv[1:]
     for i, a in enumerate(args):
