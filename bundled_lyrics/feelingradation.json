@@ -9,489 +9,534 @@
   "lines": [
     {
       "t": [
-        13.57,
-        15.96
+        28.79,
+        32.69
       ],
-      "jp": "キラキラで始(はじ)まるオーバーチュア",
-      "rm": "kirakira de hajimaru overture",
-      "en": "Overture begins with glitter"
-    },
-    {
-      "t": [
-        15.96,
-        17.86
-      ],
-      "jp": "二人(ふたり)はいつでもマイペース",
-      "rm": "futari wa itsu de mo my pace",
-      "en": "The two of us always go at our own pace"
-    },
-    {
-      "t": [
-        17.86,
-        19.42
-      ],
-      "jp": "大慌(おおあわ)てのコンダクター",
-      "rm": "ooawate no conductor",
-      "en": "Conductor in a panic"
-    },
-    {
-      "t": [
-        19.42,
-        21.42
-      ],
-      "jp": "今(いま)どこいるの？ってマジレス",
-      "rm": "ima doko iru no? tte majiresu",
-      "en": "Where are you now? That's serious"
-    },
-    {
-      "t": [
-        21.42,
-        24.76
-      ],
-      "jp": "秒針(びょうしん)も置き去(おきざ)りのロケーション",
-      "rm": "byoushin mo okizari no location",
-      "en": "A location where even the second hand is left behind"
-    },
-    {
-      "t": [
-        24.76,
-        28.53
-      ],
-      "jp": "行(い)く先々(さきざき) 探(さが)す宝物(ほうもつ)",
-      "rm": "iku sakizaki sagasu houmotsu",
-      "en": "Treasures to search for wherever you go"
-    },
-    {
-      "t": [
-        28.53,
-        30.3
-      ],
-      "jp": "(Pomped pomped pomped...)",
+      "jp": "My heart starts skipping a beat",
       "rm": "",
-      "en": ""
+      "en": "My heart starts skipping a beat"
     },
     {
       "t": [
-        30.3,
-        32.06
+        32.69,
+        35.79
       ],
-      "jp": "Allday 弾(はず)んじゃってさ",
-      "rm": "allday hazunjatte sa",
-      "en": "Allday Bouncy"
+      "jp": "紐解(ひもと)いた新章(しんしょう)",
+      "rm": "himotoita shinshou",
+      "en": "New chapter unraveled"
     },
     {
       "t": [
-        32.06,
-        33.84
+        35.79,
+        39.28
       ],
-      "jp": "(Prink prink prink...)",
+      "jp": "様変(さまが)わりしてゆく Show time",
+      "rm": "samagawari shite yuku Show time",
+      "en": "Show time is changing"
+    },
+    {
+      "t": [
+        39.28,
+        43.19
+      ],
+      "jp": "全然(ぜんぜん)悪(わる)くないイマジネーション",
+      "rm": "zenzen waruku nai imagination",
+      "en": "Not a bad imagination at all"
+    },
+    {
+      "t": [
+        43.19,
+        46.79
+      ],
+      "jp": "視界(しかい)の霧(きり)は晴(は)れ渡(わた)って",
+      "rm": "shikai no kiri wa hare watatte",
+      "en": "The fog in my vision clears up"
+    },
+    {
+      "t": [
+        46.79,
+        50.23
+      ],
+      "jp": "悲(かな)しみに別(わか)れを告(つ)げる",
+      "rm": "kanashimi ni wakare wo tsugeru",
+      "en": "Say goodbye to sadness"
+    },
+    {
+      "t": [
+        50.23,
+        53.75
+      ],
+      "jp": "酸(す)いも甘(あま)いも宙(ちゅう)に放り出(ほうりだ)して",
+      "rm": "sui mo amai mo chuu ni houridashite",
+      "en": "Throw both the sour and the sweet into the air"
+    },
+    {
+      "t": [
+        53.75,
+        56.78
+      ],
+      "jp": "滲(にじ)む空(そら)インクは薔薇色(ばらいろ)",
+      "rm": "nijimu sora ink wa barairo",
+      "en": "The bleeding sky ink is rose-colored"
+    },
+    {
+      "t": [
+        56.78,
+        60.33
+      ],
+      "jp": "どれだけ上手(うま)く魅(み)せようとしても (Hey)",
+      "rm": "dore dake umaku miseyou to shite mo (Hey)",
+      "en": "No matter how well you try to charm me,"
+    },
+    {
+      "t": [
+        60.33,
+        63.85
+      ],
+      "jp": "キミがいなければ何(なん)の意味(いみ)もない",
+      "rm": "kimi ga inakereba nan no imi mo nai",
+      "en": "Without you, there's no meaning to me"
+    },
+    {
+      "t": [
+        63.85,
+        67.32
+      ],
+      "jp": "擦り傷(すりきず)すらつかない幻想(げんそう) (Hey)",
+      "rm": "surikizu sura tsukanai gensou (Hey)",
+      "en": "The fantasy of not even getting scratches"
+    },
+    {
+      "t": [
+        67.32,
+        70.68
+      ],
+      "jp": "針(はり)の落(お)ちないレコードさ",
+      "rm": "hari no ochinai record sa",
+      "en": "It's a record where the needle doesn't fall"
+    },
+    {
+      "t": [
+        70.68,
+        76.03
+      ],
+      "jp": "たった今(いま)止(と)め処(ところ)ない追い風(おいかぜ)背(せ)にして",
+      "rm": "tatta ima tome tokoro nai oikaze se ni shite",
+      "en": "With an unstoppable tailwind at my back"
+    },
+    {
+      "t": [
+        76.03,
+        77.7
+      ],
+      "jp": "Come on, let's roll",
       "rm": "",
-      "en": ""
+      "en": "Come on, let's roll"
     },
     {
       "t": [
-        33.84,
-        35.6
+        77.7,
+        80.48
       ],
-      "jp": "華麗(かれい)に Dress up",
-      "rm": "karei ni Dress up",
-      "en": "Dress up splendidly"
+      "jp": "颯爽(さっそう)と吹き荒(ふきあ)れる向かい風(むかいかぜ)にも",
+      "rm": "sassou to fukiareru mukaikaze ni mo",
+      "en": "Even in the face of a strong headwind"
     },
     {
       "t": [
-        35.6,
-        36.85
+        80.48,
+        84.79
       ],
-      "jp": "魔法(まほう)かける",
-      "rm": "mahou kakeru",
-      "en": "Cast a spell"
+      "jp": "ココロ靡(なび)かせて",
+      "rm": "kokoro nabikasete",
+      "en": "Let my heart flutter"
     },
     {
       "t": [
-        36.85,
-        38.57
+        84.79,
+        88.32
       ],
-      "jp": "そうね、Don't rush Don't rush",
-      "rm": "sou ne, Don't rush Don't rush",
-      "en": "Yeah, Don't rush Don't rush"
+      "jp": "飛び乗(とびの)って To the future",
+      "rm": "tobinotte To the future",
+      "en": "Jump to the future"
     },
     {
       "t": [
-        38.57,
-        40.48
+        88.32,
+        90.08
       ],
-      "jp": "予定(よてい)大幅(おおはば)遅(おく)れ？",
-      "rm": "yotei oohaba okure?",
-      "en": "Significantly behind schedule?"
+      "jp": "フライングしたって Alright",
+      "rm": "flying shitatte Alright",
+      "en": "Flying Alright"
     },
     {
       "t": [
-        40.48,
-        45.18
+        90.08,
+        91.84
       ],
-      "jp": "Cho Very Very Very Good Traveling",
+      "jp": "ReSTART LINE! (Hey!)",
       "rm": "",
-      "en": "Cho Very Very Very Good Traveling"
+      "en": "ReSTART LINE!"
     },
     {
       "t": [
-        45.18,
-        48.5
+        91.84,
+        95.31
       ],
-      "jp": "終(お)わんない Curious Curious",
-      "rm": "owannai Curious Curious",
-      "en": "Curious Curious"
+      "jp": "ときめいてしまえば",
+      "rm": "tokimeite shimaeba",
+      "en": "Once your heart flutters"
     },
     {
       "t": [
-        48.5,
-        52.0
+        95.31,
+        98.82
       ],
-      "jp": "イニミニダベリング",
-      "rm": "iniminidaberingu",
-      "en": "Inimini Doveling"
+      "jp": "瞬(しばたた)く間(あいだ)に広(ひろ)がる開放(かいほう)区(く)",
+      "rm": "shibatataku aida ni hirogaru kaihouku",
+      "en": "An open area that expands in the blink of an eye"
     },
     {
       "t": [
-        52.0,
-        55.06
+        98.82,
+        102.34
       ],
-      "jp": "次(つぎ)の場所(ばしょ)へ Moving on Moving on",
-      "rm": "tsugi no basho e Moving on Moving on",
-      "en": "Moving on Moving on to the next location"
+      "jp": "ひとつひとつすべてがドラマ",
+      "rm": "hitotsu hitotsu subete ga drama",
+      "en": "Every single thing is a drama"
     },
     {
       "t": [
-        56.08,
-        59.6
+        102.34,
+        104.07
       ],
-      "jp": "あちこち そっちどっち フタリ 2co1",
-      "rm": "achikochi sotchi dotchi futa ris 2co1",
-      "en": "Both here and there Futari 2co1"
+      "jp": "待ち侘(まちわ)びた Daybreak",
+      "rm": "machiwabita Daybreak",
+      "en": "Long-awaited Daybreak"
     },
     {
       "t": [
-        59.6,
-        61.14
+        104.07,
+        105.85
       ],
-      "jp": "ニッコリーナ New topics",
-      "rm": "nikkoriina New topics",
-      "en": "Nicolina New topics"
-    },
-    {
-      "t": [
-        61.14,
-        63.67
-      ],
-      "jp": "一気(いっき)に召し上(めしあ)がれ Yummy Yummy Yah",
-      "rm": "ikki ni meshiagare Yummy Yummy Yah",
-      "en": "Enjoy it all at once Yummy Yummy Yah"
-    },
-    {
-      "t": [
-        63.67,
-        67.18
-      ],
-      "jp": "この先(さき)も一緒(いっしょ)に ヨリドリミドリ",
-      "rm": "kono saki mo issho ni yoridorimidori",
-      "en": "Let's be together from now on, Yoridorimidori"
-    },
-    {
-      "t": [
-        67.18,
-        70.4
-      ],
-      "jp": "ミナ午後(ごご)ニ シブヤデ Rendez-vous",
-      "rm": "mina gogo ni Shibuya des Rendez-vous",
-      "en": "Mina Afternoon Shibuyade Rendez-vous"
-    },
-    {
-      "t": [
-        71.06,
-        74.07
-      ],
-      "jp": "Sounds good 軽(かる)い足取(あしど)り",
-      "rm": "sounds good karui ashidori",
-      "en": "Sounds good light steps"
-    },
-    {
-      "t": [
-        74.07,
-        76.32
-      ],
-      "jp": "気(き)の赴(おもむ)くまま",
-      "rm": "ki no omomuku mama",
-      "en": "As my heart goes"
-    },
-    {
-      "t": [
-        76.32,
-        78.26
-      ],
-      "jp": "Oh, Let me go my way",
+      "jp": "ReSTART LINE! (Hey!)",
       "rm": "",
-      "en": "Oh, let me go my way"
+      "en": "ReSTART LINE!"
     },
     {
       "t": [
-        78.26,
-        80.06
+        105.85,
+        109.36
       ],
-      "jp": "ナビいらずの学(まな)び",
-      "rm": "navigation irazu no manabi",
-      "en": "Learning without navigation"
+      "jp": "代わる代(かわるが)わる彩(いろど)るパノラマ",
+      "rm": "kawarugawaru irodoru panorama",
+      "en": "A panorama that changes colors one after another"
     },
     {
       "t": [
-        80.06,
-        81.8
+        109.36,
+        114.62
       ],
-      "jp": "AI も羨(うらや)み Wanna be",
-      "rm": "aI mo urayami Wanna be",
-      "en": "AI is also jealous Wanna be"
+      "jp": "満ち溢(みちあふ)れるフィーリングラデーション",
+      "rm": "michiafureru fiiringuradeeshon",
+      "en": "Full feeling gradation"
     },
     {
       "t": [
-        81.8,
-        83.58
+        114.62,
+        121.64
       ],
-      "jp": "その気付(きづ)きの続(つづ)き",
-      "rm": "sono kizuki no tsuzuki",
-      "en": "Continuation of that realization"
+      "jp": "始(はじ)まりのその時(とき)が来(き)た",
+      "rm": "hajimari no sono toki ga kita",
+      "en": "The time has come for the beginning"
     },
     {
       "t": [
-        83.58,
-        85.4
+        121.64,
+        126.79
       ],
-      "jp": "先(さき)ペカってる To do list",
-      "rm": "saki pe ka tte ru To do list",
-      "en": "To do list"
-    },
-    {
-      "t": [
-        85.4,
-        87.19
-      ],
-      "jp": "(Fun fun fun...)",
+      "jp": "Nothing is impossible",
       "rm": "",
-      "en": ""
+      "en": "Nothing is impossible"
     },
     {
       "t": [
-        87.19,
-        88.95
+        126.79,
+        130.26
       ],
-      "jp": "Allday 冒険(ぼうけん)してみたい",
-      "rm": "allday bouken shite mitai",
-      "en": "Allday I want to go on an adventure"
+      "jp": "マヤカシ誤魔化(ごまか)し効(き)かない世界(せかい)",
+      "rm": "mayakashi gomakashi kikanai sekai",
+      "en": "A world where Mayakashi deceives and does not work"
     },
     {
       "t": [
-        88.95,
-        90.76
+        130.26,
+        133.78
       ],
-      "jp": "(Meow meow meow...)",
+      "jp": "この先(さき)はまだ誰(だれ)も知(し)らない正解(せいかい)",
+      "rm": "kono saki wa mada dare mo shiranai seikai",
+      "en": "The correct answer that no one knows yet"
+    },
+    {
+      "t": [
+        133.78,
+        137.25
+      ],
+      "jp": "傍観(ぼうかん)してるだけじゃ味気(あじけ)ない",
+      "rm": "boukan shiteru dake ja ajikenai",
+      "en": "Just watching from the sidelines is boring"
+    },
+    {
+      "t": [
+        137.25,
+        140.85
+      ],
+      "jp": "リアルタイムで通じ合(つうじあ)って",
+      "rm": "real time de tsuujiatte",
+      "en": "Communicate in real time"
+    },
+    {
+      "t": [
+        140.85,
+        142.51
+      ],
+      "jp": "振り子(ふりこ)にかけるエモーション",
+      "rm": "furiko ni kakeru emotion",
+      "en": "Emotion on a pendulum"
+    },
+    {
+      "t": [
+        142.51,
+        144.33
+      ],
+      "jp": "後(あと)の祭(まつ)りでも I don't mind",
+      "rm": "ato no matsuri de mo I don't mind",
+      "en": "Even at the festival later, I don't mind"
+    },
+    {
+      "t": [
+        144.33,
+        145.95
+      ],
+      "jp": "大胆(だいたん)不敵(ふてき)なシチュエーション",
+      "rm": "daitan futeki na situation",
+      "en": "Fearless Situations"
+    },
+    {
+      "t": [
+        145.95,
+        148.27
+      ],
+      "jp": "行(い)けるところまで行(い)ってみたい",
+      "rm": "ikeru tokoro made itte mitai",
+      "en": "I want to go as far as I can."
+    },
+    {
+      "t": [
+        148.27,
+        151.82
+      ],
+      "jp": "選択(せんたく)肢(し)にない Get off on the way",
+      "rm": "sentakushi ni nai Get off on the way",
+      "en": "Not an option Get off on the way"
+    },
+    {
+      "t": [
+        151.82,
+        154.82
+      ],
+      "jp": "共(とも)に声(こえ)を鳴(な)らせ",
+      "rm": "tomo ni koe wo narase",
+      "en": "Let's make our voices heard together"
+    },
+    {
+      "t": [
+        154.82,
+        156.77
+      ],
+      "jp": "素肌(すはだ)を貫(つらぬ)くような",
+      "rm": "suhada wo tsuranuku you na",
+      "en": "Like penetrating your bare skin"
+    },
+    {
+      "t": [
+        156.77,
+        161.79
+      ],
+      "jp": "真っ直(まっす)ぐな痛(いた)みが伴(ともな)っても",
+      "rm": "massugu na itami ga tomonatte mo",
+      "en": "Even if it comes with straight pain"
+    },
+    {
+      "t": [
+        161.79,
+        165.4
+      ],
+      "jp": "この仲間(なかま)たちと最果(さいは)てまで",
+      "rm": "kono nakamatachi to saihate made",
+      "en": "To the end with these friends"
+    },
+    {
+      "t": [
+        165.4,
+        168.91
+      ],
+      "jp": "Keep running to the end",
       "rm": "",
-      "en": ""
+      "en": "Keep running to the end"
     },
     {
       "t": [
-        90.76,
-        92.5
+        168.91,
+        172.4
       ],
-      "jp": "ド派手(はで)に Free style",
-      "rm": "do hade ni Free style",
-      "en": "Flashy Free style"
+      "jp": "飛び乗(とびの)って To the future",
+      "rm": "tobinotte To the future",
+      "en": "Jump to the future"
     },
     {
       "t": [
-        92.5,
-        93.83
+        172.4,
+        174.12
       ],
-      "jp": "二人(ふたり)なら",
-      "rm": "futari nara",
-      "en": "For two people"
+      "jp": "フライングしたって Alright",
+      "rm": "flying shitatte Alright",
+      "en": "Flying Alright"
     },
     {
       "t": [
-        93.83,
-        95.4
+        174.12,
+        175.91
       ],
-      "jp": "人生(じんせい) Bonus bonus",
-      "rm": "jinsei Bonus bonus",
-      "en": "Life Bonus bonus"
-    },
-    {
-      "t": [
-        95.4,
-        97.39
-      ],
-      "jp": "どこまでもいけるね",
-      "rm": "doko made mo ikeru ne",
-      "en": "You can go anywhere"
-    },
-    {
-      "t": [
-        97.39,
-        99.63
-      ],
-      "jp": "Cho Very Very Very Good",
+      "jp": "ReSTART LINE! (Hey!)",
       "rm": "",
-      "en": "Cho Very Very Very Good"
+      "en": "ReSTART LINE!"
     },
     {
       "t": [
-        99.63,
-        101.61
+        175.91,
+        179.4
       ],
-      "jp": "Trouble Eyy",
+      "jp": "ときめいてしまえば",
+      "rm": "tokimeite shimaeba",
+      "en": "Once your heart flutters"
+    },
+    {
+      "t": [
+        179.4,
+        182.91
+      ],
+      "jp": "瞬(しばたた)く間(あいだ)に広(ひろ)がる開放(かいほう)区(く)",
+      "rm": "shibatataku aida ni hirogaru kaihouku",
+      "en": "An open area that expands in the blink of an eye"
+    },
+    {
+      "t": [
+        182.91,
+        186.41
+      ],
+      "jp": "ひとつひとつすべてがドラマ",
+      "rm": "hitotsu hitotsu subete ga drama",
+      "en": "Every single thing is a drama"
+    },
+    {
+      "t": [
+        186.41,
+        188.16
+      ],
+      "jp": "待ち侘(まちわ)びた Daybreak",
+      "rm": "machiwabita Daybreak",
+      "en": "Long-awaited Daybreak"
+    },
+    {
+      "t": [
+        188.16,
+        189.98
+      ],
+      "jp": "ReSTART LINE! (Hey!)",
       "rm": "",
-      "en": "Trouble Eyey"
+      "en": "ReSTART LINE!"
     },
     {
       "t": [
-        101.61,
-        105.87
+        189.98,
+        193.4
       ],
-      "jp": "ツカズハナレズ キミヲ詠(えい)ム",
-      "rm": "tsukazuhanarezu kimiwoei mu",
-      "en": "Tsukazuhanarezu Kimiwo Song"
+      "jp": "代わる代(かわるが)わる彩(いろど)るパノラマ",
+      "rm": "kawarugawaru irodoru panorama",
+      "en": "A panorama that turns colorful"
     },
     {
       "t": [
-        105.87,
-        108.76
+        193.4,
+        196.93
       ],
-      "jp": "イニミニ Double Eyy",
-      "rm": "ini mini Double Eyy",
-      "en": "Inimini Double Eyey"
+      "jp": "満ち溢(みちあふ)れるフィーリングラデーション",
+      "rm": "michiafureru fiiringuradeeshon",
+      "en": "Full feeling gradation"
     },
     {
       "t": [
-        108.76,
-        111.9
+        196.93,
+        200.39
       ],
-      "jp": "フタツガサネ 意気(いき) Yo-yo",
-      "rm": "futatsugasane iki Yo-yo",
-      "en": "Futatsugasane Moki Yo-yo"
+      "jp": "飛び出(とびだ)せ You raise me up",
+      "rm": "tobidase You raise me up",
+      "en": "You raise me up"
     },
     {
       "t": [
-        114.08,
-        117.52
+        200.39,
+        202.19
       ],
-      "jp": "風(かぜ)に吹(ふ)かれる ライラック",
-      "rm": "kaze ni fukareru lilac",
-      "en": "Lilac blown by the wind"
+      "jp": "恐(おそ)れるものはない",
+      "rm": "osoreru mono wa nai",
+      "en": "There's nothing to be afraid of"
     },
     {
       "t": [
-        117.52,
-        121.16
+        202.19,
+        203.96
       ],
-      "jp": "空(そら)に惚れ惚(ほれぼ)れ 隣り合(となりあ)う",
-      "rm": "sora ni horebore tonariau",
-      "en": "Falling in love with the sky, standing next to each other"
-    },
-    {
-      "t": [
-        121.16,
-        123.86
-      ],
-      "jp": "笑い合(わらいあ)い イタチ 5co",
-      "rm": "waraiai itachi 5co",
-      "en": "Laughing together Itachi 5co"
-    },
-    {
-      "t": [
-        123.86,
-        127.6
-      ],
-      "jp": "宝物(ほうもつ) また見(み)つけに行(い)こう",
-      "rm": "houmotsu mata mitsuke ni ikou",
-      "en": "Treasure Let's go find it again"
-    },
-    {
-      "t": [
-        127.6,
-        132.3
-      ],
-      "jp": "Cho Very Very Very Good Traveling",
+      "jp": "ReSTART LINE! (Hey!)",
       "rm": "",
-      "en": "Cho Very Very Very Good Traveling"
+      "en": "ReSTART LINE!"
     },
     {
       "t": [
-        132.3,
-        135.61
+        203.96,
+        207.4
       ],
-      "jp": "終(お)わんない Curious Curious",
-      "rm": "owannai Curious Curious",
-      "en": "Curious Curious"
+      "jp": "奇麗(きれい)な朝焼(あさや)けが",
+      "rm": "kirei na asayake ga",
+      "en": "A beautiful sunrise"
     },
     {
       "t": [
-        135.61,
-        139.13
+        207.4,
+        216.14
       ],
-      "jp": "イニミニダベリング",
-      "rm": "iniminidaberingu",
-      "en": "Inimini Doveling"
+      "jp": "不(ふ)透明(とうめい)な明日(あした)を照(て)らすよ",
+      "rm": "futoumei na ashita wo terasu yo",
+      "en": "I'll shine a light on an uncertain tomorrow"
     },
     {
       "t": [
-        139.13,
-        142.15
+        216.14,
+        223.2
       ],
-      "jp": "次(つぎ)の場所(ばしょ)へ Moving on Moving on",
-      "rm": "tsugi no basho e Moving on Moving on",
-      "en": "Moving on Moving on"
+      "jp": "ReSTART LINE! (Hey!)",
+      "rm": "",
+      "en": "ReSTART LINE!"
     },
     {
       "t": [
-        143.2,
-        146.72
+        223.2,
+        228.2
       ],
-      "jp": "あちこち そっちどっち フタリ 2co1",
-      "rm": "achikochi sotchi dotchi futa ris 2co1",
-      "en": "Both here and there Futari 2co1"
-    },
-    {
-      "t": [
-        146.72,
-        148.3
-      ],
-      "jp": "ニッコリーナ New topics",
-      "rm": "nikkoriina New topics",
-      "en": "Nicolina New topics"
-    },
-    {
-      "t": [
-        148.3,
-        150.72
-      ],
-      "jp": "一気(いっき)に召し上(めしあ)がれ Yummy Yummy Yah",
-      "rm": "ikki ni meshiagare Yummy Yummy Yah",
-      "en": "Enjoy it all at once Yummy Yummy Yah"
-    },
-    {
-      "t": [
-        150.72,
-        154.3
-      ],
-      "jp": "この先(さき)も一緒(いっしょ)に ヨリドリミドリ",
-      "rm": "kono saki mo issho ni yoridorimidori",
-      "en": "Let's be together from now on too"
-    },
-    {
-      "t": [
-        154.3,
-        157.52
-      ],
-      "jp": "ミナ午後(ごご)ニ シブヤデ Rendez-vous",
-      "rm": "mina gogo ni Shibuya des Rendez-vous",
-      "en": "Mina Afternoon Shibuyade Rendez-vous"
+      "jp": "ReSTART LINE! (Hey!)",
+      "rm": "",
+      "en": "ReSTART LINE!"
     }
   ]
 }
