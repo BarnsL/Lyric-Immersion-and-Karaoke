@@ -188,7 +188,10 @@ def _parse_vtt(path: Path) -> list[dict]:
         nonlocal cur, buf
         if cur and buf:
             txt = re.sub(r"<[^>]+>", "", " ".join(buf)).strip()
-            txt = re.sub(r"\s+", " ", txt)
+            # Drop sound-event annotations — [音楽]/[Music]/【拍手】/♪ etc. are never
+            # lyrics; bracketed tags in a caption are always non-vocal markers.
+            txt = re.sub(r"[\[【][^\]】]*[\]】]", "", txt).replace("♪", "")
+            txt = re.sub(r"\s+", " ", txt).strip()
             if txt and not _CAP_CREDIT.search(txt):
                 out.append({"t": [round(cur[0], 2), round(cur[1], 2)],
                             "jp": txt, "rm": "", "en": ""})
@@ -285,9 +288,12 @@ def fetch_captions_only(query: str, lang: str | None = None):
             # long (a pile-up of these stuttered the audio).
             "outtmpl": str(tmp / "c.%(ext)s"), "retries": 1, "socket_timeout": 15,
             "match_filter": yt_dlp.utils.match_filter_func(f"duration < {_MAX_DUR}"),
-            # manual subs (exact lyrics) AND auto-captions (ASR) — many MVs only
-            # have the latter; both are locked to the video's real timing.
-            "writesubtitles": True, "writeautomaticsub": True,
+            # MANUAL subs ONLY — the v1.0.25 behaviour. YouTube AUTO-captions (ASR)
+            # are close-but-WRONG (鉄後/ラッキラ mis-hearings), carry [音楽]/[Music]
+            # sound tags, and ROLL (each word repeats across overlapping cues), which
+            # parsed into duplicated "excess" lines. A song with no manual track now
+            # falls through to the provider LRC (cleaner) instead of bad ASR.
+            "writesubtitles": True, "writeautomaticsub": False,
             "subtitleslangs": langs,
             "subtitlesformat": "vtt",
         }

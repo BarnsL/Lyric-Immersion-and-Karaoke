@@ -8,6 +8,27 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-059 — Auto-captions = wrong/excess lyrics + [音楽] tags 🟢
+**Symptom:** lyrics "close but wrong" (鉄後/ラッキラ mis-hearings), full of `[音楽]` /
+`[ongaku]` tags, and an "excess" wall of duplicated text — on ReGLOSS MVs.
+**Root cause:** `fetch_captions_only` had `writeautomaticsub: True`, so it used
+YouTube's AUTO (ASR) caption track. ASR is inaccurate, inserts sound-event tags, and
+ROLLS (each word repeats across overlapping cues) → duplicated lines. v1.0.25
+(commit 616a70c) used MANUAL captions only.
+**Fix:** back to **manual captions only** (`writeautomaticsub: False`); a song with no
+manual track falls through to the provider LRC (cleaner) instead of bad ASR. Also
+strip `[...]`/`【...】`/♪ sound tags in `_parse_vtt`. Purged the 48 cached
+auto-caption songs so they re-fetch correctly.
+
+## TICKET-058 — Karaoke fill (yellow highlight) jumped on sync correction 🟢
+**Symptom:** the sung-word highlight was "a bit off" and SKIPPED to a new place when
+sound-sync corrected the offset — poor UX.
+**Fix:** render against an **eased display offset** (`_eased_offset`) that glides
+toward the sound-sync target (Shazam offset + energy correlation) at ~20%/frame
+(capped 0.10 s/frame) instead of snapping, so the highlight + scroll slide smoothly
+into a correction. A major re-sync (>5 s, e.g. a song change) still snaps. The match
+target is unchanged (still heard-audio driven) — only its APPLICATION is now smooth.
+
 ## TICKET-057 — MV intro hold never released → lyrics never started 🟢
 **Symptom:** a music video (V.W.P 電脳) sat on "Instrumental intro — waiting for
 vocals…" for the WHOLE song; lyrics never appeared even after singing clearly began.

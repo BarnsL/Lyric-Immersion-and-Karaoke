@@ -68,7 +68,17 @@ font even when the static font is large; (b) auto-reduce scale when many rows
 (furigana+romaji+EN) push block height up; (c) just inform the user that 1.0–1.2
 roughly doubles fps. No code yet — needs a product call.
 
-## LP-005 — First-appearance spawn spike (cache miss) 🔴
+## LP-005 — First-appearance spawn spike (cache miss) 🟢 SOLVED (glyph atlas)
+**Fix that worked:** a **glyph atlas** (`_atlas_tile` + `_glyph_cache`). Each
+(glyph, font, colour, stroke) is rasterised ONCE into a tiny cached tile; a line is
+composed by `alpha_composite`-ing tiles instead of re-rasterising ~180 stroked
+glyphs. Benchmarked **8× faster** (30 → 3.5 ms/line) and verified **pixel-identical**
+to the old renderer before shipping (0-pixel diff). Warm-up is now per-unique-glyph
+(a few hundred per session), not per-line.
+**Measured live (v1.0.56f):** render **57 fps**, frames a steady **16-17 ms**, 1
+frame >60 ms in 60 (warm-up). The scroll is no longer render-bound at all — it hits
+the loop's full frame rate. This is the fix that makes it smooth on most computers.
+Earlier history (for the record):
 The cache (LP-001) makes repeats free, but the FIRST time each unique line appears it
 renders once (~150–290 ms at 1.5×). This — not lane count — is what made "single lane
 still has poor performance". Post-warmup (cache full) the scroll is a smooth 30 fps at
