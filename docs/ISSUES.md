@@ -8,6 +8,28 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-066 — Stutter on Shazam-unconfirmable songs (MMD/cover/performance) 🟢
+**Symptom:** on songs Shazam can't fingerprint (an MMD "Performance Video", a cover, a
+live arrangement) the overlay stutters — `/diag.fps.worst_ms` spikes to 150-475 ms,
+render drops to ~8 fps in bursts — and it never settles. Lyrics ARE loaded and in sync
+(`drift ≈ 0`); the jank is purely the render hitching.
+**Cause:** the recal loop treats the track as `unconfirmed` forever (Shazam never
+matches the arrangement) and so polls `recognize_playing` every ~4 s indefinitely. Each
+recognize stalls the Tk render thread via **GIL contention** (the fingerprint compute) —
+caught live: `worst_ms` spikes track `identifying=True`, not the new Whisper tier.
+**Fix:** an **anti-stutter back-off** in `_recalibrate_loop`. (1) A settled-but-
+unconfirmable track (lyrics loaded, `|offset| ≤ 1 s`, ~45 s elapsed, no sound lock,
+not `live_mode`) backs the Shazam poll off to `unconfirmed_backoff_s` (30 s) instead of
+4 s. (2) A CONFIRMED + boundary-watched track relaxes its Shazam re-lock to
+`confirmed_recal_s` (45 s, was 25 s) — drift is now re-locked by the adaptive sync tier
+and song changes by the boundary detector, so the frequent recognize was redundant.
+Measured: `identifying=True` went from near-constant (stall every ~4 s) to ~20% of
+samples. Concerts (`live_mode`) keep polling. Remaining: the occasional ~25-45 s spike is
+shazamio's LOCAL fingerprint holding the GIL during `recognize` — the deeper fix is to
+run `recognize_playing` in a separate PROCESS (no shared GIL), deferred (risky in a
+frozen PyInstaller build). This is the same escalation/de-escalation the user asked for,
+applied to the Shazam loop.
+
 ## TICKET-065 — Adaptive escalation/de-escalation sync-verification tier 🟢
 **Ask:** sample sound-matching more often while syncing — verify with TPVR ≥3×/min;
 once a check succeeds drop to 1×/min; any failure resyncs and snaps back to 3×/min,
