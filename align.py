@@ -136,10 +136,21 @@ def _get_model(size=_MODEL):
             os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         from faster_whisper import WhisperModel
         m, used = None, None
-        # Prefer the GPU (CUDA) — transcription is ~5-10x faster, so generation
-        # keeps up with the song. Falls back to CPU when there's no GPU or the
-        # CUDA/cuDNN libraries aren't vendored (any load error → CPU).
-        for device, ctype in (("cuda", "float16"), ("cpu", "int8")):
+        # Prefer the GPU (CUDA) — transcription is ~5-10x faster — but ONLY when
+        # the CUDA math libs are actually loadable. ctranslate2 builds a CUDA
+        # model object even without cuBLAS, then fails on the first encode with
+        # "cublas64_12.dll not found" — so a construct-time try/except isn't
+        # enough. Probe the DLL first (the GPU extras are an optional ~1.5 GB
+        # download via gpu_setup; without them we use CPU, which is fine for the
+        # short align/generation clips — a 16 s clip in ~2 s).
+        devices = [("cpu", "int8")]
+        try:
+            import ctypes
+            ctypes.CDLL("cublas64_12.dll")          # raises if not on the DLL path
+            devices = [("cuda", "float16"), ("cpu", "int8")]
+        except Exception:
+            pass
+        for device, ctype in devices:
             try:
                 m = WhisperModel(size, device=device, compute_type=ctype,
                                  download_root=md)
