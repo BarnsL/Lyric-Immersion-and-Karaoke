@@ -2297,6 +2297,14 @@ class Overlay:
                                              self._drift_integral)
                                     self._drift_integral = 0.0
                                     self._maybe_auto_align(reason="drift-integral")
+                elif (self.meta.get("source") or "").startswith("bundled") and self.lines:
+                    # BAKED-IN authoritative lyrics. These songs (MMD / "Performance
+                    # Video" cuts) can't be Shazam-fingerprinted, so Shazam keeps
+                    # mis-ID'ing them as random other tracks (サクラミラージュ heard as
+                    # "Daybreak Frontline" / "Mumei"). A baked cache is ground truth —
+                    # NEVER let a heard mis-ID override it (no switch, no strikes).
+                    log.info("ignoring sound %r — bundled (baked) lyrics are "
+                             "authoritative for %r", f_title, self.meta.get("title", ""))
                 elif self._title_locked:
                     # The lyrics came from a confident EXACT match on a clean
                     # official title, but Shazam heard a DIFFERENT song — usually a
