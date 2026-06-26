@@ -150,16 +150,22 @@ def _get_model(size=_MODEL):
             devices = [("cuda", "float16"), ("cpu", "int8")]
         except Exception:
             pass
+        # Bound CPU inference to a FEW threads. CTranslate2 otherwise defaults to
+        # every physical core, and on CPU that saturated the render cores (8-15)
+        # during a transcribe — the audio/scroll stutter. 4 threads keep short
+        # int8 clips fast while leaving headroom for the render + audio. Ignored
+        # on CUDA. This protects the periodic sync-tier listen (and the applause
+        # resync / "sync by listening" button) from hitching the overlay.
         for device, ctype in devices:
             try:
                 m = WhisperModel(size, device=device, compute_type=ctype,
-                                 download_root=md)
+                                 download_root=md, cpu_threads=4)
                 used = device
                 break
             except Exception:
                 continue
         _models[size] = m or WhisperModel(size, device="cpu", compute_type="int8",
-                                          download_root=md)
+                                          download_root=md, cpu_threads=4)
         _device[size] = used or "cpu"
         try:        # surface GPU-vs-CPU once per model so it's visible in the log
             import logging

@@ -49,6 +49,18 @@ karaoke tool. Read this first, then `ARCHITECTURE.md`.
    `deep_transcribe.py` (fetch auto subs to a hint buffer) + a matcher feeding `_consume_async`.
 
 ## What this session shipped (all deployed + pushed)
+- **Adaptive sync-verification tier** (TICKET-065) — `_periodic_auto_align` verifies
+  ~3×/min while syncing, relaxes to 1×/min once confirmed, snaps back on any miss
+  (`_note_sync_verdict` / `_sync_tier_interval`). Energy correlation gives the verdict;
+  when it's blind on a song it escalates to a short two-point-verified Whisper listen
+  (`_tier_listen_now`). Whisper CPU capped (`align.py cpu_threads=4`). `/diag.sync.tier_*`.
+- **Cover detection fix** (TICKET-064) — `_COVER_RE` now catches `【Cover MV】` /
+  `（Cover MV）` lenticular tags; covers with no parseable original artist DROP the cover
+  channel and search title-first (the MAFIA / マフィア — Ouro Kronii case).
+- **Language-confidence + known-acts** (TICKET-062) — `confidence.language_confidence`
+  + `_KNOWN_JA`; GHOST/星街すいせい → JA, feelingradation/ReGLOSS → JA.
+- **Long-concert** (TICKET-063) — applause gap = song boundary → re-identify; 2-6 min
+  duration heuristic. (Open: transcription-based song-ID against the library.)
 - **Glyph atlas** render — each (glyph,font,colour,stroke) rasterised once + pasted;
   pixel-identical, **8× faster**, 9-13 fps → **57 fps**. (Background prewarm REVERTED: Pillow
   text holds the GIL, a render thread stalls the Tk scroll.) See LYRIC_PERFORMANCE.md.

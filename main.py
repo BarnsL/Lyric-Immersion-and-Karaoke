@@ -423,7 +423,13 @@ def _is_generic_title(s):
 _COVER_RE = re.compile(
     r"歌ってみた|うたってみた|歌わせて|踊ってみた|おどってみた"
     r"|演奏してみた|弾いてみた|叩いてみた|covered?\s+by"
-    r"|\(\s*cover\s*\)|\[\s*cover\s*\]|[/／]\s*cover\b", re.I)
+    r"|\(\s*cover\s*\)|\[\s*cover\s*\]|[/／]\s*cover\b"
+    # "cover" as a TAG right after any common opening bracket — 【Cover MV】,
+    # ［Cover］, （Cover MV）, (Cover MV). The lenticular / fullwidth styles VTuber
+    # covers use that the ASCII-paren rules above miss. This is the bug that made
+    # "【Cover MV】MAFIA / マフィア - Ouro Kronii" search by the COVER channel
+    # (Ouro Kronii) — which has no lyrics for it — instead of title-first.
+    r"|[【\[（(［]\s*covers?\b", re.I)
 
 
 def is_cover_title(title):
@@ -449,6 +455,8 @@ def extract_cover_original(raw_title, cover_channel=""):
     # strip cover markers and brackets containing them
     t = re.sub(r"\[\s*cover\s*\]", "", t, flags=re.I).strip()
     t = re.sub(r"\(\s*cover\s*\)", "", t, flags=re.I).strip()
+    # a whole bracketed cover tag with extra words — 【Cover MV】, （Cover MV）, ［Cover］
+    t = re.sub(r"[【\[（(［]\s*covers?\b[^】\]）)］]*[】\]）)］]", "", t, flags=re.I).strip()
     t = re.sub(r"\s*(?:[/／]|を)?\s*(?:歌ってみた|うたってみた|歌わせて|踊ってみた|おどってみた|"
                r"演奏してみた|弾いてみた|叩いてみた).*$", "", t, flags=re.I).strip()
     t = re.sub(r"\s*\bcovered?\s+by\b.*$", "", t, flags=re.I).strip()
@@ -500,6 +508,9 @@ def extract_cover_original(raw_title, cover_channel=""):
         if len(parts) == 2 and parts[0].strip() and parts[1].strip():
             if not _ch_match(parts[1]):
                 return parts[1].strip(), parts[0].strip()
+            # the tail IS the cover channel ("MAFIA / マフィア - Ouro Kronii") → keep
+            # the SONG, no original artist (search title-first, ignore the channel).
+            return None, parts[0].strip()
     return None, None
 
 
@@ -1196,10 +1207,19 @@ class Overlay:
             "reset_offset_max":      5.0,   # only reset when |offset| < this
             "drift_align_trigger":   6.0,   # integral → trigger auto-align
             "drift_min_for_accum":   0.8,   # |drift| > this contributes to integral
-            "auto_align_cooldown":  25.0,   # min s between auto-aligns
+            "auto_align_cooldown":  14.0,   # min s between auto-aligns (< fast tier so it doesn't throttle it)
             "auto_align_min_pos":   12.0,   # min player pos before auto-align
             "shazam_lock_grace":    30.0,   # auto-align skipped within N s of lock
-            "continuous_recal_ms": 15000,   # background correlation cadence
+            "continuous_recal_ms": 15000,   # legacy fixed cadence (superseded by the adaptive tier)
+            # ── ADAPTIVE sync-verification tier (escalation / de-escalation) ──
+            # Verify sync ~3×/min while syncing or after a miss; once a check CONFIRMS
+            # we're in sync, relax toward 1×/min; ANY miss snaps back to fast and
+            # resyncs (two-point verified). Endpoints are the user's 3×/min ↔ 1×/min.
+            "sync_tier_fast_s":     20.0,   # escalated verify cadence (~3×/min)
+            "sync_tier_mid_s":      40.0,   # one hysteresis step (after 1 good check)
+            "sync_tier_slow_s":     60.0,   # relaxed cadence (1×/min) once sync holds
+            "sync_tier_ok_drift":    0.8,   # |measured drift| ≤ this on a check = in sync
+            "sync_tier_listen_s":    6.0,   # Whisper capture length for a tier check (short = light)
             "energy_apply_min":      0.4,   # min |new-old| to apply correlation
             "energy_lift_floor":     0.10,  # min peak-vs-median lift to accept
             "energy_max_offset":    60.0,   # |new_off| < this for sanity
@@ -1232,6 +1252,18 @@ class Overlay:
         self._align_tpvr_active = False  # the pending align is an applause two-point resync
         self._align_tpvr = None       # 1st-read offset awaiting a 2nd confirming read
         self._align_tpvr_until = 0.0  # deadline for the 2nd confirming read
+        # Adaptive sync-verification tier (escalation/de-escalation — user request):
+        # verify ~3×/min while syncing, relax to 1×/min once confirmed, snap back to
+        # fast on any miss. The cheap energy correlator gives the verdict when it can;
+        # when it's blind on a song (flat/ambiguous peak) the tier escalates to a
+        # short, two-point-verified Whisper listen.
+        self._sync_tier_interval = 20.0  # current verify cadence (s): 20=fast(3×/min) … 60=relaxed(1×/min)
+        self._sync_good_streak = 0    # consecutive in-sync confirmations (drives de-escalation)
+        self._sync_miss_streak = 0    # consecutive out-of-sync checks (telemetry / stay-fast)
+        self._energy_blind = 0        # consecutive energy checks with no usable peak → escalate to Whisper
+        self._tier_tpvr = None        # held 1st Whisper-read offset for two-point confirm
+        self._tier_tpvr_until = 0.0   # deadline for the confirming 2nd tier read
+        self._tier_listen = False     # a tier Whisper listen is in flight
         self._last_drift = 0.0        # last audio-vs-display drift measured (sync telemetry)
         self._last_drift_t = 0.0      # when that drift was measured (time.time)
         self._pending_switch = None   # a contradicting heard song awaiting a 2nd confirming read
@@ -1318,6 +1350,11 @@ class Overlay:
         self._last_audio_off_t = 0.0
         self._sound_title_alias = None  # clear cross-language alias for new song
         self._drift_integral = 0.0      # fresh drift accumulation for new song
+        # New song → start in fast-verify (3×/min) and re-judge from scratch.
+        self._sync_tier_interval = self._tune.get("sync_tier_fast_s", 20.0)
+        self._sync_good_streak = self._sync_miss_streak = self._energy_blind = 0
+        self._tier_tpvr = None
+        self._tier_listen = False
         self._live_arrangement = is_live_arrangement(title)  # LIVE/short/alt → follow offset
         log.info("track change: %r / %r (dur %s)%s", title, artist, duration,
                  " [live-arrangement]" if self._live_arrangement else "")
@@ -1326,10 +1363,19 @@ class Overlay:
         # lyric search instead of the covering channel — "Coffee - Alka | Lumi"
         # should search "Coffee" by "Alka", not by "Lumi".
         fetch_artist = artist
-        if self._is_cover and self._cover_original_artist:
-            fetch_artist = self._cover_original_artist
-            log.info("cover: using original artist %r instead of channel %r",
-                     fetch_artist, artist)
+        if self._is_cover:
+            if self._cover_original_artist:
+                fetch_artist = self._cover_original_artist
+                log.info("cover: using original artist %r instead of channel %r",
+                         fetch_artist, artist)
+            else:
+                # No original artist parseable from the title. The covering CHANNEL
+                # ("Ouro Kronii Ch. hololive-EN") is NOT the song's artist and won't
+                # have these lyrics listed under it — DROP it and search by title
+                # alone (the original's lyrics fit the cover). Per the user's rule.
+                fetch_artist = ""
+                log.info("cover: no original artist in title → title-only search "
+                         "(ignoring cover channel %r)", artist)
 
         self._live_mode = is_live_or_compilation(title, duration)
         if self._live_mode:
@@ -1347,7 +1393,10 @@ class Overlay:
             # dead air) — but AUDIO is primary and confirms/overrides it below.
             # Try original artist first for covers, then fall back to channel.
             path = self.index.match(fetch_artist, title, duration)
-            if not path and fetch_artist != artist:
+            # Fall back to the channel ONLY when we used a real original artist; for a
+            # cover whose channel we deliberately dropped (fetch_artist=""), don't
+            # re-introduce the channel — that's the wrong-artist match we're avoiding.
+            if not path and fetch_artist and fetch_artist != artist:
                 path = self.index.match(artist, title, duration)
             if path and self._file_valid(path, duration):
                 if path != self._lyrics_path:
@@ -1551,6 +1600,15 @@ class Overlay:
                     log.info("cache %s is Korean but song is kanji (%r) → distrust, re-fetch",
                              Path(path).name, ta[:30])
                     return False
+            # WRONG-LANGUAGE guard (TICKET-062): a cached ENGLISH body for a song whose
+            # ARTIST name has KANA (uniquely Japanese — Suisei's 星街すいせい "GHOST"
+            # pulled an English "Ghost") is a same-title collision. Re-fetch under
+            # fetch_lrc's language-confidence guard. Gated on KANA only (not han, which
+            # is ambiguous JA/ZH) so it can't misfire on Chinese / romanized names.
+            if lang == "en" and re.search(r"[぀-ゟ゠-ヿ]", self._clean_artist_cache or ""):
+                log.info("cache %s is English but artist is kana-Japanese (%r) → distrust, re-fetch",
+                         Path(path).name, (self._clean_artist_cache or "")[:20])
+                return False
             return True
         except Exception:
             return True
@@ -2632,7 +2690,11 @@ class Overlay:
             # title-only search grabbed a same-titled DIFFERENT song.
             self._is_cover = is_cover_title(rawt)
             if self._is_cover:
-                orig_a, song = extract_cover_original(rawt, self._clean_artist_cache)
+                # Match the cover channel with the RAW artist, not clean_artist — the
+                # cleaner strips the personal name ("Ouro Kronii Ch. hololive-EN" →
+                # "hololive-EN"), which would make "… - Ouro Kronii" look like the
+                # ORIGINAL artist and re-introduce the wrong-artist search.
+                orig_a, song = extract_cover_original(rawt, rawa)
                 self._cover_original_artist = orig_a
                 # If the cover parse found the bare song name ("Coffee" out of
                 # "[COVER] Coffee - A!ka | Kaneko Lumi"), use it — clean_title's
@@ -3549,6 +3611,12 @@ class Overlay:
                             else ((self.idx == want_idx) if want_idx >= 0 else None)),
                 "scroll_mode": self.scroll_dir in ("lr", "rl", "tb", "bt"),
                 "offset_history": self._offset_hist[-20:],
+                # adaptive verify tier (escalation/de-escalation)
+                "tier_interval_s": round(self._sync_tier_interval, 1),
+                "tier_good_streak": self._sync_good_streak,
+                "tier_miss_streak": self._sync_miss_streak,
+                "tier_energy_blind": self._energy_blind,
+                "tier_listening": self._tier_listen,
             },
             "energy_align": self._last_energy,
             "fps": {
@@ -4474,6 +4542,17 @@ class Overlay:
         b = getattr(self, "_boundary", None)
         if not b:
             return
+        # 2-6 min heuristic (TICKET-063): a CONCERT song still showing after ~6.5 min
+        # almost certainly changed and we missed the boundary → force a re-identify.
+        if self._live_mode and not self._identifying:
+            if self._lyrics_path != getattr(self, "_concert_song_path", None):
+                self._concert_song_path, self._concert_song_t = self._lyrics_path, now
+            elif now - getattr(self, "_concert_song_t", now) > 390.0 \
+                    and now - getattr(self, "_last_align_t", 0.0) > 30.0:
+                log.info("concert song shown > 6.5 min → forced re-identify (missed a change?)")
+                self._concert_song_t, self._last_ocr_t = now, 0.0
+                self._start_identify(seconds=5, attempts=2)
+                return
         dt = min(2.0, now - self._applause_t) if self._applause_t else 0.0
         self._applause_t = now
         try:
@@ -4488,12 +4567,23 @@ class Overlay:
             if self._applause_for >= self._tune.get("applause_min_s", 2.5):
                 self._applause_armed = True
         elif self._applause_armed and lv.get("vocal_detected_now"):
-            log.info("applause gap (~%.1fs) ended, vocals back → two-point resync by ear",
-                     self._applause_for)
             self._applause_for, self._applause_armed = 0.0, False
-            self._align_tpvr, self._align_tpvr_active = None, True
-            self._align_tpvr_until = now + 14.0
-            self.align_by_listening(silent=True)
+            if self._live_mode:
+                # CONCERT compilation: an applause gap is almost always a SONG BOUNDARY,
+                # not a mid-song pause → RE-IDENTIFY the next song (sound + a forced
+                # OCR-banner read), don't resync the old one (TICKET-063).
+                log.info("applause gap (~%.1fs) in a concert → re-identify the next song",
+                         self._applause_for)
+                self._last_ocr_t = 0.0                 # force an immediate banner read
+                self._fast_calib = max(self._fast_calib, 2)
+                self._start_identify(seconds=5, attempts=2)
+            else:
+                # single LIVE arrangement: mid-song applause → two-point resync (TICKET-061)
+                log.info("applause gap (~%.1fs) ended, vocals back → two-point resync by ear",
+                         self._applause_for)
+                self._align_tpvr, self._align_tpvr_active = None, True
+                self._align_tpvr_until = now + 14.0
+                self.align_by_listening(silent=True)
         else:
             self._applause_for = max(0.0, self._applause_for - dt)
 
@@ -4563,8 +4653,10 @@ class Overlay:
             return
         now = time.time()
         # Don't run if Shazam locked the offset recently — its confirmation
-        # is more authoritative than re-checking by ear.
+        # is more authoritative than re-checking by ear. A fresh authoritative
+        # lock IS an in-sync confirmation, so let the adaptive tier de-escalate.
         if reason != "drift" and now - self._last_sound_lock_t < self._tune["shazam_lock_grace"]:
+            self._note_sync_verdict("insync")
             return
         # Don't run within the cooldown of the previous auto-align (CPU budget).
         if now - self._last_align_t < self._tune["auto_align_cooldown"]:
@@ -4620,6 +4712,12 @@ class Overlay:
     def _run_energy_correlation(self, history, st_snap):
         """The actual correlation work (runs in a background thread)."""
         import numpy as np
+        # Report this check's verdict to the adaptive tier (on the Tk thread). A
+        # clear in-tolerance peak = "insync"; a flat/ambiguous/rejected read =
+        # "inconclusive" (which, while syncing, escalates the tier to a Whisper
+        # listen). The applied-correction path reports "corrected" from _apply_*.
+        def verdict(v):
+            self.root.after(0, lambda: self._note_energy_verdict(v))
         # The history is a list of (t_wall, vocal_ratio). Each entry is one
         # 0.2 s block. Map wall-time → song-time using the player position
         # at the time of the latest entry: that entry corresponds to NOW, and
@@ -4651,6 +4749,7 @@ class Overlay:
         if spread < 0.02 or n_on < 6 or n_off < 6:
             log.info("energy-align: low vocal contrast (on=%d off=%d spread=%.3f) — no change",
                      n_on, n_off, spread)
+            verdict("inconclusive")
             return
         # Build the LRC active-mask on a fixed 0.2 s grid spanning the audio
         # window ±16 s (room for the ±15 s shift search), then evaluate ALL
@@ -4666,6 +4765,7 @@ class Overlay:
         ngrid = int(round((g1 - g0) / block_dt)) + 1
         if ngrid < 8 or ngrid > 100000:
             log.info("energy-align: grid size %d out of range — skipped", ngrid)
+            verdict("inconclusive")
             return
         grid_t = g0 + np.arange(ngrid) * block_dt
         li = np.searchsorted(starts, grid_t, side="right") - 1
@@ -4720,12 +4820,14 @@ class Overlay:
         if peak_lift < self._tune["energy_lift_floor"]:
             log.info("energy-align: weak peak (best %.3f, median %.3f, lift %.3f) — no change",
                      best_score, median, peak_lift)
+            verdict("inconclusive")
             return
         if ambiguous:
             log.info("energy-align: ambiguous — best %+.1fs (%.3f) vs rival %+.1fs (%.3f), "
                      "margin %.3f < %.3f → no change (chorus repetition)",
                      best_shift, best_score, rival_shift, rival_score,
                      best_score - rival_score, margin)
+            verdict("inconclusive")
             return
         # best_shift is the offset to ADD to audio_t so the audio mask aligns
         # to the LRC. Since the displayed song-time = player_pos + self.offset,
@@ -4733,10 +4835,12 @@ class Overlay:
         new_off = round(self.offset + best_shift, 2)
         if abs(new_off) > self._tune["energy_max_offset"]:
             log.info("energy-align: candidate offset %+.1fs out of range — skipped", new_off)
+            verdict("inconclusive")
             return
         if abs(new_off - self.offset) < self._tune["energy_apply_min"]:
             log.info("energy-align: drift %+.2fs within tolerance — no change",
                      new_off - self.offset)
+            verdict("insync")          # a clear peak AT the current offset = confirmed in sync
             return
         # SANITY CHECK against Shazam: songs with repeated patterns (la-la-la
         # choruses, repetitive hooks) produce sharp correlation peaks at MULTIPLE
@@ -4751,6 +4855,7 @@ class Overlay:
                 log.info("energy-align: candidate %+.2fs disagrees with Shazam %+.2fs "
                          "(Δ=%.1fs) — likely chorus-repetition match, rejected",
                          new_off, self._last_audio_off, disagreement)
+                verdict("inconclusive")
                 return
         self.root.after(0, lambda: self._apply_energy_align(new_off, best_score, peak_lift))
 
@@ -4770,22 +4875,157 @@ class Overlay:
         log.info("energy-align: offset %+.2fs → %+.2fs (α=%.2f, score %.3f, lift %.3f)",
                  prev, self.offset, alpha, score, lift)
         self._hint(f"🎤 Auto-synced ({self.offset:+.1f}s)")
+        self._note_energy_verdict("corrected")
+
+    # ── ADAPTIVE sync-verification tier (escalation / de-escalation) ──────────
+    #
+    # The user's model: while syncing, verify by ear at least 3×/min; once a check
+    # CONFIRMS we're in sync, relax to 1×/min; ANY miss resyncs and snaps back to
+    # 3×/min, staying fast while misses continue. Each correction is two-point
+    # verified so a chorus-matched mis-read can't yank the lyrics. The cheap energy
+    # correlator gives the verdict when it reads a clear peak; only when it goes
+    # blind on a song (flat/ambiguous — the off-vocal ReGLOSS 'サクラミラージュ'
+    # case) does the tier escalate to a short Whisper listen for the verdict.
+
+    def _note_sync_verdict(self, verdict):
+        """Drive the adaptive verify cadence from one check's outcome.
+        verdict ∈ {"insync", "corrected", "inconclusive"}:
+          • insync       → success: step the cadence DOWN toward 1×/min.
+          • corrected    → a miss we fixed: snap to 3×/min and stay fast while missing.
+          • inconclusive → no reliable reading: leave the cadence unchanged."""
+        fast = self._tune.get("sync_tier_fast_s", 20.0)
+        mid  = self._tune.get("sync_tier_mid_s", 40.0)
+        slow = self._tune.get("sync_tier_slow_s", 60.0)
+        if verdict == "insync":
+            self._sync_good_streak += 1
+            self._sync_miss_streak = 0
+            # one good check halves the rate; a second relaxes fully to 1×/min
+            self._sync_tier_interval = mid if self._sync_good_streak < 2 else slow
+        elif verdict == "corrected":
+            self._sync_miss_streak += 1
+            self._sync_good_streak = 0
+            self._sync_tier_interval = fast        # escalate; keep fast while missing
+        else:
+            return                                  # inconclusive: cadence unchanged
+        log.info("sync-tier: %s → verify every %.0fs (good=%d miss=%d)",
+                 verdict, self._sync_tier_interval, self._sync_good_streak,
+                 self._sync_miss_streak)
+
+    def _note_energy_verdict(self, verdict):
+        """Energy-correlator verdict: tracks the consecutive-blind streak (so the
+        tier knows when to escalate to Whisper) then feeds the shared tier logic."""
+        self._energy_blind = self._energy_blind + 1 if verdict == "inconclusive" else 0
+        self._note_sync_verdict(verdict)
 
     def _periodic_auto_align(self):
-        """Continuous algorithmic sync heartbeat: every ~15 s, check the
-        energy correlation against the LRC. Replaces the old strike-counter
-        approach — every correlation reading is treated as a measurement and
-        either applied (if the peak is sharp and the change is meaningful) or
-        discarded silently. No song-specific thresholds.
+        """Adaptive sync-verification heartbeat (the escalation/de-escalation tier).
 
-        15 s cadence is a balance: tight enough to catch drift within a stanza,
-        loose enough that Shazam-confirmed offsets don't get churned and the
-        rolling vocal buffer (60 s) builds enough new signal between runs."""
+        Reschedules itself at the CURRENT tier cadence (fast ≈3×/min while syncing,
+        relaxing to 1×/min once sync is confirmed). Each tick runs the cheap energy
+        correlation for a verdict; if energy has gone blind on this song while we
+        still need to confirm sync (fast tier), it escalates to a short Whisper
+        listen instead, so the heavy transcription runs only when it's the only
+        thing that can judge sync."""
         try:
-            self._maybe_auto_align(reason="periodic")
+            mid = self._tune.get("sync_tier_mid_s", 40.0)
+            fast_tier = self._sync_tier_interval <= mid
+            if (self._energy_blind >= 1 and fast_tier and not self._live_mode
+                    and not self._aligning and not self._tier_listen):
+                self._tier_listen_now()             # energy can't read this song → use ears
+            else:
+                self._maybe_auto_align(reason="periodic")
         finally:
-            self._auto_align_after = self.root.after(
-                int(self._tune["continuous_recal_ms"]), self._periodic_auto_align)
+            nxt = int(max(8.0, self._sync_tier_interval) * 1000)
+            self._auto_align_after = self.root.after(nxt, self._periodic_auto_align)
+
+    def _tier_listen_now(self):
+        """Whisper-based tier verification, used when the energy correlator is blind.
+        Transcribes a few seconds and matches to the LRC; the result is judged (and,
+        for a real miss, two-point verified) in _apply_tier_listen. Short capture,
+        gated so it runs only when it's needed and safe."""
+        if (self._aligning or self._tier_listen or not self.lines
+                or self._live_mode or not self.media):
+            return
+        if (self.meta.get("source") or "") == "youtube-captions":
+            return                                  # caption timing is already exact
+        try:
+            import align
+            if not align.available():
+                return
+        except Exception:
+            return
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING):
+            return
+        if float(st.get("position") or 0.0) < self._tune.get("auto_align_min_pos", 12.0):
+            return
+        self._tier_listen = True
+        self._aligning = True
+        lines, lang = self.lines, self.meta.get("lang", "ja")
+        secs = float(self._tune.get("sync_tier_listen_s", 6.0))
+
+        def work():
+            res = None
+            try:
+                res = align.capture_and_align(lines, lang=lang,
+                                              get_pos=self._align_pos, seconds=secs)
+            except Exception as e:
+                log.info("tier listen error: %s", e)
+            self.root.after(0, lambda: self._apply_tier_listen(res))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_tier_listen(self, res):
+        """Judge a tier Whisper read and update the adaptive cadence. A small drift
+        applies on a single read; only a LARGE proposed jump (chorus-mismatch
+        territory) is held for a confirming second read before it can move sync."""
+        self._aligning = False
+        self._tier_listen = False
+        if not res:
+            self._note_sync_verdict("inconclusive")
+            return
+        offset, ratio, _start = res
+        now = time.time()
+        pending = self._tier_tpvr is not None and now <= self._tier_tpvr_until
+        if not pending:
+            self._tier_tpvr = None
+            drift = offset - self.offset
+            if abs(drift) <= self._tune.get("sync_tier_ok_drift", 0.8):
+                log.info("sync-tier: confirmed in sync (drift %+.2fs) — relaxing", drift)
+                self._note_sync_verdict("insync")
+                return
+            # a modest drift is low-risk → apply on this single read
+            if abs(drift) <= 2.0 and not (abs(offset) > 6.0 and ratio < 0.72):
+                self._tier_commit(offset, ratio, "drift %+.2fs" % drift)
+                return
+            # a big jump → HOLD and confirm with a 2nd listen (two-point). The
+            # window must outlast the 2.5 s gap + the next capture (~6 s) + margin.
+            self._tier_tpvr, self._tier_tpvr_until = offset, now + 14.0
+            log.info("sync-tier: holding %+.2fs — confirming with a 2nd listen", offset)
+            self.root.after(2500, self._tier_listen_now)
+            return
+        # confirming (second) read of a held big jump
+        first = self._tier_tpvr
+        self._tier_tpvr = None
+        if abs(offset - first) > 1.2:
+            log.info("sync-tier: reads disagree (%.2f vs %.2f) → no change", first, offset)
+            self._note_sync_verdict("inconclusive")
+            return
+        measured = 0.5 * (first + offset)
+        if abs(measured) > 6.0 and ratio < 0.72:
+            self._note_sync_verdict("inconclusive")
+            return
+        self._tier_commit(measured, ratio, "two reads agree %.2f≈%.2f" % (first, offset))
+
+    def _tier_commit(self, offset, ratio, why):
+        prev = self.offset
+        self.offset = round(offset, 2)
+        self.idx = -1
+        self._drift_integral = 0.0
+        log.info("sync-tier: resync %+.2fs → %+.2fs (%s, match %.2f)",
+                 prev, self.offset, why, ratio)
+        self._hint(f"🎤 Re-synced ({self.offset:+.1f}s)")
+        self._note_sync_verdict("corrected")
 
     def _apply_align(self, res):
         self._aligning = False

@@ -8,6 +8,61 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-065 — Adaptive escalation/de-escalation sync-verification tier 🟢
+**Ask:** sample sound-matching more often while syncing — verify with TPVR ≥3×/min;
+once a check succeeds drop to 1×/min; any failure resyncs and snaps back to 3×/min,
+staying fast while failures continue.
+**Fix:** `_periodic_auto_align` is now an **adaptive heartbeat**. `_sync_tier_interval`
+starts at **20 s (3×/min)**; each check yields a verdict via `_note_sync_verdict`:
+`insync` steps the cadence down (40 s → 60 s after two good checks), `corrected` snaps
+back to 20 s and stays fast while misses continue, `inconclusive` holds. The cheap
+energy correlation gives the verdict when it reads a clear peak; when it's **blind on a
+song** (flat/ambiguous — the off-vocal ReGLOSS 'サクラミラージュ' case, `_energy_blind`)
+the tier escalates to a short **Whisper listen** (`_tier_listen_now`, 6 s capture),
+**two-point verified** for any large jump before it can move sync. Whisper CPU is capped
+(`cpu_threads=4` in `align.py`) so the transcribe can't stutter the overlay. Knobs:
+`sync_tier_fast_s` / `_mid_s` / `_slow_s` / `_ok_drift` / `_listen_s`. Telemetry in
+`/diag.sync`: `tier_interval_s`, `tier_good_streak`, `tier_miss_streak`,
+`tier_energy_blind`, `tier_listening`.
+
+## TICKET-064 — Cover videos (【Cover MV】) searched by the cover channel 🟢
+**Symptom:** "【Cover MV】MAFIA / マフィア - Ouro Kronii" loaded the wrong/no lyrics and
+took ages — the cover went undetected, so the search used the COVER CHANNEL ("Ouro
+Kronii Ch. hololive-EN"), which has no lyrics listed for that song.
+**Cause:** `_COVER_RE` matched `(cover)` / `[cover]` / `/cover` but **not** the
+lenticular/fullwidth bracket tags VTuber covers use — `【Cover MV】`, `（Cover MV）`,
+`［Cover］`. Also `extract_cover_original` was handed the *cleaned* artist
+("hololive-EN"), so " - Ouro Kronii" looked like the ORIGINAL artist.
+**Fix:** `_COVER_RE` now catches a `cover` tag after any common opening bracket;
+`extract_cover_original` strips the bracketed tag, is passed the **raw** channel, and
+keeps the song when the tail is the cover channel. On a cover with no parseable original
+artist, `_on_track_change` **drops the channel** (`fetch_artist=""`) and searches by
+title alone (the original's lyrics fit the cover) — never re-introducing the channel.
+This also fixes the "taking too long to detect" complaint for covers (title-first
+resolves instantly instead of failing through to sound).
+
+## TICKET-063 — Long concert videos: weak song detection between songs 🟡
+**Ask:** in a 1h+ concert, combine OCR (banner) + audio (Shazam) + the applause
+detector + a 2-6 min duration heuristic to detect & switch songs and sync smoothly.
+**Done:** in `live_mode`, an **applause gap is treated as a song BOUNDARY** —
+`_check_applause_gap` re-identifies (Shazam + a forced OCR banner read) the NEXT song
+instead of resyncing the old one. Plus a **2-6 min heuristic**: a concert song still
+showing after ~6.5 min forces a re-identify (caught a missed transition).
+**Open:** transcription-based song-ID (transcribe the singing → match against the whole
+lyric LIBRARY to pick the song) as the last fallback when OCR + Shazam both miss.
+
+## TICKET-062 — Language-confidence score (artist's usual language) 🟢
+**Ask:** weight the artist's usual language so a Japanese act's English-titled song
+isn't matched to an English same-title collision (Suisei's "GHOST" → English "Ghost";
+ReGLOSS "feelingradation" must read Japanese). As a percentage with other factors.
+**Fix:** `confidence.language_confidence(title, artist)` → {ja,en,zh,ko,certainty}.
+Strong cue = the artist NAME script (kana→JA, hangul→KO) + a `_KNOWN_JA` reference for
+romanized acts (hololive/ReGLOSS/V.W.P/Reol…). When certainty is high and CJK clearly
+beats EN, `fetch_lrc.take()` rejects an English body as a collision; `_file_valid`
+self-heals a cached English body for a kana-named artist. Neutral (certainty 0) for
+plain romanized names so DEADPOOL/Suisei is unaffected. Measured: GHOST/星街すいせい
+75% JA, feelingradation/ReGLOSS 71% JA, DEADPOOL/Suisei-Hoshimachi 0 certainty.
+
 ## TICKET-061 — Concert applause/cheering pause drifts the lyrics 🟢
 **Symptom:** in a LIVE/concert cut the song pauses for applause & cheering; the player
 clock keeps running, so the lyrics scroll ahead and stay desynced after the music
