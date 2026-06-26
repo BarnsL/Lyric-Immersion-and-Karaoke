@@ -1210,6 +1210,8 @@ class Overlay:
             "auto_align_cooldown":  14.0,   # min s between auto-aligns (< fast tier so it doesn't throttle it)
             "auto_align_min_pos":   12.0,   # min player pos before auto-align
             "shazam_lock_grace":    30.0,   # auto-align skipped within N s of lock
+            "unconfirmed_backoff_s": 30.0,  # settled-but-unconfirmable song → slow the Shazam poll (anti-stutter)
+            "confirmed_recal_s":     45.0,  # confirmed+watched song → slow Shazam re-lock (tier handles drift)
             "continuous_recal_ms": 15000,   # legacy fixed cadence (superseded by the adaptive tier)
             # ── ADAPTIVE sync-verification tier (escalation / de-escalation) ──
             # Verify sync ~3×/min while syncing or after a miss; once a check CONFIRMS
@@ -1901,11 +1903,13 @@ class Overlay:
                     watched = (confirmed and self._boundary is not None
                                and self.boundary_on and not self._live_mode)
                     if watched:
-                        # The detector is listening for the next song, so blind
-                        # polling is wasteful — just re-lock timing slowly. (In a
-                        # live set songs often segue with no silent gap for the
-                        # detector to catch, so live mode keeps polling instead.)
-                        nxt = max(self.recal_secs, 25)
+                        # The detector is listening for the next song AND the
+                        # adaptive sync tier now re-locks drift, so a frequent Shazam
+                        # re-lock is largely redundant — and each recognize stalls the
+                        # render (GIL). Relax it well back; the tier handles drift, the
+                        # boundary detector handles song changes. (Live sets segue with
+                        # no silent gap, so live_mode keeps polling instead.)
+                        nxt = max(self.recal_secs, self._tune.get("confirmed_recal_s", 45.0))
                     else:
                         # poll as fast as feasible while the song isn't confirmed by
                         # sound yet (each listen is ~4s of audio — the floor)
@@ -1919,6 +1923,21 @@ class Overlay:
                         nxt = min(nxt, 8)
                     elif abs(self.offset) > 0.8:
                         nxt = min(nxt, 12)
+                    # ANTI-STUTTER BACK-OFF (de-escalation): a song Shazam simply
+                    # CAN'T fingerprint (an MMD/cover/performance arrangement) stays
+                    # "unconfirmed" forever, so the unconfirmed branch above polls
+                    # recognize every ~4 s indefinitely — and each recognize stalls
+                    # the render (GIL contention: ~150-475 ms frames, the visible
+                    # stutter). Once the track is clearly SETTLED — lyrics loaded, in
+                    # sync (|offset|≤1 s), and ~45 s have passed with no sound lock —
+                    # there's nothing left to confirm, so stop hammering: back the
+                    # poll off to a slow heartbeat. Song changes are still caught by
+                    # the boundary detector; live_mode (concert) is exempt (it needs
+                    # continuous polling to catch the next song).
+                    if (self.lines and abs(self.offset) <= 1.0 and not self._live_mode
+                            and time.time() - getattr(self, "_track_t0", 0.0) > 45.0
+                            and ((not self._verified) or self._sound_song is None)):
+                        nxt = max(nxt, self._tune.get("unconfirmed_backoff_s", 22.0))
         finally:
             self._arm_recal(nxt)
 
