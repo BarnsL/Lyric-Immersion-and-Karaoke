@@ -8,6 +8,22 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-061 — Concert applause/cheering pause drifts the lyrics 🟢
+**Symptom:** in a LIVE/concert cut the song pauses for applause & cheering; the player
+clock keeps running, so the lyrics scroll ahead and stay desynced after the music
+resumes.
+**Fix:** `_check_applause_gap` (polled ~3×/s) watches the live audio in a live cut for
+a sustained **loud-but-non-vocal** stretch (broadband cheering — high spectral
+flatness, no tonal singing). When singing returns it fires a **Whisper
+transcribe-and-match resync gated by TWO-POINT verification**: align by ear, HOLD the
+offset, confirm with a 2nd listen ~2.5 s later, apply only if the two agree. Tunable
+via `/tune applause_min_s`.
+
+## TICKET-060 — Kanji song matched Korean lyrics (花譜 邂逅 → "Chance meeting") 🟢
+**Fix:** kanji (Han) is JA/ZH, never modern Korean (hangul) — so a kanji title/artist
+rejects a Korean lyric body at fetch AND on cache load (self-healing). Suppressed when
+the title/artist itself carries hangul.
+
 ## TICKET-059 — Auto-captions = wrong/excess lyrics + [音楽] tags 🟢
 **Symptom:** lyrics "close but wrong" (鉄後/ラッキラ mis-hearings), full of `[音楽]` /
 `[ongaku]` tags, and an "excess" wall of duplicated text — on ReGLOSS MVs.
