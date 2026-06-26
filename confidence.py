@@ -91,10 +91,18 @@ _KNOWN_JA = (
     "hololive", "regloss", "dev_is", "dev is", "holostars", "kamitsubaki",
     "v.w.p", "vwp", "virtual witch", "neko hacker", "phase connect", "phase-connect",
     # VTuber acts / J-artists the user plays
-    "reol", "kanaria", "suisei", "hoshimachi", "kanade", "otonose", "ririka",
-    "ichijou", "raden", "juufuutei", "hajime", "todoroki", "hiodoshi", "ouro kronii",
-    "kaf", "kanaeru", "kobo", "michiru shisui", "kaneko lumi", "harusaruhi",
-    "isekaijoucho", "rim", "理芽", "幸祜",
+    "reol", "kanaria", "suisei", "hoshimachi", "hoshimatic", "kanade", "otonose",
+    "ririka", "ichijou", "raden", "juufuutei", "hajime", "todoroki", "hiodoshi",
+    "ouro kronii", "kaf", "kanaeru", "kobo", "michiru shisui", "kaneko lumi",
+    "harusaruhi", "isekaijoucho", "rim", "理芽", "幸祜",
+)
+
+# A subset of _KNOWN_JA that is UNAMBIGUOUS and consistent enough that the
+# romanized name alone is a FULL Japanese signal (certainty 1.0) — the user's
+# "Suisei is always Japanese, make her channel/name full JA" rule. Matched as a
+# lowercase substring of the artist/channel.
+_ALWAYS_JA = (
+    "suisei", "hoshimachi", "hoshimatic", "星街すいせい", "すいせい",
 )
 
 
@@ -113,18 +121,26 @@ def language_confidence(title: str, artist: str = "") -> dict:
     romanized-Japanese from a Western song).
     """
     t, a = title or "", artist or ""
+    al = a.lower()
     v = {"ja": 0.0, "en": 0.0, "zh": 0.0, "ko": 0.0}
     strong = 0.0
-    known_ja = any(k in a.lower() for k in _KNOWN_JA)   # known romanized JP act/label
+    always_ja = any(k in al for k in _ALWAYS_JA)        # unambiguous JP act (Suisei…)
+    known_ja = any(k in al for k in _KNOWN_JA)          # known romanized JP act/label
     # Artist name script = the act's usual language (the strongest cue).
-    if _LC_KANA.search(a):
+    if always_ja:
+        v["ja"] += 3.0; strong += 3.0          # Suisei etc.: romanized name = FULL JA
+    elif _LC_KANA.search(a):
         v["ja"] += 3.0; strong += 3.0          # kana is uniquely Japanese
     elif _LC_HANGUL.search(a):
         v["ko"] += 3.0; strong += 3.0
     elif _LC_HAN.search(a):
         v["ja"] += 1.4; v["zh"] += 1.4; strong += 2.0   # kanji shared JA/ZH
     elif known_ja:
-        v["ja"] += 2.5; strong += 2.5          # known JP act with a fully-romanized name
+        # A KNOWN romanized JP act (ReGLOSS, hololive, Reol…) is as reliably
+        # Japanese as a kana name — give it FULL weight (certainty 1.0), not a weak
+        # partial. These are curated acts that always sing Japanese, so a romanized
+        # channel name must still strongly prefer the JA match over an EN collision.
+        v["ja"] += 3.0; strong += 3.0
     # Title script (weaker — titles are often English/romaji regardless).
     if _LC_KANA.search(t):
         v["ja"] += 2.0; strong += 2.0

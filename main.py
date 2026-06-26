@@ -123,6 +123,35 @@ def _resource(name):
     return Path(getattr(sys, "_MEIPASS", BASE)) / name
 
 
+def _seed_bundled_lyrics():
+    """Copy lyrics SHIPPED with the app (bundled_lyrics/) into the runtime cache so
+    songs whose providers ALWAYS fail are baked in and reliably available.
+
+    feelingradation (ReGLOSS) is the case: the app searches under the verbose
+    channel 'hololive DEV_IS ReGLOSS' and every provider misses, so it fell back to
+    a poor Whisper transcription. The real synced LRC exists under 'ReGLOSS', so we
+    ship a properly furigana'd / romaji'd / translated copy and seed it here. It
+    OVERWRITES a weaker (generated/transcribed) cache of the same song; an identical
+    already-seeded copy is left alone. Best-effort; any failure is ignored."""
+    import shutil
+    try:
+        src_dir = _resource("bundled_lyrics")
+        if not src_dir.is_dir():
+            return
+        LYRICS_DIR.mkdir(exist_ok=True)
+        for src in src_dir.glob("*.json"):
+            dst = LYRICS_DIR / src.name
+            try:
+                if dst.exists() and dst.read_bytes() == src.read_bytes():
+                    continue                       # already seeded, identical
+                shutil.copyfile(src, dst)
+                log.info("seeded bundled lyrics: %s", src.name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _load_settings():
     """Read settings.json (returns {} if missing or unreadable)."""
     try:
@@ -1212,6 +1241,7 @@ class Overlay:
             "shazam_lock_grace":    30.0,   # auto-align skipped within N s of lock
             "unconfirmed_backoff_s": 30.0,  # settled-but-unconfirmable song → slow the Shazam poll (anti-stutter)
             "confirmed_recal_s":     45.0,  # confirmed+watched song → slow Shazam re-lock (tier handles drift)
+            "wrong_song_strikes":     5,    # heard the SAME other song this many × → loaded song is wrong, switch
             "continuous_recal_ms": 15000,   # legacy fixed cadence (superseded by the adaptive tier)
             # ── ADAPTIVE sync-verification tier (escalation / de-escalation) ──
             # Verify sync ~3×/min while syncing or after a miss; once a check CONFIRMS
@@ -1237,8 +1267,11 @@ class Overlay:
             # PERF-102 — scroll bitmap-area controls (the dominant scroll cost):
             "scroll_max_lanes":      3,     # stacked scrolling lines (capped to what fits on screen)
             "scroll_spawn_margin": 1100,    # px off-screen a block is pre-rendered (avoid pop-in)
-            # MV/cinematic intro hold backstop (primary release is the vocal poll):
-            "mv_intro_timeout":     75.0,   # s before the intro card releases regardless
+            # MV/cinematic intro hold backstop (primary release is the vocal poll).
+            # Kept SHORT: a false "waiting for vocals" while the song is already
+            # singing is worse than briefly running into a genuine long intro, so
+            # the hold can never sit through more than this many seconds of vocals.
+            "mv_intro_timeout":     20.0,   # s before the intro card releases regardless
         }
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
@@ -1270,6 +1303,8 @@ class Overlay:
         self._last_drift = 0.0        # last audio-vs-display drift measured (sync telemetry)
         self._last_drift_t = 0.0      # when that drift was measured (time.time)
         self._pending_switch = None   # a contradicting heard song awaiting a 2nd confirming read
+        self._sound_fail_streak = 0   # consecutive times the SAME other song was heard (wrong-song strikes)
+        self._last_heard_contra = None  # the last contradicting heard song (for the strike streak)
         self._fast_calib = 0          # remaining quick re-locks after a song change
         self._recal_after = None      # pending recalibrate timer id
         self._live_mode = False       # concert/compilation → sound-only, no title-match
@@ -1277,6 +1312,7 @@ class Overlay:
         self._intro_anchored = True   # have we anchored past this track's intro yet?
         self._track_t0 = 0.0          # wall-clock when the current track started
 
+        _seed_bundled_lyrics()        # bake-in songs providers always miss (feelingradation)
         self.index = LyricsIndex()
         self.media = MediaWatcher()
         self.character = Character(self.root, _DATA)
@@ -1340,6 +1376,8 @@ class Overlay:
                 pass
             self._sync_confirm_after = None
         self._pending_switch = None  # drop any pending song-switch confirmation
+        self._sound_fail_streak = 0  # fresh wrong-song strike count for the new track
+        self._last_heard_contra = None
         self._gen_token += 1       # cancel any in-flight lyric generation
         self._deep_token += 1      # cancel any in-flight deep (offline) transcription
         self._track_seq += 1
@@ -2121,6 +2159,8 @@ class Overlay:
                     # a Shazam mis-ID on a mix — was what produced wild offsets.)
                     self._sound_song = heard
                     self._pending_switch = None     # current song reconfirmed
+                    self._sound_fail_streak = 0     # heard == loaded → sync works, clear strikes
+                    self._last_heard_contra = None
                     if offset is not None and t_cap is not None:
                         st = self.media.get()
                         if st and st.get("status") == PLAYING:
@@ -2259,11 +2299,46 @@ class Overlay:
                                     self._maybe_auto_align(reason="drift-integral")
                 elif self._title_locked:
                     # The lyrics came from a confident EXACT match on a clean
-                    # official title, but Shazam heard a DIFFERENT song — almost
-                    # always a mis-ID of another track by the SAME artist
-                    # (feelingradation heard as SKAVLA). Trust the title; ignore it.
-                    log.info("ignoring sound %r — title-locked to %r",
-                             f_title, self.meta.get("title", ""))
+                    # official title, but Shazam heard a DIFFERENT song — usually a
+                    # mis-ID of another track by the SAME artist (feelingradation
+                    # heard as SKAVLA). Normally we trust the title and ignore it.
+                    # BUT if we keep hearing the SAME other song over and over, the
+                    # title-lock is genuinely WRONG (we loaded "Dunk" for a "Deep
+                    # Dive" video) and no amount of re-syncing will ever fix it — the
+                    # song is wrong. After N strikes (user's rule: 5) BREAK the lock
+                    # and switch to what we actually hear.
+                    if heard == self._last_heard_contra:
+                        self._sound_fail_streak += 1
+                    else:
+                        self._last_heard_contra, self._sound_fail_streak = heard, 1
+                    strikes = self._tune.get("wrong_song_strikes", 5)
+                    if self._sound_fail_streak >= strikes:
+                        log.info("title-lock OVERRIDDEN: heard %r %d× ≠ locked %r → wrong "
+                                 "song, switching", f_title, self._sound_fail_streak,
+                                 self.meta.get("title", ""))
+                        self._title_locked = False
+                        self._sound_fail_streak = 0
+                        self._last_heard_contra = None
+                        self._pending_switch = None
+                        self._sound_song = heard
+                        self.offset = 0.0
+                        self._fast_calib = max(self._fast_calib, 2)
+                        self._arm_recal(7)
+                        cached = self._prefer_cjk_cache(f_artist, f_title, self._cur_duration) \
+                            or self.index.match(f_artist, f_title, self._cur_duration)
+                        if cached and self._file_valid(cached, self._cur_duration):
+                            if cached != self._lyrics_path:
+                                log.info("wrong-song correction → cached %s", cached.name)
+                                self.load(cached)
+                            self._maybe_translate()
+                        else:
+                            log.info("wrong-song correction → fetching %r / %r", f_title, f_artist)
+                            self._hint(f"🔄 Wrong song — switching to {f_title}…")
+                            self._start_fetch(f_artist, f_title, self._cur_duration)
+                    else:
+                        log.info("ignoring sound %r — title-locked to %r (strike %d/%d)",
+                                 f_title, self.meta.get("title", ""),
+                                 self._sound_fail_streak, strikes)
                 elif heard == self._sound_song:
                     # Already switched to this heard song and its lyrics are still
                     # pending or simply don't exist (generation handles that). Don't
@@ -3904,14 +3979,17 @@ class Overlay:
         except Exception:
             return False
         recent = [r for (_, r) in hist]
-        if len(recent) < 4:
+        if len(recent) < 3:
             return False
-        # vocals = ratio meaningfully over the instrumental floor (relative when a
-        # baseline was learned, else an absolute fallback), sustained across MOST
-        # of the window so a single instrumental stab can't trip the release.
-        thresh = max(0.20, base * 1.5) if base > 0 else 0.24
+        # vocals = ratio over the instrumental floor (relative when a baseline was
+        # learned, else an absolute fallback), sustained across HALF the window.
+        # Loosened (was base*1.5 / 60%): the old bar missed real singing on
+        # backing-heavy mixes (covers), leaving the lyrics stranded on the
+        # "cinematic intro — waiting for vocals" card while the song was clearly
+        # singing. Releasing a touch early is far better than holding through vocals.
+        thresh = max(0.16, base * 1.3) if base > 0 else 0.20
         above = sum(1 for r in recent if r >= thresh)
-        return above >= max(3, int(0.6 * len(recent)))
+        return above >= max(2, int(0.5 * len(recent)))
 
     def _on_vocal_onset(self):
         """Vocals just started — singing rose above the instrumental floor. Used

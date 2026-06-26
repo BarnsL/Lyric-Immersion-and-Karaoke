@@ -13,6 +13,10 @@ from PyInstaller.utils.hooks import collect_all
 WHISPER = os.path.isdir(".deps")
 
 datas = [("icon.ico", ".")]
+# Lyrics baked into the app for songs the providers always miss (feelingradation):
+# seeded into the runtime cache at startup by _seed_bundled_lyrics().
+if os.path.isdir("bundled_lyrics"):
+    datas.append(("bundled_lyrics", "bundled_lyrics"))
 binaries = []
 hiddenimports = [
     "pystray._win32", "PIL._tkinter_finder", "PIL.ImageTk", "PIL.ImageGrab",
