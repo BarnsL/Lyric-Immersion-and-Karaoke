@@ -1,0 +1,605 @@
+{
+  "meta": {
+    "title": "サクラミラージュ",
+    "artist": "hololive DEV_IS ReGLOSS",
+    "lang": "ja",
+    "duration": 250.0,
+    "source": "bundled"
+  },
+  "lines": [
+    {
+      "t": [
+        18.88,
+        20.7
+      ],
+      "jp": "Staring into your eyes",
+      "rm": "",
+      "en": "Staring into your eyes"
+    },
+    {
+      "t": [
+        20.7,
+        22.61
+      ],
+      "jp": "Make me feel alive",
+      "rm": "",
+      "en": "Make me feel alive"
+    },
+    {
+      "t": [
+        22.61,
+        24.68
+      ],
+      "jp": "それは始(はじ)まりの合図(あいず)",
+      "rm": "sore wa hajimari no aizu",
+      "en": "It's a sign of the beginning"
+    },
+    {
+      "t": [
+        24.68,
+        26.34
+      ],
+      "jp": "Are you ready for this?",
+      "rm": "",
+      "en": "Are you ready for this?"
+    },
+    {
+      "t": [
+        26.34,
+        28.61
+      ],
+      "jp": "柔(やわ)らかな風(かぜ)ほら、春(はる)めいて",
+      "rm": "yawaraka na kaze hora, harumeite",
+      "en": "Look at the soft wind, it feels like spring"
+    },
+    {
+      "t": [
+        28.61,
+        33.53
+      ],
+      "jp": "共鳴(きょうめい)するファンファーレ",
+      "rm": "kyoumei suru fanfare",
+      "en": "Resonating fanfare"
+    },
+    {
+      "t": [
+        33.53,
+        35.62
+      ],
+      "jp": "桜花(おうか)爛漫(らんまん) 染(そ)める桃色(ももいろ)",
+      "rm": "ouka ranman someru momoiro",
+      "en": "Cherry blossoms in full bloom, dyed pink"
+    },
+    {
+      "t": [
+        35.62,
+        37.54
+      ],
+      "jp": "別(わか)れの予感(よかん)はソメイヨシノ",
+      "rm": "wakare no yokan wa someiyoshino",
+      "en": "The premonition of separation comes from Somei Yoshino"
+    },
+    {
+      "t": [
+        37.54,
+        39.47
+      ],
+      "jp": "I'll be there, I'll be there, I'll be there, I'll be there for you",
+      "rm": "",
+      "en": "I'll be there, I'll be there, I'll be there, I'll be there for you"
+    },
+    {
+      "t": [
+        39.47,
+        41.21
+      ],
+      "jp": "一閃(いっせん)浴(あ)びて dance with me now",
+      "rm": "issen abite dance with me now",
+      "en": "Dance with me now"
+    },
+    {
+      "t": [
+        41.21,
+        44.68
+      ],
+      "jp": "音(おと)も立(た)てず交(か)わす",
+      "rm": "oto mo tatezu kawasu",
+      "en": "Exchange without making a sound"
+    },
+    {
+      "t": [
+        44.68,
+        48.3
+      ],
+      "jp": "キミとのコントラスト",
+      "rm": "kimi to no contrast",
+      "en": "Contrast with you"
+    },
+    {
+      "t": [
+        48.3,
+        52.92
+      ],
+      "jp": "その余白(よはく)はいつかのため",
+      "rm": "sono yohaku wa itsu ka no tame",
+      "en": "That blank space is for someday"
+    },
+    {
+      "t": [
+        52.92,
+        56.41
+      ],
+      "jp": "Save the best for last",
+      "rm": "",
+      "en": "Save the best for last"
+    },
+    {
+      "t": [
+        56.41,
+        59.61
+      ],
+      "jp": "小(ちい)さく震(ふる)えた lip",
+      "rm": "chiisaku furueta Lip",
+      "en": "Lips that trembled slightly"
+    },
+    {
+      "t": [
+        59.61,
+        63.54
+      ],
+      "jp": "喵み締(し)める まだ微熱(びねつ)の real",
+      "rm": "? mishimeru mada binetsu no real",
+      "en": "I hold on to the reality that I still have a slight fever"
+    },
+    {
+      "t": [
+        63.54,
+        67.31
+      ],
+      "jp": "本音(ほんね)の speaker, ダイレクトな weaver",
+      "rm": "honne no speaker, direct na weaver",
+      "en": "Honest speaker, direct weaver"
+    },
+    {
+      "t": [
+        67.31,
+        70.35
+      ],
+      "jp": "解き放(ときはな)て on my mind",
+      "rm": "tokihanate on my mind",
+      "en": "Release on my mind"
+    },
+    {
+      "t": [
+        70.35,
+        73.94
+      ],
+      "jp": "春(はる)が来(き)た パッと サクラミラージュ",
+      "rm": "haru ga kita pat to sakura mirage",
+      "en": "Spring has come, Sakura Mirage"
+    },
+    {
+      "t": [
+        73.94,
+        78.01
+      ],
+      "jp": "咲(さ)いて 儚(はかな)いね笑(わら)って endless (Woah-woah)",
+      "rm": "saite hakanai ne waratte endless (Woah-woah)",
+      "en": "Blooming and fleeting, smiling endlessly"
+    },
+    {
+      "t": [
+        78.01,
+        81.41
+      ],
+      "jp": "揺(ゆ)れながらまだ夢(ゆめ)半(なか)ば yeah",
+      "rm": "yurenagara mada yume nakaba yeah",
+      "en": "Shaking but still in the middle of a dream yeah"
+    },
+    {
+      "t": [
+        81.41,
+        86.33
+      ],
+      "jp": "そっと 囁(ささや)いて 叶(かな)えて stay for me (Let's make a miracle, miracle)",
+      "rm": "sotto sasayaite kanaete stay for me (Let's make a miracle, miracle)",
+      "en": "Whisper softly and make it come true stay for me"
+    },
+    {
+      "t": [
+        86.33,
+        89.61
+      ],
+      "jp": "花桜(はなざくら) (息(いき)つく暇(ひま)もない life is)",
+      "rm": "hanazakura (iki tsuku hima mo nai life is)",
+      "en": "Flowering cherry blossoms, a life with no time to grow is)"
+    },
+    {
+      "t": [
+        89.61,
+        93.81
+      ],
+      "jp": "ぱぱはらりら (一(いち)世(せい)一(いち)代(だい)のエチュード)",
+      "rm": "papa wa rarira (ichisei ichi dai no etude)",
+      "en": "Papahararira Etude of the World)"
+    },
+    {
+      "t": [
+        93.81,
+        97.51
+      ],
+      "jp": "徒桜(あだざくら) (大胆(だいたん)不敵(ふてき)なラプソディー)",
+      "rm": "adazakura (daitan futeki na rhapsody)",
+      "en": "Takuzakura (Fearless Rhapsody)"
+    },
+    {
+      "t": [
+        97.51,
+        101.05
+      ],
+      "jp": "きらり涙(なみだ) (Stay for me)",
+      "rm": "kirari namida (Stay for me)",
+      "en": "Kirari Tears"
+    },
+    {
+      "t": [
+        101.05,
+        104.8
+      ],
+      "jp": "ぼやけてしまいそうな桃源(とうげん)郷(きょう)",
+      "rm": "boyakete shimai sou na tougenkyou",
+      "en": "A paradise that seems to become blurry"
+    },
+    {
+      "t": [
+        104.8,
+        108.65
+      ],
+      "jp": "完(かん)壁(へき)に描(えが)けなくたっていいよ",
+      "rm": "kanheki ni egakenakutatte ii yo",
+      "en": "It's okay if you can't draw it perfectly."
+    },
+    {
+      "t": [
+        108.65,
+        113.32
+      ],
+      "jp": "熱(ねつ)を帯(お)びたまま込み上(こみあ)げる feel my soul",
+      "rm": "netsu wo obita mama komiageru feel my soul",
+      "en": "Feel my soul rising with fever"
+    },
+    {
+      "t": [
+        113.32,
+        116.32
+      ],
+      "jp": "はらり等身(とうしん)大(おおき)な宙(ちゅう)を舞(ま)う",
+      "rm": "harari toushin ookina chuu wo mau",
+      "en": "Dancing in the air life-size"
+    },
+    {
+      "t": [
+        116.32,
+        119.88
+      ],
+      "jp": "新(あたら)しい自分(じぶん)を",
+      "rm": "atarashii jibun wo",
+      "en": "A new you"
+    },
+    {
+      "t": [
+        119.88,
+        122.97
+      ],
+      "jp": "この目(め)で catch on",
+      "rm": "kono me de catch on",
+      "en": "Catch on with these eyes"
+    },
+    {
+      "t": [
+        122.97,
+        128.72
+      ],
+      "jp": "変(か)わらないモノを胸(むね)に",
+      "rm": "kawaranai mono wo mune ni",
+      "en": "Keep things that don't change in your heart"
+    },
+    {
+      "t": [
+        128.72,
+        131.45
+      ],
+      "jp": "歩(あゆ)んでいこう",
+      "rm": "ayunde ikou",
+      "en": "Let's walk"
+    },
+    {
+      "t": [
+        131.45,
+        134.93
+      ],
+      "jp": "点(てん)と線(せん)紡(つむ)ぐ物語(ものがたり)は endless",
+      "rm": "ten to sen tsumugu monogatari wa endless",
+      "en": "The story spun by dots and lines is endless"
+    },
+    {
+      "t": [
+        134.93,
+        138.94
+      ],
+      "jp": "Call my name (Ayy-oh) 研ぎ澄(とぎす)ます先見(せんけん)の明(あきら)",
+      "rm": "call my name (Ayy-oh) togisumasu senken no Akira",
+      "en": "Call my name Sharpen your foresight"
+    },
+    {
+      "t": [
+        138.94,
+        142.28
+      ],
+      "jp": "蹴り上(けりあ)げる snеaker, 来世(らいせ)だって dreamer",
+      "rm": "keriageru sn ? aker, raise da tte dreamer",
+      "en": "Kick up snеaker, dreamer in the next life"
+    },
+    {
+      "t": [
+        142.28,
+        145.26
+      ],
+      "jp": "咲き誇(さきほこ)れ round and round",
+      "rm": "sakihokore round and round",
+      "en": "Bloom round and round"
+    },
+    {
+      "t": [
+        145.26,
+        148.98
+      ],
+      "jp": "春(はる)が来(き)た パッと サクラミラージュ",
+      "rm": "haru ga kita pat to sakura mirage",
+      "en": "Spring has come, Sakura Mirage"
+    },
+    {
+      "t": [
+        148.98,
+        152.91
+      ],
+      "jp": "咲(さ)いて 使(つか)いね笑(わら)って еndless (Woah-woah)",
+      "rm": "saite tsukai ne waratte ? ndless (Woah-woah)",
+      "en": "Bloom, use it, smile, eendless"
+    },
+    {
+      "t": [
+        152.91,
+        156.66
+      ],
+      "jp": "揺(ゆ)れながらまだ夢(ゆめ)半(なか)ば yeah",
+      "rm": "yurenagara mada yume nakaba yeah",
+      "en": "Shaking but still in the middle of a dream yeah"
+    },
+    {
+      "t": [
+        156.66,
+        161.51
+      ],
+      "jp": "そっと 囁(ささや)いて叶(かな)えて stay for me (Let's make a miracle, miracle)",
+      "rm": "sotto sasayaite kanaete stay for me (Let's make a miracle, miracle)",
+      "en": "Whisper softly and make it come true, stay for me"
+    },
+    {
+      "t": [
+        161.51,
+        164.9
+      ],
+      "jp": "花桜(はなざくら) (息(いき)つく暇(ひま)もない life is)",
+      "rm": "hanazakura (iki tsuku hima mo nai life is)",
+      "en": "Flowering cherry blossoms, a life with no time to grow is)"
+    },
+    {
+      "t": [
+        164.9,
+        168.79
+      ],
+      "jp": "ぱぱはらりら (一(いち)世(せい)一(いち)代(だい)のエチュード)",
+      "rm": "papa wa rarira (ichisei ichi dai no etude)",
+      "en": "Papahararira Etude of the World)"
+    },
+    {
+      "t": [
+        168.79,
+        172.53
+      ],
+      "jp": "徒桜(あだざくら) (大胆(だいたん)不敵(ふてき)なラプソディー)",
+      "rm": "adazakura (daitan futeki na rhapsody)",
+      "en": "Takuzakura (Fearless Rhapsody)"
+    },
+    {
+      "t": [
+        172.53,
+        176.23
+      ],
+      "jp": "きらり涙(なみだ) (Stay for me)",
+      "rm": "kirari namida (Stay for me)",
+      "en": "Kirari Tears"
+    },
+    {
+      "t": [
+        176.23,
+        176.97
+      ],
+      "jp": "「明日(あした)以降(いこう)」が決(き)まり文句(もんく)じゃ",
+      "rm": "\"ashita ikou\" ga kimari monku ja",
+      "en": "“After tomorrow” is a cliché."
+    },
+    {
+      "t": [
+        176.97,
+        179.78
+      ],
+      "jp": "大(だい)報(ほう)袋(ふくろ)なシナリオとニアリーイコール",
+      "rm": "daihou fukuro na scenario to nearly equal",
+      "en": "Big news scenario and almost equal"
+    },
+    {
+      "t": [
+        179.78,
+        181.83
+      ],
+      "jp": "紆余(うよ)曲折(きょくせつ)しながら軌道(きどう)修正(しゅうせい)",
+      "rm": "uyo kyokusetsu shinagara kidou shuusei",
+      "en": "Correct your course through twists and turns"
+    },
+    {
+      "t": [
+        181.83,
+        183.93
+      ],
+      "jp": "Top speed 旋風(せんぷう)巻き起(まきお)こす new wave",
+      "rm": "top speed senpuu makiokosu new wave",
+      "en": "Top speed new wave creating a whirlwind"
+    },
+    {
+      "t": [
+        183.93,
+        185.63
+      ],
+      "jp": "We can't stop, 人生(じんせい)は夢幻(むげん)泡影(ほうえい)",
+      "rm": "we can't stop, jinsei wa mugen houei",
+      "en": "We can't stop, life is a dreamlike bubble shadow"
+    },
+    {
+      "t": [
+        185.63,
+        187.51
+      ],
+      "jp": "We gotta go, いつだって全(ぜん)速力(そくりょく)",
+      "rm": "we gotta go, itsu da tte zensokuryoku",
+      "en": "We gotta go, always full speed"
+    },
+    {
+      "t": [
+        187.51,
+        189.2
+      ],
+      "jp": "連鎖(れんさ)するシナジー",
+      "rm": "rensa suru synergy",
+      "en": "Chain synergy"
+    },
+    {
+      "t": [
+        189.2,
+        191.66
+      ],
+      "jp": "未来(みらい)切り拓(きりひら)いて響き合(ひびきあ)う鼓動(こどう)",
+      "rm": "mirai kirihiraite hibikiau kodou",
+      "en": "Heartbeats resonating as we open up the future"
+    },
+    {
+      "t": [
+        191.66,
+        194.8
+      ],
+      "jp": "ずっと飾(かざ)らないキミでいて",
+      "rm": "zutto kazaranai kimi de ite",
+      "en": "Always be yourself without decoration"
+    },
+    {
+      "t": [
+        194.8,
+        198.81
+      ],
+      "jp": "人(ひと)伝(つた)いの温度(おんど)で誰(だれ)かがそう嘆(なげ)いた",
+      "rm": "hitotsutai no ondo de dare ka ga sou nageita",
+      "en": "Someone lamented this with an infectious warmth."
+    },
+    {
+      "t": [
+        198.81,
+        202.58
+      ],
+      "jp": "霞(かす)んでは、また芽吹(めぶ)いて メロディ",
+      "rm": "kasunde wa, mata mebuite melody",
+      "en": "Once it becomes hazy, it sprouts again, a melody"
+    },
+    {
+      "t": [
+        202.58,
+        205.41
+      ],
+      "jp": "この期(き)に及(およ)んで恋(こい)してる",
+      "rm": "kono ki ni oyonde koi shiteru",
+      "en": "I've been in love with you for this long time"
+    },
+    {
+      "t": [
+        205.41,
+        208.94
+      ],
+      "jp": "春(はる)が来(き)た パッと サクラミラージュ",
+      "rm": "haru ga kita pat to sakura mirage",
+      "en": "Spring has come, Sakura Mirage"
+    },
+    {
+      "t": [
+        208.94,
+        212.99
+      ],
+      "jp": "咲(さ)いて停(てい)いね笑(わら)って endless (Woah-woah)",
+      "rm": "saitetei i ne waratte endless (Woah-woah)",
+      "en": "Bloom and stop smiling endlessly"
+    },
+    {
+      "t": [
+        212.99,
+        216.5
+      ],
+      "jp": "揺(ゆ)れながらまだ夢(ゆめ)半(なか)ば yeah (がら)",
+      "rm": "yurenagara mada yume nakaba yeah (gara)",
+      "en": "Shaking but still in the middle of a dream yeah"
+    },
+    {
+      "t": [
+        216.5,
+        221.35
+      ],
+      "jp": "そっと 囁(ささや)いて 叶(かな)えて stay for me (Let's make a miracle, miracle; Miracle)",
+      "rm": "sotto sasayaite kanaete stay for me (Let's make a miracle, miracle; Miracle)",
+      "en": "Whisper softly and make it come true stay for me"
+    },
+    {
+      "t": [
+        221.35,
+        224.98
+      ],
+      "jp": "花桜(はなざくら) (息(いき)つく暇(ひま)もない life is)",
+      "rm": "hanazakura (iki tsuku hima mo nai life is)",
+      "en": "Flowering cherry blossoms, a life with no time to grow is)"
+    },
+    {
+      "t": [
+        224.98,
+        228.81
+      ],
+      "jp": "ぱぱはらりら (一(いち)世(せい)一(いち)代(だい)のエチュード)",
+      "rm": "papa wa rarira (ichisei ichi dai no etude)",
+      "en": "Papahararila Etude of the World)"
+    },
+    {
+      "t": [
+        228.81,
+        231.08
+      ],
+      "jp": "徒桜(あだざくら) (大胆(だいたん)不敵(ふてき)なラプソディー)",
+      "rm": "adazakura (daitan futeki na rhapsody)",
+      "en": "Takuzakura (Fearless Rhapsody)"
+    },
+    {
+      "t": [
+        231.08,
+        236.08
+      ],
+      "jp": "きらり涙(なみだ) (Stay for me)",
+      "rm": "kirari namida (Stay for me)",
+      "en": "Kirari Tears"
+    }
+  ]
+}
