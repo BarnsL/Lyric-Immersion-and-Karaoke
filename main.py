@@ -2045,7 +2045,12 @@ class Overlay:
                                            if self._drift_integral_t > 0 else 4.0)
                                 self._drift_integral_t = now_t
                                 if abs(diff) > self._tune["drift_min_for_accum"]:
-                                    self._drift_integral += abs(diff) * dt_last
+                                    # cap the accumulator: if the offset never
+                                    # confirms (repeated choruses → reads never
+                                    # agree) it would otherwise grow without bound
+                                    # and re-fire the aligner every read.
+                                    self._drift_integral = min(
+                                        12.0, self._drift_integral + abs(diff) * dt_last)
                                 else:
                                     # decay quickly when drift drops back into the deadband
                                     self._drift_integral *= 0.5
@@ -2784,6 +2789,7 @@ class Overlay:
         w, h = base.size
         mask = Image.new("L", (w, h), 0)
         md = ImageDraw.Draw(mask)
+        sw = max(1, round(2 * self.font_scale * self._auto_scale))
         for row in spec["rows"]:
             chars = row["chars"]
             if not chars:
@@ -2791,9 +2797,19 @@ class Overlay:
             n = int(frac * len(chars) + 0.5)
             if n <= 0:
                 continue
-            x_sung = w if n >= len(chars) else int(chars[n][1])
-            fs = getattr(row["font"], "size", 30)
-            md.rectangle([0, int(row["y"] - fs), x_sung, int(row["y"] + fs * 0.4)],
+            # Reveal the sung layer up to the boundary char + a hair past it so the
+            # boundary glyph's left stroke isn't sliced.
+            x_sung = w if n >= len(chars) else int(chars[n][1]) + sw
+            # FULL-GLYPH vertical band: glyphs are drawn anchor="lm" (centred at
+            # row["y"]), so cover ±(half text height) PLUS the stroke and a margin —
+            # the old y+0.4·fs cut off descenders (g, y, p) and the lower outline,
+            # leaving the bottom of letters un-highlighted.
+            try:
+                asc, desc = row["font"].getmetrics()
+                half = (asc + desc) / 2.0 + sw + 3
+            except Exception:
+                half = getattr(row["font"], "size", 30) * 0.9
+            md.rectangle([0, int(row["y"] - half), x_sung, int(row["y"] + half)],
                          fill=255)
         out = base.copy()
         out.paste(sung, (0, 0), mask)
@@ -4056,21 +4072,14 @@ class Overlay:
         if vpos < self._tune["auto_align_min_pos"]:
             return
         self._last_align_t = now
-        # Prefer Whisper alignment when it's bundled — its transcript match is
-        # more authoritative than energy correlation. Fall back to the
-        # Whisper-free correlator otherwise (the lean .exe ships without
-        # faster-whisper to keep the download small).
-        try:
-            import align
-            whisper_ok = align.available()
-        except Exception:
-            whisper_ok = False
-        if whisper_ok:
-            log.info("auto-align (%s) — checking sync by Whisper", reason)
-            self.align_by_listening(silent=True)
-        else:
-            log.info("auto-align (%s) — checking sync by energy correlation", reason)
-            self._auto_align_by_energy(reason)
+        # AUTOMATIC sync ALWAYS uses the cheap vocal-energy correlation. Whisper
+        # transcription is HEAVY (~1-2 s of 100% on a core) and running it on ANY
+        # automatic path — periodic OR drift-triggered — stuttered the scroll AND
+        # the audio (render fell to ~22 fps, worst-frame 492 ms). Whisper stays
+        # reserved for the EXPLICIT "Sync by listening" button (align_by_listening,
+        # which doesn't go through here) and the last-resort deep transcription.
+        log.info("auto-align (%s) — checking sync by energy correlation", reason)
+        self._auto_align_by_energy(reason)
 
     def _auto_align_by_energy(self, reason):
         """Whisper-free sync correction: cross-correlate the recent audio's
