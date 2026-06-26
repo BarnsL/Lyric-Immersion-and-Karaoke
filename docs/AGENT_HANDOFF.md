@@ -28,7 +28,13 @@ karaoke tool. Read this first, then `ARCHITECTURE.md`.
 - **Path guard:** deleting under `D:\DesktopKaraoke` can trip a protection error mid-script
   (aborts before relaunch — then the overlay is down, relaunch it). Prefer `/purgecache`.
 
-## ⭐ NEXT WORK — the three requests from the last message (NOT yet implemented)
+## ⭐ NEXT WORK
+0. **Split `main.py` (5600 lines) into logical modules** — user-requested, DEFERRED until
+   they finish live-testing (a big regression-prone refactor; don't do it mid-iteration).
+   Code is already heavily commented and md docs are already in `docs/`; this is purely the
+   structural split (e.g. render / sync / matching / api-glue modules). Default branch is now
+   `claude/caption-sync-perf-fixes` (the repo homepage renders it; `master` is still the old
+   separate v1.1.1 history, untouched).
 1. **Concert sync must transcribe in the SONG'S language.** `align.capture_and_align(lang=…)`
    gets `self.meta.get("lang","ja")`. For live/concert cuts ensure the lang matches the lyric
    track (JA/EN/ZH/KO) so the Whisper transcript actually matches the displayed lines; thread
