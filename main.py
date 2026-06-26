@@ -261,6 +261,7 @@ class MediaWatcher:
         self._lock = threading.Lock()
         self._stop = False
         self.error = None
+        self._pick_src = None       # source_app of the session we're following (sticky)
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
@@ -320,25 +321,53 @@ class MediaWatcher:
             await asyncio.sleep(0.15)   # position is extrapolated, so 0.15s polling
             #                              keeps accuracy while cutting CPU ~33%
 
-    @staticmethod
-    def _pick(mgr):
+    def _pick(self, mgr):
+        """Pick the media session to follow — STICKY, so a paused background tab
+        can't hijack playback. The bug: with a paused tab (Coffee) AND a playing
+        Mix, during the brief gap between Mix songs NO session is 'playing', and
+        the old code fell back to `get_current_session()` (often the paused tab) —
+        so the overlay flip-flopped Coffee↔Mix every track, loading the wrong
+        song's lyrics. Now: prefer a PLAYING session, preferring the one we were
+        already following; and when nothing is playing (a transition gap) KEEP
+        following the last session instead of jumping to a different paused tab."""
         try:
             sessions = list(mgr.get_sessions())
         except Exception:
             sessions = []
-        cur = mgr.get_current_session()
-        try:
-            if cur and cur.get_playback_info().playback_status == PLAYING:
-                return cur
-        except Exception:
-            pass
-        for s in sessions:
+
+        def sid(s):
             try:
-                if s.get_playback_info().playback_status == PLAYING:
-                    return s
+                return s.source_app_user_model_id or ""
             except Exception:
-                continue
-        return cur
+                return ""
+
+        def playing(s):
+            try:
+                return s.get_playback_info().playback_status == PLAYING
+            except Exception:
+                return False
+
+        playing_now = [s for s in sessions if playing(s)]
+        # 1) keep following our session if it's still playing (stability)
+        if self._pick_src:
+            for s in playing_now:
+                if sid(s) == self._pick_src:
+                    return s
+        # 2) otherwise the first playing session — and remember it
+        if playing_now:
+            self._pick_src = sid(playing_now[0])
+            return playing_now[0]
+        # 3) NOTHING is playing (likely a gap between Mix tracks). Do NOT jump to
+        #    a paused tab — keep the session we were following if it still exists,
+        #    so the overlay holds the current song through the gap.
+        if self._pick_src:
+            for s in sessions:
+                if sid(s) == self._pick_src:
+                    return s
+        try:
+            return mgr.get_current_session()
+        except Exception:
+            return None
 
     def get(self):
         with self._lock:
@@ -1200,6 +1229,9 @@ class Overlay:
         self._cur_duration = duration
         self._health_attempts = 0
         self.offset = 0.0          # fresh baseline; sound calibration sets it
+        self.meta = {}             # drop the PREVIOUS song's meta so a new song
+        #                            with no lyrics yet can't show its stale source
+        #                            (e.g. "youtube-captions / 0 lines")
         self._sound_song = None    # new video → re-identify by ear
         self._pending_corr = 1e9   # drop any pending large-offset confirmation
         self._pending_switch = None  # drop any pending song-switch confirmation

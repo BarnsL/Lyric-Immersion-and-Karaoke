@@ -599,6 +599,26 @@ music). HPSS + mid-band energy ratio is the lightweight robust approach
 ([MDPI: Singing Onset](https://www.mdpi.com/2076-3417/12/15/7391),
 [Silero VAD #546](https://github.com/snakers4/silero-vad/discussions/546)).
 
+## TICKET-054 — Paused tab hijacked playback (Coffee↔Mix flip-flop) 🟢🟢🟢
+**Symptom:** on a YouTube Mix, the log showed the app flip-flopping between the
+playing song and a PAUSED background tab every track: `track change: Coffee → Rumor
+→ Coffee → Hug → Coffee …`. So the overlay kept loading the paused Coffee tab's
+lyrics over the actually-playing song → "No lyrics found", wrong song, stale lyrics,
+and a fresh fetch/caption churn on every flip. A huge part of the live "desync."
+**Root cause:** `MediaWatcher._pick` returned `get_current_session()` when no session
+was "playing". Between Mix tracks there's a brief gap where NOTHING is playing — so
+`_pick` fell to the OS "current session", which was often the paused Coffee tab. Next
+poll the Mix was playing again → back to it. Flip-flop.
+**Fix (pushed, v1.0.48):** made `_pick` STICKY. It tracks the source_app it's
+following and (1) keeps it while still playing, (2) else the first playing session,
+(3) and when NOTHING is playing — a transition gap — KEEPS the followed session
+instead of jumping to a different paused tab. A paused background tab can no longer
+hijack the overlay.
+**Also:** `_on_track_change` now clears `self.meta` so a new song with no lyrics yet
+can't display the previous song's stale source (the "youtube-captions / 0 lines" bug).
+**Verified live:** "【歌ってみた】One Last Kiss" held stable for 60 s with no Coffee
+interleaving; got youtube-captions/62 lines, drift 0.0.
+
 ## TICKET-053 — Overlay FROZE on the old song (the real "hella bad") 🟢🟢🟢
 **Symptom:** caught live — the SMTC title had changed to a new song
 ("【歌ってみた】林檎売りの泡沫少女") but the app was STUCK showing the previous song's
