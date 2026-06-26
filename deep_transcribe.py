@@ -293,6 +293,9 @@ def fetch_captions_only(query: str, lang: str | None = None):
         }
         if _sh.which("node"):
             opts["js_runtimes"] = {"node": {}}
+        # (Browser cookies were tried for region/age-gated videos but Chromium
+        # LOCKS its cookie DB while running — yt-dlp #7271 — so it just errored.
+        # The title search already finds an available upload for most songs.)
         # Exact URL / 11-char video id → fetch THAT video; else search by title.
         q = query.strip()
         if re.match(r"https?://", q):
