@@ -1191,6 +1191,7 @@ class Overlay:
             # same offset and falsely "agree" ("All The Things She Said" symptom).
             "sync_confirm_hold_ms": 2600,   # hesitation before the confirming listen
             "sync_confirm_listen_s": 5.0,   # confirming-listen capture length
+            "applause_min_s":        2.5,   # loud-non-vocal seconds = a concert applause gap
             "spread_reset":         20.0,   # chorus-ambiguity spread threshold
             "reset_offset_max":      5.0,   # only reset when |offset| < this
             "drift_align_trigger":   6.0,   # integral → trigger auto-align
@@ -1223,6 +1224,14 @@ class Overlay:
         self._sync_confirm_after = None  # pending 2s "confirm with a 2nd listen" timer
         self._recent_corr = []        # last few audio offsets — spot repeated-chorus ambiguity
         self._live_arrangement = False  # LIVE/short/alt version → FOLLOW the offset, don't reset
+        # Concert applause/cheering-pause detection (TICKET-061): a live cut pauses
+        # for applause while the player clock runs on, drifting the lyrics ahead.
+        self._applause_for = 0.0      # accumulated loud-but-non-vocal (applause) time
+        self._applause_t = 0.0        # last applause-check timestamp
+        self._applause_armed = False  # a real gap was seen → resync when singing returns
+        self._align_tpvr_active = False  # the pending align is an applause two-point resync
+        self._align_tpvr = None       # 1st-read offset awaiting a 2nd confirming read
+        self._align_tpvr_until = 0.0  # deadline for the 2nd confirming read
         self._last_drift = 0.0        # last audio-vs-display drift measured (sync telemetry)
         self._last_drift_t = 0.0      # when that drift was measured (time.time)
         self._pending_switch = None   # a contradicting heard song awaiting a 2nd confirming read
@@ -2578,6 +2587,13 @@ class Overlay:
             self._offset_hist_last = self.offset
 
         self._consume_async()
+        # Watch for a concert applause/cheering pause (TICKET-061) — throttled, cheap.
+        if now - getattr(self, "_applause_check_t", 0.0) > 0.3:
+            self._applause_check_t = now
+            try:
+                self._check_applause_gap(now)
+            except Exception:
+                pass
         self._check_monitors(now)
         state = self.media.get()
 
@@ -4445,6 +4461,42 @@ class Overlay:
         st = self.media.get() or {}
         return float(st.get("position") or 0.0)
 
+    def _check_applause_gap(self, now):
+        """In a LIVE/concert cut a pause for applause & cheering keeps the player
+        clock running while no one sings, so the lyrics drift ahead by the pause
+        length. Detect the gap — loud but NON-vocal (broadband cheering, not tonal
+        singing) — and, when singing returns, kick off a Whisper transcribe-and-match
+        resync GATED BY TWO-POINT verification (TICKET-061). Cheap poll; the caller
+        throttles it."""
+        if not (self._live_arrangement or self._live_mode) or not self.lines or self._aligning:
+            self._applause_for, self._applause_armed, self._applause_t = 0.0, False, now
+            return
+        b = getattr(self, "_boundary", None)
+        if not b:
+            return
+        dt = min(2.0, now - self._applause_t) if self._applause_t else 0.0
+        self._applause_t = now
+        try:
+            lv = b.live_audio()
+        except Exception:
+            return
+        # applause/cheering = loud, broadband (high spectral flatness), NOT tonal singing
+        applause = (not lv.get("is_silent") and lv.get("noise_like")
+                    and not lv.get("vocal_detected_now"))
+        if applause:
+            self._applause_for += dt
+            if self._applause_for >= self._tune.get("applause_min_s", 2.5):
+                self._applause_armed = True
+        elif self._applause_armed and lv.get("vocal_detected_now"):
+            log.info("applause gap (~%.1fs) ended, vocals back → two-point resync by ear",
+                     self._applause_for)
+            self._applause_for, self._applause_armed = 0.0, False
+            self._align_tpvr, self._align_tpvr_active = None, True
+            self._align_tpvr_until = now + 14.0
+            self.align_by_listening(silent=True)
+        else:
+            self._applause_for = max(0.0, self._applause_for - dt)
+
     def align_by_listening(self, silent=False):
         """On-demand: transcribe a few seconds of the live vocals and match them
         to the loaded lyrics to set the sync offset — fixes timing when Shazam
@@ -4739,6 +4791,27 @@ class Overlay:
         self._aligning = False
         silent = getattr(self, "_auto_align_silent", False)
         self._auto_align_silent = False
+        # APPLAUSE two-point resync (TICKET-061): HOLD the 1st read, confirm with a
+        # 2nd ~2.5 s later, and apply only if they agree — a chorus-matched mis-read
+        # on resume can't jump the sync. Falls through to the normal apply when the
+        # two reads agree.
+        if self._align_tpvr_active:
+            if not res or time.time() > self._align_tpvr_until:
+                self._align_tpvr_active, self._align_tpvr = False, None
+                log.info("applause resync aborted (no capture / expired)")
+                return
+            offset = res[0]
+            if self._align_tpvr is None:
+                self._align_tpvr = offset
+                log.info("applause resync: holding %+.2fs — confirming with a 2nd listen", offset)
+                self.root.after(2500, lambda: self.align_by_listening(silent=True))
+                return
+            first = self._align_tpvr
+            self._align_tpvr, self._align_tpvr_active = None, False
+            if abs(offset - first) > 1.2:
+                log.info("applause resync: reads disagree (%.2f vs %.2f) → discard", first, offset)
+                return
+            log.info("applause resync: two reads agree (%.2f≈%.2f) → applying", first, offset)
         if not res:
             if not silent:
                 self._hint("Couldn't hear the lyrics clearly — try again")
