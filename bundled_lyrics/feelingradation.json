@@ -1,0 +1,497 @@
+{
+  "meta": {
+    "title": "feelingradation",
+    "artist": "hololive DEV_IS ReGLOSS",
+    "lang": "ja",
+    "duration": null,
+    "source": "bundled"
+  },
+  "lines": [
+    {
+      "t": [
+        13.57,
+        15.96
+      ],
+      "jp": "キラキラで始(はじ)まるオーバーチュア",
+      "rm": "kirakira de hajimaru overture",
+      "en": "Overture begins with glitter"
+    },
+    {
+      "t": [
+        15.96,
+        17.86
+      ],
+      "jp": "二人(ふたり)はいつでもマイペース",
+      "rm": "futari wa itsu de mo my pace",
+      "en": "The two of us always go at our own pace"
+    },
+    {
+      "t": [
+        17.86,
+        19.42
+      ],
+      "jp": "大慌(おおあわ)てのコンダクター",
+      "rm": "ooawate no conductor",
+      "en": "Conductor in a panic"
+    },
+    {
+      "t": [
+        19.42,
+        21.42
+      ],
+      "jp": "今(いま)どこいるの？ってマジレス",
+      "rm": "ima doko iru no? tte majiresu",
+      "en": "Where are you now? That's serious"
+    },
+    {
+      "t": [
+        21.42,
+        24.76
+      ],
+      "jp": "秒針(びょうしん)も置き去(おきざ)りのロケーション",
+      "rm": "byoushin mo okizari no location",
+      "en": "A location where even the second hand is left behind"
+    },
+    {
+      "t": [
+        24.76,
+        28.53
+      ],
+      "jp": "行(い)く先々(さきざき) 探(さが)す宝物(ほうもつ)",
+      "rm": "iku sakizaki sagasu houmotsu",
+      "en": "Treasures to search for wherever you go"
+    },
+    {
+      "t": [
+        28.53,
+        30.3
+      ],
+      "jp": "(Pomped pomped pomped...)",
+      "rm": "",
+      "en": ""
+    },
+    {
+      "t": [
+        30.3,
+        32.06
+      ],
+      "jp": "Allday 弾(はず)んじゃってさ",
+      "rm": "allday hazunjatte sa",
+      "en": "Allday Bouncy"
+    },
+    {
+      "t": [
+        32.06,
+        33.84
+      ],
+      "jp": "(Prink prink prink...)",
+      "rm": "",
+      "en": ""
+    },
+    {
+      "t": [
+        33.84,
+        35.6
+      ],
+      "jp": "華麗(かれい)に Dress up",
+      "rm": "karei ni Dress up",
+      "en": "Dress up splendidly"
+    },
+    {
+      "t": [
+        35.6,
+        36.85
+      ],
+      "jp": "魔法(まほう)かける",
+      "rm": "mahou kakeru",
+      "en": "Cast a spell"
+    },
+    {
+      "t": [
+        36.85,
+        38.57
+      ],
+      "jp": "そうね、Don't rush Don't rush",
+      "rm": "sou ne, Don't rush Don't rush",
+      "en": "Yeah, Don't rush Don't rush"
+    },
+    {
+      "t": [
+        38.57,
+        40.48
+      ],
+      "jp": "予定(よてい)大幅(おおはば)遅(おく)れ？",
+      "rm": "yotei oohaba okure?",
+      "en": "Significantly behind schedule?"
+    },
+    {
+      "t": [
+        40.48,
+        45.18
+      ],
+      "jp": "Cho Very Very Very Good Traveling",
+      "rm": "",
+      "en": "Cho Very Very Very Good Traveling"
+    },
+    {
+      "t": [
+        45.18,
+        48.5
+      ],
+      "jp": "終(お)わんない Curious Curious",
+      "rm": "owannai Curious Curious",
+      "en": "Curious Curious"
+    },
+    {
+      "t": [
+        48.5,
+        52.0
+      ],
+      "jp": "イニミニダベリング",
+      "rm": "iniminidaberingu",
+      "en": "Inimini Doveling"
+    },
+    {
+      "t": [
+        52.0,
+        55.06
+      ],
+      "jp": "次(つぎ)の場所(ばしょ)へ Moving on Moving on",
+      "rm": "tsugi no basho e Moving on Moving on",
+      "en": "Moving on Moving on to the next location"
+    },
+    {
+      "t": [
+        56.08,
+        59.6
+      ],
+      "jp": "あちこち そっちどっち フタリ 2co1",
+      "rm": "achikochi sotchi dotchi futa ris 2co1",
+      "en": "Both here and there Futari 2co1"
+    },
+    {
+      "t": [
+        59.6,
+        61.14
+      ],
+      "jp": "ニッコリーナ New topics",
+      "rm": "nikkoriina New topics",
+      "en": "Nicolina New topics"
+    },
+    {
+      "t": [
+        61.14,
+        63.67
+      ],
+      "jp": "一気(いっき)に召し上(めしあ)がれ Yummy Yummy Yah",
+      "rm": "ikki ni meshiagare Yummy Yummy Yah",
+      "en": "Enjoy it all at once Yummy Yummy Yah"
+    },
+    {
+      "t": [
+        63.67,
+        67.18
+      ],
+      "jp": "この先(さき)も一緒(いっしょ)に ヨリドリミドリ",
+      "rm": "kono saki mo issho ni yoridorimidori",
+      "en": "Let's be together from now on, Yoridorimidori"
+    },
+    {
+      "t": [
+        67.18,
+        70.4
+      ],
+      "jp": "ミナ午後(ごご)ニ シブヤデ Rendez-vous",
+      "rm": "mina gogo ni Shibuya des Rendez-vous",
+      "en": "Mina Afternoon Shibuyade Rendez-vous"
+    },
+    {
+      "t": [
+        71.06,
+        74.07
+      ],
+      "jp": "Sounds good 軽(かる)い足取(あしど)り",
+      "rm": "sounds good karui ashidori",
+      "en": "Sounds good light steps"
+    },
+    {
+      "t": [
+        74.07,
+        76.32
+      ],
+      "jp": "気(き)の赴(おもむ)くまま",
+      "rm": "ki no omomuku mama",
+      "en": "As my heart goes"
+    },
+    {
+      "t": [
+        76.32,
+        78.26
+      ],
+      "jp": "Oh, Let me go my way",
+      "rm": "",
+      "en": "Oh, let me go my way"
+    },
+    {
+      "t": [
+        78.26,
+        80.06
+      ],
+      "jp": "ナビいらずの学(まな)び",
+      "rm": "navigation irazu no manabi",
+      "en": "Learning without navigation"
+    },
+    {
+      "t": [
+        80.06,
+        81.8
+      ],
+      "jp": "AI も羨(うらや)み Wanna be",
+      "rm": "aI mo urayami Wanna be",
+      "en": "AI is also jealous Wanna be"
+    },
+    {
+      "t": [
+        81.8,
+        83.58
+      ],
+      "jp": "その気付(きづ)きの続(つづ)き",
+      "rm": "sono kizuki no tsuzuki",
+      "en": "Continuation of that realization"
+    },
+    {
+      "t": [
+        83.58,
+        85.4
+      ],
+      "jp": "先(さき)ペカってる To do list",
+      "rm": "saki pe ka tte ru To do list",
+      "en": "To do list"
+    },
+    {
+      "t": [
+        85.4,
+        87.19
+      ],
+      "jp": "(Fun fun fun...)",
+      "rm": "",
+      "en": ""
+    },
+    {
+      "t": [
+        87.19,
+        88.95
+      ],
+      "jp": "Allday 冒険(ぼうけん)してみたい",
+      "rm": "allday bouken shite mitai",
+      "en": "Allday I want to go on an adventure"
+    },
+    {
+      "t": [
+        88.95,
+        90.76
+      ],
+      "jp": "(Meow meow meow...)",
+      "rm": "",
+      "en": ""
+    },
+    {
+      "t": [
+        90.76,
+        92.5
+      ],
+      "jp": "ド派手(はで)に Free style",
+      "rm": "do hade ni Free style",
+      "en": "Flashy Free style"
+    },
+    {
+      "t": [
+        92.5,
+        93.83
+      ],
+      "jp": "二人(ふたり)なら",
+      "rm": "futari nara",
+      "en": "For two people"
+    },
+    {
+      "t": [
+        93.83,
+        95.4
+      ],
+      "jp": "人生(じんせい) Bonus bonus",
+      "rm": "jinsei Bonus bonus",
+      "en": "Life Bonus bonus"
+    },
+    {
+      "t": [
+        95.4,
+        97.39
+      ],
+      "jp": "どこまでもいけるね",
+      "rm": "doko made mo ikeru ne",
+      "en": "You can go anywhere"
+    },
+    {
+      "t": [
+        97.39,
+        99.63
+      ],
+      "jp": "Cho Very Very Very Good",
+      "rm": "",
+      "en": "Cho Very Very Very Good"
+    },
+    {
+      "t": [
+        99.63,
+        101.61
+      ],
+      "jp": "Trouble Eyy",
+      "rm": "",
+      "en": "Trouble Eyey"
+    },
+    {
+      "t": [
+        101.61,
+        105.87
+      ],
+      "jp": "ツカズハナレズ キミヲ詠(えい)ム",
+      "rm": "tsukazuhanarezu kimiwoei mu",
+      "en": "Tsukazuhanarezu Kimiwo Song"
+    },
+    {
+      "t": [
+        105.87,
+        108.76
+      ],
+      "jp": "イニミニ Double Eyy",
+      "rm": "ini mini Double Eyy",
+      "en": "Inimini Double Eyey"
+    },
+    {
+      "t": [
+        108.76,
+        111.9
+      ],
+      "jp": "フタツガサネ 意気(いき) Yo-yo",
+      "rm": "futatsugasane iki Yo-yo",
+      "en": "Futatsugasane Moki Yo-yo"
+    },
+    {
+      "t": [
+        114.08,
+        117.52
+      ],
+      "jp": "風(かぜ)に吹(ふ)かれる ライラック",
+      "rm": "kaze ni fukareru lilac",
+      "en": "Lilac blown by the wind"
+    },
+    {
+      "t": [
+        117.52,
+        121.16
+      ],
+      "jp": "空(そら)に惚れ惚(ほれぼ)れ 隣り合(となりあ)う",
+      "rm": "sora ni horebore tonariau",
+      "en": "Falling in love with the sky, standing next to each other"
+    },
+    {
+      "t": [
+        121.16,
+        123.86
+      ],
+      "jp": "笑い合(わらいあ)い イタチ 5co",
+      "rm": "waraiai itachi 5co",
+      "en": "Laughing together Itachi 5co"
+    },
+    {
+      "t": [
+        123.86,
+        127.6
+      ],
+      "jp": "宝物(ほうもつ) また見(み)つけに行(い)こう",
+      "rm": "houmotsu mata mitsuke ni ikou",
+      "en": "Treasure Let's go find it again"
+    },
+    {
+      "t": [
+        127.6,
+        132.3
+      ],
+      "jp": "Cho Very Very Very Good Traveling",
+      "rm": "",
+      "en": "Cho Very Very Very Good Traveling"
+    },
+    {
+      "t": [
+        132.3,
+        135.61
+      ],
+      "jp": "終(お)わんない Curious Curious",
+      "rm": "owannai Curious Curious",
+      "en": "Curious Curious"
+    },
+    {
+      "t": [
+        135.61,
+        139.13
+      ],
+      "jp": "イニミニダベリング",
+      "rm": "iniminidaberingu",
+      "en": "Inimini Doveling"
+    },
+    {
+      "t": [
+        139.13,
+        142.15
+      ],
+      "jp": "次(つぎ)の場所(ばしょ)へ Moving on Moving on",
+      "rm": "tsugi no basho e Moving on Moving on",
+      "en": "Moving on Moving on"
+    },
+    {
+      "t": [
+        143.2,
+        146.72
+      ],
+      "jp": "あちこち そっちどっち フタリ 2co1",
+      "rm": "achikochi sotchi dotchi futa ris 2co1",
+      "en": "Both here and there Futari 2co1"
+    },
+    {
+      "t": [
+        146.72,
+        148.3
+      ],
+      "jp": "ニッコリーナ New topics",
+      "rm": "nikkoriina New topics",
+      "en": "Nicolina New topics"
+    },
+    {
+      "t": [
+        148.3,
+        150.72
+      ],
+      "jp": "一気(いっき)に召し上(めしあ)がれ Yummy Yummy Yah",
+      "rm": "ikki ni meshiagare Yummy Yummy Yah",
+      "en": "Enjoy it all at once Yummy Yummy Yah"
+    },
+    {
+      "t": [
+        150.72,
+        154.3
+      ],
+      "jp": "この先(さき)も一緒(いっしょ)に ヨリドリミドリ",
+      "rm": "kono saki mo issho ni yoridorimidori",
+      "en": "Let's be together from now on too"
+    },
+    {
+      "t": [
+        154.3,
+        157.52
+      ],
+      "jp": "ミナ午後(ごご)ニ シブヤデ Rendez-vous",
+      "rm": "mina gogo ni Shibuya des Rendez-vous",
+      "en": "Mina Afternoon Shibuyade Rendez-vous"
+    }
+  ]
+}
