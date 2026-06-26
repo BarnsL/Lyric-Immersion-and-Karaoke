@@ -1187,6 +1187,7 @@ class Overlay:
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
         self._pending_corr = 1e9      # a large sound offset awaiting a 2nd confirming read
+        self._sync_confirm_after = None  # pending 2s "confirm with a 2nd listen" timer
         self._recent_corr = []        # last few audio offsets — spot repeated-chorus ambiguity
         self._live_arrangement = False  # LIVE/short/alt version → FOLLOW the offset, don't reset
         self._last_drift = 0.0        # last audio-vs-display drift measured (sync telemetry)
@@ -1255,6 +1256,12 @@ class Overlay:
         #                            (e.g. "youtube-captions / 0 lines")
         self._sound_song = None    # new video → re-identify by ear
         self._pending_corr = 1e9   # drop any pending large-offset confirmation
+        if self._sync_confirm_after is not None:   # cancel a pending confirm listen
+            try:
+                self.root.after_cancel(self._sync_confirm_after)
+            except Exception:
+                pass
+            self._sync_confirm_after = None
         self._pending_switch = None  # drop any pending song-switch confirmation
         self._gen_token += 1       # cancel any in-flight lyric generation
         self._deep_token += 1      # cancel any in-flight deep (offline) transcription
@@ -1615,6 +1622,25 @@ class Overlay:
         threading.Thread(target=work, daemon=True).start()
 
     # ── audio identification (detect by SOUND, not title) ──
+
+    def _schedule_sync_confirm(self):
+        """Two-point verification for sync-by-sound: after a CANDIDATE offset is
+        held (one read), hesitate ~2 s and take a confirming listen, so a single
+        chorus-matched read can't move the lyrics. The 2nd read, if it agrees,
+        commits the offset via the AGREE branch in _consume_async. Scheduled at
+        most once per pending; cancelled on track change / when sync settles."""
+        if self._sync_confirm_after is not None:
+            return                              # a confirm listen is already pending
+        def _confirm():
+            self._sync_confirm_after = None
+            # Only re-listen if a candidate is still waiting and we're not mid-ID.
+            if self._pending_corr < 1e8 and not self._identifying:
+                log.info("sync: 2s hesitation up → confirming listen")
+                self._start_identify(seconds=4, attempts=1)
+        try:
+            self._sync_confirm_after = self.root.after(2000, _confirm)
+        except Exception:
+            self._sync_confirm_after = None
 
     def _start_identify(self, seconds=6, attempts=2):
         """Listen and identify by sound. Short captures (re-sync of a known
@@ -1994,24 +2020,16 @@ class Overlay:
                                 log.info("sync: CONFIRMED offset %+.2fs (two reads agree) → applied", corr)
                                 self._last_sound_lock_t = time.time()
                                 self._drift_integral = 0.0
-                            elif (self._drift_integral > self._tune["drift_fastpath"]
-                                  and abs(diff) < self._tune["drift_fastpath_cap"]):
-                                # Drift has been accumulating without confirmation. Apply the
-                                # current single-read correction now — waiting for two agreeing
-                                # reads costs the user 10+ s of wrong sync, and the drift
-                                # integral being high IS the agreement (consistent direction
-                                # over time). Cap |diff| < 5 s so a wild single read can't yank.
-                                self.offset = round(corr, 2)
-                                self._pending_corr = 1e9
-                                log.info("sync: applying %+.2fs via drift-integral fast-path "
-                                         "(integral=%.1f, drift=%+.2fs)",
-                                         corr, self._drift_integral, diff)
-                                self._last_sound_lock_t = time.time()
-                                self._drift_integral = 0.0
                             else:
-                                # one-read non-zero offset — hold for confirmation.
+                                # TWO-POINT VERIFICATION: a single read of a non-zero
+                                # offset is NEVER applied — on a song with choruses the
+                                # first read can match a repeated section and point to
+                                # the wrong place. Hold it, then HESITATE ~2 s and take a
+                                # confirming listen; only when the 2nd read agrees (the
+                                # AGREE branch above) does the offset commit.
                                 self._pending_corr = corr
-                                log.info("sync: holding %+.2fs pending a 2nd agreeing read", corr)
+                                log.info("sync: holding %+.2fs — confirming with a 2nd listen in 2s", corr)
+                                self._schedule_sync_confirm()
                                 # ── Continuous drift-integral fallback ──
                                 # When Shazam reads a non-trivial drift but won't
                                 # confirm, accumulate |drift|·dt over time. Trigger
@@ -4419,7 +4437,11 @@ def main():
         from playlist_import_gui import show_import_window
         show_import_window(ov.root)
     def _quit(icon, *_):
-        icon.stop()
+        ov._tray_quit = True       # tell the self-healing runner to stop
+        try:
+            icon.stop()
+        except Exception:
+            pass
         ov.root.after(0, ov.quit)
 
     def _set_op(v):  return lambda *_: ov.root.after(0, lambda: ov.set_opacity(v))
@@ -4653,7 +4675,31 @@ def main():
     )
     icon = pystray.Icon("desktop-karaoke", make_icon(), "Desktop Karaoke", menu)
     updater.background_check(_on_update_found)   # notify if a newer release exists (portable build)
-    threading.Thread(target=icon.run, daemon=True).start()
+    # SELF-HEALING TRAY ICON: the icon is the ONLY way to reach the menu (Quit,
+    # toggles), so it must be present whenever the app runs. pystray's run() can
+    # die on a Windows shell race (Explorer restart, icon-registration timing) and
+    # then the overlay keeps playing with NO icon — unkillable except via Task
+    # Manager. Run it in a loop that re-creates and re-shows the icon if it ever
+    # exits or throws, until the user actually picks Quit.
+    ov._tray_quit = False
+
+    def _tray_runner():
+        cur = icon
+        while not getattr(ov, "_tray_quit", False):
+            try:
+                cur.run()                       # blocks until stop() or failure
+            except Exception as e:
+                log.info("tray icon crashed: %s — re-creating", e)
+            if getattr(ov, "_tray_quit", False):
+                break
+            log.info("tray icon vanished — restoring it")
+            time.sleep(2)
+            try:
+                cur = pystray.Icon("desktop-karaoke", make_icon(),
+                                   "Desktop Karaoke", menu)
+            except Exception:
+                pass
+    threading.Thread(target=_tray_runner, daemon=True).start()
     ov.run()
 
 
