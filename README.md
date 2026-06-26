@@ -83,7 +83,7 @@ of the box** (lyrics, sync, furigana/romaji/translation, AI generate-by-ear, and
 sync-by-listening all run on the CPU; the small speech model downloads itself the
 first time it's needed). It keeps its lyric library and settings next to itself, so
 you can copy the whole folder anywhere — or run it off a USB stick. To self-build it
-instead, see [BUILD.md](BUILD.md).
+instead, see [BUILD.md](docs/BUILD.md).
 
 > Optional, NVIDIA only: the tray's **⚡ Enable GPU acceleration** fetches the CUDA
 > libraries on demand (~1.5 GB) — they're not bundled, so the download above stays
@@ -110,7 +110,7 @@ speech model build/download themselves the first time they're needed.
 
 ### Microsoft Store — recommended
 
-<!-- STORE LINK --> _Store listing pending — see [STORE_SUBMISSION.md](STORE_SUBMISSION.md)._
+<!-- STORE LINK --> _Store listing pending — see [STORE_SUBMISSION.md](docs/STORE_SUBMISSION.md)._
 
 Open the **Microsoft Store**, search **Desktop Karaoke**, and click **Get**. It
 installs with no Python and **no security warnings** (the Store signs it), and
@@ -135,7 +135,7 @@ later), **Fast song-change detect**, the **dancing character**, **Start with
 Windows**, **Wrong lyrics — fix this song**, and **Quit**. Left-click toggles the
 overlay show/hide.
 
-That tray icon *is* the control panel — see **[USAGE.md](USAGE.md)** for every
+That tray icon *is* the control panel — see **[USAGE.md](docs/USAGE.md)** for every
 menu option explained.
 
 ---
@@ -257,7 +257,7 @@ identifies the song by **sound** and fetches under the canonical name.
 - [`deep-translator`](https://github.com/nidhaloff/deep-translator) — English
   (Google by default; DeepL if a `DEEPL_API_KEY` is set)
 
-See the header of `fetch_lyrics.py` and [RESEARCH.md](RESEARCH.md) for candidate
+See the header of `fetch_lyrics.py` and [RESEARCH.md](docs/RESEARCH.md) for candidate
 future sources (PetitLyrics, QQ Music / Kugou, Apple Music) and the research
 behind each design choice.
 
@@ -314,7 +314,7 @@ python  main.py --offset -1.5    # nudge sync earlier for an intro-heavy video
 > (deep transcription), and GPU acceleration. Each is a Y/N choice � skip what
 > you don't want.
 
-**Build the one-click installer yourself** — see [BUILD.md](BUILD.md):
+**Build the one-click installer yourself** — see [BUILD.md](docs/BUILD.md):
 
 ```bash
 build.bat        # → dist\DesktopKaraoke.exe  (+ DesktopKaraoke-Setup.exe if Inno Setup is installed)
@@ -481,11 +481,11 @@ it, the instant best-effort generation still works.
 | `lyrics/*.json` | Cached, annotated, timed lyrics (git-ignored — not redistributed) |
 
 ### Documentation
-- **[USAGE.md](USAGE.md)** — every tray menu option, explained.
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — module-by-module design, every public function.
-- **[BUILD.md](BUILD.md)** — how the one-click installer is produced.
+- **[USAGE.md](docs/USAGE.md)** — every tray menu option, explained.
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — module-by-module design, every public function.
+- **[BUILD.md](docs/BUILD.md)** — how the one-click installer is produced.
 - **[AGENTS.md](AGENTS.md)** — how to add songs, languages, and katakana data.
-- **[RESEARCH.md](RESEARCH.md)** — the investigation and root-cause notes behind each design choice.
+- **[RESEARCH.md](docs/RESEARCH.md)** — the investigation and root-cause notes behind each design choice.
 - **[SECURITY.md](SECURITY.md)** — exactly what data leaves the machine (almost nothing).
 
 ---

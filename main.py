@@ -1027,7 +1027,12 @@ class Overlay:
 
         s = _load_settings()
         self.opacity = float(s.get("opacity", 1.0))
-        self.position = s.get("position", "bottom")   # 'top' | 'bottom'
+        # Position is now TWO independent axes — a vertical AND a horizontal anchor,
+        # chosen separately. Migrate the old single 'position' value.
+        _op = s.get("position", "bottom")
+        self.pos_y = s.get("pos_y", {"top": "top", "center": "center",
+                                     "left": "center", "right": "center"}.get(_op, "bottom"))
+        self.pos_x = s.get("pos_x", {"left": "left", "right": "right"}.get(_op, "center"))
         self.display = s.get("display", "primary")     # 'primary' | 'mon:N' | 'span'
         self._display_fp = s.get("display_fp")         # fingerprint for monitor identity
         self._mon_snapshot = ()                         # current monitor topology
@@ -1522,9 +1527,61 @@ class Overlay:
                     log.info("cache %s came from weak path %r but source is clean & "
                              "non-cover → distrust, re-fetch", Path(path).name, src)
                     return False
+            # WRONG-LANGUAGE guard (TICKET-060): a cached KOREAN body for a song
+            # whose title/artist is kanji (Han, no hangul) is a wrong-language
+            # collision (花譜's 邂逅 → a Korean "Chance meeting"). Reject → re-fetch
+            # under fetch_lrc's Han→reject-ko rule. Self-healing, no manual purge.
+            try:
+                lang = (json.loads(Path(path).read_text("utf-8"))
+                        .get("meta", {}).get("lang") or "")
+            except Exception:
+                lang = ""
+            if lang == "ko":
+                ta = (self._clean_title_cache or "") + (self._clean_artist_cache or "")
+                if re.search(r"[㐀-鿿]", ta) and not re.search(r"[가-힣]", ta):
+                    log.info("cache %s is Korean but song is kanji (%r) → distrust, re-fetch",
+                             Path(path).name, ta[:30])
+                    return False
             return True
         except Exception:
             return True
+
+    def purge_cache(self, lang=None, source=None, current=False):
+        """Delete cached lyric JSONs matching a language and/or source filter, or
+        the CURRENT song's file, then re-fetch the current song if it was removed.
+        Returns the removed filenames. Backs /purgecache — clearing a bad match at
+        runtime instead of by hand."""
+        removed = []
+        cur = Path(self._lyrics_path) if self._lyrics_path else None
+        for p in LYRICS_DIR.glob("*.json"):
+            hit = bool(current and cur and p == cur)
+            if not hit and (lang or source):
+                try:
+                    m = json.loads(p.read_text("utf-8")).get("meta", {})
+                except Exception:
+                    continue
+                hit = ((not lang or (m.get("lang") or "") == lang)
+                       and (not source or (m.get("source") or "").startswith(source)))
+            if hit:
+                try:
+                    p.unlink()
+                    removed.append(p.name)
+                except Exception:
+                    pass
+        if removed:
+            cur_removed = bool(current or (cur and cur.name in removed))
+            def _after():                      # index + UI work on the Tk thread
+                try:
+                    self.index.refresh()
+                except Exception:
+                    pass
+                if cur_removed:
+                    self.refetch()
+            try:
+                self.root.after(0, _after)
+            except Exception:
+                pass
+        return removed
 
     @staticmethod
     def _titles_match(a, b):
@@ -2690,11 +2747,24 @@ class Overlay:
             chars, cur_y = self._wrap_row(ln.en, cur_y, self.EN_FONT, EN_C, pad, max_w)
             self._kara.append({"chars": chars, "base": EN_C, "sung": SUNG})
 
-        # anchor the whole block: near the top, or near the bottom of the window
-        # anchor within the FIXED window: near the top, or above the media bar
-        dy = (self._win_margin if self.position == "top"
-              else max(self._win_margin, self.work_h - cur_y - self._bottom_clear))
-        self.cv.move("cur", 0, dy)
+        # Anchor the whole block within the FIXED window. VERTICAL: top edge,
+        # bottom band, or centred (center/left/right all sit vertically centred).
+        if self.pos_y == "top":
+            dy = self._win_margin
+        elif self.pos_y == "center":
+            dy = max(self._win_margin, round((self.work_h - cur_y) / 2))
+        else:   # bottom
+            dy = max(self._win_margin, self.work_h - cur_y - self._bottom_clear)
+        # HORIZONTAL: the block is laid out from the left margin; PIN it to the
+        # right edge or centre it per pos_x (independent of the vertical anchor).
+        bb = self.cv.bbox("cur")
+        dx = 0
+        if bb:
+            if self.pos_x == "right":
+                dx = (self.W - pad) - bb[2]
+            elif self.pos_x == "center":
+                dx = round((self.W - (bb[2] - bb[0])) / 2) - bb[0]
+        self.cv.move("cur", dx, dy)
         self._animate_in()
         if self._mirrors:
             self._update_mirrors(ln)
@@ -3245,9 +3315,9 @@ class Overlay:
     def _block_x_v(self, w):
         """Horizontal X for a block in VERTICAL scroll, from the `position`
         setting: hug the left edge, the right edge, or centre the column."""
-        if self.position == "left":
+        if self.pos_x == "left":
             return self.pad
-        if self.position == "right":
+        if self.pos_x == "right":
             return max(self.pad, self.W - w - self.pad)
         return max(0, round((self.W - w) / 2))            # center (default)
 
@@ -3625,10 +3695,10 @@ class Overlay:
     def apply_preset(self, name):
         """One-click settings bundles for common use cases."""
         if name == "gaming":          # learn a language while gaming — subtle
-            self.opacity, self.position, self.scroll_dir = 0.45, "top", "left"
+            self.opacity, self.pos_y, self.pos_x, self.scroll_dir = 0.45, "top", "center", "left"
             self.font_scale, self.perf = 1.0, "fast"
         elif name == "karaoke":       # big, flowing lyrics for a room of people
-            self.opacity, self.position, self.scroll_dir = 1.0, "bottom", "rl"
+            self.opacity, self.pos_y, self.pos_x, self.scroll_dir = 1.0, "bottom", "center", "rl"
             self.font_scale, self.perf, self.scroll_speed = 1.5, "smooth", 200.0
         self.root.attributes("-alpha", self.opacity)
         self._apply_perf()
@@ -3872,7 +3942,7 @@ class Overlay:
         threading.Thread(target=work, daemon=True).start()
 
     def _persist(self):
-        _save_settings({"opacity": self.opacity, "position": self.position,
+        _save_settings({"opacity": self.opacity, "pos_y": self.pos_y, "pos_x": self.pos_x,
                         "scroll": self.scroll_dir, "font_scale": self.font_scale,
                         "scroll_speed": self.scroll_speed, "perf": self.perf,
                         "recal_secs": self.recal_secs, "git_sync": self.git_sync,
@@ -3948,8 +4018,16 @@ class Overlay:
         self.root.update_idletasks()
         self._persist()
 
-    def set_position(self, p):
-        self.position = p
+    def set_pos(self, axis, value):
+        """Set ONE position axis independently — axis 'y' (top|center|bottom) or
+        'x' (left|center|right). The two are chosen separately so the user can pick,
+        e.g., bottom-right or top-left."""
+        if axis == "y" and value in ("top", "center", "bottom"):
+            self.pos_y = value
+        elif axis == "x" and value in ("left", "center", "right"):
+            self.pos_x = value
+        else:
+            return
         self._relayout_song()          # recompute the anchor for the new position
         self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
@@ -4002,7 +4080,7 @@ class Overlay:
                 continue
             m = win._mirror_mon
             cw, ch = m["ww"], m["wh"]
-            cy = (self._win_margin + 40 if self.position == "top"
+            cy = (self._win_margin + 40 if self.pos_y == "top"
                   else ch - self._bottom_clear - 40)
             if ln.jp:
                 draw_text(cv, cw // 2, cy, ln.jp, self.JP_FONT, WHITE)
@@ -4196,11 +4274,11 @@ class Overlay:
         self._lanes = max(1, min(cap, int(fit)))
         # First-lane Y inside the fixed window: top-anchored or bottom-anchored.
         stack = self._block_h + self._lane_gap * (self._lanes - 1)
-        if self.position == "top":
+        if self.pos_y == "top":
             self._lane_y0 = self._win_margin + self._lane_top
-        elif self.position == "center":
+        elif self.pos_y == "center":
             self._lane_y0 = max(self._win_margin, round((self.work_h - stack) / 2))
-        else:   # bottom (and left/right, which only steer the column in vertical scroll)
+        else:   # bottom
             self._lane_y0 = max(self._win_margin,
                                 self.work_h - self._bottom_clear - stack)
         self._compute_scroll_floor()
@@ -4826,7 +4904,7 @@ def main():
         ov.root.after(0, ov.quit)
 
     def _set_op(v):  return lambda *_: ov.root.after(0, lambda: ov.set_opacity(v))
-    def _set_pos(p): return lambda *_: ov.root.after(0, lambda: ov.set_position(p))
+    def _set_pos(axis, v): return lambda *_: ov.root.after(0, lambda: ov.set_pos(axis, v))
     def _set_scr(d): return lambda *_: ov.root.after(0, lambda: ov.set_scroll(d))
     def _set_font(v): return lambda *_: ov.root.after(0, lambda: ov.set_font_scale(v))
     def _toggle_startup(*_): set_startup(not startup_enabled())
@@ -4835,9 +4913,10 @@ def main():
         return pystray.MenuItem(label, _set_op(v), radio=True,
                                 checked=lambda i, v=v: abs(ov.opacity - v) < 0.02)
 
-    def _pos_item(label, p):
-        return pystray.MenuItem(label, _set_pos(p), radio=True,
-                                checked=lambda i, p=p: ov.position == p)
+    def _pos_item(label, axis, v):
+        return pystray.MenuItem(label, _set_pos(axis, v), radio=True,
+                                checked=lambda i, axis=axis, v=v:
+                                    (ov.pos_y if axis == "y" else ov.pos_x) == v)
 
     def _scr_item(label, d):
         return pystray.MenuItem(label, _set_scr(d), radio=True,
@@ -4848,13 +4927,18 @@ def main():
         _op_item("70%", 0.70), _op_item("55%", 0.55),
         _op_item("40%  (faint — for games)", 0.40), _op_item("25%", 0.25),
     )
+    # Position is two INDEPENDENT axes now — pick a vertical AND a horizontal anchor.
     position_menu = pystray.Menu(
-        _pos_item("Top of screen", "top"),
-        _pos_item("Bottom of screen", "bottom"),
-        _pos_item("Center of screen", "center"),
-        pystray.Menu.SEPARATOR,
-        _pos_item("Left of screen", "left"),
-        _pos_item("Right of screen", "right"),
+        pystray.MenuItem("Vertical", pystray.Menu(
+            _pos_item("Top", "y", "top"),
+            _pos_item("Center", "y", "center"),
+            _pos_item("Bottom", "y", "bottom"),
+        )),
+        pystray.MenuItem("Horizontal", pystray.Menu(
+            _pos_item("Left", "x", "left"),
+            _pos_item("Center", "x", "center"),
+            _pos_item("Right", "x", "right"),
+        )),
     )
 
     # ── Display (multi-monitor) ──────────────────────────────────────────

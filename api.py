@@ -318,6 +318,40 @@ def make_handler(app, log_file, token):
                     force     = q.get("force",     ["0"])[0] in ("1", "true", "yes")
                     result = _start_csv_import(csv_path, translate=translate, force=force)
                     self._send(200 if result["ok"] else 409, result)
+                elif path == "/font":
+                    # ?scale=1.0  — set the lyric font scale live (no settings edit/restart)
+                    try:
+                        v = float(q.get("scale", q.get("size", ["1.0"]))[0])
+                    except Exception:
+                        return self._err(400, "scale must be a number, e.g. ?scale=1.0")
+                    self._run(lambda: app.set_font_scale(v))
+                    self._send(200, {"ok": True, "action": f"font scale → {v}"})
+                elif path == "/scroll":
+                    # ?dir=rl  — none|left|right|lr|rl|tb|bt
+                    d = q.get("dir", q.get("mode", [""]))[0].strip().lower()
+                    if d not in ("none", "off", "stationary", "left", "right", "lr", "rl", "tb", "bt"):
+                        return self._err(400, "dir must be none|left|right|lr|rl|tb|bt")
+                    self._run(lambda: app.set_scroll(d))
+                    self._send(200, {"ok": True, "action": f"scroll → {d}"})
+                elif path == "/position":
+                    # ?y=bottom&x=right  — set either/both axes (top|center|bottom / left|center|right)
+                    y, x = q.get("y", [""])[0].strip().lower(), q.get("x", [""])[0].strip().lower()
+                    if not y and not x:
+                        return self._err(400, "send ?y=top|center|bottom and/or ?x=left|center|right")
+                    if y:
+                        self._run(lambda: app.set_pos("y", y))
+                    if x:
+                        self._run(lambda: app.set_pos("x", x))
+                    self._send(200, {"ok": True, "action": f"position y={y or '-'} x={x or '-'}"})
+                elif path == "/purgecache":
+                    # clear bad cached lyrics at runtime: ?current=1, ?lang=ko, ?source=youtube-captions
+                    cur = q.get("current", ["0"])[0] in ("1", "true", "yes")
+                    lang = q.get("lang", [""])[0].strip() or None
+                    source = q.get("source", [""])[0].strip() or None
+                    if not (cur or lang or source):
+                        return self._err(400, "send ?current=1 and/or ?lang=ko and/or ?source=...")
+                    removed = app.purge_cache(lang=lang, source=source, current=cur)
+                    self._send(200, {"ok": True, "removed": removed, "count": len(removed)})
                 else:
                     self._err(404, f"no POST {path}")
             except Exception as e:

@@ -858,6 +858,12 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     # it doesn't pin a language.
     title_ja = bool(_KANA.search(t))
     title_ko = bool(_HANGUL.search(t))
+    # HAN (kanji) is used in Japanese & Chinese but NOT modern Korean lyrics (which
+    # are hangul). So a kanji title/artist is a JA/ZH song — a KOREAN lyric body is a
+    # same-title collision (花譜's kanji "邂逅" pulled a Korean "Chance meeting").
+    # Suppressed when the title/artist ITSELF carries hangul (a real Korean entry).
+    han_song = (bool(_HAN.search(t)) or bool(_HAN.search(a))) \
+        and not (title_ko or bool(_HANGUL.search(a)))
 
     def take(lrc, meta):
         """Accept this match now — unless it's romanized Japanese (stash + keep
@@ -870,6 +876,8 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
             return None   # kana title = Japanese song; zh/ko hit is a collision
         if title_ko and body_lang in ("zh", "ja"):
             return None   # hangul title = Korean song; zh/ja hit is a collision
+        if han_song and body_lang == "ko":
+            return None   # kanji (JA/ZH) song; a Korean body is a wrong-language collision
         if _looks_romaji(body):
             if romaji_fallback[0] is None:
                 romaji_fallback[0] = (lrc, {**meta, "romaji": True})
