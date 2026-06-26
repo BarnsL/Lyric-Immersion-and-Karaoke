@@ -1035,6 +1035,35 @@ def _make_translator():
     return GoogleTranslator(source="auto", target="en")
 
 
+def _translate_window(tr, idxs: list[int], raw_fn) -> dict:
+    """Translate a window of line-indices TOGETHER (so each line is read with its
+    neighbours for context) and return {index: english} for as many as map back.
+
+    Uses a NUMBERED protocol ("1. …\n2. …") rather than a bare newline-join: the
+    translator routinely merges/splits/reorders lines, which made the plain join
+    misalign and silently drop the WHOLE window to context-free per-line
+    translation — the "out-of-context single line" symptom. Numbers survive
+    translation, so we can map each result back to its source line even when the
+    counts don't match exactly."""
+    if not idxs:
+        return {}
+    numbered = "\n".join(f"{k + 1}. {(raw_fn(w).strip() or '　')}"
+                         for k, w in enumerate(idxs))
+    try:
+        out = tr.translate(numbered) or ""
+    except Exception:
+        return {}
+    res = {}
+    for line in out.split("\n"):
+        m = re.match(r"\s*(\d+)\s*[.)．、:：]\s*(.*)", line)
+        if not m:
+            continue
+        k = int(m.group(1)) - 1
+        if 0 <= k < len(idxs) and m.group(2).strip():
+            res[idxs[k]] = m.group(2).strip()
+    return res
+
+
 def _translate_lines(lines: list[dict], song_lang: str | None = None,
                      only_missing: bool = False) -> int:
     try:
@@ -1062,10 +1091,10 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
         return re.sub(r"\(.*?\)", "", lines[i]["jp"])
 
     # Translate in windows that CARRY CONTEXT: each block of focus lines is sent
-    # together with CTX neighbouring lines before and after, so a line is read in
-    # the flow of the song (pronouns/subjects often only make sense from the
-    # surrounding lines) instead of in isolation. Only the focus lines' results
-    # are kept; the context lines just steer the translation.
+    # together with CTX neighbouring lines before and after (and the whole block is
+    # numbered), so a line is read in the flow of the song (pronouns/subjects often
+    # only make sense from the surrounding lines) instead of in isolation. Only the
+    # focus lines' results are kept; the context lines just steer the translation.
     CTX, SIZE, n = 2, 24, len(lines)
     done = pos = 0
     while pos < n:
@@ -1075,26 +1104,27 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
             pos = end
             continue
         lo, hi = max(0, pos - CTX), min(n, end + CTX)
-        window = list(range(lo, hi))
-        joined = "\n".join(raw(w) if raw(w).strip() else "　" for w in window)
-        parts = None
-        try:
-            parts = tr.translate(joined).split("\n")
-        except Exception:
-            parts = None
-        if parts and len(parts) == len(window):           # aligned → keep focus
-            m = dict(zip(window, parts))
-            for i in focus:
-                lines[i]["en"] = m[i].strip()
+        got = _translate_window(tr, list(range(lo, hi)), raw)
+        for i in focus:
+            if got.get(i):
+                lines[i]["en"] = got[i]
                 done += 1
-        else:                                              # fallback: per line
-            for i in focus:
-                try:
-                    t = raw(i)
-                    lines[i]["en"] = tr.translate(t) if t.strip() else ""
-                    done += 1
-                except Exception:
-                    pass
+                continue
+            # The block translator merged/dropped this one. Retry it in a SMALL
+            # numbered window of just its ±CTX neighbours (still in context), and
+            # only fall to a bare single-line translation if even that fails.
+            sub = list(range(max(0, i - CTX), min(n, i + CTX + 1)))
+            g2 = _translate_window(tr, sub, raw)
+            if g2.get(i):
+                lines[i]["en"] = g2[i]
+                done += 1
+                continue
+            try:
+                t = raw(i)
+                lines[i]["en"] = tr.translate(t) if t.strip() else ""
+                done += 1
+            except Exception:
+                pass
         pos = end
     return done
 

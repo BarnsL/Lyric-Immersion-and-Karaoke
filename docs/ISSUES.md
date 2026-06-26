@@ -8,6 +8,46 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-070 — feelingradation (ReGLOSS) always fails to fetch → baked in 🟢
+**Symptom:** "ReGLOSS - feelingradation OFFICIAL MV" always failed to get real lyrics
+and fell back to a poor Whisper transcription.
+**Cause:** the app searches under the verbose channel "hololive DEV_IS ReGLOSS", which
+every provider misses; the real synced LRC exists under "feelingradation ReGLOSS".
+**Fix:** a `bundled_lyrics/` dir SHIPS with the app (PyInstaller datas); at startup
+`_seed_bundled_lyrics()` copies it into the runtime cache, overwriting a weaker
+generated cache. feelingradation is baked in (54 lines, furigana + romaji + translation,
+`source: bundled`). Any always-failing song can now be added the same way.
+
+## TICKET-069 — "Cinematic intro" shown while the song is already singing 🟢
+**Symptom:** the "🎬 Cinematic intro — waiting for vocals…" card stuck on screen for a
+cover (RIDE ON TIME) that clearly had vocals from early on.
+**Cause:** `_vocals_active_now` was too strict (vocal-band ≥ baseline×1.5 across 60% of
+the window) and missed real singing on backing-heavy mixes, and the backstop was 75 s —
+long enough to hold most of a song. **Fix:** loosened the detector (×1.3 / 50% / min 2)
+so present vocals release the hold, and dropped `mv_intro_timeout` 75 → 20 s so a false
+hold can never sit through more than 20 s of vocals.
+
+## TICKET-068 — Wrong song never recovers when title-locked (Deep Dive→Dunk) 🟢
+**Symptom:** the overlay shows the WRONG song's lyrics and no amount of re-syncing fixes
+it — e.g. playing "Dunk" lyrics over the "Deep Dive" video.
+**Cause:** when `_title_locked`, the app IGNORED Shazam hearing a different song forever
+(to resist same-artist mis-IDs), so a genuinely wrong title-lock never self-corrected.
+**Fix (user's rule):** count strikes — hearing the SAME other song N× (`wrong_song_strikes`,
+default **5**) means the loaded song is wrong, so BREAK the title-lock and switch to what
+we hear (load cache or fetch). Strikes reset when the heard song matches the loaded one or
+on track change; a different heard song restarts the count (spurious single mis-IDs can't trip it).
+
+## TICKET-067 — Out-of-context single-line translation + Suisei mis-language 🟢
+**Ask:** translate each line WITH its ±2 neighbours for context, not in isolation; and stop
+getting Suisei songs in the wrong language.
+**Fix:** translation already used ±2-line windows, but when the translator merged/split
+lines the bare newline-join misaligned and dropped the WHOLE window to context-free
+per-line translation. `_translate_window` now uses a **numbered protocol** ("1. …\n2. …")
+that survives merges/splits/reorders, so context is preserved; a missed line retries in a
+small numbered ±2 window before any isolated fallback. Confidence: `_ALWAYS_JA` (Suisei,
+Hoshimachi, Hoshimatic) + known romanized JP acts now score **full Japanese (certainty
+1.0)**, not a weak partial — a romanized JP channel still beats an English same-title collision.
+
 ## TICKET-066 — Stutter on Shazam-unconfirmable songs (MMD/cover/performance) 🟢
 **Symptom:** on songs Shazam can't fingerprint (an MMD "Performance Video", a cover, a
 live arrangement) the overlay stutters — `/diag.fps.worst_ms` spikes to 150-475 ms,
