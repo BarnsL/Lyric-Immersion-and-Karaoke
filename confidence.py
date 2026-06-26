@@ -76,3 +76,65 @@ def is_common_title(title: str, threshold: float = 0.35) -> bool:
     locking the lyrics to a generic title (so a wrong same-title match can be
     corrected by sound — the 'Awake'/'BANG'/'Lucky Star' case)."""
     return title_distinctiveness(title) < threshold
+
+
+_LC_KANA   = re.compile(r"[぀-ゟ゠-ヿ]")
+_LC_HAN    = re.compile(r"[㐀-鿿豈-﫿]")
+_LC_HANGUL = re.compile(r"[가-힣ᄀ-ᇿ]")
+
+# Known acts/labels whose ROMANIZED name carries no CJK script but who sing in a CJK
+# language — so "ReGLOSS - feelingradation" (hololive DEV_IS) still scores Japanese
+# even though both title and artist are Latin. Matched as a lowercase substring of the
+# artist (the channel/label is the reliable cue). Expand as needed; this is the
+# "ran against a database of known artists" cue the title/script alone can't give.
+_KNOWN_JA = (
+    "hololive", "regloss", "dev_is", "dev is", "holostars", "kamitsubaki",
+    "v.w.p", "vwp", "virtual witch", "neko hacker", "phase connect", "phase-connect",
+    # VTuber acts / J-artists the user plays
+    "reol", "kanaria", "suisei", "hoshimachi", "kanade", "otonose", "ririka",
+    "ichijou", "raden", "juufuutei", "hajime", "todoroki", "hiodoshi", "ouro kronii",
+    "kaf", "kanaeru", "kobo", "michiru shisui", "kaneko lumi", "harusaruhi",
+    "isekaijoucho", "rim", "理芽", "幸祜",
+)
+
+
+def language_confidence(title: str, artist: str = "") -> dict:
+    """Estimate the SONG's language as a percentage per language, fusing the script
+    of the artist name (≈ the artist's USUAL language) and the title. Signal #7 of
+    the confidence model, made concrete.
+
+    Why it matters: the title alone is often English even for a Japanese song
+    ("GHOST" by 星街すいせい), so a bare-title search pulls an English same-title
+    collision. A kana/kanji or hangul ARTIST NAME is a strong cue to the act's usual
+    language, so we can prefer the Japanese match. Returns {'ja','en','zh','ko'}
+    summing to ~1, plus 'certainty' (0..1) — how much the verdict rests on a strong
+    NON-Latin signal. When everything is romanized Latin (e.g. "Suisei Hoshimachi")
+    certainty is LOW and the score must not be used to reject (it can't tell
+    romanized-Japanese from a Western song).
+    """
+    t, a = title or "", artist or ""
+    v = {"ja": 0.0, "en": 0.0, "zh": 0.0, "ko": 0.0}
+    strong = 0.0
+    known_ja = any(k in a.lower() for k in _KNOWN_JA)   # known romanized JP act/label
+    # Artist name script = the act's usual language (the strongest cue).
+    if _LC_KANA.search(a):
+        v["ja"] += 3.0; strong += 3.0          # kana is uniquely Japanese
+    elif _LC_HANGUL.search(a):
+        v["ko"] += 3.0; strong += 3.0
+    elif _LC_HAN.search(a):
+        v["ja"] += 1.4; v["zh"] += 1.4; strong += 2.0   # kanji shared JA/ZH
+    elif known_ja:
+        v["ja"] += 2.5; strong += 2.5          # known JP act with a fully-romanized name
+    # Title script (weaker — titles are often English/romaji regardless).
+    if _LC_KANA.search(t):
+        v["ja"] += 2.0; strong += 2.0
+    elif _LC_HANGUL.search(t):
+        v["ko"] += 2.0; strong += 2.0
+    elif _LC_HAN.search(t):
+        v["ja"] += 0.8; v["zh"] += 0.8; strong += 1.0
+    elif re.search(r"[A-Za-z]", t):
+        v["en"] += 1.0                          # Latin title — could be EN or romaji
+    total = sum(v.values()) or 1.0
+    out = {k: round(val / total, 3) for k, val in v.items()}
+    out["certainty"] = round(min(1.0, strong / 3.0), 3)
+    return out

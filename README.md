@@ -23,9 +23,9 @@ while it runs.
 
 ## ▶️ Demo
 
-[![Desktop Karaoke — AI song recognition & lyric synchronization](https://img.youtube.com/vi/bZ1t7MSgU4Q/hqdefault.jpg)](https://youtu.be/aTtGICNRhiY)
+[![Desktop Karaoke — AI song recognition & lyric synchronization](https://img.youtube.com/vi/AQfNzmsx1qU/hqdefault.jpg)](https://youtu.be/AQfNzmsx1qU)
 
-*[Watch on YouTube](https://youtu.be/aTtGICNRhiY) — AI song recognition + lyric synchronization in action.*
+*[Watch on YouTube](https://youtu.be/AQfNzmsx1qU) — AI song recognition + lyric synchronization in action.*
 
 ---
 

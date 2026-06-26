@@ -118,6 +118,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import confidence   # language_confidence — prefer the artist's usual language
+
 # syncedlyrics logs noisy provider warnings (e.g. Musixmatch 401) — quiet them
 for _n in ("syncedlyrics", "syncedlyrics.providers"):
     logging.getLogger(_n).setLevel(logging.CRITICAL)
@@ -878,6 +880,16 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
             return None   # hangul title = Korean song; zh/ja hit is a collision
         if han_song and body_lang == "ko":
             return None   # kanji (JA/ZH) song; a Korean body is a wrong-language collision
+        # LANGUAGE-CONFIDENCE guard (TICKET-062): a kana/hangul-named artist almost
+        # never IS an English same-title song — Suisei's 星街すいせい "GHOST" pulled an
+        # English "Ghost". When confidence clearly favours a CJK language over English
+        # AND rests on a strong NON-Latin signal (so a romanized name like "Suisei
+        # Hoshimachi" can't misfire), reject the English body as a collision.
+        if body_lang == "en":
+            lc = confidence.language_confidence(t, a)
+            cjk = lc["ja"] + lc["zh"] + lc["ko"]
+            if lc.get("certainty", 0.0) >= 0.6 and cjk >= 0.6 and cjk > lc["en"] + 0.2:
+                return None
         if _looks_romaji(body):
             if romaji_fallback[0] is None:
                 romaji_fallback[0] = (lrc, {**meta, "romaji": True})
