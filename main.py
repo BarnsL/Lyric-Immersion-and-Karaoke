@@ -501,10 +501,103 @@ _COVER_RE = re.compile(
     r"|[【\[（(［]\s*covers?\b", re.I)
 
 
+# TICKET-086: bands whose canonical names include an ampersand or "and" — must
+# NOT trip the ampersand-collab cover detector. Lowercased for compact compare.
+_AMP_ARTIST_ALLOWLIST = (
+    "hall & oates", "simon & garfunkel", "crosby, stills & nash",
+    "crosby, stills, nash & young", "earth, wind & fire",
+    "florence + the machine", "tegan and sara", "ike & tina turner",
+    "ashford & simpson", "sonny & cher", "iggy & the stooges",
+    "captain & tennille", "peaches & herb", "salt-n-pepa",
+    "kool & the gang", "emerson, lake & palmer", "blood, sweat & tears",
+)
+
+# TICKET-086: "Song <sep> Artist1 & Artist2" on YouTube Music is almost always
+# a collaboration cover. We separate the EXPLICIT cover-tag signal (high
+# confidence) from this AMPERSAND collab signal (lower confidence) so the cover
+# routing can be conservative — title-only search, no trust in the right-hand
+# names as the "original artist".
+# A title-separator is EITHER: a dash/slash/pipe/colon with WHITESPACE around it
+# (so 'Counter-Strike & War' / 'T-Pain & Lil Wayne' / 'AC/DC & Friends' /
+# 'k-os & Mike' do NOT match — those are single-artist names with embedded
+# punctuation), OR an opening bracket character (always a delimiter on its own).
+# Verify caught this — the original `[-–—/|:【「(\[]` matched ANY hyphen and
+# wrongly fired on every hyphenated-artist title.
+_AMP_COLLAB_SEPS = r"(?:\s[-–—/|:]\s|[【「(\[])"
+_AMP_COLLAB_TAIL_RE = re.compile(
+    # right side of the title-separator: two-or-more artist-like tokens joined
+    # by & (with optional spaces) or ＆ — each token ≥ 2 chars of word /
+    # CJK / a few in-name punctuators (' - ’ · ・). Anchored to end of string
+    # after a light trim so a trailing bracket / pipe doesn't kill the match.
+    r"^\s*([\w\-’'·・]{2,}(?:\s+[\w\-’'·・]{2,})*)"
+    r"(?:\s*[&＆]\s*[\w\-’'·・]{2,}(?:\s+[\w\-’'·・]{2,})*)+\s*$",
+    re.UNICODE,
+)
+
+
+def _is_amp_collab_title(title, cover_channel=""):
+    """TICKET-086: True for a title like ``Song - Artist1 & Artist2`` where the
+    ampersand sits between two DISTINCT artist tokens after a real title
+    separator. Guards: HTML-unescape so ``&amp;`` decodes, refuse a single
+    known-embedded-ampersand band name, and ignore the COVER channel as one of
+    the tokens (so the channel landing on the right side doesn't itself fire
+    the signal)."""
+    import html as _html
+    t = _html.unescape(title or "").strip()
+    if not t:
+        return False
+    low = t.lower()
+    for band in _AMP_ARTIST_ALLOWLIST:
+        if band in low:
+            return False
+    # find the FIRST title separator and take what's on the right of it
+    m = re.search(_AMP_COLLAB_SEPS, t)
+    if not m:
+        return False
+    right = t[m.end():].strip(" -–—|/_:")
+    # strip a trailing closing bracket so "Song - A & B)" still parses
+    right = right.rstrip(")】］」』])」")
+    if not right or "&" not in right and "＆" not in right:
+        return False
+    if not _AMP_COLLAB_TAIL_RE.match(right):
+        return False
+    # split on the ampersand and ensure both sides are distinct names of length
+    # ≥ 2 and neither is just the cover channel itself
+    parts = [p.strip() for p in re.split(r"\s*[&＆]\s*", right) if p.strip()]
+    if len(parts) < 2:
+        return False
+    seen = set()
+    for p in parts:
+        pl = p.lower()
+        if len(pl) < 2 or pl in seen:
+            return False
+        seen.add(pl)
+    ch = (cover_channel or "").strip().lower()
+    if ch and all(p.lower() == ch for p in parts):
+        return False
+    return True
+
+
 def is_cover_title(title):
     """True if a media title marks a 歌ってみた / cover. Drives a title-first lyric
-    fetch — the original song's lyrics fit the cover (see fetch_lrc cover=)."""
-    return bool(_COVER_RE.search(title or ""))
+    fetch — the original song's lyrics fit the cover (see fetch_lrc cover=).
+    TICKET-086: also fires on an ampersand-collab title (``Song - A & B``)
+    which on YouTube Music is almost always a collaboration cover."""
+    return bool(_COVER_RE.search(title or "")) or _is_amp_collab_title(title)
+
+
+def cover_signal(title, cover_channel=""):
+    """TICKET-086: WHICH cover signal fired — ``'explicit'`` for a real cover
+    tag (歌ってみた / [COVER] / 'covered by' …), ``'amp_collab'`` for the weaker
+    ampersand-collab heuristic, ``None`` for no cover signal. Lets callers vary
+    confidence: an explicit tag is unambiguous; the ampersand signal only takes
+    the title-only search path and can be DEMOTED by other evidence (e.g. a
+    non-empty YouTube Music ``album`` field = official original)."""
+    if _COVER_RE.search(title or ""):
+        return "explicit"
+    if _is_amp_collab_title(title, cover_channel):
+        return "amp_collab"
+    return None
 
 
 def extract_cover_original(raw_title, cover_channel=""):
@@ -520,6 +613,17 @@ def extract_cover_original(raw_title, cover_channel=""):
     """
     if not raw_title or not is_cover_title(raw_title):
         return None, None
+    # TICKET-086: an AMP-COLLAB signal (Song - A & B) carries lower confidence
+    # than an explicit cover tag — providers index covers under the ORIGINAL
+    # artist, not the collab pair, so we deliberately return (None, song) and
+    # let the caller take the title-only search path. Never trust the right-
+    # hand "A & B" as the original artist.
+    if cover_signal(raw_title, cover_channel) == "amp_collab":
+        t0 = raw_title.strip()
+        # take everything BEFORE the first title separator as the song
+        m = re.search(_AMP_COLLAB_SEPS, t0)
+        song = (t0[:m.start()] if m else t0).strip(" -–—|/_:")
+        return None, (song or None)
     t = raw_title.strip()
     # strip cover markers and brackets containing them
     t = re.sub(r"\[\s*cover\s*\]", "", t, flags=re.I).strip()
@@ -607,6 +711,11 @@ def clean_title(title, source="", artist=""):
     and **cover credits** ('天誅 / covered by 幸祜' → '天誅'). `source` is the player
     app id (browser titles get extra cleanup)."""
     t = title or ""
+    # TICKET-086: YouTube Music's autoplay-mix indicator leaks "Mix - <song>"
+    # into the SMTC title and would mismatch every lyric provider (the song is
+    # `<song>`, not `Mix - <song>`). Anchored to BOL so a song actually titled
+    # 'DJ Mix - Track' (content BEFORE 'Mix') isn't touched.
+    t = re.sub(r"^\s*Mix\s*[-–—]\s*", "", t, flags=re.I)
     # A 歌ってみた / cover is usually titled "OriginalSong / Singer(s)" and its
     # lyrics are the ORIGINAL song's. Detect the marker from the RAW title now —
     # the (cover) / 歌ってみた tags get stripped below — so we can keep just the
@@ -801,11 +910,18 @@ def is_live_arrangement(title):
     return bool(_LIVE_VER_RE.search(title or ""))
 
 
-def clean_artist(artist):
+def clean_artist(artist, source=""):
     """Strip YouTube channel cruft so the artist matches lyric providers:
     'Kaneko Lumi - Topic' → 'Kaneko Lumi', 'LMFAOVEVO' → 'LMFAO'. Auto-generated
     '… - Topic' / VEVO / 'Official Artist Channel' uploads are real tracks; the
-    suffix just blocks the provider/Shazam-name search."""
+    suffix just blocks the provider/Shazam-name search.
+
+    TICKET-086: ``source`` (the SMTC source-app id) lets the cleaner BYPASS the
+    aggressive channel rules for YouTube Music (``music.youtube.*``), which
+    delivers a clean artist name already (``轟はじめ`` alone, not the channel
+    string). Default empty preserves all existing callers."""
+    if source and "music.youtube" in (source or "").lower():
+        return (artist or "").strip()
     a = (artist or "").strip()
     D = r"[-–—‐]"          # include U+2010 ‐ used by hololive-style channel names
     a = re.sub(rf"\s*{D}\s*Topic$", "", a, flags=re.I)
@@ -1232,6 +1348,7 @@ class Overlay:
         self._clean_title_cache = ""
         self._clean_artist_cache = ""
         self._is_cover = False       # current title is a 歌ってみた / cover (title-first fetch)
+        self._cover_signal = None    # TICKET-086: 'explicit' / 'amp_collab' / None
         self._cover_original_artist = None   # original artist extracted from a cover title
         self._last_caption_t = 0.0   # throttle YouTube caption fetches (rate-limit guard)
         self._caption_song = None    # (artist,title) we last attempted captions for
@@ -1463,6 +1580,11 @@ class Overlay:
             "fine_tune_exit_drift_s":     2.5,  # |drift| above this hands back to the tier (above BOTH caps so leftover-after-step still handles on next tick)
             "fine_tune_listen_interval_s": 8.0, # cadence between fine-tune Whisper listens
             "fine_tune_inconclusive_exit":   2, # consecutive unreadable listens → exit
+            # ── TICKET-086 YouTube Music + ampersand-collab cover knobs ──
+            # 1.0 = ON (default). Drop to 0 to disable the demote, e.g. for
+            # diagnosis. Only affects the WEAKER amp_collab signal; an explicit
+            # cover tag (歌ってみた / [COVER] / "covered by") is never demoted.
+            "cover_amp_album_demote":     1.0,  # YT Music album → demote amp_collab
         }
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
@@ -3080,12 +3202,28 @@ class Overlay:
                 or rawa != self._last_artist):
             self._last_raw_title, self._last_src, self._last_artist = rawt, src, rawa
             self._clean_title_cache = clean_title(rawt, src, rawa)
-            self._clean_artist_cache = clean_artist(rawa)
+            # TICKET-086: source-aware bypass — YouTube Music delivers a clean
+            # SMTC artist field already (e.g. '轟はじめ', not 'Hajime Ch. 轟はじめ
+            # ‐ ReGLOSS'), so the channel-stripping rules tuned for the regular
+            # YouTube tab can over-strip on YT Music. Trust the source there.
+            self._clean_artist_cache = clean_artist(rawa, src)
             # Only EXPLICIT covers (歌ってみた / "covered by" / [COVER]) take
             # the loose title-first path. Routing VTuber-channel uploads through
             # it too was WRONG: for a generic title like "Lucky Star" the
             # title-only search grabbed a same-titled DIFFERENT song.
             self._is_cover = is_cover_title(rawt)
+            self._cover_signal = cover_signal(rawt, rawa)
+            # TICKET-086: a non-empty YouTube Music album field is strong
+            # evidence of an OFFICIAL original (covers / UGC don't carry an
+            # album). Demote the WEAKER ampersand-collab signal in that case;
+            # never override an explicit cover tag (those are unambiguous).
+            album = (state.get("album") or "").strip()
+            yt_music_src = "music.youtube" in (src or "").lower()
+            if (self._cover_signal == "amp_collab" and album and yt_music_src
+                    and float(self._tune.get("cover_amp_album_demote", 1.0)) >= 0.5):
+                log.info("cover: amp-collab demoted — YT Music album %r = official", album)
+                self._cover_signal = None
+                self._is_cover = False
             if self._is_cover:
                 # Match the cover channel with the RAW artist, not clean_artist — the
                 # cleaner strips the personal name ("Ouro Kronii Ch. hololive-EN" →
@@ -3093,6 +3231,9 @@ class Overlay:
                 # ORIGINAL artist and re-introduce the wrong-artist search.
                 orig_a, song = extract_cover_original(rawt, rawa)
                 self._cover_original_artist = orig_a
+                if self._cover_signal == "amp_collab":
+                    log.info("cover: amp-collab signal → title-only search "
+                             "(ignoring right-hand A & B as original artist)")
                 # If the cover parse found the bare song name ("Coffee" out of
                 # "[COVER] Coffee - A!ka | Kaneko Lumi"), use it — clean_title's
                 # generic rules leave the "- Artist | Channel" tail on, which
@@ -4286,7 +4427,16 @@ class Overlay:
                 "clean_artist": self._clean_artist_cache,
                 "track_tuple": list(self._track) if self._track else None,
                 "is_cover": self._is_cover,
+                # TICKET-086: WHICH cover signal fired — 'explicit' is the
+                # high-confidence tag; 'amp_collab' takes the lower-confidence
+                # title-only path; None = no cover signal.
+                "cover_signal": getattr(self, "_cover_signal", None),
                 "cover_original_artist": self._cover_original_artist,
+                # TICKET-086: source-aware fields so /source confirms YT Music
+                # routing live (album field is mirrored from raw for diag clarity).
+                "yt_music_source": ("music.youtube"
+                                    in (st.get("source") or "").lower()),
+                "album": st.get("album"),
                 "trusted_duration": self._trusted_duration(st) if st else None,
                 "live_mode": self._live_mode,
                 "mv_mode": self._mv_mode,
@@ -4720,6 +4870,13 @@ class Overlay:
         caption fetch hits that exact upload (not a fuzzy title search). A new
         URL re-arms the per-song caption fetch."""
         url = (url or "").strip() or None
+        # TICKET-086: a YouTube Music tab pushes a music.youtube.com URL — same
+        # video id, different host. Canonicalize here so the cached _now_url and
+        # the diagnostics (/source, /status) always carry the www.youtube.com
+        # form (belt-and-braces with deep_transcribe._normalize_youtube_url).
+        if url and "music.youtube.com" in url.lower():
+            url = (url.replace("://music.youtube.com", "://www.youtube.com")
+                      .replace("://m.music.youtube.com", "://www.youtube.com"))
         if url and url != self._now_url:
             self._now_url = url
             self._caption_song = None        # re-fetch captions for the exact video

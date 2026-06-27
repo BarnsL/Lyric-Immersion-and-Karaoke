@@ -137,11 +137,17 @@ def _download_audio(query: str, dest: Path) -> tuple[Path | None, str | None]:
     # machine with neither, the download may 403 and we degrade gracefully.
     if _sh.which("node"):
         opts["js_runtimes"] = {"node": {}}
+    # TICKET-086: normalize music.youtube.com → www.youtube.com so the rewrite
+    # is centralized at every yt-dlp entry point. If the input is already a URL
+    # we pass it straight in (else yt-dlp would prepend ytsearch1: to a URL,
+    # which it tolerates but is wasteful).
+    search_q = _normalize_youtube_url(query)
+    target = search_q if re.match(r"https?://", search_q) else f"ytsearch1:{search_q}"
     info_title, last_err = None, None
     for vopts in _yt_variants(opts):                 # cookies+anti-bot → anti-bot → plain
         try:
             with yt_dlp.YoutubeDL(vopts) as y:
-                info = y.extract_info(f"ytsearch1:{query}", download=True)
+                info = y.extract_info(target, download=True)
                 if isinstance(info, dict):
                     ents = info.get("entries") or [info]
                     if ents and isinstance(ents[0], dict):
@@ -307,6 +313,27 @@ def _captions_from_dir(dest: Path, lang: str | None):
     return (lines, clang) if len(lines) >= 6 else None
 
 
+def _normalize_youtube_url(q):
+    """TICKET-086: rewrite ``music.youtube.com`` → ``www.youtube.com`` so every
+    yt-dlp / video-id entry point sees the canonical host. The same 11-char video
+    id resolves either way, but our regex fast-paths (and any future host check)
+    are tuned for ``www.youtube.com``; a browser pushing a YouTube Music tab URL
+    used to slip past them. NO-OP on non-http strings (title / 11-char id paths
+    still work) and a lossless urlsplit/urlunsplit roundtrip on a normal URL."""
+    q = (q or "").strip()
+    if not re.match(r"https?://", q, re.I):
+        return q
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(q)
+        if parts.netloc.lower() in ("music.youtube.com", "m.music.youtube.com"):
+            parts = parts._replace(netloc="www.youtube.com")
+            return urlunsplit(parts)
+    except Exception:
+        pass
+    return q
+
+
 def fetch_captions_only(query: str, lang: str | None = None):
     """FAST path: download ONLY the caption track (no audio, no Whisper) for the
     top YouTube hit for `query`, parse it to timed lines → (lines, lang) or None.
@@ -363,7 +390,9 @@ def fetch_captions_only(query: str, lang: str | None = None):
         # are applied per-attempt via _yt_variants — the web client now 403s without
         # a PO token, so the ios/tv/mweb clients are what actually fetch the captions.
         # Exact URL / 11-char video id → fetch THAT video; else search by title.
-        q = query.strip()
+        # TICKET-086: normalize music.youtube.com → www.youtube.com first so the
+        # canonical host flows through every code path below.
+        q = _normalize_youtube_url(query)
         if re.match(r"https?://", q):
             target = q
         elif re.fullmatch(r"[\w-]{11}", q):
