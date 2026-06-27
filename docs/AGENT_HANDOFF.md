@@ -7,9 +7,13 @@ karaoke tool. Read this first, then `ARCHITECTURE.md`.
 
 ## Where things live
 - **Source repo:** `D:\Desktop-Karaoke` (git). Remote: **`BarnsL/Lyric-Immersion-and-Karaoke`**
-  (renamed from Desktop-Karaoke). Work branch: **`claude/caption-sync-perf-fixes`**.
-  `origin/master` is a *separate* fresh v1.1.1 history — NEVER push master (unrelated
-  root, would need a force). Push to the branch only; it fast-forwards cleanly.
+  (renamed from Desktop-Karaoke). **`master` is now the canonical default branch** — the 188
+  commits of work were consolidated onto it from `claude/caption-sync-perf-fixes` (kept as a
+  backup mirror; both point to the same commit). **Push to `master`.** The old separate v1.1.1
+  stub history is gone from the branch but preserved as the `v1.1.1` tag/release. A
+  `non_fast_forward` ruleset guards ALL branches (no force-pushes — to consolidate again you'd
+  PUT its enforcement=disabled, push, then re-enable); master's old classic PR/identity-check
+  protection was REMOVED so direct pushes work. Keep both `master` + the claude branch in sync.
 - **Deployed app:** `D:\DesktopKaraoke\` — `DesktopKaraoke.exe` + `_internal\` + runtime
   dirs `lyrics\` (LRC cache), `deps\`, `models\` (whisper), `settings.json`.
 - **Local API:** `http://127.0.0.1:8765` (api.py) — agent control + diagnostics.
