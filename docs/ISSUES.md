@@ -8,6 +8,28 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-082 — Karaoke fill decoupling + scroll-mode deferral + MV-intro fast-sync + in-app perf recorder 🟡 (082a landed; 082b open)
+**Symptoms:**
+- The currently-sung lyrics highlighting (karaoke fill) doesn't ramp smoothly across syllables — visible "stutter" or "race-then-snap" feel even on songs where sync is technically correct.
+- Scroll-through modes (`tb`/`bt`/`lr`/`rl`) bypass the v1.0.78/81 `_smooth_offset` deferral entirely, so every offset write snaps in scroll mode.
+- Studio MVs with long instrumental preambles (綺麗事 / Suisei: 33s of quiet before vocals) take too long to lock sync — the 25s track-start auto-align fires BEFORE vocals against silence and produces nothing.
+- Heisenberg observer effect: polling `/diag` at 4 Hz (the diagnostic tool itself) dragged the render thread from baseline 33ms/frame to 60-200ms/frame, making the diagnostic worse than the bug.
+
+**Fix (v1.0.82 — 082a):**
+- **Karaoke fill on the RAW song clock** (not the eased display offset). `_tick` now computes BOTH `pos = state["position"] + self._eased_offset()` AND `pos_raw = state["position"] + self.offset`. `_ticker_update` / `_ticker_update_v` / `_karaoke` all take a new `pos_raw` argument and use it for the karaoke `frac` computation, while line POSITION (where the line is drawn on the belt) continues to use the eased `pos`. Result: lines glide smoothly into place visually, but the sung-vs-unsung highlight tracks the actual song clock — no more "fill races ahead during ease then snaps back."
+- **Frac clamp to [0,1]** in both ticker renderers — the old `else 0.0` fallback briefly reset the karaoke fill to 0 whenever pos exited the line's window during ease. Now clamped, no more zero-flash.
+- **Scroll-mode deferral coverage.** Removed the `if is_scroll: snap` bypass in `_smooth_offset`. Scroll modes now queue at the next line boundary too. Belt position still glides via `_eased_offset` regardless.
+- **Wall-clock based ease** in `_eased_offset` instead of per-frame. Old: `(target - cur) * 0.2` capped at 0.10 s/frame. New: exponential pull `1 - exp(-pull * dt)` with absolute cap `rate_per_sec * dt`. Heavy frames no longer stretch the glide; a 1s drift finishes in ~0.5s regardless of FPS. Tune knobs: `ease_slew_cap_s` (default 3.0), `ease_pull_per_sec` (default 3.5).
+- **MV-intro fast-sync** in `_on_vocal_onset`: when `_mv_mode` is true (studio MV, LRC shorter than video) AND vocals just calibrated the offset, schedule a fresh `_maybe_auto_align(reason="mv-intro-onset")` ~5s later. Locks precise sync before chorus 2 instead of waiting for the slow tier loop.
+- **In-app perf recorder** — new tune knob `perf_record` (1 = on). When on, every `_tick` appends a line to `D:\DesktopKaraoke\perf.log` (rotated at `perf_record_cap_mb`=20 MB) with: timestamp, frame_ms, render-branch (line/scroll-h/scroll-v), pos_eased, pos_raw, offset, pending_offset, idx, ease_delta, and meta tags for OFFSET_JUMP / IDX transitions. Buffered append on the Tk thread itself = zero observer effect. This is what the user asked for: a diagnostic that doesn't interfere with what it observes.
+- **Live trace already proved itself** — captured Tk-thread freezes of 3.3s, 5.8s, 6.2s during normal playback. Song-time keeps advancing while the render hangs (audio is on a separate thread). That's the user-visible stutter root cause beyond the fill ramp — Tk's event loop is sometimes blocked for seconds.
+
+**Still open (082b):**
+- The 100-500 ms spikes correlate with track changes (LRC load + first-line render) and `_consume_async` handling Shazam results. These need to be offloaded from the Tk thread (currently the load/render is synchronous). Next fix: move LRC parse + first-block PIL render to a worker thread, marshal the finished render back via `root.after(0, ...)`.
+- /diag GIL isolation: the `/diag` handler reads live state under Python's GIL, which contends with the render thread. Should snapshot at end of each `_tick` into a deque, /diag reads the deque. Makes any future polling free.
+
+---
+
 ## TICKET-081 — Title/artist weight rebalancing + cover-as-live + Shazam smooth-sync + lib MIN 60 🟢
 **Symptoms (one big session of failures, all rooted in the same weight issues):**
 - **GHOST/Suisei "halloween thing"**: title-match for `GHOST` picked `ghosting.json` (score 78 via substring-cover) over the correct `ghost.json`. Title-lock then suppressed Shazam for ~37 s until 5-strike override. The displayed "Ghost in your house, ghost in your arms" was actually `ghosting.json`'s English lyrics — not a literal halloween song.
