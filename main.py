@@ -282,22 +282,62 @@ def _translit_cyr(s):
     return "".join(_CYR_LAT.get(c.lower(), c) for c in (s or ""))
 
 
+_kks_title = None
+
+
+def _to_hepburn(s):
+    """Romanize JP (kanji/hiragana/katakana) in `s` to Hepburn so a cached file
+    titled 'かもね' is reachable from a player title 'kamone' (and vice versa).
+    Empty/no-CJK → returns the input unchanged; pykakasi unavailable → ditto.
+    Memoized: the kakasi analyzer is reused across calls (TICKET-080)."""
+    if not s or not _has_cjk(s):
+        return s
+    global _kks_title
+    if _kks_title is None:
+        try:
+            import pykakasi
+            _kks_title = pykakasi.kakasi()
+        except Exception:
+            _kks_title = False
+    if not _kks_title:
+        return s
+    try:
+        return "".join(it.get("hepburn") or it.get("orig") or ""
+                       for it in _kks_title.convert(s))
+    except Exception:
+        return s
+
+
 def _title_forms(title):
-    """Normalized forms a title may be matched by: the whole thing, and — for a
-    JP-style 'Artist / Song' upload — the **song** part (the segment after the last
-    '/'), plus a Cyrillic→Latin transliteration of each. Only the last segment is
-    tried (the song; the leading parts are the artist), and segments shorter than
-    4 chars are dropped, so the artist name can't cause a false match."""
-    forms = set()
-    for base in (title or "", _translit_cyr(title or "")):
-        forms.add(_norm_title(base))
+    """Backwards-compat flat set of forms (native ∪ alt) used by older callers."""
+    n, a = _title_forms_split(title)
+    return n | a
+
+
+def _title_forms_split(title):
+    """Return (native_forms, alt_forms): the whole thing, each 'Artist / Song'
+    segment, and Cyrillic→Latin go to NATIVE; the Hepburn romaji of a JP-script
+    title goes to ALT so the matcher can apply a small penalty for cross-script
+    bridge hits (TICKET-080). Only the last segment is tried (the song; the
+    leading parts are the artist) and segments shorter than 4 chars are dropped
+    so the artist name can't cause a false match."""
+    def _expand(base, dest):
+        dest.add(_norm_title(base))
         segs = re.split(r"\s*[/／]\s*", base)
         if len(segs) > 1:
-            nf = _norm_title(segs[-1])          # 'Artist / Song' → the Song
+            nf = _norm_title(segs[-1])
             if len(nf) >= 4:
-                forms.add(nf)
-    forms.discard("")
-    return forms
+                dest.add(nf)
+    native, alt = set(), set()
+    for base in (title or "", _translit_cyr(title or "")):
+        _expand(base, native)
+    hep = _to_hepburn(title or "")
+    if hep and hep != (title or ""):
+        _expand(hep, alt)
+    native.discard("")
+    alt.discard("")
+    alt -= native                                   # don't double-count an alt that's also native
+    return native, alt
 
 
 # ── Real playback position via Windows Media Transport Controls ───────
@@ -866,11 +906,22 @@ class LyricsIndex:
             forms = {cn}
             if any("а" <= c <= "я" or c == "ё" for c in core.lower()):
                 forms.add(_norm_title(_translit_cyr(core)))
+            # TICKET-080: cross-script lookup — index 'かもね' under its Hepburn
+            # romaji 'kamone' too so a romanized YouTube title finds it. Kept in
+            # a SEPARATE set so the matcher can prefer a native-script match if
+            # one also exists (avoids picking かもね.json over kamone.json when
+            # the query is 'kamone' and both are cached).
+            forms_alt = set()
+            if _has_cjk(core):
+                rj = _norm_title(_to_hepburn(core))
+                if rj and rj != cn:
+                    forms_alt.add(rj)
             entries.append({
                 "path": p,
                 "title": lt,
                 "core": core,
                 "forms": {f for f in forms if f},
+                "forms_alt": {f for f in forms_alt if f},
                 "artist": m.get("artist") or "",
                 "dur": m.get("duration"),
             })
@@ -916,15 +967,16 @@ class LyricsIndex:
         qa = _norm_title(artist)
         if not qt:
             return None
-        # whole title + each 'Artist / Song' segment + Cyrillic transliteration,
-        # so a wrapped MV title ("IA & ОИЕ / Into Starlight -ver-") still matches.
-        q_forms = _title_forms(title)
+        # whole title + each 'Artist / Song' segment + Cyrillic transliteration
+        # (native); Hepburn romaji of a JP title goes to alt forms (penalized -3
+        # on either side so a same-script cache beats a cross-script bridge).
+        q_native, q_alt = _title_forms_split(title)
         best, best_score = None, 0
         for e in self.entries:
             ea = _norm_title(e["artist"])
             e_core = _norm_title(e["core"])
             score = 0
-            for ct in e.get("forms") or {e_core}:
+            def _score_form(ct, q_forms, alt_side):
                 # An ARTIST/GROUP-only SEGMENT (e.g. 'flowglow' from 'Song / FLOW
                 # GLOW') is shared across that artist's songs, so on its own it must
                 # not carry a match — require the SONG to match. Skip a *segment*
@@ -932,7 +984,8 @@ class LyricsIndex:
                 if (ct and len(ct) >= 3 and ct != e_core
                         and ((ea and (ct == ea or ct in ea))
                              or (qa and (ct == qa or ct in qa)))):
-                    continue
+                    return 0
+                best_s = 0
                 for q in q_forms:
                     if not ct or not q:
                         continue
@@ -946,7 +999,16 @@ class LyricsIndex:
                         s = 60 + int(30 * cover) if cover >= 0.6 else 0
                     else:
                         s = 0
-                    score = max(score, s)
+                    if s and alt_side:                 # cross-script (Hepburn) bridge
+                        s -= 3                         # → prefer a same-script entry
+                    best_s = max(best_s, s)
+                return best_s
+            # native↔native (full points); native↔alt or alt↔native or alt↔alt → -3.
+            for ct in e.get("forms") or {e_core}:
+                score = max(score, _score_form(ct, q_native, alt_side=False))
+                score = max(score, _score_form(ct, q_alt, alt_side=True))
+            for ct in e.get("forms_alt") or set():
+                score = max(score, _score_form(ct, q_native | q_alt, alt_side=True))
             if not score:
                 continue
             if duration and e["dur"]:
@@ -5278,8 +5340,19 @@ class Overlay:
         if getattr(self, "_title_locked", False) and loaded_key not in ("loaded",):
             MIN += self._tune.get("decide_titlelock_bump", 15.0)
             MARGIN = max(MARGIN, self._tune.get("decide_titlelock_margin", 28.0))
-        if (best_key not in ("loaded", loaded_key) and best_score >= MIN
-                and best_score - loaded_score >= MARGIN):
+        # TICKET-080: "lopsided win" override — when the loaded lyrics are clearly
+        # wrong (score < wrong_floor) AND the best library candidate has a wildly
+        # bigger margin (>= 3× the usual), accept it even if it's just under MIN.
+        # The kamone case (69 vs 20, library MIN=70) lost the right song by 1 point
+        # of an absolute threshold while the margin was 49 — a clear net win that
+        # the strict gate was throwing away in favor of a slow re-fetch.
+        wrong = self._tune.get("decide_wrong_floor", 32.0)
+        lopsided = (expanded and loaded_score < wrong
+                    and best_score >= max(50.0, MIN - 10.0)
+                    and best_score - loaded_score >= 3.0 * MARGIN)
+        if (best_key not in ("loaded", loaded_key)
+                and ((best_score >= MIN and best_score - loaded_score >= MARGIN)
+                     or lopsided)):
             try:
                 p = Path(best_key)
                 if p.exists() and self._file_valid(p, self._cur_duration):
