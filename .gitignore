@@ -9,9 +9,9 @@ env/
 # Build / logs / one-off scratch
 *.log
 preload.log
-build_*.exit
-build_*.log
-build_*.err
+build*.exit
+build*.log
+build*.err
 _batch_fetch*
 *.done
 

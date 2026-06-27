@@ -997,6 +997,13 @@ class LyricsIndex:
                         short, lng = sorted((ct, q), key=len)
                         cover = len(short) / max(1, len(lng))
                         s = 60 + int(30 * cover) if cover >= 0.6 else 0
+                        # TICKET-081: penalize a CANDIDATE that's a strict superset
+                        # of the QUERY ('ghost' ⊂ 'ghosting' shouldn't beat exact
+                        # 'ghost' — that's the GHOST/Suisei "halloween thing" bug).
+                        # Doesn't fire when the query is the superset (which is the
+                        # legitimate "drop trailing 'feat.' / version tag" case).
+                        if q == short and ct == lng and q != ct:
+                            s -= 12
                     else:
                         s = 0
                     if s and alt_side:                 # cross-script (Hepburn) bridge
@@ -1013,8 +1020,18 @@ class LyricsIndex:
                 continue
             if duration and e["dur"]:
                 score += 8 if abs(e["dur"] - duration) <= 12 else -40
-            if qa and _norm_title(e["artist"]) == qa:
-                score += 5
+            # TICKET-081: artist corroboration is the strongest non-title signal
+            # for the failure modes we keep seeing (GHOST → ghosting.json, Suisei
+            # → 'Suisei' as title). Bumped exact from +5 to +12; added a partial
+            # +6 for 'Suisei' ⊂ 'Hoshimachi Suisei' / 'Suisei' ⊂ 'Suisei Channel'.
+            if qa:
+                ea_norm = _norm_title(e["artist"])
+                if ea_norm and ea_norm == qa:
+                    score += 12
+                elif ea_norm and (qa in ea_norm or ea_norm in qa):
+                    short_a, lng_a = sorted((qa, ea_norm), key=len)
+                    if len(short_a) >= 3 and len(short_a) / max(1, len(lng_a)) >= 0.5:
+                        score += 6
             if score > best_score:
                 best, best_score = e["path"], score
         if best and best_score >= 60:
@@ -1363,7 +1380,10 @@ class Overlay:
                                             # mislabeled/poisoned LRC that title+Shazam pass on NAME) → reject
             # ── SMART song decision by ear (Whisper 'small' + rapidfuzz, ~250 MB) ──
             "decide_min_score":      55.0,  # a title candidate must match the heard singing ≥ this to win
-            "decide_library_min":    70.0,  # a WHOLE-LIBRARY identification must clear this higher bar
+            "decide_library_min":    60.0,  # a WHOLE-LIBRARY identification must clear this higher bar
+                                            # (TICKET-081: was 70 — kamone scored 69 vs loaded 20, a clear win
+                                            #  rejected by 1 point of an absolute threshold. The lopsided
+                                            #  override + sync-reject still catch real misfires.)
             "decide_margin":         12.0,  # …and beat the loaded song's match by this much to switch
             "decide_wrong_floor":    32.0,  # loaded match below this = the lyrics are the wrong song → search the library
             "decide_listen_s":       12.0,  # seconds of vocals to transcribe for the decision
@@ -1557,12 +1577,19 @@ class Overlay:
         self._sync_fail_streak = self._sync_reject_count = 0
         self._tier_tpvr = None
         self._tier_listen = False
-        self._live_arrangement = is_live_arrangement(title)  # LIVE/short/alt → follow offset
+        # TICKET-081: a COVER's timing (intro length, tempo, edits) almost never
+        # matches the original artist's studio LRC we fetched for it, so a
+        # studio reset-to-0 strategy strands the lyrics 30-90 s out of sync
+        # for the whole song (the 名前のない怪物 / 快晴 by 音乃瀬奏 cases).
+        # Treat covers like live-arrangements: FOLLOW the measured offset.
+        self._live_arrangement = (is_live_arrangement(title)
+                                  or bool(getattr(self, "_is_cover", False)))
         self._live_sync_streak = 0          # new song → resync aggressively again (~8×/min)
         self._live_resync_gap = None
         self._live_resync_inflight = False
-        log.info("track change: %r / %r (dur %s)%s", title, artist, duration,
-                 " [live-arrangement]" if self._live_arrangement else "")
+        log.info("track change: %r / %r (dur %s)%s%s", title, artist, duration,
+                 " [live-arrangement]" if self._live_arrangement else "",
+                 " [cover]" if getattr(self, "_is_cover", False) else "")
 
         # For covers, use the original artist (extracted from the title) for
         # lyric search instead of the covering channel — "Coffee - Alka | Lumi"
@@ -2388,12 +2415,13 @@ class Overlay:
                                 # nudges the offset).
                                 AGREE_LIVE = self._tune["agree_live"]
                                 if abs(corr - self._pending_corr) < AGREE_LIVE:
-                                    new = (corr if abs(self.offset) < DEADBAND
-                                           else 0.6 * corr + 0.4 * self.offset)
-                                    self.offset = round(new, 2)
-                                    self._pending_corr = corr
+                                    new = round(
+                                        (corr if abs(self.offset) < DEADBAND
+                                         else 0.6 * corr + 0.4 * self.offset), 2)
                                     log.info("sync(live): following → offset %+.2fs (drift was %+.2f)",
-                                             self.offset, diff)
+                                             new, diff)
+                                    self._smooth_offset(new, "sync(live)-follow")   # TICKET-081
+                                    self._pending_corr = corr
                                 else:
                                     self._pending_corr = corr
                                     log.info("sync(live): holding %+.2fs for a 2nd read", corr)
@@ -2410,22 +2438,20 @@ class Overlay:
                                 if abs(self.offset) > DEADBAND:
                                     log.info("sync: ambiguous reads (spread %.0fs, small offset "
                                              "%+.2fs) → backing off to 0", spread, self.offset)
-                                    self.offset = 0.0
+                                    self._smooth_offset(0.0, "sync-ambiguous-reset")   # TICKET-081
                             elif abs(corr) <= DEADBAND:
                                 # audio says NO offset needed but we're showing one → drifted →
                                 # reset to the exact player clock (manual "reset to 0", automatic).
                                 self._pending_corr = 1e9
                                 log.info("sync: audio_off≈0 but showing %+.2fs → AUTO-RESET to 0", self.offset)
-                                self.offset = 0.0
+                                self._smooth_offset(0.0, "sync-audio0-reset")    # TICKET-081
                                 self._last_sound_lock_t = time.time()
-                                self._drift_integral = 0.0
                             elif abs(corr - self._pending_corr) < AGREE:
                                 # real non-zero offset CORROBORATED by a 2nd agreeing read → apply.
-                                self.offset = round(corr, 2)
                                 self._pending_corr = 1e9
                                 log.info("sync: CONFIRMED offset %+.2fs (two reads agree) → applied", corr)
+                                self._smooth_offset(round(corr, 2), "sync-confirmed")    # TICKET-081
                                 self._last_sound_lock_t = time.time()
-                                self._drift_integral = 0.0
                             else:
                                 # TWO-POINT VERIFICATION: a single read of a non-zero
                                 # offset is NEVER applied — on a song with choruses the
@@ -2483,11 +2509,44 @@ class Overlay:
                     # Dive" video) and no amount of re-syncing will ever fix it — the
                     # song is wrong. After N strikes (user's rule: 5) BREAK the lock
                     # and switch to what we actually hear.
+                    # TICKET-081: parenthetical equivalence — 'GHOST' and 'Ghost
+                    # (Still Still Stellar ver.)' are the SAME song; don't strike.
+                    # Strips '(…)' and '[…]' suffixes and compares titles. Same
+                    # for the JP variants '（…）' '［…］'.
+                    loaded_t = self.meta.get("title", "")
+                    bare_heard = re.sub(r"\s*[\(（\[［][^\)）\]］]*[\)）\]］]\s*$", "", f_title).strip()
+                    bare_loaded = re.sub(r"\s*[\(（\[［][^\)）\]］]*[\)）\]］]\s*$", "", loaded_t).strip()
+                    if (bare_heard and bare_loaded
+                            and self._titles_match(bare_heard, bare_loaded)):
+                        log.info("title-lock: %r ≡ %r after stripping parenthetical "
+                                 "suffix — not a strike", f_title, loaded_t)
+                        self._last_heard_contra = None
+                        self._sound_fail_streak = 0
+                        self._sound_song = heard           # treat as same song confirmed
+                        return
                     if heard == self._last_heard_contra:
                         self._sound_fail_streak += 1
                     else:
                         self._last_heard_contra, self._sound_fail_streak = heard, 1
-                    strikes = self._tune.get("wrong_song_strikes", 5)
+                    base_strikes = self._tune.get("wrong_song_strikes", 5)
+                    # TICKET-081: artist disagreement → DOUBLE the bar before
+                    # overriding (the GHOST/Suisei case where Shazam mis-IDs to a
+                    # halloween track by some unrelated artist). When SMTC artist
+                    # corroborates the heard artist OR the loaded artist, the
+                    # mismatch is more likely a real same-artist mis-ID and the
+                    # current 5 still applies.
+                    smtc_artist = _norm_title(g_artist)
+                    heard_artist_n = _norm_title(f_artist)
+                    loaded_artist_n = _norm_title(self.meta.get("artist") or "")
+                    artist_corroborates = bool(smtc_artist and heard_artist_n and (
+                        smtc_artist == heard_artist_n
+                        or smtc_artist in heard_artist_n
+                        or heard_artist_n in smtc_artist))
+                    if (smtc_artist and heard_artist_n and not artist_corroborates
+                            and not (loaded_artist_n and loaded_artist_n == heard_artist_n)):
+                        strikes = base_strikes * 2     # 10 strikes when artist disagrees
+                    else:
+                        strikes = base_strikes
                     if self._sound_fail_streak >= strikes:
                         log.info("title-lock OVERRIDDEN: heard %r %d× ≠ locked %r → wrong "
                                  "song, switching", f_title, self._sound_fail_streak,
@@ -3827,6 +3886,11 @@ class Overlay:
             self._drift_integral = 0.0
             self._pending_offset = None
             return
+        # TICKET-081: reset the timestamp on EVERY new queue so the 8s safety
+        # cap measures "how long has this CURRENT correction been waiting,"
+        # not "how long has SOME correction been waiting." Otherwise a stream
+        # of fresh corrections inherits the first one's t0 and the cap fires
+        # mid-line, defeating the deferral.
         self._pending_offset = new_off
         self._pending_offset_t = time.time()
         log.info("sync: deferring %+.2fs → %+.2fs until current line ends (%s)",
@@ -4265,6 +4329,24 @@ class Overlay:
             log.info("vocal onset @%.1fs — too early to be a long intro, ignored", vpos)
             return
         if first_start > 8.0:
+            # TICKET-081: for COVERS / live-arrangements the LRC is the studio
+            # original — its intro is bound to be shorter than the cover/live
+            # rendition. When measured vocals arrive MUCH later than the LRC's
+            # first line (gap > 15 s), don't bail; compute the negative offset
+            # so lyrics align to the actual first sung word. The 名前のない怪物
+            # cover sat 78s out of sync because this branch returned silently.
+            cover_or_live = (self._is_cover or self._live_arrangement
+                             or (self.meta.get("source") or "").endswith("/cover"))
+            gap = vpos - first_start
+            if cover_or_live and gap > 15.0:
+                new_off = round(first_start - vpos, 2)
+                if -300.0 < new_off < 0.0:
+                    self._intro_anchored = True
+                    log.info("vocal onset @%.1fs (1st line @%.1fs) cover/live extended "
+                             "intro → calibrated offset %+.1fs", vpos, first_start, new_off)
+                    self._smooth_offset(new_off, "vocal-onset-cover")
+                    self._hint("🎤 Vocals — synced (cover intro)")
+                    return
             log.info("vocal onset @%.1fs — LRC already has intro baked in (1st @%.1fs)",
                      vpos, first_start)
             self._intro_anchored = True
@@ -5326,12 +5408,41 @@ class Overlay:
                  "library" if expanded else "title", res["heard"][:40],
                  Path(best_key).name if best_key not in ("loaded",) else best_key,
                  best_score, loaded_score)
+        # TICKET-081: a very short transcript (e.g. 11 chars in the 名前のない怪物
+        # cover case) can produce a deceptive tie at low score that the matcher
+        # logs as "in sync" while the song is actually way off. Treat short
+        # transcripts as inconclusive — don't switch, don't claim alignment.
+        heard_text = res.get("heard") or ""
+        if len(heard_text.strip()) < 20:
+            log.info("decide-by-ear: only %d chars heard — inconclusive, no action",
+                     len(heard_text.strip()))
+            return
         # A LIBRARY-WIDE identification (broad search over every cached song) must
         # clear a HIGHER bar than a title-confined check, so a short transcript can't
         # latch onto a stray song among hundreds.
-        MIN = (self._tune.get("decide_library_min", 70.0) if expanded
+        MIN = (self._tune.get("decide_library_min", 60.0) if expanded
                else self._tune.get("decide_min_score", 55.0))
         MARGIN = self._tune.get("decide_margin", 12.0)
+        # TICKET-081: when SMTC artist is known and the best library candidate's
+        # artist clearly disagrees with it, penalize best_score by -8 BEFORE the
+        # MIN/MARGIN compare — a transcript-only switch should hesitate when the
+        # candidate is by the wrong artist. Skipped for covers (a cover's original
+        # artist is DIFFERENT by design).
+        if expanded and best_key not in ("loaded", loaded_key) and not getattr(self, "_is_cover", False):
+            smtc_artist_n = _norm_title(getattr(self, "_clean_artist_cache", "") or "")
+            best_artist_n = ""
+            try:
+                for ent in self.index.entries:
+                    if str(ent["path"]) == best_key:
+                        best_artist_n = _norm_title(ent.get("artist") or "")
+                        break
+            except Exception:
+                pass
+            if smtc_artist_n and best_artist_n and smtc_artist_n != best_artist_n:
+                if not (smtc_artist_n in best_artist_n or best_artist_n in smtc_artist_n):
+                    log.info("decide-by-ear: best candidate's artist %r ≠ SMTC artist %r "
+                             "— penalizing best_score by 8", best_artist_n, smtc_artist_n)
+                    best_score -= 8.0
         # GUARD: a title-LOCKED song came from a confident title match — strong ground
         # truth. Require an OVERWHELMING library match before a by-ear read may override
         # it, so one noisy/short clip can't switch away from the right song (the Suisei

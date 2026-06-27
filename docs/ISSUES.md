@@ -8,6 +8,33 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-081 — Title/artist weight rebalancing + cover-as-live + Shazam smooth-sync + lib MIN 60 🟢
+**Symptoms (one big session of failures, all rooted in the same weight issues):**
+- **GHOST/Suisei "halloween thing"**: title-match for `GHOST` picked `ghosting.json` (score 78 via substring-cover) over the correct `ghost.json`. Title-lock then suppressed Shazam for ~37 s until 5-strike override. The displayed "Ghost in your house, ghost in your arms" was actually `ghosting.json`'s English lyrics — not a literal halloween song.
+- **「名前のない怪物」 / 「快晴」 by 音乃瀬奏 (covers)**: right LRC loaded (`名前のない怪物_egoist.json` / `快晴.json`), but the EGOIST original's timing didn't match the cover. `_on_vocal_onset` bailed via the `first_start > 8.0 → "LRC already has intro baked in"` early-return, even though measured vocals arrived 78 s LATER than the LRC's first_start. The cover wasn't classified as live_arrangement, so the FOLLOW path that would have absorbed the drift never engaged. Offset stayed at +0.00 the whole song while singing was 78 s behind.
+- **Hand Sign / KizunaAI**: cached `hand_sign.json` was the wrong song's lyrics (poisoned cache); decide-by-ear scored loaded 20 — clearly wrong — but library best was `datte.json` at 33 (below library MIN=70) so the re-fetch path fired uselessly.
+- **kamone**: TICKET-080 fixed the romaji↔CJK match, but library MIN=70 still made by-ear wins one-point misses.
+
+**Fix (v1.0.81 — bundled because the failure modes share the same scoring weakness):**
+- **`decide_library_min`: 70 → 60** (user-requested + matches the lopsided-win heuristic from TICKET-080).
+- **`_score_form` substring-superset penalty (-12)**: when the CANDIDATE title is a strict superset of the QUERY (`ghost` ⊂ `ghosting`), penalize. The reverse direction (query is the superset, e.g. dropping `feat. X`) still scores full. Live-verified: `ghost`→`ghost.json` (was `ghosting.json`); `ghosting`→`ghosting.json`.
+- **Artist corroboration bumped**: was `+5` exact match. Now `+12` exact, `+6` partial (one contains the other, length ratio ≥0.5). `'Suisei' ⊂ 'Hoshimachi Suisei'` and `'Suisei' ⊂ 'Suisei Channel'` (the latter via `clean_artist`'s existing channel-stripping at main.py:835) all corroborate.
+- **Title-lock parenthetical equivalence in `_consume_async`**: `GHOST` and `Ghost (Still Still Stellar ver.)` are the same song. Strips `(…)` / `[…]` / `（…）` / `［…］` suffixes before comparing. Doesn't count as a strike when equivalent.
+- **Title-lock artist-disagree doubles strikes (5 → 10)**: when SMTC artist clearly disagrees with the heard artist (and neither corroborates loaded artist), require twice the strikes before flipping the lock. Genuine same-artist mis-IDs (the feelingradation/SKAVLA case) still use the base 5.
+- **Cover → live_arrangement** in `_on_track_change`: `_live_arrangement = is_live_arrangement(title) or self._is_cover`. Covers now use the FOLLOW path that absorbs the inevitable cover-vs-original timing drift.
+- **`_on_vocal_onset` extended-intro fix**: when the LRC's first_start is >8 s AND the song is a cover/live AND measured vocals arrive >15 s LATER than that first_start, compute `offset = first_start - vpos` (negative, cap −300 s) and route through `_smooth_offset`. The 名前のない怪物 cover would have got `≈ −78 s` instead of the silent bail.
+- **In-tick Shazam writes routed through `_smooth_offset`** (4 callsites previously snapping): live-FOLLOW (`sync(live)-follow`), ambiguous-reset (`sync-ambiguous-reset`), audio≈0 reset (`sync-audio0-reset`), confirmed (`sync-confirmed`). These are the high-frequency steady-state writes — the user-reported "mid-line jump" is almost always one of these four. Big-jump (>5 s) gate inside `_smooth_offset` preserves clean snap behavior for genuine song changes.
+- **`_apply_decision` minimum heard-chars (20)**: a tie at 62/62 with only 11 transcribed chars (the cover case) now logs "inconclusive, no action" instead of silently confirming "in sync."
+- **`_apply_decision` artist-disagree penalty (−8)** for library expansion: when SMTC artist is known and best library candidate's artist clearly disagrees AND we're not in cover mode, penalize best_score before MIN/MARGIN compare. Don't let a high-fuzz cross-artist transcript pull us off a correctly-loaded artist-confirmed song.
+- **Cache: deleted poisoned `hand_sign.json`** so the next play re-fetches clean.
+
+**Still open (deferred to TICKET-082 / TICKET-083):**
+- **TICKET-082**: smooth-sync coverage gaps remaining (scroll-mode bypass; karaoke fill stuttering during glide because `frac=(pos-ln.start)/dur` uses eased pos against fixed ln.start; force-sync writes still snap). The big in-tick fix in v1.0.81 covered the worst offender; finer polish queued.
+- **TICKET-083**: `ghost.json` and `ghost_still_still_stellar_ver.json` are byte-identical content — dedup via sha + alias.
+- Feature stack (v1.0.82+): YouTube chapters + DOM via yt-dlp/`/nowplaying`, Demucs source separation (opt-in), librosa beat-anchor, AcoustID fingerprint.
+
+---
+
 ## TICKET-080 — Romaji↔CJK title equivalence + lopsided decide-by-ear win + GPU picker by utilization 🟢
 **Symptom (kamone took ~41 s):**
 ```
