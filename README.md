@@ -76,7 +76,7 @@ while it runs.
 - **Optional dancing character.** A little companion, themed to the current
   song's artist, that bobs along to the music. Toggle it from the tray.
 - **Portable & private.** No account, no telemetry. The whole app is one folder
-  you can copy anywhere.
+  you can copy anywhere, and it **can run off a USB stick**.
 
 ---
 
