@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.86.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.89.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -53,7 +53,80 @@ Suisei). **Current build: v1.0.86.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.86, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.89, all deployed + on master)
+- **v1.0.89 — Slide-in top/bottom + SMTC-paused Shazam takeover + Discord RP fallback
+  (TICKET-098 / TICKET-099 / TICKET-100):** three independent features in one build, each
+  surgical. **(098)** Per-line slide-in gains `top` and `bottom` modes (drop from above /
+  rise from below); `_animate_in` now offsets on the Y axis when `scroll_dir in {top,bottom}`
+  and `_anim_step` takes an (ox, oy) pair so the easing applies to both axes. `set_scroll`
+  auto-orients `pos_x` per the design contract (left→left, right→right, top/bottom→center)
+  on the per-line slide modes only — continuous scroll modes (`lr`/`rl`/`tb`/`bt`) and
+  `none` keep whatever horizontal anchor the user already chose; `pos_y` is untouched.
+  Tray entries placed between "Slide in from right" and the first SEPARATOR per the spec.
+  **(099)** SMTC vs Shazam disagreement: `_verified` is now split into `_verified_meta`
+  (the v1.0.88 duration/title check) AND `_sound_corroborated` (≥1 Shazam read agreed with
+  the loaded title). Public `/status.verified` requires BOTH — closing the v1.0.88 bug
+  where a paused SMTC tab with a stale title was being reported `verified=true` before
+  any audio ever confirmed it. `/status.verified_meta` exposes the old check for
+  backward-compatible watchers. New `_resolve_source_priority(state, heard)` returns
+  `'agree' | 'smtc' | 'shazam-live' | 'confused'`; the heart of the change: when SMTC has
+  been NOT-PLAYING for ≥ `smtc_paused_min_s` (8s) and Shazam confidently hears a different
+  song, `_smtc_paused_takeover` drops the loaded lyrics, swaps to the heard song (reusing
+  the wrong-song correction path so reviewers learn one set of switch-mechanics), and
+  debounces back-to-back takeovers via `smtc_takeover_debounce_s` (20s). A real user
+  un-pause (SMTC PAUSED→PLAYING edge) clears `_last_takeover_t` so the next pause can take
+  over immediately. The 2-read agreement gate applies (first contradicting read demotes
+  `_verified` + drops `_title_locked` + seeds `_pending_switch`; second agreeing read
+  fires the takeover). Concert OCR path explicitly sets both verification flags so the
+  badge still goes true on a confident banner read. Three new tune knobs (all commented
+  in the `self._tune` dict); five new fields in `/diag.derived` (`source_priority`,
+  `verified_meta`, `sound_corroborated`, `smtc_paused_for_s`, `last_takeover_age_s`).
+  **(100)** Discord Rich Presence reader for the user's own Spotify-Listening activity
+  via the local IPC pipe (`\\.\pipe\discord-ipc-0..9`). New module `discord_rpc.py`:
+  pure stdlib + ctypes (pywin32 optional), 500 ms hard timeout, exponential-backoff
+  reconnect (5→10→20→40, cap 60s) so a missing Discord client doesn't spam the log,
+  module-singleton connection. Public surface is two functions — `available()` and
+  `get_listening_track(timeout_s=0.5)` → `{title, artist, source, started_at} | None`.
+  Wired in `_tick` as a third-priority fallback: only contributes when both SMTC AND
+  Shazam-live have been silent for ≥ `discord_rpc_silent_gap_s` (8s); the synthesized
+  state dict carries `source="discord-rpc:<sub>"` so downstream paths recognize it.
+  Opt-in (default OFF) — tray menu item under the detection group + persisted via
+  `discord_rpc` settings key. Four new tune knobs (`discord_rpc_on`,
+  `discord_rpc_silent_gap_s`, `discord_rpc_poll_s`, `discord_rpc_timeout_s`); pinned in
+  `DesktopKaraoke.spec` hiddenimports so the frozen build includes the module. Per-game
+  RP parsing + SteamWorks + registered-application-id work is spun off as TICKET-101
+  (referenced inline in `discord_rpc.py` + the `_tune` dict comment).
+- **v1.0.88 — Language lock + Shazam wins + snap fixes + Chinese pinyin/jieba/NetEase + SMTC
+  normalizer + tray reorg (TICKETs 088 / 089 / 090 / 091 / 093 / 094 / 095 / 097):** eight
+  tickets in one build. **(088)** Smooth-transition snap fixes: per-frame ease cap so a
+  single 300 ms render frame can't blow past the destination, shared `_commit_offset`
+  helper for atomic same-tick offset writes, sub-50 ms deadzone (don't ease drifts smaller
+  than render jitter), re-queue logic when an offset commit races a deferred commit, and
+  a debug-gated assertion that warns when >2 offset writes hit the same tick. **(089)**
+  Whisper language lock: `_decide_whisper_lang` pins Whisper to the known song language
+  (from SMTC `system.language` / fetched lyrics' `lang` / live Shazam result) instead of
+  letting Whisper auto-detect; kills the Japanese-hallucination class of bugs where
+  English/Spanish/Chinese vocals were being transcribed as gibberish kana. New tune knob
+  `whisper_lang_lock=1`. **(090)** Verified-Shazam wins: gate the decide-by-ear loop behind
+  `_verified AND _title_locked` so we don't re-fight a confident lock on every Shazam tick;
+  clear stale `self.offset` + per-track decide cache on lock so an old track's offset can't
+  bleed into the next song. **(091)** SMTC artist normalizer: `_normalize_smtc_artist`
+  decompacts PascalCase artist handles (CalibreCincuenta → Calibre 50) including
+  Spanish/English/Japanese number-words. **(093)** Pinyin tone marks: `lazy_pinyin(..., style=Style.TONE)`
+  so "yao zou shang hang ye ta jian" becomes "yāo zǒu shàng háng yè tǎ jiān". **(094)** jieba
+  word segmentation: per-word pinyin chunking + polyphonic-character disambiguation via
+  `jieba.cut` (so 行 picks `xíng` vs `háng` from word context). **(095)** NetEase Cloud Music
+  lyrics provider added to `fetch_lyrics.py` chain; attempted only when `lang == "zh"`,
+  fills the Chinese long-tail gap before AI generation. **(097)** Tray menu reorganized
+  into 8 grouped sections (per-song actions, detection/sources, sync behavior, visual,
+  performance, library, app/system, updates) with separators between.
+- **v1.0.87 — Karaoke fill speedup (+1 CPU core to app):** widened the app's CPU affinity
+  from cores 7-14 (8 cores) to cores 7-15 (9 cores) — the laptop has 16 logical cores and
+  the previous mask left core 15 unused. Karaoke fill paint is the dominant per-frame cost
+  during a sung line; the extra core eats spikes during simultaneous Shazam decode +
+  scroll-belt redraw without bumping the build mask (still 3-6 to avoid the app's cores).
+  Re-tuned the fill rate constant accordingly. NOTE: BUILD AFFINITY (cores 3-6) is now ONE
+  LESS than before to avoid overlapping core 7 — the recipe block above already reflects this.
 - **v1.0.86 — YouTube Music URL + ampersand-collab cover signal + YT Music metadata trust (TICKET-086):**
   three small, surgical changes targeting YouTube Music sources. (A) URL-prep helper
   `deep_transcribe._normalize_youtube_url` rewrites `music.youtube.com` → `www.youtube.com`

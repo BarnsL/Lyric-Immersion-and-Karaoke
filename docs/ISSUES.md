@@ -18,7 +18,16 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
-## TICKET-100 — Discord Rich Presence + Steam overlay music ingestion 🔵
+## TICKET-101 — Game Rich Presence + Steam SteamWorks music ingestion 🔵
+**Spun off from TICKET-100 (v1.0.89 shipped the Spotify-Listening Discord RP reader; this ticket owns the deferred parts).**
+**(A) Per-game Discord Rich Presence:** rhythm/music games (Muse Dash, beatmania, BMS clients, some VRChat worlds) publish "now playing" track info in their Discord RP `details`/`state`/`large_text`. Each game uses an ad-hoc string format, so this needs a per-`application_id` allowlist + per-game parser. Gate behind a new tune knob `discord_game_rpc = 0` (default OFF) and a separate menu item so a wrong parser can't poison the Spotify-Listening path that already works.
+**(B) Steam Rich Presence / SteamWorks:** as previously scoped under TICKET-100. Read self via `steam_api64.dll` `ISteamFriends::GetFriendRichPresence` for keys `"steam_display"` / `"music_track"`. Effectiveness varies wildly per game; ship behind `steam_rpc = 0` (default OFF).
+**(C) Registered Discord application id:** the current discord_rpc.py uses a placeholder client_id for the read-only GET_ACTIVITY handshake. Discord has historically allowed unregistered ids for read-only IPC, but the discord_rpc.py module-level comment flags this as undocumented. If Discord tightens enforcement we need a real registered application (one-time setup at discord.com/developers/applications). Track as a sub-task here so it's not lost.
+**Priority:** lowest of the new batch — TICKET-100/A (Spotify Listening) already covers the high-value case (audio playing on a phone / BT speaker / non-SMTC device while the laptop's Discord shows the track).
+
+---
+
+## TICKET-100 — Discord Rich Presence + Steam overlay music ingestion 🟢 (v1.0.89; A landed, B + Steam deferred to TICKET-101)
 **Goal:** add supplementary "what's playing" sources beyond SMTC so we catch overlay/ambient music.
 **(A) Discord Rich Presence (local IPC):** Discord client exposes a local named pipe on Windows (`\\?\pipe\discord-ipc-0` through `discord-ipc-9`). The IPC supports `GET_ACTIVITY` to read the current user's Activity, which includes "Listening to Spotify" with track/artist/timestamps. Implementation: connect via win32pipe, send the Discord RPC handshake + GET_ACTIVITY, parse the response. Wire as a SOURCE that augments SMTC when SMTC is silent (or as a "what's my friend playing" presence-aware mode behind a tray toggle).
 **(B) Steam Rich Presence / SteamWorks:** Steam doesn't expose game audio directly, but some games broadcast track info via Steam Rich Presence (visible on profile). Read via `steam_api64.dll` `ISteamFriends::GetFriendRichPresence` for self, key `"steam_display"` or `"music_track"`. Effectiveness varies wildly per game; most games don't populate it.
@@ -28,7 +37,7 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
-## TICKET-099 — SMTC vs Shazam disagreement: trust live audio over paused player 🔴
+## TICKET-099 — SMTC vs Shazam disagreement: trust live audio over paused player 🟢 (v1.0.89)
 **Symptom (live diag, 2026-06-27):**
 ```
 player_title: "HAVE A NICE DAY"     ← SMTC (paused YouTube)
@@ -53,7 +62,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 
 ---
 
-## TICKET-098 — Scroll-in: slide-in from top/bottom (centered) + right-orient on slide-in right 🔴
+## TICKET-098 — Scroll-in: slide-in from top/bottom (centered) + right-orient on slide-in right 🟢 (v1.0.89)
 **User request:** under Scroll-in menu, add "Slide in from top" and "Slide in from bottom" which auto-center text horizontally. "Slide in from right" should auto-set text orientation to right-aligned.
 **Current state (main.py:6989-7002):**
 - `none` (stationary), `left`/`right` (per-line slide from edge), `lr`/`rl` (continuous scroll-through), `tb`/`bt` (continuous vertical scroll-through).
@@ -73,7 +82,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 
 ---
 
-## TICKET-097 — Tray menu logical reorganization 🔴
+## TICKET-097 — Tray menu logical reorganization 🟢 (v1.0.88)
 **Symptom:** current tray menu order grew organically; alike controls are scattered. "Re-fetch lyrics" sits in the system section, "Local API" sits between visual settings and Start-with-Windows, "Show / Hide" lives below "Re-fetch lyrics" instead of at the top of the visual block.
 **Target structure** (separators between each group; alike controls grouped):
 1. **Per-song actions** — Wrong lyrics, Identify by sound, Force Sync, Re-fetch lyrics, Get captions for this video now
@@ -96,7 +105,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 
 ---
 
-## TICKET-095 — NetEase Cloud Music lyrics fallback (Chinese coverage) 🔴
+## TICKET-095 — NetEase Cloud Music lyrics fallback (Chinese coverage) 🟢 (v1.0.88)
 **Symptom:** Chinese long-tail (pop, rap, indie) often missing from lrclib + syncedlyrics. NetEase 网易云音乐 is the de-facto Chinese lyrics database with synced LRC for almost every Chinese release.
 **Implementation:** add `_fetch_netease_lyrics(title, artist, lang)` provider to `fetch_lyrics.py` chain. Search via public NetEase search API (`/cloudsearch?keywords=...`), grab top match by title+artist fuzzy, fetch lyrics via `/lyric?id=...`, parse `[mm:ss.xx]` LRC. Only attempted when `lang == "zh"` (skip cost for non-Chinese tracks). Falls in chain after lrclib/syncedlyrics, before AI generation.
 **Verify:** 揽佬SKAI, 法老, 陳奕迅, 五月天, 周杰倫 all hit NetEase before generation.
@@ -104,7 +113,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 
 ---
 
-## TICKET-094 — jieba word segmentation + per-word karaoke fill (zh) 🔴
+## TICKET-094 — jieba word segmentation + per-word karaoke fill (zh) 🟢 (v1.0.88)
 **Symptom:** Chinese lyrics chunked per-character. Karaoke fill highlights one hanzi at a time when it should highlight one WORD at a time (`梦想` should fill together, not 梦 then 想). Also: pinyin generated per-character misses polyphonic disambiguation (`行` could be `xíng` or `háng` depending on word context).
 **Implementation:** `jieba` segments full line. Karaoke fill iterates segments instead of chars. Pinyin generated per-segment via `pypinyin.lazy_pinyin(segment, style=Style.TONE)` (after TICKET-093), which uses dictionary-based disambiguation. Falls back to per-character when jieba unavailable.
 **Verify:** "要走上行业塔尖" → segments ["要", "走上", "行业", "塔尖"] → pinyin "yào zǒu shàng háng yè tǎ jiān". Per-word fill animation visible.
@@ -112,7 +121,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 
 ---
 
-## TICKET-093 — Pinyin tone marks (pypinyin Style.TONE) 🔴
+## TICKET-093 — Pinyin tone marks (pypinyin Style.TONE) 🟢 (v1.0.88)
 **Symptom:** Chinese pinyin currently displays without tone marks (`yao zou shang hang ye ta jian`). For learners this is critically incomplete — tones distinguish words (`mā má mǎ mà` = mother/hemp/horse/scold). Without tones the romanization is half-useful.
 **Fix:** `fetch_lyrics.py:595` — change `lazy_pinyin(text)` to `lazy_pinyin(text, style=Style.TONE)`. Add `from pypinyin import Style` import.
 **Verify:** Chinese track displays "yāo zǒu shàng háng yè tǎ jiān" instead of "yao zou shang hang ye ta jian"; tone-mark glyphs (ā/á/ǎ/à/ē/é/ě/è/ī/í/ǐ/ì/ō/ó/ǒ/ò/ū/ú/ǔ/ù/ǖ/ǘ/ǚ/ǜ) render correctly in current font. If font lacks combining diacritics, fall back to numbered tones (`yao1 zou3 shang4`) via `Style.TONE3`.
@@ -138,7 +147,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 
 ---
 
-## TICKET-091 — SMTC artist normalizer (number-word handles, PascalCase compaction) 🔴
+## TICKET-091 — SMTC artist normalizer (number-word handles, PascalCase compaction) 🟢 (v1.0.88)
 **Symptom (live diag, Calibre 50 - Corrido De Juanito):** SMTC reports `player_artist: "CalibreCincuenta"` (YouTube channel handle, "50" spelled out in Spanish, no space). Library lookup by SMTC text never finds the song; only Shazam succeeded. Generalizes to any artist whose YT/Spotify handle compacts spaces or spells digits.
 **Fix:**
 - Add `_normalize_smtc_artist(s)` invoked in `_on_track_change` before library lookup. Original SMTC string preserved on the side for display, normalized string used for matching.
@@ -151,7 +160,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 
 ---
 
-## TICKET-090 — Verified-Shazam wins (gate decide loop, clear stale offset on lock) 🔴
+## TICKET-090 — Verified-Shazam wins (gate decide loop, clear stale offset on lock) 🟢 (v1.0.88)
 **Symptom (live diag, Calibre 50 - Corrido De Juanito):** Shazam correctly identified the song (`verified: true`, `heard_by_sound: ["Corrido De Juanito", "Calibre 50"]`, `matched_title`/`matched_artist` set, `line_count: 54` lyrics loaded). But `title_locked: false` and `identifying: true` — decide loop kept running, ranked four wrong Japanese candidates (`too_late_18if_episode_7_ending`, `the_world_is_mine_feat_hatsune_miku`, `sky_high`, `reincarnation`), and a stale offset of `-22.98s` from an earlier wrong-song decide blocked all lyric display (`effective_song_time: -16.99` while position was `+5.8`, `current_line: null`).
 **Fix:**
 - When Shazam returns `verified=True` AND `heard_by_sound` matches the loaded library file (title+artist fuzzy), immediately set `_title_locked = True`.
@@ -163,7 +172,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 
 ---
 
-## TICKET-089 — Whisper language lock from SMTC / Shazam metadata (kill Japanese hallucination on non-CJK audio) 🔴
+## TICKET-089 — Whisper language lock from SMTC / Shazam metadata (kill Japanese hallucination on non-CJK audio) 🟢 (v1.0.88)
 **Symptom (live diag, Calibre 50 - Corrido De Juanito):** `lang: "es"` was known from artist/title heuristics, yet faster-whisper transcription returned `"てれこにでもなくすまさきまで読むとってよメタ取ればズラだった呼吸やるはやかててもる受け取れた"`. Whisper's language auto-detect defaulted to Japanese on Spanish vocals (likely because our library is ~95% Japanese, hyperparameters tuned for it, and Spanish input below the model's confidence floor). The Japanese hallucination then ranked four Japanese candidates in `decision.ranked` and triggered `wrong_song_strikes` against the actually-correct Shazam match.
 **Fix:**
 - In `deep_transcribe.transcribe_audio` (and wherever WhisperModel.transcribe is called for ID purposes), accept an optional `language` arg. Default `None` (current behavior).
@@ -176,7 +185,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 
 ---
 
-## TICKET-088 — Smooth sync transitions still SNAPPING (user observation post-v1.0.85) 🔴
+## TICKET-088 — Smooth sync transitions still SNAPPING (user observation post-v1.0.85) 🟢 (v1.0.88)
 **Symptom (user report):** "we have bad performance with merely sliding text right now and smooth transitions arent working yet they are snapping instead." Despite TICKET-078 (line-boundary deferral), TICKET-081 (in-tick Shazam routed through `_smooth_offset`), TICKET-082a (karaoke fill decoupling + scroll-mode deferral coverage + wall-clock ease), TICKET-082c (topmost re-assert) — transitions are still visually snapping for the user.
 **Hypotheses to verify:**
 - Some offset-write path I missed routing through `_smooth_offset` (e.g., `_on_song_onset` lines 4322/4324 still snap by design; maybe one of those is firing during normal playback now)
