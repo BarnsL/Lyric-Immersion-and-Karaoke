@@ -1,8 +1,12 @@
-# 🎤 Desktop Karaoke
+# 🎤 Lyric Immersion and Karaoke
+
+<sub>*(formerly Desktop Karaoke)*</sub>
 
 **A transparent, always-on-top karaoke overlay that floats synced, annotated
 lyrics over whatever you're playing — built for learning Japanese (plus Chinese,
 Korean, Spanish, German, and Russian) by singing along.**
+
+> ### ⬇️ Just want to use it? [**Download the latest release**](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest) → unzip → double-click `DesktopKaraoke.exe`. No install, no Python, no account. That's it.
 
 Play a song in **Spotify, YouTube, or any app** that talks to Windows' media
 controls, and Desktop Karaoke pulls the **real playback position** and streams
@@ -76,32 +80,50 @@ while it runs.
 
 ### Portable build (no install, no Python — just download and run)
 
-The easy path for everyone: open the **[latest release](https://github.com/BarnsL/Desktop-Karaoke/releases/latest)**,
-download **`DesktopKaraoke-portable.zip`**, right-click → **Extract All**, and
-double-click **`DesktopKaraoke.exe`** inside. That's it — **every feature works out
-of the box** (lyrics, sync, furigana/romaji/translation, AI generate-by-ear, and
-sync-by-listening all run on the CPU; the small speech model downloads itself the
-first time it's needed). It keeps its lyric library and settings next to itself, so
-you can copy the whole folder anywhere — or run it off a USB stick. To self-build it
-instead, see [BUILD.md](docs/BUILD.md).
+The easy path for everyone:
 
+1. Open the **[latest release](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest)**.
+2. Download **`LyricImmersion-portable.zip`**.
+3. Right-click → **Extract All**.
+4. Double-click **`DesktopKaraoke.exe`** inside.
+
+That's it. The app starts in your **system tray** (the little purple microphone by
+the clock), and lyrics appear the moment you play a song. It's **fully portable** —
+the lyric library and settings live next to the `.exe`, so you can copy the whole
+folder anywhere, or run it off a USB stick. To build it yourself, see
+[BUILD.md](docs/BUILD.md).
+
+**Everything you need for everyday use is built in** — synced lyrics, furigana /
+romaji / pinyin / romaja, English translation, the karaoke fill, identify-by-sound
+(Shazam), playlist import, and multi-monitor. No extra downloads.
+
+> #### 🧠 Optional AI add-on (only if you want it)
+> One feature is **not** bundled, to keep the download small (~200 MB instead of
+> ~750 MB): **Whisper** (`faster-whisper`). It's only needed as a **last resort to
+> GENERATE lyrics by ear** for a song *no* lyric site or caption has — and it also
+> powers the optional "sync / identify by listening" extras. **You don't need it for
+> normal use** (provider lyrics + the video's own captions cover almost everything).
+> If you ever want it, run **`install_extras.bat`** in the app folder (or the tray's
+> **Install AI extras**) — it downloads it once, and the small speech model fetches
+> itself the first time it's used.
+>
 > Optional, NVIDIA only: the tray's **⚡ Enable GPU acceleration** fetches the CUDA
-> libraries on demand (~1.5 GB) — they're not bundled, so the download above stays
-> small (~200 MB). Everything already works without it.
+> libraries on demand (~1.5 GB) to speed that AI up. Everything works without it.
 
 #### ✅ What you need for each feature
 
-The **portable build and the Microsoft Store install include everything below** —
-nothing extra to install. The right-hand column is only for running **from source**.
+**Everything below except the AI add-on is built into the portable build** — nothing
+extra to install. The right-hand column is only for running **from source**.
 
-| Feature | Portable / Store | From source (`pip install -r requirements.txt` covers all but the optional ones) |
+| Feature | Portable build | From source (`pip install -r requirements.txt` covers all but the optional ones) |
 |---|---|---|
 | Synced lyrics · furigana · romaji · pinyin/romaja · translation · karaoke fill | ✅ built-in | ✅ in `requirements.txt` |
-| Identify-by-sound (Shazam) · fast song-change detect | ✅ built-in | ✅ in `requirements.txt` |
+| Identify-by-sound (Shazam) · fast song-change detect · live-version resync | ✅ built-in | ✅ in `requirements.txt` |
+| Use the video's own caption track for exact, perfectly-timed lyrics | ✅ built-in | ✅ in `requirements.txt` |
 | Multi-monitor: move to a screen · span/scroll across all · mirror | ✅ built-in | ✅ in `requirements.txt` |
 | Import playlists (Spotify OAuth · Exportify CSV · YouTube Music) | ✅ built-in | ✅ in `requirements.txt` |
-| **Generate lyrics by ear** (instant best-effort) · **Sync by listening** | ✅ bundles **faster-whisper** | `pip install faster-whisper` |
-| **Deep transcription** (downloads the source audio + transcribes the whole song for a clean, complete generated lyric — see [docs/GENERATION.md](docs/GENERATION.md)) | ✅ bundles **faster-whisper + yt-dlp** | `pip install faster-whisper yt-dlp` **+** a JS runtime on `PATH` (**Node** or **Deno**) so YouTube downloads don't 403 |
+| 🧠 **Generate lyrics by ear** (last resort, when no source has them) · **identify / sync by listening** | ⬇️ optional — **`install_extras.bat`** (downloads **faster-whisper** once) | `pip install faster-whisper` |
+| 🧠 **Deep transcription** (downloads the source audio + transcribes the whole song — see [docs/GENERATION.md](docs/GENERATION.md)) | ⬇️ optional — **`install_extras.bat`** | `pip install faster-whisper yt-dlp` **+** a JS runtime on `PATH` (**Node** or **Deno**) so YouTube downloads don't 403 |
 | GPU acceleration (NVIDIA, optional speed-up) | tray → **⚡ Enable GPU acceleration** (downloads CUDA on demand) | same, or `python gpu_setup.py` |
 
 Every optional piece **degrades gracefully** — if it's missing, that one feature
@@ -311,7 +333,7 @@ python  main.py --offset -1.5    # nudge sync earlier for an intro-heavy video
 
 > **?? Optional features:** Run **`install_extras.bat`** for a guided installer
 > that offers faster-whisper (AI lyric generation + sync by listening), yt-dlp
-> (deep transcription), and GPU acceleration. Each is a Y/N choice � skip what
+> (deep transcription), and GPU acceleration. Each is a Y/N choice � skip what
 > you don't want.
 
 **Build the one-click installer yourself** — see [BUILD.md](docs/BUILD.md):
