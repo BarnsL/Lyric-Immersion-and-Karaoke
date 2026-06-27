@@ -8,6 +8,30 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-084 — Rebrand "Desktop Karaoke" → "Lyric Immersion and Karaoke" (display strings) 🟢
+**Symptom:** taskbar tray icon tooltip still read "Desktop Karaoke" (and other user-facing surfaces did too), even though the exe + product were renamed in v1.0.77. Discord-shared previews, the /health endpoint, the About / window-title, and the MSIX DisplayName all still showed the old name.
+
+**Audit + replacement (v1.0.84 — workflow `rebrand-display-strings`):**
+- **15 DISPLAY-REPLACE edits** across 6 files; every internal data-path / cache slug / build artifact preserved:
+  - `api.py:190 / 238` — `/health` `app` field (both endpoints)
+  - `character.py:180` — artist-fallback theme key
+  - `main.py:177` — Startup .lnk filename
+  - `main.py:1161` — Tk window title
+  - `main.py:6418, 6428, 6463, 6470, 6479, 6487, 6533, 6556` — pystray tray tooltip + all `icon.notify(..., "Lyric Immersion and Karaoke")` toast titles + update-checker hints
+  - `playlist_import_gui.py:70` — Import Playlist window title
+  - `packaging/AppxManifest.template.xml:20, 38` — MSIX `<DisplayName>` + VisualElements DisplayName
+  - `packaging/AppxManifest.template.xml:35` — MSIX `Executable="Lyric-Immersion-and-Karaoke.exe"` (caught by adversarial verify, the audit had missed it — would have made the MSIX point at a file that no longer existed)
+  - `packaging/build_msix.ps1:46` — `-SkipBuild` Test-Path now checks the renamed exe so the fast-path actually skips the rebuild (caught by verify too)
+  - `version.py` → `1.0.84`
+- **INTERNAL-PRESERVE** kept intact:
+  - `D:\DesktopKaraoke\` deploy folder, `%LOCALAPPDATA%\DesktopKaraoke` data-dir (would orphan lyric cache + Whisper models if changed)
+  - `DesktopKaraoke.spec` PyInstaller spec name + `dist/DesktopKaraoke/` build output dir
+  - `<Application Id="DesktopKaraoke">` MSIX AppId (immutable identity — changing loses upgrade path)
+  - mutex name, UA strings, pystray icon-name slug (`"desktop-karaoke"`), build scripts, all code comments / docstrings / historical doc references
+- **Live verified:** `/health` returns `"app":"Lyric Immersion and Karaoke","version":"1.0.84"` immediately after deploy.
+
+---
+
 ## TICKET-082c — Overlay below game/app layer (z-order topmost re-assert) 🟢
 **Symptom:** the click-through lyric overlay was getting buried under a borderless-windowed game (or any other app that asserts topmost) after a focus change. Tk's `-topmost True` attribute is one-shot at window creation — nothing kept the overlay at top z-order over time. v1.0.82's `_click_guard` re-asserted click-through every 500 ms but not topmost.
 **Fix (v1.0.83):** `_click_through` now also calls `SetWindowPos(hwnd, HWND_TOPMOST, …, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)` on every guard tick — the exact pattern Discord/Steam/Nvidia overlays use, and a no-op when the window is already topmost so it's free to call at 500 ms cadence. Also added `WS_EX_TOPMOST` (0x00000008) to the EXSTYLE mask so the bit stays set. Mirror windows get the same treatment per-HWND inside the same loop.

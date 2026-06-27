@@ -43,7 +43,7 @@ if (-not $makeappx) { throw "makeappx.exe not found - install the Windows 10/11 
 if (-not (Test-Path $venvPy)) { throw "venv python not found at $venvPy - create the .venv and pip install -r requirements.txt pyinstaller first." }
 
 # 1) Build the frozen app (PyInstaller).
-if ($SkipBuild -and (Test-Path "$bundle\DesktopKaraoke.exe")) {
+if ($SkipBuild -and (Test-Path "$bundle\Lyric-Immersion-and-Karaoke.exe")) {
   Write-Host "[1/5] Reusing existing bundle at $bundle" -ForegroundColor Cyan
 } else {
   Write-Host "[1/5] Building app bundle (PyInstaller)..." -ForegroundColor Cyan

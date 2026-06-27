@@ -67,7 +67,7 @@ def _create_or_raise(root: tk.Misc) -> None:
 
 def _build_window(root: tk.Misc) -> None:
     win = tk.Toplevel(root)
-    win.title("Import Playlist — Desktop Karaoke")
+    win.title("Import Playlist — Lyric Immersion and Karaoke")
     win.configure(bg=_BG)
     win.resizable(False, False)
     win.geometry("560x560")

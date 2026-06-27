@@ -177,7 +177,7 @@ class Character:
         cv = self.cv
         cv.delete("all")
         t = time.time() - self._t0
-        body, dark, hair = _theme(self.artist or "Desktop Karaoke")
+        body, dark, hair = _theme(self.artist or "Lyric Immersion and Karaoke")
         cx = self.W / 2
 
         # dance: lively bob + sway while playing; gentle idle otherwise
