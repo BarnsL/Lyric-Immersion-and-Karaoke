@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import contextlib
 import ctypes
 from ctypes import wintypes
 import json
@@ -24,6 +25,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -903,12 +905,21 @@ def clean_title(title, source="", artist=""):
 
 
 # Titles that name an EVENT (a whole concert / festival / medley), not a song.
+# TICKET-106: added the "Nth ONE-MAN LIVE" / "Nth LIVE TOUR" / ワンマン family so
+# titles like "歌姫 from V.W.P 4th ONE-MAN LIVE" promote to live_mode (drive by
+# sound, ignore title-as-song) instead of just is_live_arrangement (FOLLOW offset,
+# title still trusted). Generic bare "(Live)" / "[LIVE]" / "Live ver." stay OUT —
+# those mark single-song live arrangements and are handled by _LIVE_VER_RE.
 _LIVE_RE = re.compile(
     r"\b(?:concert|fes(?:tival)?|tour|setlist|set\s*list|medley|megamix|"
     r"mega\s*mix|non-?stop|dj\s*set|full\s*(?:album|live|concert|set)|"
     r"rock\s*japan|rising\s*sun|summer\s*sonic|fuji\s*rock|countdown|"
-    r"anniversary\s*live)\b"
+    r"anniversary\s*live|"
+    r"one[\s-]?man\s*live|"                                   # TICKET-106: 'ONE-MAN LIVE' (JP solo-concert idiom)
+    r"\d+(?:st|nd|rd|th)\s+one[\s-]?man(?:\s*live)?|"         # TICKET-106: '4th ONE-MAN LIVE', '5th ONE-MAN'
+    r"\d+(?:st|nd|rd|th)\s+(?:live|tour|anniversary)\s+(?:tour|live|stage|fes(?:tival)?))\b"  # TICKET-106: '10th LIVE TOUR', '5th ANNIVERSARY LIVE'
     r"|ライブ|ﾗｲﾌﾞ|生放送|コンサート|フェス|ツアー|メドレー|セットリスト|セトリ|"
+    r"ワンマン(?:ライブ)?|"                                    # TICKET-106: ワンマン / ワンマンライブ
     r"周年ライブ|[0-9]+\s*周年|[0-9]\s*d\s*live",
     re.I,
 )
@@ -1292,22 +1303,60 @@ def draw_text(cv, x, y, text, font, fill, anchor="center", tags="cur"):
                           anchor=anchor, tags=tags)
 
 
-_MEASURE_CACHE = {}
+# Bounded LRU cache for measure_text widths. The previous implementation was an
+# unbounded dict, which (a) drifted up forever when font_scale or the active
+# script set changed mid-session, and (b) couldn't be inspected from /diag. The
+# OrderedDict variant evicts oldest on overflow and exposes hit-rate telemetry.
+# Cardinality target: ~3000-5000 entries per song (JP common-char set + Latin +
+# 1-3 effective (size, weight) variants per font). 4096 covers this with
+# headroom; raise via the 'measure_text_cache_size' tune knob (effective at
+# next app restart since the cache is module-level).
+_MEASURE_CACHE_MAX = 4096
+_MEASURE_CACHE = OrderedDict()
+# Lifetime counters for /diag (process-lifetime; no reset path today since the
+# app has no hot-reload of main.py). Kept as a small list so we don't need a
+# 'global' declaration in the hot path.
+_MEASURE_CACHE_STATS = [0, 0]  # [hits, misses]
 
 
 def measure_text(cv, text, font):
     """Pixel width of `text` in `font`, cached. Width depends only on (text,
     font), so caching avoids creating/deleting a throwaway canvas item on every
-    call (the non-scroll renderer measures every character per line)."""
+    call (the non-scroll renderer measures every character per line).
+
+    Bounded LRU (cap = _MEASURE_CACHE_MAX). Tk-thread only (every caller is
+    reached via root.after), so no lock is taken; if measure_text is ever moved
+    off the Tk thread, revisit this and the create_text/bbox/delete trio below.
+    """
     key = (text, font)
-    w = _MEASURE_CACHE.get(key)
-    if w is None:
-        tid = cv.create_text(-9999, -9999, text=text, font=font, anchor="nw")
-        bbox = cv.bbox(tid)
-        cv.delete(tid)
-        w = (bbox[2] - bbox[0]) if bbox else 0
-        _MEASURE_CACHE[key] = w
+    cache = _MEASURE_CACHE
+    w = cache.get(key)
+    if w is not None:
+        # Hit: refresh recency, bump counter, return cached width.
+        cache.move_to_end(key)
+        _MEASURE_CACHE_STATS[0] += 1
+        return w
+    # Miss: do the (expensive) Tk measurement, insert, evict oldest if over cap.
+    tid = cv.create_text(-9999, -9999, text=text, font=font, anchor="nw")
+    bbox = cv.bbox(tid)
+    cv.delete(tid)
+    w = (bbox[2] - bbox[0]) if bbox else 0
+    cache[key] = w
+    if len(cache) > _MEASURE_CACHE_MAX:
+        cache.popitem(last=False)
+    _MEASURE_CACHE_STATS[1] += 1
     return w
+
+
+def _measure_text_cache_hit_rate():
+    """hits / (hits + misses) over process lifetime, or None if no calls yet.
+    Surfaced in /diag as 'measure_text_cache_hit_rate' to detect cache
+    thrashing (e.g. font_scale spam) without rebuilding."""
+    hits, misses = _MEASURE_CACHE_STATS
+    total = hits + misses
+    if total == 0:
+        return None
+    return round(hits / total, 4)
 
 
 def _work_area():
@@ -1512,6 +1561,15 @@ class Overlay:
         self._perf_path = None
         self._perf_last_offset = None
         self._perf_last_idx = None
+        # A2 sub-branch timing: dict reset every _tick; populated by _perf_branch.
+        # Values are "last completed call within this tick" (a cancelled _render
+        # leaves the prior value stale, document in _perf_record).
+        self._perf_branch_ms = {}
+        # Cached parsed set so we don't re-split the pipe string every tick.
+        self._perf_branches_raw = None
+        self._perf_branches_set = set()
+        # A2 raw frame dt (untrusted samples → None so the log shows '-').
+        self._raw_dt_ms = None
         self._display_offset = None
         self._display_offset_t = 0.0
         self._spawn_budget = 1       # max scroll blocks to PIL-render per heavy frame
@@ -1593,6 +1651,12 @@ class Overlay:
         self._verified = False           # public api.verified: meta AND sound-corroborated
         self._verified_meta = False      # internal: duration/title match at load time
         self._sound_corroborated = False # internal: ≥1 Shazam read agreed with loaded title
+        # TICKET batch4: wall-clock of the most recent True→False transition
+        # of self._verified. Drives the verified_render_gate_s grace window
+        # (lyrics on screen survive a transient disagreement instead of
+        # tearing down immediately). 0 = not currently in a gate window.
+        # Cleared on _on_track_change (real song change is not transient).
+        self._verified_gate_t = 0.0
         # TICKET-099: paused-SMTC Shazam takeover tracking.
         # _smtc_paused_since: wall-clock when SMTC most recently EDGED PLAYING→not-PLAYING (0 = currently playing or unknown)
         # _last_takeover_t:   wall-clock of the last takeover swap (debounces back-to-back swaps)
@@ -1643,14 +1707,15 @@ class Overlay:
             "sync_confirm_hold_ms": 2600,   # hesitation before the confirming listen
             "sync_confirm_listen_s": 5.0,   # confirming-listen capture length
             "applause_min_s":        2.5,   # loud-non-vocal seconds = a concert applause gap
-            "live_resync_s":        12.0,   # (legacy) LIVE/concert lyric-match RESYNC cadence
+            "live_resync_s":         6.0,   # (legacy) LIVE/concert lyric-match RESYNC cadence (TICKET-106: 12.0 → 6.0)
             # Concert/live ARRANGEMENTS resync on a rolling, aggressive de-escalation:
-            # start ~8×/min; after 3 good reads in a row relax to ~5×/min; after 3 more
-            # to ~3×/min; ANY miss snaps straight back to ~8×/min so a drifting concert
-            # gets hammered until it re-locks. (gap = pause AFTER a listen; period≈listen+gap)
-            "live_resync_listen_s":  6.0,   # shorter capture for live (faster cycle than the 9 s default)
-            "live_resync_fast_gap_s": 1.5,  # ~8×/min  (fresh song / while missing)
-            "live_resync_mid_gap_s":  6.0,  # ~5×/min  (after 3 good reads)
+            # start ~12×/min (TICKET-106; was ~8); after 3 good reads in a row relax to
+            # ~6×/min; after 3 more to ~3×/min; ANY miss snaps straight back to fast so a
+            # drifting concert gets hammered until it re-locks. (gap = pause AFTER a
+            # listen; period≈listen+gap)
+            "live_resync_listen_s":  4.0,   # TICKET-106: 6.0 → 4.0 (shorter capture, faster cycle)
+            "live_resync_fast_gap_s": 1.0,  # TICKET-106: 1.5 → 1.0 (~12×/min while missing / fresh song)
+            "live_resync_mid_gap_s":  6.0,  # ~6×/min  (after 3 good reads)
             "live_resync_slow_gap_s": 14.0, # ~3×/min  (after 6 good reads — locked in)
             "live_resync_relax_n":     3,   # good reads per de-escalation step
             "spread_reset":         20.0,   # chorus-ambiguity spread threshold
@@ -1676,6 +1741,31 @@ class Overlay:
             "smtc_paused_shazam_takeover": 1,    # 1 = enable takeover; 0 = disable
             "smtc_paused_min_s":           8.0,  # continuous non-PLAYING floor before takeover may fire
             "smtc_takeover_debounce_s":   20.0,  # min seconds between consecutive takeovers
+            # ── TICKET batch4 A3: title-alias album fallback ──
+            # When Shazam returns the ALBUM name instead of the track name (very
+            # common with V.W.P style releases where Shazam responds with e.g.
+            # 'DIVA (feat. KAF, RIM, Harusaruhi, Isekaijoucho & KOKO)' while
+            # SMTC has the actual track '歌姫'), the existing wrong-song strike
+            # flow used to spend 70+s tearing the lyrics down on a benign
+            # disagreement. With this knob ON (default 1), structural markers
+            # in the Shazam title ('(feat.', ' - EP', ' (Album)', ' Vol.', or
+            # ALL-CAPS multi-word ASCII) make us accept SMTC as canonical and
+            # set _sound_title_alias = Shazam_title so subsequent reads still
+            # calibrate via the existing alias path. Set 0 to disable and fall
+            # back to v1.0.90 strike behavior for diagnosis.
+            "title_alias_album_fallback":   1,   # 1 = album-string fallback on; 0 = off
+            # ── TICKET batch4: verified→False render grace window ──
+            # A True→False flip of self._verified used to start the teardown of
+            # lyrics immediately (the 71s outage in workflow w821l9jnw was a
+            # benign Shazam disagreement that demoted verified, then the
+            # downstream tear logic kicked in for the full window). Hold the
+            # render-side teardown for this many seconds after the most recent
+            # True→False transition so a re-confirming Shazam read (or the
+            # album-alias path above) can bring verified back without ever
+            # clearing self.lines. _on_track_change clears the gate immediately
+            # — a real new song must wipe. /diag exposes
+            # verified_render_gate_remaining_s so the live window is visible.
+            "verified_render_gate_s":     3.0,
             "unconfirmed_backoff_s": 30.0,  # settled-but-unconfirmable song → slow the Shazam poll (anti-stutter)
             "confirmed_recal_s":     45.0,  # confirmed+watched song → slow Shazam re-lock (tier handles drift)
             "wrong_song_strikes":     5,    # heard the SAME other song this many × → loaded song is wrong, switch
@@ -1689,10 +1779,20 @@ class Overlay:
                                             #  rejected by 1 point of an absolute threshold. The lopsided
                                             #  override + sync-reject still catch real misfires.)
             # ── TICKET-082 perf instrumentation ──
-            "perf_record":           0,     # 1 = log per-frame perf to perf.log (zero observer effect,
+            "perf_record":           0,     # 1 = log per-frame perf to perf.log (near-zero observer effect,
                                             #     writes on Tk thread to a buffered append). Off by default.
             "perf_record_path":      "",    # explicit path; if empty + perf_record=1 → <data>/perf.log
             "perf_record_cap_mb":    20.0,  # rotate the perf log when it grows beyond this
+            # A2 sub-branch timers: pipe-separated set of branches to bracket with
+            # time.perf_counter() in the hot path. Default covers the three known
+            # offenders from workflow w821l9jnw (LINE-mode stutter root cause).
+            # Drop entries (e.g. "render|kara") once a branch is ruled out to
+            # cut the per-frame overhead further. Unknown branches are no-ops.
+            "perf_record_branches":  "render|kara|itemconfig",
+            # A2 raw frame dt: when 1, the perf log adds a `raw_dt_ms` column
+            # right after `frame_ms` so a single stall stands out instead of
+            # being smeared by the 0.9/0.1 EWMA. 0 = legacy format (EWMA only).
+            "perf_record_raw_frame_ms": 1,
             "ease_slew_cap_s":       3.0,   # max seconds-per-second the eased offset can slew
             "ease_pull_per_sec":     3.5,   # exponential pull rate (higher = catches up faster)
             # TICKET-088: per-frame fraction cap so a single heavy frame (e.g. 300ms
@@ -1728,8 +1828,8 @@ class Overlay:
             "sync_tier_fast_s":     20.0,   # escalated verify cadence (~3×/min)
             "sync_tier_mid_s":      40.0,   # one hysteresis step (after 1 good check)
             "sync_tier_slow_s":     60.0,   # relaxed cadence (1×/min) once sync holds
-            "sync_tier_ok_drift":    0.8,   # |measured drift| ≤ this on a check = in sync
-            "sync_tier_listen_s":    6.0,   # Whisper capture length for a tier check (short = light)
+            "sync_tier_ok_drift":    1.2,   # TICKET batch1: 0.8 → 1.2 — unblocks tier scheduler on periodic JP tracks
+            "sync_tier_listen_s":    4.0,   # TICKET batch1: 6.0 → 4.0 — faster retry cadence
             # ── FORCE SYNC (manual nuclear resync) ──
             "force_sync_streak":       3,   # confirming reads in a row before a candidate locks
             "force_sync_listen_s":   8.0,   # transcribe capture length per Force-Sync read
@@ -1742,20 +1842,29 @@ class Overlay:
             "energy_max_offset":    60.0,   # |new_off| < this for sanity
             "energy_shift_penalty":  0.012, # per-second penalty for large offset changes (small-shift prior)
             "energy_peak_margin":    0.06,  # reject if a distant rival peak is within this of the best
-            # ── render perf knobs (scroll-through smoothness) ──
-            # heavy_budget_ms caps the per-frame spawn/repaint work so a PIL
-            # paste can't stall the scroll belt; 0 disables the cap.
-            "heavy_budget_ms":      14.0,   # max ms of spawn+repaint work per heavy frame (40% more PIL slice with +1 core)
-            "repaint_budget":        3.0,   # max karaoke-fill SLIVER pastes per heavy frame (cheap now)
-            "fill_interval":        0.04,   # min seconds between a block's fill repaints (25 fps cap; was 0.06=16 fps)
-            "spawn_budget":          1.0,   # max block PIL-renders per heavy frame (alloc spikes still dangerous, keep low)
-            "fill_skip":             2.0,   # heavy work runs every Nth frame (fills are sliver-cheap)
+            # ── render perf knobs (SCROLL-MODE ONLY — scroll-through smoothness) ──
+            # scroll_heavy_budget_ms caps the per-frame spawn/repaint work so a PIL
+            # paste can't stall the scroll belt; 0 disables the cap. NONE of these
+            # gate LINE-mode work (line mode's per-char measure_text + per-font
+            # canvas ascent measurement is unbudgeted — see TICKET-104/105).
+            "scroll_heavy_budget_ms": 14.0, # scroll-mode only: max ms of spawn+repaint work per heavy frame (40% more PIL slice with +1 core)
+            "scroll_repaint_budget":   3.0, # scroll-mode only: max karaoke-fill SLIVER pastes per heavy frame (cheap now)
+            "scroll_fill_interval":   0.04, # scroll-mode only: min seconds between a block's fill repaints (25 fps cap; was 0.06=16 fps)
+            "scroll_spawn_budget":     1.0, # scroll-mode only: max block PIL-renders per heavy frame (alloc spikes still dangerous, keep low)
+            "scroll_fill_skip":        2.0, # scroll-mode only: heavy work runs every Nth frame (fills are sliver-cheap)
             # PERF-102 — scroll bitmap-area controls (the dominant scroll cost):
             "scroll_max_lanes":      3,     # stacked scrolling lines (capped to what fits on screen)
             "scroll_v_stagger":    250,     # VERTICAL scroll: horizontal stagger (px@scale1) between
                                             # the 2-3 staggered columns so lines cascade diagonally
                                             # (centre mode isn't bound by the L/R pad — it fans wide)
             "scroll_spawn_margin": 1100,    # px off-screen a block is pre-rendered (avoid pop-in)
+            # TICKET-104 A1 — bounded LRU cache for measure_text widths. Default
+            # 4096 comfortably holds the ~3000-5000 (char, font) working set per
+            # song with headroom for font_scale transitions. The cache is
+            # MODULE-LEVEL (_MEASURE_CACHE) so this knob takes effect at next
+            # app restart, not on live tune-knob edits. Bump if /diag shows
+            # measure_text_cache_hit_rate dropping under steady-state playback.
+            "measure_text_cache_size": 4096,
             # MV/cinematic intro hold backstop (primary release is the vocal poll).
             # Kept SHORT: a false "waiting for vocals" while the song is already
             # singing is worse than briefly running into a genuine long intro, so
@@ -1832,6 +1941,17 @@ class Overlay:
             "window_titles_generic_browsers": 0,  # 1 = ALSO scrape chrome/edge/firefox/etc (opt-in)
             "window_titles_poll_s":       2.0,  # background poll cadence (s); EnumWindows is sub-ms so 2s is safe
         }
+        # TICKET-104 A1: apply measure_text cache size ONCE at startup. The
+        # cache is module-level (shared across Overlay/Mirror), so we set the
+        # cap here rather than per-call (which would re-introduce the
+        # dict-lookup overhead the LRU is meant to eliminate). Live /tune POST
+        # changes to this key are ignored until next restart by design.
+        try:
+            global _MEASURE_CACHE_MAX
+            _MEASURE_CACHE_MAX = int(self._tune.get("measure_text_cache_size",
+                                                    _MEASURE_CACHE_MAX))
+        except Exception:
+            pass
         # TICKET-100: mirror the persisted toggle into the tune dict so a user
         # who flipped the tray menu ON in v1.0.89 boots back into the same
         # state at v1.0.90+ (the dict literal above defaults to 0; the persisted
@@ -2009,6 +2129,11 @@ class Overlay:
         self._sound_corroborated = False
         self._verified_meta = False
         self._verified = False
+        # TICKET batch4: a real SMTC track change must wipe lyrics immediately
+        # (the render-side gate is for transient mid-track demotions only).
+        # Clear the gate timestamp so /diag and any downstream gate check
+        # see "no active grace window".
+        self._verified_gate_t = 0.0
         self._smtc_paused_since = 0.0
         self._last_smtc_playing = None
         self._source_priority = "agree"
@@ -2117,6 +2242,7 @@ class Overlay:
             self._verified = False
             self._verified_meta = False           # TICKET-099
             self._sound_corroborated = False      # TICKET-099
+            self._verified_gate_t = 0.0           # TICKET batch4: real track change, no gate
             self._hint("🎤 Live set — listening for each song…")
         else:
             # Provisional: show the title/artist match instantly (so there's no
@@ -2156,6 +2282,7 @@ class Overlay:
                 self._verified = False
                 self._verified_meta = False           # TICKET-099
                 self._sound_corroborated = False      # TICKET-099
+                self._verified_gate_t = 0.0           # TICKET batch4: real track change, no gate
                 self._title_locked = False
                 self._hint(f"♪ {title} — identifying…")
                 self._start_fetch(fetch_artist, title, duration, cover=self._is_cover,
@@ -2310,7 +2437,39 @@ class Overlay:
             self._sound_corroborated = True
         # Public verified = meta AND sound-corroborated (TICKET-099). A duration
         # match alone is no longer enough — Shazam must agree at least once.
-        self._verified = bool(self._verified_meta and self._sound_corroborated)
+        new_v = bool(self._verified_meta and self._sound_corroborated)
+        # TICKET batch4: route through _set_verified so the True↔False edge
+        # bookkeeping (verified_render_gate_t) stays consistent across every
+        # site that mutates the flag.
+        self._set_verified(new_v, reason="mark_verified")
+
+    def _set_verified(self, value, reason=""):
+        """TICKET batch4: single chokepoint for self._verified assignments.
+
+        Records wall-clock of any True→False transition into
+        ``self._verified_gate_t`` so the verified_render_gate_s window can
+        defer lyric teardown on transient disagreements (e.g. Shazam returned
+        the album string while SMTC has the actual track). A False→True
+        transition resets the gate (something — alias path or a re-confirming
+        Shazam read — has restored verified, so no teardown is owed).
+
+        Bare ``self._verified = False`` assignments mid-track should be
+        replaced with this helper; the genuinely catastrophic sites
+        (``_on_track_change`` and ``_smtc_paused_takeover``) explicitly clear
+        ``_verified_gate_t = 0`` after the assignment, because a real song
+        swap must wipe lyrics immediately rather than holding the gate window.
+        """
+        new_v = bool(value)
+        prev = bool(getattr(self, "_verified", False))
+        self._verified = new_v
+        if prev and not new_v:
+            self._verified_gate_t = time.time()
+            if reason:
+                log.info("verified True→False (%s) — render gate armed", reason)
+        elif (not prev) and new_v:
+            if self._verified_gate_t:
+                log.info("verified False→True — render gate cleared")
+            self._verified_gate_t = 0.0
 
     def _update_smtc_pause_state(self, st):
         """TICKET-099: edge-detect SMTC PLAYING/not-PLAYING transitions.
@@ -2427,6 +2586,11 @@ class Overlay:
         self._sound_corroborated = False
         self._verified_meta = False
         self._verified = False
+        # TICKET batch4: takeover is an intentional swap to a different song;
+        # the render gate exists for transient mid-track demotions, not real
+        # song changes. Clear the gate so any deferred teardown can fire
+        # immediately and the new lyrics replace cleanly.
+        self._verified_gate_t = 0.0
         self.offset = 0.0
         self._fast_calib = max(self._fast_calib, 2)
         self._arm_recal(7)
@@ -2880,7 +3044,9 @@ class Overlay:
                 # flag goes true even before Shazam fingerprints the live cut.
                 self._verified_meta = True
                 self._sound_corroborated = True
-                self._verified = True
+                # TICKET batch4: route through _set_verified so the False→True
+                # transition clears any pending render gate window.
+                self._set_verified(True, reason="concert-ocr")
                 self._title_locked = True          # OCR is authoritative in a concert
                 self._sound_song = (title, artist)
                 self._last_sound_lock_t = time.time()
@@ -3003,6 +3169,50 @@ class Overlay:
                 # vs the normal SMTC-playing wrong-song flow). Cached locally so
                 # we don't hit the cross-thread media getter twice per result.
                 st_now = self.media.get() or {}
+                # TICKET batch4 A3: album-string fallback. Some Shazam reads
+                # respond with the ALBUM name plus a long "(feat. ...)" block
+                # instead of the actual track name (V.W.P "DIVA (feat. KAF,
+                # RIM, Harusaruhi, Isekaijoucho & KOKO)" vs SMTC's track
+                # "歌姫"). The existing wrong-song strike flow then spent ~71s
+                # tearing the lyrics down on what was actually the right song.
+                # When the Shazam title carries clear album-context markers
+                # AND it shares no content with the SMTC title (i.e. it's not
+                # the romanized-CJK alias case the existing flow already
+                # handles), accept SMTC as canonical and set the alias so
+                # subsequent reads of the same album-string still calibrate
+                # via the existing alias path. Heuristic is intentionally
+                # conservative — structural markers, not just any disagreement.
+                loaded_title = self.meta.get("title", "")
+                if (int(self._tune.get("title_alias_album_fallback", 1) or 0) == 1
+                        and bool(self.lines)
+                        and loaded_title
+                        and f_title
+                        and not self._titles_match(loaded_title, f_title)
+                        and (self._sound_title_alias is None
+                             or not self._titles_match(self._sound_title_alias, f_title))
+                        and not self._titles_share_content(loaded_title, f_title)
+                        and not _is_generic_title(loaded_title)
+                        and len(_norm_title(loaded_title)) >= 2):
+                    markers = ("(feat.", " - EP", " - Single", " (Album)",
+                               "(Album)", "(Deluxe", "(Remastered", " Vol.",
+                               " vol.", " / ")
+                    has_marker = any(m in f_title for m in markers)
+                    # ASCII all-caps multi-word: scoped tight (ASCII-only,
+                    # ≥2 space-separated tokens, total len ≥5) so JP/KR style
+                    # caps titles like 'IDOL'/'KICK BACK' don't trip it. Even
+                    # so we require a co-marker to fire — single-signal caps
+                    # alone are too fragile across languages.
+                    ascii_only = all(ord(c) < 128 for c in f_title)
+                    parts = f_title.split()
+                    caps_style = (ascii_only and len(parts) >= 2
+                                  and len(f_title) >= 5
+                                  and f_title.upper() == f_title
+                                  and any(p.isalpha() for p in parts))
+                    if has_marker or caps_style:
+                        log.info("album-alias accepted: shazam-title %r treated as "
+                                 "album for smtc-track %r (markers=%s caps=%s)",
+                                 f_title, loaded_title, has_marker, caps_style)
+                        self._sound_title_alias = f_title
                 # Does the song we HEARD match the lyrics currently loaded?
                 # Title match OR the romanized-title alias: when we loaded an
                 # original-script (CJK) cache for a romanized heard title (e.g.
@@ -3254,7 +3464,11 @@ class Overlay:
                                  "SMTC paused + Shazam contradicts loaded %r with %r",
                                  self.meta.get("title", ""), f_title)
                     self._sound_corroborated = False
-                    self._verified = False
+                    # TICKET batch4: route through _set_verified so a True→False
+                    # transition arms the render gate (lyrics survive while we
+                    # wait for the 2nd read or for the album-alias path to
+                    # re-confirm). This is the demote path the gate exists for.
+                    self._set_verified(False, reason="smtc-paused-demote")
                     self._title_locked = False
                     self._pending_switch = heard
                     # Also seed last_heard_contra so the title-lock strike flow
@@ -3316,6 +3530,31 @@ class Overlay:
                     else:
                         strikes = base_strikes
                     if self._sound_fail_streak >= strikes:
+                        # HIGH-FIX (verify lens 3-of-3): wire verified_render_gate
+                        # at the mid-track teardown site. When the v1.0.89 strict
+                        # verified gate just flipped to False (e.g., a transient
+                        # album-vs-track Shazam disagreement like V.W.P 歌姫 /
+                        # Shazam "DIVA (feat. ...)"), defer the wrong-song switch
+                        # for verified_render_gate_s seconds. If title_alias_album_fallback
+                        # accepts the alias and verified flips back to True, the
+                        # gate clears and the strike resolves naturally. Real
+                        # wrong-song persists and will retrigger after the window.
+                        # Real track changes go through _on_track_change which
+                        # already sets _verified_gate_t=0.0 so this gate never
+                        # defers a legitimate track change.
+                        gate_s = float(self._tune.get("verified_render_gate_s", 3.0))
+                        gate_active = (self._verified_gate_t
+                                       and time.time() - self._verified_gate_t < gate_s)
+                        if gate_active:
+                            remaining = gate_s - (time.time() - self._verified_gate_t)
+                            log.info("wrong-song teardown DEFERRED by verified_render_gate "
+                                     "(%.1fs remaining; heard=%r locked=%r streak=%d/%d)",
+                                     remaining, f_title, self.meta.get("title", ""),
+                                     self._sound_fail_streak, strikes)
+                            # Decay the streak so a transient disagreement doesn't
+                            # immediately retrigger after the gate window expires.
+                            self._sound_fail_streak = max(0, self._sound_fail_streak - 1)
+                            return
                         log.info("title-lock OVERRIDDEN: heard %r %d× ≠ locked %r → wrong "
                                  "song, switching", f_title, self._sound_fail_streak,
                                  self.meta.get("title", ""))
@@ -3424,6 +3663,7 @@ class Overlay:
         self._verified = False
         self._verified_meta = False           # TICKET-099
         self._sound_corroborated = False      # TICKET-099
+        self._verified_gate_t = 0.0           # TICKET batch4: explicit teardown, no gate
         self.meta = {"title": self._gen_title, "artist": self._gen_artist,
                      "lang": "ja", "duration": self._cur_duration, "source": "generated"}
         self._hint("✨ Generating lyrics by ear… (AI — marked ***)")
@@ -3768,9 +4008,19 @@ class Overlay:
         # /status render_fps readout — paused/no-music frames use a slower cadence
         # and would skew it, so they're excluded.
         now = time.time()
+        # A2 (workflow w821l9jnw): clear any prior tick's sub-branch timings, then
+        # default raw dt to None so paused/no-music ticks (and rejected outliers)
+        # render '-' in the perf log instead of a misleading value carried over.
+        self._perf_branch_ms = {}
+        self._raw_dt_ms = None
         if self._render_frame and self._last_tick_t is not None:
             dt = (now - self._last_tick_t) * 1000.0
-            if 0.0 < dt < 500.0:
+            # A2: cap raised 500ms → 5000ms. The old 500ms drop was hiding the
+            # 200-960ms stalls workflow w821l9jnw was hunting for. 5000ms still
+            # rejects sleep/lid-close/debugger-pause outliers that would otherwise
+            # drag the EWMA (published on /status) into nonsense for ~20 frames.
+            if 0.0 < dt < 5000.0:
+                self._raw_dt_ms = dt
                 self._frame_ms = (dt if self._frame_ms <= 0
                                   else 0.9 * self._frame_ms + 0.1 * dt)
                 # Stutter metrics: jitter = how far each frame strays from the
@@ -4249,76 +4499,81 @@ class Overlay:
     # ── drawing ──
 
     def _render(self, ln):
-        self._cancel_anim()
-        self.cv.delete("all")
-        self._kara = []   # per-line "tracks" (index-based karaoke fill)
-        pad = self.pad
-        max_w = self.W - 2 * pad
-        cur_y = 0.0
+        # A2: bracket the whole _render() body. Even on cancellation paths the
+        # context-manager `finally` records the elapsed time, so a partial
+        # render still shows up in the perf log (documented "last completed
+        # call within this tick" semantics).
+        with self._perf_branch("render"):
+            self._cancel_anim()
+            self.cv.delete("all")
+            self._kara = []   # per-line "tracks" (index-based karaoke fill)
+            pad = self.pad
+            max_w = self.W - 2 * pad
+            cur_y = 0.0
 
-        # ── main line (furigana over kanji); wrap at segment boundaries ──
-        if ln.jp:
-            jpf = self._main_tk_font(ln)   # script-aware: Hangul→Malgun, etc.
-            jp_h, furi_h = self._text_h(jpf), self._text_h(self.FURI_FONT)
-            line_h = jp_h + furi_h + 10
-            chars = []
-            cur_y += furi_h + jp_h / 2 + 6
-            cx = pad
-            for base, reading in split_furigana(ln.jp):
-                seg_w = max(measure_text(self.cv, base, jpf),
-                            measure_text(self.cv, reading, self.FURI_FONT) if reading else 0)
-                if cx + seg_w > pad + max_w and cx > pad:      # wrap underneath
-                    cx, cur_y = pad, cur_y + line_h
-                seg_start = cx
-                for ch in base:
-                    w = measure_text(self.cv, ch, jpf)
-                    if w <= 0:
-                        continue
-                    fid = draw_text(self.cv, cx + w / 2, cur_y, ch, jpf, WHITE)
-                    chars.append({"fill": fid, "last": WHITE})
-                    cx += w
-                if reading:
-                    draw_text(self.cv, (seg_start + cx) / 2,
-                              cur_y - jp_h / 2 - furi_h / 2 - 2,
-                              reading, self.FURI_FONT, FURI_C)
-                cx += 6
-            self._kara.append({"chars": chars, "base": WHITE, "sung": SUNG})
-            cur_y += jp_h / 2 + 14
+            # ── main line (furigana over kanji); wrap at segment boundaries ──
+            if ln.jp:
+                jpf = self._main_tk_font(ln)   # script-aware: Hangul→Malgun, etc.
+                jp_h, furi_h = self._text_h(jpf), self._text_h(self.FURI_FONT)
+                line_h = jp_h + furi_h + 10
+                chars = []
+                cur_y += furi_h + jp_h / 2 + 6
+                cx = pad
+                for base, reading in split_furigana(ln.jp):
+                    seg_w = max(measure_text(self.cv, base, jpf),
+                                measure_text(self.cv, reading, self.FURI_FONT) if reading else 0)
+                    if cx + seg_w > pad + max_w and cx > pad:      # wrap underneath
+                        cx, cur_y = pad, cur_y + line_h
+                    seg_start = cx
+                    for ch in base:
+                        w = measure_text(self.cv, ch, jpf)
+                        if w <= 0:
+                            continue
+                        fid = draw_text(self.cv, cx + w / 2, cur_y, ch, jpf, WHITE)
+                        chars.append({"fill": fid, "last": WHITE})
+                        cx += w
+                    if reading:
+                        draw_text(self.cv, (seg_start + cx) / 2,
+                                  cur_y - jp_h / 2 - furi_h / 2 - 2,
+                                  reading, self.FURI_FONT, FURI_C)
+                    cx += 6
+                self._kara.append({"chars": chars, "base": WHITE, "sung": SUNG})
+                cur_y += jp_h / 2 + 14
 
-        if ln.rm:
-            chars, cur_y = self._wrap_row(ln.rm, cur_y, self.ROMAJI_FONT, ROMAJI_C, pad, max_w)
-            self._kara.append({"chars": chars, "base": ROMAJI_C, "sung": SUNG})
-        if ln.en:
-            chars, cur_y = self._wrap_row(ln.en, cur_y, self.EN_FONT, EN_C, pad, max_w)
-            self._kara.append({"chars": chars, "base": EN_C, "sung": SUNG})
+            if ln.rm:
+                chars, cur_y = self._wrap_row(ln.rm, cur_y, self.ROMAJI_FONT, ROMAJI_C, pad, max_w)
+                self._kara.append({"chars": chars, "base": ROMAJI_C, "sung": SUNG})
+            if ln.en:
+                chars, cur_y = self._wrap_row(ln.en, cur_y, self.EN_FONT, EN_C, pad, max_w)
+                self._kara.append({"chars": chars, "base": EN_C, "sung": SUNG})
 
-        # Anchor the whole block within the FIXED window. VERTICAL: top edge,
-        # bottom band, or centred (center/left/right all sit vertically centred).
-        if self.pos_y == "top":
-            dy = self._win_margin
-        elif self.pos_y == "center":
-            dy = max(self._win_margin, round((self.work_h - cur_y) / 2))
-        else:   # bottom
-            dy = max(self._win_margin, self.work_h - cur_y - self._bottom_clear)
-        # HORIZONTAL: the block is laid out from the left margin; PIN it to the
-        # right edge or centre it per pos_x (independent of the vertical anchor).
-        bb = self.cv.bbox("cur")
-        dx = 0
-        if bb:
-            if self.pos_x == "right":
-                dx = (self.W - pad) - bb[2]
-            elif self.pos_x == "center":
-                dx = round((self.W - (bb[2] - bb[0])) / 2) - bb[0]
-        self.cv.move("cur", dx, dy)
-        self._animate_in()
-        if self._mirrors:
-            self._update_mirrors(ln)
-        if self.display == "cycle" and len(_monitors()) > 1:
-            self._cycle_idx = (self._cycle_idx + 1) % len(_monitors())
-            try:
-                self._apply_display()
-            except Exception:
-                pass
+            # Anchor the whole block within the FIXED window. VERTICAL: top edge,
+            # bottom band, or centred (center/left/right all sit vertically centred).
+            if self.pos_y == "top":
+                dy = self._win_margin
+            elif self.pos_y == "center":
+                dy = max(self._win_margin, round((self.work_h - cur_y) / 2))
+            else:   # bottom
+                dy = max(self._win_margin, self.work_h - cur_y - self._bottom_clear)
+            # HORIZONTAL: the block is laid out from the left margin; PIN it to the
+            # right edge or centre it per pos_x (independent of the vertical anchor).
+            bb = self.cv.bbox("cur")
+            dx = 0
+            if bb:
+                if self.pos_x == "right":
+                    dx = (self.W - pad) - bb[2]
+                elif self.pos_x == "center":
+                    dx = round((self.W - (bb[2] - bb[0])) / 2) - bb[0]
+            self.cv.move("cur", dx, dy)
+            self._animate_in()
+            if self._mirrors:
+                self._update_mirrors(ln)
+            if self.display == "cycle" and len(_monitors()) > 1:
+                self._cycle_idx = (self._cycle_idx + 1) % len(_monitors())
+                try:
+                    self._apply_display()
+                except Exception:
+                    pass
 
     def _wrap_row(self, text, y, font, color, pad, max_w):
         """Draw a text row, wrapping overflow onto lines underneath.
@@ -4787,7 +5042,7 @@ class Overlay:
         # two of spawn latency is invisible) and a fill sweeping at ~20fps looks
         # identical — so do it every Nth frame, keeping the belt at full rate.
         self._tick_n += 1
-        if self._tick_n % int(self._tune.get("fill_skip", self._fill_skip) or 1):
+        if self._tick_n % int(self._tune.get("scroll_fill_skip", self._fill_skip) or 1):
             return
 
         # The spawn window must be wide enough that the widest block (a long
@@ -4808,13 +5063,13 @@ class Overlay:
         # — deferred spawns appear a frame later (invisible, 1200px off-screen)
         # and deferred fills catch up next heavy frame. Belt stays smooth.
         t_heavy = time.perf_counter()
-        budget_ms = self._tune.get("heavy_budget_ms", 10.0)
+        budget_ms = self._tune.get("scroll_heavy_budget_ms", 10.0)
         def _over_budget():
             return budget_ms > 0 and (time.perf_counter() - t_heavy) * 1000.0 > budget_ms
         # Spawn missing blocks, nearest-to-centre (most imminent) first.
         missing = sorted((i for i in want if i not in have),
                          key=lambda i: abs(want[i] - center))
-        spawn_budget = int(self._tune.get("spawn_budget", self._spawn_budget))
+        spawn_budget = int(self._tune.get("scroll_spawn_budget", self._spawn_budget))
         # TICKET-082: fill is keyed off pos_raw (raw song clock), NOT pos (eased).
         # Defaults to pos for backwards-compat if a caller didn't pass pos_raw.
         pos_f = pos_raw if pos_raw is not None else pos
@@ -4834,7 +5089,7 @@ class Overlay:
         # Despawn off-screen blocks, and advance karaoke fills — capped per pass.
         now = time.time()
         repaints = 0
-        repaint_budget = int(self._tune.get("repaint_budget", self._repaint_budget))
+        repaint_budget = int(self._tune.get("scroll_repaint_budget", self._repaint_budget))
         for b in self._stream[:]:
             cxb = want.get(b["idx"])
             # Despawn when outside the want window OR fully past the EXIT edge by
@@ -4863,7 +5118,7 @@ class Overlay:
                 # repaints per frame, each block's repaint rate, AND the total
                 # heavy-frame time — a karaoke sweep at ~5fps reads fine.
                 if (n != b["sung_n"] and repaints < repaint_budget
-                        and now - b.get("paint_t", 0.0) >= self._tune.get("fill_interval", self._fill_interval)
+                        and now - b.get("paint_t", 0.0) >= self._tune.get("scroll_fill_interval", self._fill_interval)
                         and not _over_budget()):
                     b["sung_n"] = n
                     b["paint_t"] = now
@@ -4919,7 +5174,7 @@ class Overlay:
                 self.cv.move("strm", 0, dy)
         self._last_pos = pos
         self._tick_n += 1
-        if self._tick_n % int(self._tune.get("fill_skip", self._fill_skip) or 1):
+        if self._tick_n % int(self._tune.get("scroll_fill_skip", self._fill_skip) or 1):
             return
         bh = self._block_h
         margin = bh * 2 + 80                               # spawn a couple blocks off-screen
@@ -4932,12 +5187,12 @@ class Overlay:
             self.cv.delete("hint")
         have = {b["idx"] for b in self._stream}
         t_heavy = time.perf_counter()
-        budget_ms = self._tune.get("heavy_budget_ms", 10.0)
+        budget_ms = self._tune.get("scroll_heavy_budget_ms", 10.0)
         def _over_budget():
             return budget_ms > 0 and (time.perf_counter() - t_heavy) * 1000.0 > budget_ms
         missing = sorted((i for i in want if i not in have),
                          key=lambda i: abs(want[i] - center))
-        spawn_budget = int(self._tune.get("spawn_budget", self._spawn_budget))
+        spawn_budget = int(self._tune.get("scroll_spawn_budget", self._spawn_budget))
         pos_f = pos_raw if pos_raw is not None else pos    # TICKET-082: raw clock for fill
         for i in missing[:spawn_budget]:
             if _over_budget():
@@ -4958,7 +5213,7 @@ class Overlay:
             self._stream.append(b)
         now = time.time()
         repaints = 0
-        repaint_budget = int(self._tune.get("repaint_budget", self._repaint_budget))
+        repaint_budget = int(self._tune.get("scroll_repaint_budget", self._repaint_budget))
         for b in self._stream[:]:
             cyb = want.get(b["idx"])
             if cyb is None:                               # outside window OR past exit edge
@@ -4980,7 +5235,7 @@ class Overlay:
             if b.get("img"):
                 n = int(frac * b["nchars"] + 0.5)
                 if (n != b["sung_n"] and repaints < repaint_budget
-                        and now - b.get("paint_t", 0.0) >= self._tune.get("fill_interval", self._fill_interval)
+                        and now - b.get("paint_t", 0.0) >= self._tune.get("scroll_fill_interval", self._fill_interval)
                         and not _over_budget()):
                     b["sung_n"] = n
                     b["paint_t"] = now
@@ -5132,11 +5387,40 @@ class Overlay:
         self._display_offset_t = now
         return self._display_offset
 
+    @contextlib.contextmanager
+    def _perf_branch(self, name):
+        """A2 sub-branch timer (workflow w821l9jnw).
+
+        Brackets a code region with time.perf_counter() ONLY when `name` is in
+        the parsed `perf_record_branches` set, otherwise the manager is a
+        ~50ns set-membership check + yield (the 'off' fast-path).
+
+        Result lands in self._perf_branch_ms[name] and is emitted in the perf
+        log's meta column as ` | branch=name1=ms,name2=ms,...`. The dict is
+        reset at the top of every _tick, so a value is the LAST completed call
+        within this tick (a cancelled _render leaves a stale entry from the
+        prior render — acceptable for stutter hunting).
+
+        DO NOT nest inside per-character loops — three pairs per frame is
+        ~600ns, N pairs per frame is observably non-zero on Windows.
+        """
+        if name not in self._perf_branches_set:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._perf_branch_ms[name] = (time.perf_counter() - t0) * 1000.0
+
     def _perf_record(self, state, pos, pos_raw, branch):
-        """TICKET-082: append-only per-frame perf log (zero observer effect).
-        Captures: ts, render-branch, frame_ms, pos (eased), pos_raw, offset,
-        idx, pending_offset, ease delta. Only when the perf_record tune knob
-        is on. Rotated when the file passes perf_record_cap_mb.
+        """TICKET-082: append-only per-frame perf log (near-zero observer effect
+        when perf_record=0; under ~100us per frame when on, even with all three
+        A2 sub-branch timers enabled). Captures: ts, frame_ms, raw_dt_ms (A2),
+        render-branch, pos (eased), pos_raw, offset, idx, pending_offset, ease
+        delta, plus an optional ` | branch=...` segment with the A2 sub-branch
+        timings. Only when the perf_record tune knob is on. Rotated when the
+        file passes perf_record_cap_mb.
 
         Usage:
           POST /tune?key=perf_record&value=1            # turn on
@@ -5152,6 +5436,16 @@ class Overlay:
                         pass
                     self._perf_fh = None
                 return
+            # A2: refresh the cached sub-branch set ONLY when the tune string
+            # changes (a per-tick string-split would burn ~300ns we don't need).
+            raw_branches = self._tune.get("perf_record_branches",
+                                          "render|kara|itemconfig") or ""
+            if raw_branches != self._perf_branches_raw:
+                self._perf_branches_raw = raw_branches
+                self._perf_branches_set = {
+                    s.strip() for s in raw_branches.split("|") if s.strip()
+                }
+            raw_on = bool(int(self._tune.get("perf_record_raw_frame_ms", 1)))
             if self._perf_fh is None:
                 path = (self._tune.get("perf_record_path") or "").strip()
                 if not path:
@@ -5170,7 +5464,19 @@ class Overlay:
                 self._perf_fh = open(path, "a", buffering=1, encoding="utf-8")
                 self._perf_path = path
                 self._perf_fh.write(f"\n# perf session start {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                self._perf_fh.write("# ts  frame_ms  branch    pos_eased  pos_raw  offset  pending  idx  ease_delta  meta\n")
+                # A2: format v2 = adds raw_dt_ms column (when perf_record_raw_frame_ms=1)
+                # and an optional ' | branch=...' suffix in the meta column.
+                self._perf_fh.write("# format v2\n")
+                if raw_on:
+                    self._perf_fh.write(
+                        "# ts  frame_ms  raw_dt_ms  branch    pos_eased  pos_raw  "
+                        "offset  pending  idx  ease_delta  meta\n"
+                    )
+                else:
+                    self._perf_fh.write(
+                        "# ts  frame_ms  branch    pos_eased  pos_raw  "
+                        "offset  pending  idx  ease_delta  meta\n"
+                    )
             ts = time.strftime("%H:%M:%S") + f".{int((time.time() % 1) * 1000):03d}"
             disp = getattr(self, "_display_offset", None) or 0.0
             ease_delta = round(disp - self.offset, 3)
@@ -5180,13 +5486,33 @@ class Overlay:
                 meta = f"OFFSET_JUMP {self.offset - self._perf_last_offset:+.2f}"
             elif self._perf_last_idx is not None and self.idx != self._perf_last_idx:
                 meta = f"IDX {self._perf_last_idx}->{self.idx}"
+            # A2: append sub-branch timings to the meta column via a ' | ' guard
+            # so the legacy meta values (OFFSET_JUMP / IDX a->b) can coexist on
+            # the same line. Branches dict was cleared at the top of _tick, so
+            # only branches that ACTUALLY ran this tick appear.
+            if self._perf_branch_ms:
+                bparts = ",".join(
+                    f"{n}={ms:.1f}" for n, ms in self._perf_branch_ms.items()
+                )
+                meta = f"{meta} | branch={bparts}" if meta else f"branch={bparts}"
             self._perf_last_offset = self.offset
             self._perf_last_idx = self.idx
-            self._perf_fh.write(
-                f"{ts}  {self._frame_ms:5.1f}  {branch:8s}  "
-                f"{pos:8.2f}  {pos_raw:8.2f}  {self.offset:+6.2f}  {pending:>7s}  {self.idx:4d}  "
-                f"{ease_delta:+6.3f}  {meta}\n"
-            )
+            if raw_on:
+                # '-' (right-justified to keep column width) when we have no
+                # trusted dt sample this tick (paused/no-music or outlier).
+                raw_col = (f"{self._raw_dt_ms:6.1f}"
+                           if self._raw_dt_ms is not None else "     -")
+                self._perf_fh.write(
+                    f"{ts}  {self._frame_ms:5.1f}  {raw_col}  {branch:8s}  "
+                    f"{pos:8.2f}  {pos_raw:8.2f}  {self.offset:+6.2f}  "
+                    f"{pending:>7s}  {self.idx:4d}  {ease_delta:+6.3f}  {meta}\n"
+                )
+            else:
+                self._perf_fh.write(
+                    f"{ts}  {self._frame_ms:5.1f}  {branch:8s}  "
+                    f"{pos:8.2f}  {pos_raw:8.2f}  {self.offset:+6.2f}  {pending:>7s}  {self.idx:4d}  "
+                    f"{ease_delta:+6.3f}  {meta}\n"
+                )
         except Exception:
             pass     # never let perf-logging break the tick
 
@@ -5194,21 +5520,31 @@ class Overlay:
         """TICKET-082: takes pos_raw (raw song clock) so the fill ramps at the
         actual song rate instead of the eased glide rate. Caller decides which
         timebase — _tick passes pos_raw, legacy callers (if any) pass pos."""
-        if not self._kara:
-            return
-        ln = self.lines[self.idx]
-        dur = ln.end - ln.start
-        if dur <= 0:
-            return
-        frac = max(0.0, min(1.0, (pos_raw - ln.start) / dur))
-        for tr in self._kara:                       # JP, romaji, English in lockstep
-            n = int(frac * len(tr["chars"]) + 0.5)  # index-based: works across wraps
-            base, sung = tr["base"], tr["sung"]
-            for i, k in enumerate(tr["chars"]):
-                col = sung if i < n else base
-                if k["last"] != col:
-                    self.cv.itemconfig(k["fill"], fill=col)
-                    k["last"] = col
+        # A2: bracket the whole _karaoke() body. The early returns inside the
+        # `with` block still let the context manager record elapsed time on the
+        # way out (the value will be ~0ms for the empty/zero-dur fast paths,
+        # which is itself useful signal).
+        with self._perf_branch("kara"):
+            if not self._kara:
+                return
+            ln = self.lines[self.idx]
+            dur = ln.end - ln.start
+            if dur <= 0:
+                return
+            frac = max(0.0, min(1.0, (pos_raw - ln.start) / dur))
+            # A2: wrap the per-char itemconfig loop ONCE (not per call). This
+            # measures the aggregate cost of the hot loop identified in
+            # workflow w821l9jnw without adding N time.perf_counter() calls per
+            # frame. Per-call probing is deliberately out of scope (A3-shaped).
+            with self._perf_branch("itemconfig"):
+                for tr in self._kara:                       # JP, romaji, English in lockstep
+                    n = int(frac * len(tr["chars"]) + 0.5)  # index-based: works across wraps
+                    base, sung = tr["base"], tr["sung"]
+                    for i, k in enumerate(tr["chars"]):
+                        col = sung if i < n else base
+                        if k["last"] != col:
+                            self.cv.itemconfig(k["fill"], fill=col)
+                            k["last"] = col
 
     def _hint(self, msg):
         self.cv.delete("all")
@@ -5279,6 +5615,17 @@ class Overlay:
                 "source_priority": self._source_priority,
                 "verified_meta": bool(self._verified_meta),
                 "sound_corroborated": bool(self._sound_corroborated),
+                # TICKET batch4: verified→False render grace remaining.
+                # 0 when no gate is active (verified is True, or the gate
+                # has already expired, or a real song change cleared it).
+                # >0 means lyrics are being held on screen while we wait for
+                # a re-confirming Shazam read / album-alias path / takeover.
+                "verified_render_gate_remaining_s": (
+                    max(0.0, round((self._verified_gate_t
+                                    + float(self._tune.get(
+                                        "verified_render_gate_s", 3.0)))
+                                   - time.time(), 2))
+                    if self._verified_gate_t else 0.0),
                 "smtc_paused_for_s": (round(time.time() - self._smtc_paused_since, 1)
                                       if self._smtc_paused_since else 0.0),
                 "last_takeover_age_s": (round(time.time() - self._last_takeover_t, 1)
@@ -5325,6 +5672,13 @@ class Overlay:
                 "recent_ms": hist,
                 "perf_mode": self.perf,
                 "scroll_dir": self.scroll_dir,
+                # TICKET-104 A1: bounded LRU cache for measure_text widths.
+                # Steady-state target is >0.95 once the per-song char set is
+                # warm; a sustained drop signals thrashing (font_scale churn
+                # or cap too low for the active script mix).
+                "measure_text_cache_hit_rate": _measure_text_cache_hit_rate(),
+                "measure_text_cache_size": len(_MEASURE_CACHE),
+                "measure_text_cache_max": _MEASURE_CACHE_MAX,
             },
             "aligning": self._aligning,
             "identifying": self._identifying,
@@ -5485,10 +5839,28 @@ class Overlay:
             "anomalies": anomalies,
         }
 
+    # TICKET-106 / batch1: legacy → new key map for /tune back-compat. The scroll
+    # perf knobs were renamed with a scroll_ prefix so future operators don't
+    # confuse them with LINE-mode work (line mode is unbudgeted; see TICKET-104).
+    # Existing /tune scripts that POST the old name still work: we redirect to the
+    # new key and log a warning.
+    _TUNE_LEGACY_ALIASES = {
+        "heavy_budget_ms":  "scroll_heavy_budget_ms",
+        "spawn_budget":     "scroll_spawn_budget",
+        "repaint_budget":   "scroll_repaint_budget",
+        "fill_skip":        "scroll_fill_skip",
+        "fill_interval":    "scroll_fill_interval",
+    }
+
     def set_tune(self, key, value):
         """Set one live-tunable sync parameter. Returns (ok, message). Coerces
         the value to the existing type. Only known keys accepted — silent reject
         of unknowns is a footgun for tuning."""
+        # Back-compat: old (pre-rename) keys redirect to the new scroll_* name.
+        alias = self._TUNE_LEGACY_ALIASES.get(key)
+        if alias is not None and alias in self._tune:
+            log.warning("tune: legacy key %r → use %r (redirected)", key, alias)
+            key = alias
         if key not in self._tune:
             return False, f"unknown tune key {key!r}"
         try:
@@ -6183,7 +6555,7 @@ class Overlay:
             self._fill_skip = 3          # belt moves at 60fps; fills/spawns at ~20fps
         # mirror into the live-tune dict so /tune reflects the mode's defaults
         if hasattr(self, "_tune"):
-            self._tune["fill_skip"] = float(self._fill_skip)
+            self._tune["scroll_fill_skip"] = float(self._fill_skip)
 
     def set_quality(self, mode):
         self.perf = mode
@@ -7289,12 +7661,14 @@ class Overlay:
         else:
             # inconclusive = couldn't get a reading (NOT a detected desync). A song we
             # can't verify must NOT be hammered at 3×/min — that only costs CPU (and
-            # risks a stutter) for nothing. Back the cadence off one notch after two
-            # blind checks so we settle toward 1×/min instead of churning Whisper.
+            # risks a stutter) for nothing. Back the cadence off one notch after a
+            # blind check (TICKET batch1: threshold 2 → 1 — the periodic-JP-track
+            # tier-deadlock case sat in fast tier for 90 s on streak=1, so we no
+            # longer wait for a 2nd inconclusive before relaxing).
             self._fine_good_t0 = None              # blind = streak interrupted; restart clock on next insync
             self._sync_incon_streak += 1
-            if self._sync_incon_streak < 2:
-                return                              # one-off blip: hold cadence
+            if self._sync_incon_streak < 1:
+                return                              # (dead branch after threshold lowering — kept for shape)
             self._sync_incon_streak = 0
             if not fine_owns:
                 self._sync_tier_interval = mid if self._sync_tier_interval <= fast else slow
@@ -7871,7 +8245,7 @@ def main():
     # path clean on a typical 4+ core machine; on 2-3 cores we just avoid core 0.
     # On a 16-core box this is cores 7-15 (mask 0xff80, 9 cores) — the extra core
     # below the upper half gives the fill-paint loop more PIL headroom for the
-    # newly raised heavy_budget_ms / repaint_budget without crowding audio.
+    # newly raised scroll_heavy_budget_ms / scroll_repaint_budget without crowding audio.
     # Best-effort and reversible by the user via Task Manager.
     try:
         import os as _os
