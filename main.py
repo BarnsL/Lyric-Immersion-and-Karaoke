@@ -174,7 +174,7 @@ def _startup_lnk():
     """Path to the .lnk in the user's Startup folder used for 'Start with
     Windows'."""
     return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
-            / "Start Menu" / "Programs" / "Startup" / "Desktop Karaoke.lnk")
+            / "Start Menu" / "Programs" / "Startup" / "Lyric Immersion and Karaoke.lnk")
 
 
 def startup_enabled():
@@ -1158,7 +1158,7 @@ def _monitors():
 class Overlay:
     def __init__(self, offset=0.0):
         self.root = tk.Tk()
-        self.root.title("Desktop Karaoke")
+        self.root.title("Lyric Immersion and Karaoke")
         self.offset = offset
 
         sw = self.root.winfo_screenwidth()
@@ -6415,7 +6415,7 @@ def main():
         except Exception: pass
         try: icon_.notify("Downloading CUDA libraries (~1.5 GB) in the background — "
                           "keep using the app; GPU kicks in when it's done.",
-                          "Desktop Karaoke")
+                          "Lyric Immersion and Karaoke")
         except Exception: pass
         def _do():
             ok = gpu_setup.download_gpu_libs(log=log.info)
@@ -6425,7 +6425,7 @@ def main():
             try: icon_.notify(
                 "GPU acceleration enabled — used from the next song on." if ok
                 else "Couldn't enable GPU acceleration; staying on CPU.",
-                "Desktop Karaoke")
+                "Lyric Immersion and Karaoke")
             except Exception: pass
         threading.Thread(target=_do, daemon=True).start()
     git_menu = pystray.Menu(
@@ -6460,14 +6460,14 @@ def main():
     def _on_updates(icon_, *_):
         info = _upd["info"]
         if info:                                   # an update is known → apply it
-            try: icon_.notify(f"Updating to v{info['version']}…", "Desktop Karaoke")
+            try: icon_.notify(f"Updating to v{info['version']}…", "Lyric Immersion and Karaoke")
             except Exception: pass
             def _do():
                 if updater.stage_update(info, log=log.info):
                     ov.root.after(0, lambda: _quit(icon_))   # exit so the helper swaps + relaunches
             threading.Thread(target=_do, daemon=True).start()
             return
-        try: icon_.notify("Checking for updates…", "Desktop Karaoke")    # manual check
+        try: icon_.notify("Checking for updates…", "Lyric Immersion and Karaoke")    # manual check
         except Exception: pass
         def _check():
             got = updater.check()
@@ -6476,7 +6476,7 @@ def main():
             except Exception: pass
             try: icon_.notify(
                 f"Update v{got['version']} available — open the tray menu to install." if got
-                else f"You're up to date (v{updater.current_version()}).", "Desktop Karaoke")
+                else f"You're up to date (v{updater.current_version()}).", "Lyric Immersion and Karaoke")
             except Exception: pass
         threading.Thread(target=_check, daemon=True).start()
 
@@ -6484,7 +6484,7 @@ def main():
         _upd["info"] = info
         try: icon.update_menu()
         except Exception: pass
-        try: icon.notify(f"Desktop Karaoke v{info['version']} is available.", "Update available")
+        try: icon.notify(f"Lyric Immersion and Karaoke v{info['version']} is available.", "Update available")
         except Exception: pass
 
     menu = pystray.Menu(
@@ -6530,7 +6530,7 @@ def main():
         pystray.MenuItem(f"ℹ️  About  ·  v{version.__version__}", _about),
         pystray.MenuItem("Quit", _quit),
     )
-    icon = pystray.Icon("desktop-karaoke", make_icon(), "Desktop Karaoke", menu)
+    icon = pystray.Icon("desktop-karaoke", make_icon(), "Lyric Immersion and Karaoke", menu)
     updater.background_check(_on_update_found)   # notify if a newer release exists (portable build)
     # SELF-HEALING TRAY ICON: the icon is the ONLY way to reach the menu (Quit,
     # toggles), so it must be present whenever the app runs. pystray's run() can
@@ -6553,7 +6553,7 @@ def main():
             time.sleep(2)
             try:
                 cur = pystray.Icon("desktop-karaoke", make_icon(),
-                                   "Desktop Karaoke", menu)
+                                   "Lyric Immersion and Karaoke", menu)
             except Exception:
                 pass
     threading.Thread(target=_tray_runner, daemon=True).start()

@@ -187,7 +187,7 @@ def make_handler(app, log_file, token):
                 path = urlparse(self.path).path.rstrip("/") or "/"
                 q = parse_qs(urlparse(self.path).query)
                 if path == "/health":
-                    self._send(200, {"ok": True, "app": "Desktop Karaoke",
+                    self._send(200, {"ok": True, "app": "Lyric Immersion and Karaoke",
                                      "version": API_VERSION,
                                      "uptime_s": round(time.time() - _START, 1)})
                 elif path == "/status":
@@ -235,7 +235,7 @@ def make_handler(app, log_file, token):
                 elif path == "/import/status":
                     self._send(200, {"ok": True, **_import_status()})
                 elif path == "/":
-                    self._send(200, {"ok": True, "app": "Desktop Karaoke",
+                    self._send(200, {"ok": True, "app": "Lyric Immersion and Karaoke",
                                      "version": API_VERSION, "routes": _ROUTES})
                 else:
                     self._err(404, f"no GET {path}")
