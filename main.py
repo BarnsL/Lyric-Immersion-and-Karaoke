@@ -1293,6 +1293,9 @@ class Overlay:
             "unconfirmed_backoff_s": 30.0,  # settled-but-unconfirmable song → slow the Shazam poll (anti-stutter)
             "confirmed_recal_s":     45.0,  # confirmed+watched song → slow Shazam re-lock (tier handles drift)
             "wrong_song_strikes":     5,    # heard the SAME other song this many × → loaded song is wrong, switch
+            "sync_reject_strikes":    3,    # sync-by-ear heard vocals but couldn't ANCHOR them to the loaded
+                                            # lyrics this many × in a row → the cache is the WRONG song (a
+                                            # mislabeled/poisoned LRC that title+Shazam pass on NAME) → reject
             # ── SMART song decision by ear (Whisper 'small' + rapidfuzz, ~250 MB) ──
             "decide_min_score":      55.0,  # a title candidate must match the heard singing ≥ this to win
             "decide_library_min":    70.0,  # a WHOLE-LIBRARY identification must clear this higher bar
@@ -1365,6 +1368,8 @@ class Overlay:
         self._sync_good_streak = 0    # consecutive in-sync confirmations (drives de-escalation)
         self._sync_miss_streak = 0    # consecutive out-of-sync checks (telemetry / stay-fast)
         self._sync_incon_streak = 0   # consecutive unreadable checks → back off (don't hammer)
+        self._sync_fail_streak = 0    # consecutive Whisper reads that heard vocals but couldn't ANCHOR to the
+        self._sync_reject_count = 0   # loaded lyrics → cache is the wrong song; reject after N (capped/track)
         self._energy_blind = 0        # consecutive energy checks with no usable peak → escalate to Whisper
         self._tier_tpvr = None        # held 1st Whisper-read offset for two-point confirm
         self._tier_tpvr_until = 0.0   # deadline for the confirming 2nd tier read
@@ -1478,6 +1483,7 @@ class Overlay:
         self._sync_tier_interval = self._tune.get("sync_tier_fast_s", 20.0)
         self._sync_good_streak = self._sync_miss_streak = self._energy_blind = 0
         self._sync_incon_streak = 0
+        self._sync_fail_streak = self._sync_reject_count = 0
         self._tier_tpvr = None
         self._tier_listen = False
         self._live_arrangement = is_live_arrangement(title)  # LIVE/short/alt → follow offset
@@ -5600,7 +5606,13 @@ class Overlay:
         self._aligning = False
         self._tier_listen = False
         if not res:
+            # Heard the audio but NO loaded line matched it. For the RIGHT lyrics this is
+            # just an instrumental gap; for the WRONG lyrics (a mislabeled/poisoned cache
+            # that title+Shazam pass on NAME) it happens EVERY time — so count it, and
+            # after enough in a row, reject the cache and re-identify.
+            self._sync_fail_streak += 1
             self._note_sync_verdict("inconclusive")
+            self._maybe_reject_for_sync_fail()
             return
         offset, ratio, _start = res
         now = time.time()
@@ -5610,6 +5622,7 @@ class Overlay:
             drift = offset - self.offset
             if abs(drift) <= self._tune.get("sync_tier_ok_drift", 0.8):
                 log.info("sync-tier: confirmed in sync (drift %+.2fs) — relaxing", drift)
+                self._sync_fail_streak = 0     # a real anchor → the lyrics DO match this song
                 self._note_sync_verdict("insync")
                 return
             # a modest drift is low-risk → apply on this single read
@@ -5636,6 +5649,7 @@ class Overlay:
         self._tier_commit(measured, ratio, "two reads agree %.2f≈%.2f" % (first, offset))
 
     def _tier_commit(self, offset, ratio, why):
+        self._sync_fail_streak = 0          # got a real anchor → content matches; not a wrong song
         prev = self.offset
         self.offset = round(offset, 2)
         self.idx = -1
@@ -5644,6 +5658,36 @@ class Overlay:
                  prev, self.offset, why, ratio)
         self._hint(f"🎤 Re-synced ({self.offset:+.1f}s)")
         self._note_sync_verdict("corrected")
+
+    def _maybe_reject_for_sync_fail(self):
+        """After `sync_reject_strikes` sync-by-ear reads in a row that heard vocals but
+        couldn't ANCHOR them to the loaded lyrics, the cache is the WRONG song — a
+        mislabeled / poisoned LRC that title-match and Shazam both pass on the NAME
+        while the LYRIC CONTENT is someone else's (Deep Dive cached with Dunk's words).
+        Reject it and re-identify. Capped per track so it can't loop."""
+        if self._sync_fail_streak < int(self._tune.get("sync_reject_strikes", 3)):
+            return
+        src = (self.meta.get("source") or "")
+        if (not self.lines or self._live_mode or self._force_sync_active or self._deciding
+                or src.startswith("bundled") or src == "youtube-captions"
+                or self._sync_reject_count >= 2):
+            return                              # nothing to reject / authoritative / already tried twice
+        self._reject_for_sync_fail()
+
+    def _reject_for_sync_fail(self):
+        self._sync_fail_streak = 0
+        self._sync_reject_count += 1
+        log.info("sync kept failing on %r (%d× no anchor) — lyrics don't match the singing "
+                 "→ rejecting the cache and re-identifying", self.meta.get("title", ""),
+                 int(self._tune.get("sync_reject_strikes", 3)))
+        self._hint("🎯 Lyrics don't match the song — re-identifying…")
+        # report_wrong bins the bad cache, unlocks the title, and re-identifies. For a
+        # browser video the video's OWN captions are the authoritative real lyrics (now
+        # fetchable again), so prefer those right after — they override a re-fetched
+        # provider LRC and aren't themselves rejectable (source 'youtube-captions').
+        self.report_wrong()
+        if getattr(self, "captions_on", False) and not self._live_mode:
+            self.root.after(2000, lambda: self.load_youtube_captions(silent=True))
 
     def _apply_align(self, res):
         self._aligning = False
