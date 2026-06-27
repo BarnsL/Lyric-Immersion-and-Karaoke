@@ -1243,6 +1243,15 @@ class Overlay:
         self._frame_worst = 0.0      # worst (longest) render-frame interval in the window
         self._frame_jitter = 0.0     # EWMA of |frame - target| — stutter metric
         self._frame_hist = []        # ring buffer of recent frame intervals (ms)
+        # TICKET-082: perf recorder — buffered append on the Tk thread so it
+        # captures the truth of each frame without polling-induced contention.
+        # Opens lazily on first frame when perf_record=1.
+        self._perf_fh = None
+        self._perf_path = None
+        self._perf_last_offset = None
+        self._perf_last_idx = None
+        self._display_offset = None
+        self._display_offset_t = 0.0
         self._spawn_budget = 1       # max scroll blocks to PIL-render per heavy frame
                                      # (1: spawning a block allocates a new image +
                                      # PhotoImage — the priciest op; off-screen, so
@@ -1384,6 +1393,13 @@ class Overlay:
                                             # (TICKET-081: was 70 — kamone scored 69 vs loaded 20, a clear win
                                             #  rejected by 1 point of an absolute threshold. The lopsided
                                             #  override + sync-reject still catch real misfires.)
+            # ── TICKET-082 perf instrumentation ──
+            "perf_record":           0,     # 1 = log per-frame perf to perf.log (zero observer effect,
+                                            #     writes on Tk thread to a buffered append). Off by default.
+            "perf_record_path":      "",    # explicit path; if empty + perf_record=1 → <data>/perf.log
+            "perf_record_cap_mb":    20.0,  # rotate the perf log when it grows beyond this
+            "ease_slew_cap_s":       3.0,   # max seconds-per-second the eased offset can slew
+            "ease_pull_per_sec":     3.5,   # exponential pull rate (higher = catches up faster)
             "decide_margin":         12.0,  # …and beat the loaded song's match by this much to switch
             "decide_wrong_floor":    32.0,  # loaded match below this = the lyrics are the wrong song → search the library
             "decide_listen_s":       12.0,  # seconds of vocals to transcribe for the decision
@@ -3095,16 +3111,26 @@ class Overlay:
         # Render against an EASED display offset, not the raw sync offset, so a
         # sound-sync correction GLIDES the highlight/scroll into place instead of
         # snapping (the "jumpy karaoke fill"). See _eased_offset.
+        # TICKET-082: split into TWO timebases —
+        #   pos      = eased  → drives line POSITION on the belt + line-index
+        #              selection (smooth visual transitions).
+        #   pos_raw  = raw    → drives the karaoke FILL fraction so the sung-vs-
+        #              unsung highlight tracks the ACTUAL song clock, not the
+        #              easing ramp. Decoupling the two stops the "fill races
+        #              ahead then snaps back" stutter the user kept seeing.
         pos = state["position"] + self._eased_offset()
+        pos_raw = state["position"] + self.offset
 
         if self.scroll_dir in ("lr", "rl"):       # continuous horizontal scroll-through
-            self._ticker_update(pos)
+            self._ticker_update(pos, pos_raw)
             self._render_frame = True
+            self._perf_record(state, pos, pos_raw, "scroll-h")
             self.root.after(self._fps, self._tick)
             return
         if self.scroll_dir in ("tb", "bt"):       # continuous vertical scroll-through
-            self._ticker_update_v(pos)
+            self._ticker_update_v(pos, pos_raw)
             self._render_frame = True
+            self._perf_record(state, pos, pos_raw, "scroll-v")
             self.root.after(self._fps, self._tick)
             return
 
@@ -3121,9 +3147,10 @@ class Overlay:
                 self.cv.delete("all")
                 self._kara = []
         elif new >= 0:
-            self._karaoke(pos)
+            self._karaoke(pos_raw)
 
         self._render_frame = True
+        self._perf_record(state, pos, pos_raw, "line")
         self.root.after(self._fps, self._tick)
 
     # ── drawing ──
@@ -3630,7 +3657,7 @@ class Overlay:
             # rapid-fire burst may still touch) without over-speeding the song.
             self._v_floor = min(700.0, max(0.0, reqs[int(0.92 * (len(reqs) - 1))]))
 
-    def _ticker_update(self, pos):
+    def _ticker_update(self, pos, pos_raw=None):
         center, v = self.W / 2, max(self.scroll_speed, self._v_floor)
         d = 1 if self.scroll_dir == "rl" else -1
 
@@ -3680,13 +3707,19 @@ class Overlay:
         missing = sorted((i for i in want if i not in have),
                          key=lambda i: abs(want[i] - center))
         spawn_budget = int(self._tune.get("spawn_budget", self._spawn_budget))
+        # TICKET-082: fill is keyed off pos_raw (raw song clock), NOT pos (eased).
+        # Defaults to pos for backwards-compat if a caller didn't pass pos_raw.
+        pos_f = pos_raw if pos_raw is not None else pos
         for i in missing[:spawn_budget]:
             if _over_budget():
                 break
             cx = want[i]
             ln = self.lines[i]
             dur = ln.end - ln.start
-            frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
+            if dur > 0:
+                frac = max(0.0, min(1.0, (pos_f - ln.start) / dur))
+            else:
+                frac = 0.0
             b = self._spawn_block(i, frac)
             self.cv.move(b["tag"], (cx - b["w"] / 2) - b["x"], 0)
             self._stream.append(b)
@@ -3712,7 +3745,10 @@ class Overlay:
                 continue
             ln = self.lines[b["idx"]]
             dur = ln.end - ln.start
-            frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
+            if dur > 0:
+                frac = max(0.0, min(1.0, (pos_f - ln.start) / dur))   # TICKET-082: raw clock + clamp
+            else:
+                frac = 0.0
             if b.get("img"):
                 n = int(frac * b["nchars"] + 0.5)
                 # Each fill repaint is a costly PhotoImage paste, so cap the
@@ -3760,7 +3796,7 @@ class Overlay:
         # screen edges (0 … W-w) so a fanned line is never pushed partly off-screen.
         return max(0, min(round(base), max(0, self.W - w)))
 
-    def _ticker_update_v(self, pos):
+    def _ticker_update_v(self, pos, pos_raw=None):
         """VERTICAL scroll: lines stacked in one column that scrolls up ('bt' —
         enter from the bottom, credits-style) or down ('tb' — enter from the top).
         Mirror of _ticker_update on the Y axis; column X comes from `position`
@@ -3794,13 +3830,17 @@ class Overlay:
         missing = sorted((i for i in want if i not in have),
                          key=lambda i: abs(want[i] - center))
         spawn_budget = int(self._tune.get("spawn_budget", self._spawn_budget))
+        pos_f = pos_raw if pos_raw is not None else pos    # TICKET-082: raw clock for fill
         for i in missing[:spawn_budget]:
             if _over_budget():
                 break
             cy = want[i]
             ln = self.lines[i]
             dur = ln.end - ln.start
-            frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
+            if dur > 0:
+                frac = max(0.0, min(1.0, (pos_f - ln.start) / dur))
+            else:
+                frac = 0.0
             # spawn at the right Y; then shift X to the column (width known after spawn)
             b = self._spawn_block(i, frac, place=(0, round(cy - bh / 2)))
             x = self._block_x_v(b["w"], i)                  # lane-staggered when centred
@@ -3825,7 +3865,10 @@ class Overlay:
                 continue
             ln = self.lines[b["idx"]]
             dur = ln.end - ln.start
-            frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
+            if dur > 0:
+                frac = max(0.0, min(1.0, (pos_f - ln.start) / dur))   # TICKET-082: raw clock + clamp
+            else:
+                frac = 0.0
             if b.get("img"):
                 n = int(frac * b["nchars"] + 0.5)
                 if (n != b["sung_n"] and repaints < repaint_budget
@@ -3877,10 +3920,14 @@ class Overlay:
         new_off = round(new_off, 2)
         if new_off == self.offset and self._pending_offset is None:
             return
-        is_scroll = self.scroll_dir in ("lr", "rl", "tb", "bt")
         big_jump = abs(new_off - self.offset) > 5.0
         no_line = self.idx < 0 or not self.lines
-        if is_scroll or no_line or big_jump:
+        # TICKET-082: scroll mode used to snap here (the bypass). It now also
+        # queues at the next line boundary — the karaoke fill is computed
+        # against pos_raw separately, so the belt can glide while the fill
+        # waits to commit at the boundary, no more mid-line jump-cuts in
+        # scroll mode either. Big jumps and no-line still snap.
+        if no_line or big_jump:
             self.offset = new_off
             self.idx = -1
             self._drift_integral = 0.0
@@ -3907,24 +3954,103 @@ class Overlay:
         since gliding a huge gap looks worse than a clean cut."""
         target = self.offset
         cur = getattr(self, "_display_offset", None)
+        now = time.time()
+        last_t = getattr(self, "_display_offset_t", 0.0)
         if cur is None or abs(target - cur) > 5.0:
             self._display_offset = target            # first use / major re-sync → snap
-        elif abs(target - cur) <= 0.01:
+            self._display_offset_t = now
+            return self._display_offset
+        if abs(target - cur) <= 0.01:
             self._display_offset = target
-        else:
-            # ease ~20%/frame, capped at 0.10 s/frame so even a ~4 s drift glides
-            # in well under a second and a tiny drift resolves in a few frames.
-            self._display_offset = cur + max(-0.10, min(0.10, (target - cur) * 0.2))
+            self._display_offset_t = now
+            return self._display_offset
+        # TICKET-082: WALL-CLOCK based ease instead of per-frame, so a heavy
+        # frame doesn't slow the glide — same offset change always finishes
+        # in ~the same wall-clock time regardless of FPS load.
+        # Default: 3 s/s slew speed cap, 70%/sec exponential pull. A 1s drift
+        # finishes in ~0.5s; a 4s drift in ~1.5s.
+        dt = max(0.001, min(0.25, now - last_t)) if last_t > 0 else (self._fps / 1000.0)
+        rate_per_sec = float(self._tune.get("ease_slew_cap_s", 3.0))
+        pull = float(self._tune.get("ease_pull_per_sec", 3.5))
+        delta = target - cur
+        # exponential pull: approach target at rate proportional to remaining distance
+        step = delta * (1.0 - 2.71828 ** (-pull * dt))
+        # absolute cap so even a 5s glide doesn't move faster than rate_per_sec
+        cap = rate_per_sec * dt
+        step = max(-cap, min(cap, step))
+        self._display_offset = cur + step
+        self._display_offset_t = now
         return self._display_offset
 
-    def _karaoke(self, pos):
+    def _perf_record(self, state, pos, pos_raw, branch):
+        """TICKET-082: append-only per-frame perf log (zero observer effect).
+        Captures: ts, render-branch, frame_ms, pos (eased), pos_raw, offset,
+        idx, pending_offset, ease delta. Only when the perf_record tune knob
+        is on. Rotated when the file passes perf_record_cap_mb.
+
+        Usage:
+          POST /tune?key=perf_record&value=1            # turn on
+          POST /tune?key=perf_record&value=0            # turn off
+          tail -f D:/DesktopKaraoke/perf.log            # watch live
+        """
+        try:
+            if not int(self._tune.get("perf_record", 0)):
+                if self._perf_fh is not None:
+                    try:
+                        self._perf_fh.close()
+                    except Exception:
+                        pass
+                    self._perf_fh = None
+                return
+            if self._perf_fh is None:
+                path = (self._tune.get("perf_record_path") or "").strip()
+                if not path:
+                    try:
+                        path = str(appdata.data_dir() / "perf.log")
+                    except Exception:
+                        path = "perf.log"
+                # rotate if too big
+                try:
+                    cap = float(self._tune.get("perf_record_cap_mb", 20.0)) * 1024 * 1024
+                    import os
+                    if os.path.exists(path) and os.path.getsize(path) > cap:
+                        os.replace(path, path + ".old")
+                except Exception:
+                    pass
+                self._perf_fh = open(path, "a", buffering=1, encoding="utf-8")
+                self._perf_path = path
+                self._perf_fh.write(f"\n# perf session start {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self._perf_fh.write("# ts  frame_ms  branch    pos_eased  pos_raw  offset  pending  idx  ease_delta  meta\n")
+            ts = time.strftime("%H:%M:%S") + f".{int((time.time() % 1) * 1000):03d}"
+            disp = getattr(self, "_display_offset", None) or 0.0
+            ease_delta = round(disp - self.offset, 3)
+            pending = "-" if self._pending_offset is None else f"{self._pending_offset:+.2f}"
+            meta = ""
+            if self._perf_last_offset is not None and abs(self.offset - self._perf_last_offset) > 0.04:
+                meta = f"OFFSET_JUMP {self.offset - self._perf_last_offset:+.2f}"
+            elif self._perf_last_idx is not None and self.idx != self._perf_last_idx:
+                meta = f"IDX {self._perf_last_idx}->{self.idx}"
+            self._perf_last_offset = self.offset
+            self._perf_last_idx = self.idx
+            self._perf_fh.write(
+                f"{ts}  {self._frame_ms:5.1f}  {branch:8s}  "
+                f"{pos:8.2f}  {pos_raw:8.2f}  {self.offset:+6.2f}  {pending:>7s}  {self.idx:4d}  "
+                f"{ease_delta:+6.3f}  {meta}\n"
+            )
+        except Exception:
+            pass     # never let perf-logging break the tick
+
+    def _karaoke(self, pos_raw):
+        """TICKET-082: takes pos_raw (raw song clock) so the fill ramps at the
+        actual song rate instead of the eased glide rate. Caller decides which
+        timebase — _tick passes pos_raw, legacy callers (if any) pass pos."""
         if not self._kara:
             return
         ln = self.lines[self.idx]
         dur = ln.end - ln.start
         if dur <= 0:
             return
-        frac = max(0.0, min(1.0, (pos - ln.start) / dur))
+        frac = max(0.0, min(1.0, (pos_raw - ln.start) / dur))
         for tr in self._kara:                       # JP, romaji, English in lockstep
             n = int(frac * len(tr["chars"]) + 0.5)  # index-based: works across wraps
             base, sung = tr["base"], tr["sung"]
@@ -4365,6 +4491,16 @@ class Overlay:
             log.info("vocal onset @%.1fs (1st line @%.1fs) → calibrated offset %+.1fs",
                      vpos, first_start, new_off)
             self._hint("🎤 Vocals — synced")
+            # TICKET-082: MV-intro fast-sync — for a studio MV with a long
+            # preamble (綺麗事 / Suisei was 33s of quiet before vocals), the
+            # 25s track-start auto-align happens BEFORE vocals + can't tune
+            # an offset against silence. Schedule a fresh align ~5s after the
+            # onset so we lock the precise sync before the second verse.
+            if self._mv_mode and not self._live_arrangement:
+                _seq = self._track_seq
+                self.root.after(5000, lambda t=_seq: (
+                    self._maybe_auto_align(reason="mv-intro-onset")
+                    if t == self._track_seq else None))
 
     def _on_song_onset(self, pre_quiet=0.0):
         """The audio just kicked in after a leading quiet stretch — the end of an

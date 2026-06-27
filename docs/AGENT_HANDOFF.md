@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.81.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.82.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -52,7 +52,21 @@ Suisei). **Current build: v1.0.81.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.81, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.82, all deployed + on master)
+- **v1.0.82 — Karaoke fill decoupling + scroll-mode deferral + wall-clock ease + MV-intro fast-sync
+  + in-app perf recorder (TICKET-082a):** the karaoke highlight (currently-sung characters) now
+  ramps against the RAW song clock (`pos_raw = position + self.offset`) while the LINE POSITION
+  on the belt still uses the eased `pos` — decoupled timebases stop the "fill races during ease,
+  snaps back when ease completes" stutter. Frac clamped to [0,1] so brief eased pos-excursions
+  don't reset the fill to 0. Scroll modes (tb/bt/lr/rl) now queue at line boundary too instead of
+  bypassing the deferral. Ease is wall-clock-based (`1 - exp(-pull*dt)` with abs cap) so heavy
+  frames don't stretch the glide. Studio MVs (綺麗事) get a +5s fresh auto-align after vocal
+  onset instead of waiting for the 25s slow-tier loop. New `perf_record` tune knob writes
+  per-frame trace (ts/frame_ms/branch/pos_eased/pos_raw/offset/pending/idx/ease_delta) to
+  `D:\DesktopKaraoke\perf.log` — buffered append on the Tk thread = zero observer effect;
+  the previous /diag polling experiment dragged baseline 33ms frames to 60-200ms. Live trace
+  already proved Tk-thread freezes of 3-6 SECONDS during track changes / consume_async — that
+  goes in TICKET-082b (offload LRC parse + first-block render to a worker thread).
 - **v1.0.81 — Title/artist weight rebalancing + cover-as-live + in-tick Shazam smooth-sync
   + library MIN 60 + privacy cleanup (TICKET-081):** one big bundle of targeted fixes for
   the live-session failures. Adds a substring-superset penalty (`ghost` ⊂ `ghosting` no
