@@ -17,14 +17,15 @@ mislabeled provider LRCs.
 Neural audio fingerprinting needs a reference DB of the exact tracks (useless for MMD
 covers); CLAP embeddings are ~600 MB and match audio→text descriptions, not exact songs.
 So: **faster-whisper 'small' (~250 MB int8, already bundled) + rapidfuzz**.
-**Fix:** `align.decide_song_by_lyrics(candidates, …)` captures ~12 s of vocals, transcribes
-with the *small* model, and scores each candidate's lyrics with `partial_ratio`
-(char-level → works for Japanese) and `token_set_ratio`. `_decide_by_ear` runs ~20 s into
-a track (and on demand via `POST /decide`): pool = loaded cache + title-similar library
-caches; if a candidate beats the loaded song by `decide_margin` and clears
-`decide_min_score`, it SWITCHES; if the loaded lyrics match the singing below
-`decide_wrong_floor` and nothing fits, it re-fetches by title. Verified: feelingradation
-vocals score 100 vs 13-28 for wrong songs. Skips baked/caption songs. `/diag.decision`.
+**Fix:** `align.transcribe_vocals` (small model, ~12 s) + `align.score_candidates`
+(rapidfuzz `partial_ratio` char-level → works for Japanese, + `token_set_ratio`).
+`_decide_by_ear` runs ~20 s into a track (and via `POST /decide`) in TWO stages: score the
+loaded cache + title-similar caches first; **if the loaded song matches the singing below
+`decide_wrong_floor`, identify against the WHOLE cached library** ("trained on everything we
+have" — score the one transcript against every cached song, the right one self-matches ~100
+vs ~30, must clear the higher `decide_library_min`). Switches to a clear winner, else
+re-fetches by title (cover-qualified). Verified: 快晴 chunk → #1 of **833 songs** at 100 vs
+~30; feelingradation → 100 vs 13-28. Skips baked/caption/live songs. `/diag.decision`.
 
 ## TICKET-070 — ReGLOSS songs always wrong (feelingradation, サクラミラージュ) → baked in 🟢
 **Symptom:** "feelingradation" and "サクラミラージュ Performance Video" (hololive DEV_IS

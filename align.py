@@ -207,25 +207,13 @@ def _transcribe(audio, lang, size=_MODEL):
     return [(seg.start, seg.text) for seg in segments if seg.text.strip()]
 
 
-def decide_song_by_lyrics(candidates, lang="ja", seconds=12, size=_GEN_MODEL):
-    """SMART SONG DECISION — listen to the live vocals and pick which CANDIDATE
-    song's lyrics they actually match.
-
-    This is the robust answer to "what song should we show lyrics to?" where the
-    usual signals fail: an MMD / cover / "Performance Video" cut that Shazam can't
-    fingerprint, or a provider LRC that's MISLABELED (feelingradation got a
-    different song's LRC). Instead of trusting a title or a fingerprint, it
-    compares the HEARD SINGING to each candidate's lyrics directly.
-
-    candidates: list of ``(key, lyric_text)``. Returns
-    ``{"heard": <transcript>, "ranked": [(score 0-100, key), …]}`` best-first, or
-    ``None`` if nothing could be heard. Uses the ~250 MB faster-whisper *small*
-    model (better than *base* for sung Japanese) + rapidfuzz: ``partial_ratio`` is
-    char-level so it works for Japanese (no word breaks) and matches the short
-    heard window against the full lyric body; ``token_set_ratio`` helps the
-    romaji / English lines (word reorder, ASR slips)."""
-    if not candidates:
-        return None
+def transcribe_vocals(lang="ja", seconds=12, size=_GEN_MODEL):
+    """Transcribe a few seconds of the LIVE vocals → one plain string (furigana /
+    punctuation stripped), or None if too little was sung. Uses the ~250 MB
+    faster-whisper *small* model (better than *base* for sung Japanese). Separated
+    from scoring so we can transcribe ONCE and then match the same heard text
+    against several candidate pools (title-similar first, the whole library if
+    needed)."""
     _ensure_deps_path()
     audio = _capture(seconds)
     if audio is None:
@@ -235,8 +223,19 @@ def decide_song_by_lyrics(candidates, lang="ja", seconds=12, size=_GEN_MODEL):
         return None                                   # essentially silence
     segs = _transcribe(audio, lang, size=size)
     heard = _plain(" ".join(t for _, t in segs))
-    if len(heard) < 6:
-        return None                                   # too little sung text to judge
+    return heard if len(heard) >= 6 else None
+
+
+def score_candidates(heard, candidates):
+    """Rank ``(key, lyric_text)`` candidates by how well the HEARD singing matches
+    each one's lyrics — best first. ``partial_ratio`` is char-level so it works for
+    Japanese (no word breaks) and matches the short heard window against the full
+    lyric body; ``token_set_ratio`` helps romaji / English lines (word reorder, ASR
+    slips). This is the local "Shazam by lyrics": the candidate pool IS the
+    accumulated knowledge (every song we've cached), so a high match identifies the
+    song from what's actually being sung."""
+    if not heard or not candidates:
+        return []
     from rapidfuzz import fuzz
     ranked = []
     for key, body in candidates:
@@ -246,7 +245,20 @@ def decide_song_by_lyrics(candidates, lang="ja", seconds=12, size=_GEN_MODEL):
         score = max(fuzz.partial_ratio(heard, b), fuzz.token_set_ratio(heard, b))
         ranked.append((round(float(score), 1), key))
     ranked.sort(reverse=True)
-    return {"heard": heard, "ranked": ranked}
+    return ranked
+
+
+def decide_song_by_lyrics(candidates, lang="ja", seconds=12, size=_GEN_MODEL):
+    """Convenience one-shot (transcribe + score) — used by the ``/decide`` API.
+    Returns ``{"heard": …, "ranked": [(score, key), …]}`` or None. The main loop
+    uses transcribe_vocals + score_candidates directly so it can escalate from the
+    title-similar pool to the WHOLE library on one transcription."""
+    if not candidates:
+        return None
+    heard = transcribe_vocals(lang, seconds, size)
+    if not heard:
+        return None
+    return {"heard": heard, "ranked": score_candidates(heard, candidates)}
 
 
 def transcribe_for_generation(pos_cap, lang=None, seconds=16, size=_GEN_MODEL):
