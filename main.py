@@ -1350,6 +1350,11 @@ class Overlay:
         self._pending_corr = 1e9      # a large sound offset awaiting a 2nd confirming read
         self._sync_confirm_after = None  # pending 2s "confirm with a 2nd listen" timer
         self._recent_corr = []        # last few audio offsets — spot repeated-chorus ambiguity
+        # TICKET-078: defer auto-sync corrections to the next line boundary so the
+        # CURRENT line (even if mis-synced) finishes naturally and the next line
+        # appears under the new offset. Less jarring than a mid-line snap.
+        self._pending_offset = None   # queued new offset; commits when current line ends
+        self._pending_offset_t = 0.0  # when it was queued (capped so it can't stall forever)
         self._live_arrangement = False  # LIVE/short/alt version → FOLLOW the offset, don't reset
         # Concert applause/cheering-pause detection (TICKET-061): a live cut pauses
         # for applause while the player clock runs on, drifting the lyrics ahead.
@@ -1454,6 +1459,7 @@ class Overlay:
         #                            (e.g. "youtube-captions / 0 lines")
         self._sound_song = None    # new video → re-identify by ear
         self._pending_corr = 1e9   # drop any pending large-offset confirmation
+        self._pending_offset = None  # drop any deferred sync-offset commit from prev track
         if self._sync_confirm_after is not None:   # cancel a pending confirm listen
             try:
                 self.root.after_cancel(self._sync_confirm_after)
@@ -2946,6 +2952,22 @@ class Overlay:
                     self.root.after(90, self._tick)
                     return
 
+        # TICKET-078: a deferred sync correction commits at the next line
+        # boundary so the current (possibly mis-synced) line finishes naturally
+        # before the next line is picked under the new offset. Capped at 8s in
+        # case idx gets stuck so a pending correction can't strand forever.
+        if self._pending_offset is not None and self.lines:
+            cur_pos = state["position"] + self.offset
+            cur_end = self.lines[self.idx].end if self.idx >= 0 else 0.0
+            if (self.idx < 0 or cur_pos >= cur_end
+                    or (time.time() - self._pending_offset_t) > 8.0):
+                new_off = self._pending_offset
+                self._pending_offset = None
+                log.info("sync: deferred commit %+.2fs → %+.2fs (line ended)",
+                         self.offset, new_off)
+                self.offset = new_off
+                self.idx = -1
+                self._drift_integral = 0.0
         # Render against an EASED display offset, not the raw sync offset, so a
         # sound-sync correction GLIDES the highlight/scroll into place instead of
         # snapping (the "jumpy karaoke fill"). See _eased_offset.
@@ -3718,6 +3740,32 @@ class Overlay:
         e1 = 1 - (1 - (step + 1) / steps) ** 3
         self.cv.move("cur", -(e1 - e0) * ox, 0)
         self._anim_id = self.root.after(16, self._anim_step, ox, step + 1)
+
+    def _smooth_offset(self, new_off, reason=""):
+        """Queue an auto-sync correction for the NEXT line boundary instead of
+        snapping it in mid-line (TICKET-078). User-perceived effect: whatever
+        line is on screen finishes naturally, then the following line is picked
+        under the corrected offset — no jarring jump-cut. Big jumps (>5s),
+        continuous-scroll modes, and corrections taken when no line is showing
+        all commit immediately, since deferring those would look worse than
+        snapping. A safety cap (8s) commits a stale queued offset regardless,
+        so a stuck idx can't strand a pending correction forever."""
+        new_off = round(new_off, 2)
+        if new_off == self.offset and self._pending_offset is None:
+            return
+        is_scroll = self.scroll_dir in ("lr", "rl", "tb", "bt")
+        big_jump = abs(new_off - self.offset) > 5.0
+        no_line = self.idx < 0 or not self.lines
+        if is_scroll or no_line or big_jump:
+            self.offset = new_off
+            self.idx = -1
+            self._drift_integral = 0.0
+            self._pending_offset = None
+            return
+        self._pending_offset = new_off
+        self._pending_offset_t = time.time()
+        log.info("sync: deferring %+.2fs → %+.2fs until current line ends (%s)",
+                 self.offset, new_off, reason or "auto")
 
     def _eased_offset(self):
         """The DISPLAY offset the lyrics + karaoke fill actually use. It EASES
@@ -5477,14 +5525,11 @@ class Overlay:
         # alpha=1.0 when lift≥0.30, falls linearly to 0.3 at the 0.10 floor.
         alpha = max(0.3, min(1.0, (lift - 0.10) / 0.20 + 0.3))
         prev = self.offset
-        blended = (1.0 - alpha) * prev + alpha * new_off
-        self.offset = round(blended, 2)
-        self.idx = -1
-        # Update drift integral state — a successful correction zeros it.
-        self._drift_integral = 0.0
+        blended = round((1.0 - alpha) * prev + alpha * new_off, 2)
         log.info("energy-align: offset %+.2fs → %+.2fs (α=%.2f, score %.3f, lift %.3f)",
-                 prev, self.offset, alpha, score, lift)
-        self._hint(f"🎤 Auto-synced ({self.offset:+.1f}s)")
+                 prev, blended, alpha, score, lift)
+        self._smooth_offset(blended, "energy-align")
+        self._hint(f"🎤 Auto-synced ({blended:+.1f}s)")
         self._note_energy_verdict("corrected")
 
     # ── ADAPTIVE sync-verification tier (escalation / de-escalation) ──────────
@@ -5651,12 +5696,11 @@ class Overlay:
     def _tier_commit(self, offset, ratio, why):
         self._sync_fail_streak = 0          # got a real anchor → content matches; not a wrong song
         prev = self.offset
-        self.offset = round(offset, 2)
-        self.idx = -1
-        self._drift_integral = 0.0
+        target = round(offset, 2)
         log.info("sync-tier: resync %+.2fs → %+.2fs (%s, match %.2f)",
-                 prev, self.offset, why, ratio)
-        self._hint(f"🎤 Re-synced ({self.offset:+.1f}s)")
+                 prev, target, why, ratio)
+        self._smooth_offset(target, "sync-tier")
+        self._hint(f"🎤 Re-synced ({target:+.1f}s)")
         self._note_sync_verdict("corrected")
 
     def _maybe_reject_for_sync_fail(self):
@@ -5741,9 +5785,9 @@ class Overlay:
         if silent and abs(offset - self.offset) < 0.6:
             log.info("auto-align: drift %+.2fs within tolerance — no change", offset - self.offset)
             return
-        self.offset = round(offset, 2)
         log.info("aligned by listening: offset=%.2fs (match %.2f)%s",
                  offset, ratio, " [auto]" if silent else "")
+        self._smooth_offset(offset, "align-by-ear")
         if not silent:
             self._hint(f"Synced by ear ({offset:+.1f}s)")
         else:

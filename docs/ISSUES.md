@@ -8,6 +8,34 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-078 — Defer auto-sync corrections to the next line boundary (no mid-line snap) 🟢
+**Symptom:** every auto-sync correction (energy-align, tier-listen, align-by-ear) wrote
+`self.offset = X` immediately + `self.idx = -1`, so any line on screen jump-cut to a
+different line mid-display whenever the sync moved by even ~0.5 s. The eased display
+offset hides this for the karaoke FILL but not for the LINE selection — pos = position
++ eased crossed line boundaries during the glide, swapping lines under the user's eyes.
+**User's ask:** *"i want it to fade into the sync, allow the current line onscreen to
+finish even if its wrong and start the next line it thinks it is after the last wrong
+line for better user experience."*
+**Fix (v1.0.78):**
+- New `_smooth_offset(new_off, reason)` — queues `_pending_offset` instead of writing
+  `self.offset` directly when a line is currently visible and the jump is ≤ 5 s.
+- `_tick` commits the queued offset only when `cur_pos >= current_line.end` (the wrong
+  line has finished), then clears `idx = -1` so the very next tick picks the right next
+  line under the new offset. 8 s safety cap commits a stuck pending regardless.
+- Big jumps (>5 s), continuous-scroll modes (`lr/rl/tb/bt`, no discrete lines), and
+  corrections taken when no line is showing (`idx<0`) all bypass and snap as before —
+  deferring those would be worse than snapping.
+- Routed through `_smooth_offset`: `_apply_align`, `_tier_commit`, `_apply_energy_align`.
+- Untouched (delicate or already-staggered): the in-tick Shazam follow/confirm path
+  at `main.py:~2320` (live-follow has its own two-point hesitation), `_apply_decision`
+  resets, force-sync probes, vocal-onset calibration (fires while `idx==-1` anyway),
+  track-change reset to 0.
+- `_pending_offset` is cleared on every track change so a queued correction from the
+  previous song can't bleed across.
+
+---
+
 ## TICKET-077 — Reject the song when sync-by-ear keeps failing (poisoned cache) 🟢
 **Symptom:** "Deep Dive" / 轟はじめ (ReGLOSS) showed **Dunk's** lyrics the whole time.
 ```
