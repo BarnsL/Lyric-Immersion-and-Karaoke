@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1820,6 +1820,18 @@ class Overlay:
             # Set to 1 for paranoid mode (keep deciding even when locked) when
             # diagnosing a mis-lock.
             "decide_after_verified": 0,     # 0 = locked verified stops decide, 1 = keep deciding
+            # ── TICKET-109 decision engine knobs ──
+            # Watches SMTC<->Shazam agreement, drift trend, lyric-quality flags,
+            # and decide-by-ear corroboration; aggregates dim scores into strikes;
+            # promotes state TRUST -> CAUTION -> SWITCH -> REGEN at the thresholds
+            # below. User-visible via tray hint + /diag.decision_engine.
+            "decision_engine_on":           1,
+            "decision_caution_strikes":     3,
+            "decision_switch_strikes":      5,
+            "decision_regen_strikes":       8,
+            "decision_score_window":       12,
+            "decision_tick_interval_s":   2.0,
+            "decision_action_cooldown_s": 30.0,   # min seconds between SWITCH/REGEN actions
             "continuous_recal_ms": 15000,   # legacy fixed cadence (superseded by the adaptive tier)
             # ── ADAPTIVE sync-verification tier (escalation / de-escalation) ──
             # Verify sync ~3×/min while syncing or after a miss; once a check CONFIRMS
@@ -2029,6 +2041,23 @@ class Overlay:
         self._tier_tpvr = None        # held 1st Whisper-read offset for two-point confirm
         self._tier_tpvr_until = 0.0   # deadline for the confirming 2nd tier read
         self._tier_listen = False     # a tier Whisper listen is in flight
+        # ── TICKET-109 decision engine state (exposed via /diag.decision_engine) ──
+        self._decision_state            = "TRUST"   # TRUST | CAUTION | SWITCH | REGEN
+        self._decision_strikes          = 0
+        self._decision_last_t           = 0.0
+        self._decision_last_action_t    = 0.0
+        self._decision_dim_scores       = {
+            "source_agree":  "OK",
+            "sync_stable":   "OK",
+            "lyric_quality": "OK",
+            "ear_corrob":    "OK",
+        }
+        self._decision_dim_history = {
+            k: deque(maxlen=int(self._tune.get("decision_score_window", 12)))
+            for k in self._decision_dim_scores
+        }
+        self._decision_audit            = deque(maxlen=20)
+        self._force_ai_gen              = False     # consumed by the AI-gen branch
         # ── FINE-TUNE mode state (sub-second polish, bolted onto the tier) ──
         # See the `fine_tune_*` block in self._tune for the knob semantics; these
         # are the runtime fields the entry-gate / listen tick / pause override use.
@@ -2231,6 +2260,8 @@ class Overlay:
                          "(ignoring cover channel %r)", artist)
 
         self._live_mode = is_live_or_compilation(title, duration)
+        # TICKET-109: new track => decision engine forgets the prior song's strikes
+        self._reset_decision_engine()
         if self._live_mode:
             # A concert / live / festival / compilation: the title is the EVENT,
             # not a song. Title-matching it is what made a whole concert show one
@@ -4046,6 +4077,12 @@ class Overlay:
             self._offset_hist_last = self.offset
 
         self._consume_async()
+        # TICKET-109: continuous decision engine tick. Self-throttled to
+        # decision_tick_interval_s (default 2.0s) — cheap to invoke per tick.
+        try:
+            self._decision_engine_tick()
+        except Exception as e:
+            log.info("decision-engine tick: %s", e)
         # Watch for a concert applause/cheering pause (TICKET-061) — throttled, cheap.
         if now - getattr(self, "_applause_check_t", 0.0) > 0.3:
             self._applause_check_t = now
@@ -7160,6 +7197,177 @@ class Overlay:
             if t:
                 out.append(t)
         return " ".join(out)
+
+    # ───────────────────────── TICKET-109 decision engine ─────────────────────────
+    # Continuous wrong-lyric / desync detector. Every decision_tick_interval_s,
+    # score 4 dimensions OK/DEGRADED/BAD (source-agreement, sync-stability,
+    # lyric-quality, ear-corroboration), accumulate strikes, and promote state
+    # TRUST -> CAUTION -> SWITCH -> REGEN at the threshold knobs. Each state has
+    # a concrete action (do nothing / verify nudge / drop+refetch / drop+AI gen).
+    # User asked for this: "tell me what happened and make a plan. this needs to
+    # work algorithmically and without lyrics in repo."
+    def _score_source_agree(self):
+        """SMTC vs Shazam title/artist agreement. Cover-aware (skip on covers)."""
+        if getattr(self, "_is_cover", False):
+            return "OK"
+        st = self.media.get() or {}
+        smtc_t = _norm_title(st.get("title") or "")
+        smtc_a = _norm_title(st.get("artist") or "")
+        snd = getattr(self, "_sound_song", None)
+        if not snd or not smtc_t:
+            return "OK"
+        s_title  = _norm_title(snd[0] or "")
+        s_artist = _norm_title(snd[1] or "")
+        if s_title == smtc_t and s_artist == smtc_a:
+            return "OK"
+        if s_title and (s_title in smtc_t or smtc_t in s_title):
+            return "DEGRADED"
+        return "BAD"
+
+    def _score_sync_stable(self):
+        drift = getattr(self, "_last_drift", None)
+        if drift is None:
+            return "OK"
+        integral = abs(getattr(self, "_drift_integral", 0.0))
+        if abs(drift) < 1.0 and integral < 4.0:  return "OK"
+        if abs(drift) < 3.0 and integral < 12.0: return "DEGRADED"
+        return "BAD"
+
+    def _score_lyric_quality(self):
+        if not self.lines:
+            return "OK"
+        bad = 0
+        src = (self.meta.get("source") or "") if isinstance(self.meta, dict) else ""
+        for ln in self.lines:
+            t = getattr(ln, "jp", "") or ""
+            if "�" in t or "□□" in t:
+                bad += 1
+            elif t.startswith("***") and src not in ("generated", "generated-deep", "ai-gen"):
+                bad += 1
+        ratio = bad / max(1, len(self.lines))
+        if ratio >= 0.20: return "BAD"
+        if ratio >= 0.05: return "DEGRADED"
+        return "OK"
+
+    def _score_ear_corrob(self):
+        dec = getattr(self, "_last_decision", None)
+        if not dec or (time.time() - dec.get("t", 0)) > 90:
+            return "OK"
+        ranked = dec.get("ranked") or []
+        if not ranked:
+            return "OK"
+        loaded_path = getattr(self, "_lyrics_path", None)
+        if not loaded_path:
+            return "OK"
+        loaded_name = Path(str(loaded_path)).name
+        loaded_score = 0.0
+        for entry in ranked:
+            try:
+                s, k = entry
+            except Exception:
+                continue
+            if k == str(loaded_path) or Path(str(k)).name == loaded_name:
+                loaded_score = float(s)
+                break
+        wrong_floor = float(self._tune.get("decide_wrong_floor", 32.0))
+        if loaded_score >= 55.0:        return "OK"
+        if loaded_score >= wrong_floor: return "DEGRADED"
+        return "BAD"
+
+    def _decide_state_from_strikes(self):
+        s = self._decision_strikes
+        if s >= int(self._tune.get("decision_regen_strikes",   8)): return "REGEN"
+        if s >= int(self._tune.get("decision_switch_strikes",  5)): return "SWITCH"
+        if s >= int(self._tune.get("decision_caution_strikes", 3)): return "CAUTION"
+        return "TRUST"
+
+    def _decision_engine_tick(self):
+        if not int(self._tune.get("decision_engine_on", 1)):
+            return
+        now = time.time()
+        if now - self._decision_last_t < float(
+                self._tune.get("decision_tick_interval_s", 2.0)):
+            return
+        self._decision_last_t = now
+        if not self.lines and not getattr(self, "_track", None):
+            return
+        dims = {
+            "source_agree":  self._score_source_agree(),
+            "sync_stable":   self._score_sync_stable(),
+            "lyric_quality": self._score_lyric_quality(),
+            "ear_corrob":    self._score_ear_corrob(),
+        }
+        for k, v in dims.items():
+            self._decision_dim_scores[k] = v
+            self._decision_dim_history[k].append(v)
+        delta = sum(2 if v == "BAD" else 1 if v == "DEGRADED" else 0
+                    for v in dims.values())
+        if delta == 0:
+            self._decision_strikes = max(0, self._decision_strikes - 2)
+        else:
+            self._decision_strikes += delta
+        prev = self._decision_state
+        new = self._decide_state_from_strikes()
+        if new != prev:
+            self._decision_audit.append({
+                "t": now, "from": prev, "to": new,
+                "dims": dict(dims), "strikes": self._decision_strikes,
+            })
+            self._decision_state = new
+            self._fire_decision_action(new, dims)
+
+    def _fire_decision_action(self, state, dims):
+        now = time.time()
+        log.info("decision-engine: %s -> %s (strikes=%d dims=%s)",
+                 self._decision_audit[-1].get("from") if self._decision_audit else "?",
+                 state, self._decision_strikes, dims)
+        if state == "TRUST":
+            return
+        if state == "CAUTION":
+            self._hint("🔎 Verifying current song…")
+            try:
+                self._set_verified(False, reason="decision-caution")
+            except Exception:
+                pass
+            return
+        cooldown = float(self._tune.get("decision_action_cooldown_s", 30.0))
+        if now - self._decision_last_action_t < cooldown:
+            return
+        self._decision_last_action_t = now
+        track = getattr(self, "_track", None)
+        if state == "SWITCH" and track:
+            artist, title = track
+            self._hint(f"🔁 Switched to alternative lyric source for {title}…")
+            if getattr(self, "_lyrics_path", None):
+                try: Path(self._lyrics_path).unlink(missing_ok=True)
+                except Exception: pass
+                try: self.index.refresh()
+                except Exception: pass
+            self._fetch_key = None
+            self._lyrics_path = None
+            self.lines, self.idx, self._kara = [], -1, []
+            self._start_fetch(artist, title, self._cur_duration,
+                              cover=getattr(self, "_is_cover", False))
+            self._decision_strikes = max(0, self._decision_strikes - 3)
+        elif state == "REGEN" and track:
+            self._hint("✨ Regenerating lyrics via AI…")
+            self._fetch_key = None
+            self._lyrics_path = None
+            self.lines, self.idx, self._kara = [], -1, []
+            self._force_ai_gen = True
+            self._decision_strikes = 0
+
+    def _reset_decision_engine(self):
+        """TICKET-109: new track => engine forgets everything from the prior song."""
+        self._decision_state = "TRUST"
+        self._decision_strikes = 0
+        self._decision_last_action_t = 0.0
+        for dq in self._decision_dim_history.values():
+            dq.clear()
+        for k in self._decision_dim_scores:
+            self._decision_dim_scores[k] = "OK"
+        self._force_ai_gen = False
+    # ─────────────────────── end TICKET-109 decision engine ───────────────────────
 
     def _decide_by_ear(self, track_seq, reason="track-start"):
         """Transcribe the live vocals and pick which candidate song's lyrics they
