@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.85.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.86.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -52,7 +52,24 @@ Suisei). **Current build: v1.0.85.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.85, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.86, all deployed + on master)
+- **v1.0.86 — YouTube Music URL + ampersand-collab cover signal + YT Music metadata trust (TICKET-086):**
+  three small, surgical changes targeting YouTube Music sources. (A) URL-prep helper
+  `deep_transcribe._normalize_youtube_url` rewrites `music.youtube.com` → `www.youtube.com`
+  at every yt-dlp / video-id entry point (`fetch_captions_only`, `_download_audio`) plus an
+  inline guard in `set_now_url` so cached URLs + diagnostics are canonical. (B) Cover-detector
+  gains an "ampersand collab" signal via `_is_amp_collab_title` + new `cover_signal()` helper
+  returning `'explicit'` / `'amp_collab'` / `None`; the explicit path stays full-confidence, the
+  amp-collab path takes a title-only search (extract_cover_original returns `(None, song)` for
+  it) and is DEMOTED when YT Music exposes a non-empty `album` field (strong evidence of an
+  official original). An allowlist (Hall & Oates, Simon & Garfunkel, …) plus token-length ≥ 2
+  + title-separator-required guard against false-positives. (C) `clean_artist(artist, source)`
+  bypasses channel-stripping when source is YT Music (the SMTC artist field is already clean);
+  `clean_title` strips a BOL-anchored `Mix - ` autoplay prefix. `_cover_signal` initialized in
+  __init__, exposed in `/source` derived along with `yt_music_source` + `album`. One new tune
+  knob (`cover_amp_album_demote`, default 1.0 = ON). Sanity-tested URL helper roundtrip on
+  www.youtube.com URLs, amp_collab detection on positive + allowlist + negative cases, and
+  the Mix - BOL anchor on edge cases (DJ Mix / Track - Mix preserved).
 - **v1.0.85 — Fine-tune sync mode (TICKET-085):** post-major-sync precision pass that drives
   sync to ±0.2s of the sung lyric WITHOUT touching anything else. Enters after 20s of
   satisfactory sync, listens every 8s via Whisper-anchor. Per tick: forward drift 0.2–1.0s →
