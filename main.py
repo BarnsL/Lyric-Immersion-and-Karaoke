@@ -1546,10 +1546,10 @@ class Overlay:
             # ── render perf knobs (scroll-through smoothness) ──
             # heavy_budget_ms caps the per-frame spawn/repaint work so a PIL
             # paste can't stall the scroll belt; 0 disables the cap.
-            "heavy_budget_ms":      10.0,   # max ms of spawn+repaint work per heavy frame
-            "repaint_budget":        6.0,   # max karaoke-fill SLIVER pastes per heavy frame (cheap now)
-            "fill_interval":        0.06,   # min seconds between a block's fill repaints (smoothness)
-            "spawn_budget":          1.0,   # max block PIL-renders per heavy frame
+            "heavy_budget_ms":      14.0,   # max ms of spawn+repaint work per heavy frame (40% more PIL slice with +1 core)
+            "repaint_budget":        3.0,   # max karaoke-fill SLIVER pastes per heavy frame (cheap now)
+            "fill_interval":        0.04,   # min seconds between a block's fill repaints (25 fps cap; was 0.06=16 fps)
+            "spawn_budget":          1.0,   # max block PIL-renders per heavy frame (alloc spikes still dangerous, keep low)
             "fill_skip":             2.0,   # heavy work runs every Nth frame (fills are sliver-cheap)
             # PERF-102 — scroll bitmap-area controls (the dominant scroll cost):
             "scroll_max_lanes":      3,     # stacked scrolling lines (capped to what fits on screen)
@@ -6766,8 +6766,11 @@ def main():
     # CPU AFFINITY: keep this app OFF the first core(s). Windows runs the audio
     # engine and most device interrupts (DPC/ISR) on core 0, so a CPU-busy app
     # sharing core 0 shows up as a STATIC STUTTER in playing audio. Pinning our
-    # threads to the LATER cores (upper half, never core 0) leaves the audio
+    # threads to the LATER cores (upper half + 1, never core 0) leaves the audio
     # path clean on a typical 4+ core machine; on 2-3 cores we just avoid core 0.
+    # On a 16-core box this is cores 7-15 (mask 0xff80, 9 cores) — the extra core
+    # below the upper half gives the fill-paint loop more PIL headroom for the
+    # newly raised heavy_budget_ms / repaint_budget without crowding audio.
     # Best-effort and reversible by the user via Task Manager.
     try:
         import os as _os
@@ -6781,7 +6784,10 @@ def main():
         n = _os.cpu_count() or 1
         if n >= 4:
             mask = 0
-            for c in range(n // 2, n):       # upper half: cores N/2 … N-1
+            # upper half PLUS one extra core below it: e.g. 16-core → cores 7-15
+            # (mask 0xff80); 8-core → cores 3-7 (mask 0xf8); 4-core → cores 1-3.
+            start = max(1, (n // 2) - 1)     # never include core 0
+            for c in range(start, n):
                 mask |= (1 << c)
         elif n >= 2:
             mask = ((1 << n) - 1) & ~1        # all cores except core 0
