@@ -97,18 +97,19 @@ folder anywhere, or run it off a USB stick. To build it yourself, see
 romaji / pinyin / romaja, English translation, the karaoke fill, identify-by-sound
 (Shazam), playlist import, and multi-monitor. No extra downloads.
 
-> #### 🧠 Optional AI add-on (only if you want it)
-> One feature is **not** bundled, to keep the download small (~200 MB instead of
-> ~750 MB): **Whisper** (`faster-whisper`). It's only needed as a **last resort to
-> GENERATE lyrics by ear** for a song *no* lyric site or caption has — and it also
-> powers the optional "sync / identify by listening" extras. **You don't need it for
-> normal use** (provider lyrics + the video's own captions cover almost everything).
-> If you ever want it, run **`install_extras.bat`** in the app folder (or the tray's
-> **Install AI extras**) — it downloads it once, and the small speech model fetches
-> itself the first time it's used.
+> #### 🧠 Optional AI features (you almost certainly don't need them)
+> To keep the download small (**~120 MB** instead of ~750 MB), the heavy **Whisper**
+> AI (`faster-whisper`, ~600 MB of libraries) is **left out of the portable build**.
+> Whisper is only a **last resort to GENERATE lyrics by ear** for a song that *no*
+> lyric site or caption track has, plus the optional "identify / sync by listening"
+> extras. **For normal use you never need it** — provider lyrics + the video's own
+> caption track already cover almost every song.
 >
-> Optional, NVIDIA only: the tray's **⚡ Enable GPU acceleration** fetches the CUDA
-> libraries on demand (~1.5 GB) to speed that AI up. Everything works without it.
+> If you specifically want those AI features, run the app **from source** and add
+> Whisper there: `pip install faster-whisper` (or run `install_extras.bat`). See
+> [BUILD.md](docs/BUILD.md). NVIDIA users can then `python gpu_setup.py` for a CUDA
+> speed-up. (A separate, larger "AI" download with Whisper pre-bundled can be provided
+> on request.)
 
 #### ✅ What you need for each feature
 
