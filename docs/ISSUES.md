@@ -18,7 +18,39 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
-## TICKET-105 — Self-heal Start Menu shortcut on app startup (rebrand migration) 🔴
+## v1.0.91 — Shipped (LINE-mode render perf + perf instrumentation + title-alias album fallback + verified-render grace + scroll_ rename + concert-detect regex + fine-tune pause + GPU policy followups + Start Menu self-heal)
+**Seven workflow-driven fixes in one build, all targeting failure classes captured by the v1.0.90 perf workflow (w821l9jnw) on V.W.P "歌姫" + cluster A/B stall traces.** Closes TICKET-103 followups, TICKET-104, TICKET-105, TICKET-106 and lands the batch4 A1/A2/A3 plus the scroll_ rename batch1.
+
+- **A1 (TICKET-104 followup):** bounded LRU cache for `measure_text()` keyed by `(font_name, font_size, char)`, capped at the new `measure_text_cache_size` knob (default 4096). Eliminates >95% of per-char canvas create+destroy in `_render()` after warm-up. Hit rate surfaced in `/diag.measure_text_cache_hit_rate`.
+- **A2:** sub-branch perf instrumentation. `_perf_branch(name)` context manager wraps `_render()`, `_karaoke()`, and the per-char `itemconfig` loop; perf-log line gains a ` | branch=render=… kara=… itemconfig=…` suffix. Raw-frame-ms column added too (controlled by `perf_record_raw_frame_ms`, default 1) — the EWMA was hiding 800-960 ms real stalls as 156 ms entries. New knobs: `perf_record_branches` (default `render|kara|itemconfig`), `perf_record_raw_frame_ms`, `perf_record_dt_cap_ms` (default 2000).
+- **A3 (TICKET batch4):** `title_alias_album_fallback` (default 1) — when Shazam's title is the album-string-with-features pattern (歌姫 vs DIVA (feat. …)), populate `_sound_title_alias` so the v1.0.89 strict source-priority gate keeps `verified=true` instead of blanking the overlay. `verified_render_gate_s` (default 3.0) — keep the last good lyrics on screen for N seconds after a verified→False flip before tearing down `line_count`. Single chokepoint `_set_verified` consolidates all `self._verified` assignments and records `_verified_gate_t` on every edge. `/diag.derived` exposes `sound_title_alias`, `verified_render_gate_remaining_s`.
+- **scroll_ rename (batch1, TICKET-104 follow-on):** five scroll-mode-only knobs renamed with `scroll_` prefix so a future operator can't confuse them with LINE-mode work: `heavy_budget_ms` → `scroll_heavy_budget_ms`, `spawn_budget` → `scroll_spawn_budget`, `repaint_budget` → `scroll_repaint_budget`, `fill_skip` → `scroll_fill_skip`, `fill_interval` → `scroll_fill_interval`. Back-compat via `_TUNE_LEGACY_ALIASES` in `set_tune` — old keys still POST cleanly with a warning log.
+- **TICKET-106:** `_LIVE_VER_RE` expanded to catch the `Nth ONE-MAN LIVE` / `Nth LIVE TOUR` / `Nth ANNIVERSARY LIVE` family plus `ワンマン` / `ワンマンライブ` JP idioms, fixing the V.W.P "4th ONE-MAN LIVE" miss (clear LIVE / ONE-MAN LIVE markers in the title were not firing in-tick concert detection). Live-resync cadence shortened: 12.0 → 6.0 s (`live_resync_s`), listen window 6.0 → 4.0 s (`live_resync_listen_s`), fast gap 1.5 → 1.0 s (`live_resync_fast_gap_s`) so inside-wrapper song-ID happens ~12×/min on a hot tier.
+- **TICKET-104:** `fine_tune_max_pause_s` 1.0 → 3.0 (user-requested); `fine_tune_exit_drift_s` 2.5 → 3.5 (must be > pause cap + 0.5 buffer).
+- **TICKET-103 followups:** `gpu_solo_override` knob added (default 0) so a single-GPU user can opt back into GPU; live-tune flip propagates immediately via `align.set_gpu_solo_override(bool)`. GPU device + index + reason + count surfaced in `/diag`.
+- **TICKET-105:** Start Menu shortcut self-heal at frozen-app startup — deletes a broken `Desktop Karaoke.lnk` whose target doesn't exist; creates fresh `Lyric Immersion and Karaoke.lnk` pointing to `sys.executable` (WindowStyle 7, minimized + no-activate). Skipped in dev (sys.frozen=False).
+
+**No new modules** — every change is in main.py — so `DesktopKaraoke.spec` hiddenimports needed no edit.
+
+**Follow-up (re-measure required):** A1 should reduce the per-IDX-transition spikes (cluster B 1:1 correlation) substantially; ask the user to re-run the perf capture post-restart and confirm p99 drops from 78.5 ms toward the 33-40 ms baseline. If A1 alone is insufficient, schedule `render_idx_change_budget_ms` for v1.0.92 (soft-budget `_render()` and re-queue residual segment work via `root.after(0, …)` so the next eased belt frame renders unblocked).
+
+---
+
+## TICKET-106 — Concert detection: "Nth ONE-MAN LIVE" / "ワンマン" family miss 🟢 (v1.0.91)
+**Symptom (workflow w821l9jnw, 2026-06-27):** V.W.P "4th ONE-MAN LIVE" track title carried both `LIVE` and `ONE-MAN LIVE` markers, yet the in-tick `_LIVE_VER_RE` regex did not classify the wrapper as a concert — so the live-resync hot tier never engaged and song-ID inside the container missed. Pairs with the verification deadlock identified in slice 3 (tier_incon_streak=1 for the full 90s without escalation).
+**Fix (v1.0.91):** `_LIVE_VER_RE` expanded:
+- `one[\s-]?man\s*live` matches `ONE-MAN LIVE` / `ONE MAN LIVE` / `ONEMANLIVE`.
+- `\d+(?:st|nd|rd|th)\s+one[\s-]?man(?:\s*live)?` catches the `4th ONE-MAN LIVE` / `5th ONE-MAN` ordinal form.
+- `\d+(?:st|nd|rd|th)\s+(?:live|tour|anniversary)\s+(?:tour|live|stage|fes(?:tival)?)` covers `10th LIVE TOUR`, `5th ANNIVERSARY LIVE`, `3rd TOUR FES`.
+- `ワンマン(?:ライブ)?` covers the JP solo-concert idiom.
+
+Live-resync cadence retuned in the same edit: `live_resync_s` 12.0 → 6.0 (default cadence), `live_resync_listen_s` 6.0 → 4.0 (shorter capture, faster cycle), `live_resync_fast_gap_s` 1.5 → 1.0 (~12×/min while missing / fresh song). Inside-wrapper song-ID now retries fast enough that a 90 s deadlock can no longer recur on a recognized concert title.
+
+**Verify:** play any V.W.P concert track titled with `Nth ONE-MAN LIVE` / `Nth LIVE TOUR`; `/diag.derived` shows `live_arrangement=true` within the first tick; the tier scheduler escalates to live-resync hot tier within 6 s.
+
+---
+
+## TICKET-105 — Self-heal Start Menu shortcut on app startup (rebrand migration) 🟢 (v1.0.91)
 **Symptom (user, 2026-06-27):** "i dont see the exe on my start menu". After the rebrand from "Desktop Karaoke" → "Lyric Immersion and Karaoke" (and exe rename `DesktopKaraoke.exe` → `Lyric-Immersion-and-Karaoke.exe`), the old `Desktop Karaoke.lnk` in the user's Start Menu still pointed to the now-deleted `D:\DesktopKaraoke\DesktopKaraoke.exe`. Clicking did nothing, and searching "lyric" found nothing.
 **Inline fix this session:** deleted the broken `Desktop Karaoke.lnk`, created fresh `Lyric Immersion and Karaoke.lnk` pointing to the new exe.
 **Permanent fix:** add a startup migration in main.py (only when `getattr(sys, 'frozen', False)`):
@@ -31,7 +63,7 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
-## TICKET-104 — Fine-tune pause range: max 1.0 → 3.0 seconds 🔴
+## TICKET-104 — Fine-tune pause range: max 1.0 → 3.0 seconds 🟢 (v1.0.91)
 **User request:** the fine-tune mode's max forward-drift pause is too short — bump to 3.0 s.
 **Current (main.py self._tune):**
 - `fine_tune_max_pause_s = 1.0` — biggest forward-drift pause when lyrics are ahead of vocals.
@@ -44,7 +76,7 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
-## TICKET-103 — GPU policy: secondary GPU when gaming, disabled on single-GPU 🟡
+## TICKET-103 — GPU policy: secondary GPU when gaming, disabled on single-GPU 🟢 (v1.0.91)
 **User request:** "make sure any gpu acceleration is on the secondary gpu when gaming or otherwise disabled when single gpu".
 **Current state (gpu_setup.pick_inference_device):**
 - Multi-GPU + gaming → idlest GPU (any GPU >=30% util treated as the game's, skipped) ✓
@@ -56,7 +88,7 @@ lyrics** at the same playback position — not just `/status`.
 - Add tune knob `gpu_solo_override` default 0 — user who explicitly wants GPU on single-GPU machine can flip it.
 - Expose current device + reason in /diag: `gpu_device`, `gpu_index`, `gpu_reason`, `gpu_count`.
 - Richer tray label dynamically reflecting state: "⚡ GPU: cuda:1 (3080, active)" / "⚡ GPU: CPU (game running)" / "⚡ GPU: CPU (single-GPU policy)".
-**Status:** core policy change applied 🟢; followups 🟡.
+**Status:** core policy change applied 🟢; followups 🟢 (v1.0.91 — `gpu_solo_override` knob added, `/diag` exposes gpu_device/index/reason/count, live-tune flip propagates via `align.set_gpu_solo_override`).
 
 ---
 

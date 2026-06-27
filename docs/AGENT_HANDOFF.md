@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.90.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.91.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -53,7 +53,73 @@ Suisei). **Current build: v1.0.90.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.90, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.91, all deployed + on master)
+- **v1.0.91 — LINE-mode render perf (A1) + perf instrumentation (A2) + title-alias album
+  fallback + verified-render grace (A3) + scroll_ knob rename + concert-detection regex
+  expansion (TICKETs 103-followups / 104 / 105 / 106 / batch4 A1+A2+A3):** seven workflow-driven
+  fixes in one build. **(A1, TICKET-104 followup)** Bounded LRU cache for `measure_text()`
+  (main.py:1298), keyed by `(font_name, font_size, char)`, capped at the new
+  `measure_text_cache_size` tune knob (default 4096). The per-character canvas
+  create+destroy that `_render()` triggered on every IDX transition (the textbook
+  cause of the 200-960 ms stalls captured in workflow w821l9jnw cluster A / B) now
+  hits the cache for >95% of calls after a song's character set is warm. Hit-rate
+  surfaced in `/diag.measure_text_cache_hit_rate` so a regression is visible
+  immediately. **(A2)** Sub-branch perf instrumentation: `_perf_branch(name)`
+  context-manager wraps `_render()`, `_karaoke()`, and the per-char `itemconfig`
+  loop with named timers; the perf-log line now appends `| branch=render=42.1
+  kara=8.2 itemconfig=3.4` so the operator sees WHICH operation owns a 158 ms
+  spike (slice 4's blind spot). Raw-frame-ms column added too — the v1.0.85 EWMA
+  was hiding 800-960 ms real stalls as 156 ms entries because dt>500 ms was
+  silently dropped (main.py:3773-3775); raw column logs the actual dt up to the new
+  `perf_record_dt_cap_ms` ceiling (2000 ms). Two new tune knobs: `perf_record_branches`
+  (pipe-separated names to instrument, default `render|kara|itemconfig`) and
+  `perf_record_raw_frame_ms` (1 = on, default on). **(A3, TICKET batch4)**
+  Title-alias album fallback + verified-render grace window. The capture showed
+  V.W.P "歌姫" (SMTC track name) vs Shazam "DIVA (feat. KAF, RIM, Harusaruhi,
+  Isekaijoucho & KOKO)" (album-string-with-features) tore down lyrics for 71 s on
+  a benign disagreement — same release, same song. New `title_alias_album_fallback`
+  (default 1): when Shazam's title aliases an album-string we've seen before for the
+  loaded track, populate `_sound_title_alias` so the v1.0.89 strict-source-priority
+  gate keeps `verified=true` instead of blanking the overlay. `_set_verified` is the
+  new single chokepoint for all `self._verified` assignments — every flip records
+  the wall-clock time so the verified→False render grace window can keep the last
+  good lyrics on screen for `verified_render_gate_s` (default 3.0 s) before tearing
+  down `line_count`. `_verified_gate_t` surfaces in /diag.derived alongside
+  `sound_title_alias`. Routed through `_set_verified` at 5 call sites (decide,
+  consume_async, takeover, fine-tune, force-sync). **(scroll_ rename, batch1 follow-on
+  of TICKET-104)** Renamed five scroll-mode-only knobs with a `scroll_` prefix so a
+  future operator can't confuse them with LINE-mode work (line mode is unbudgeted
+  — A1's whole point): `heavy_budget_ms` → `scroll_heavy_budget_ms`,
+  `spawn_budget` → `scroll_spawn_budget`, `repaint_budget` → `scroll_repaint_budget`,
+  `fill_skip` → `scroll_fill_skip`, `fill_interval` → `scroll_fill_interval`. The
+  old names still work via the new `_TUNE_LEGACY_ALIASES` map in `set_tune` — a
+  /tune POST with a legacy key logs a warning and redirects. **(TICKET-106)**
+  `_LIVE_VER_RE` expanded to catch `Nth ONE-MAN LIVE` / `Nth LIVE TOUR` /
+  `Nth ANNIVERSARY LIVE` plus the `ワンマン` / `ワンマンライブ` JP family, fixing
+  the V.W.P "4th ONE-MAN LIVE" miss where the in-tick concert-detection regex
+  didn't fire on the obviously-LIVE wrapper. Live-resync cadence shortened in
+  parallel (12.0 → 6.0 s; listen window 6.0 → 4.0 s; fast gap 1.5 → 1.0 s) so
+  inside-wrapper song-ID happens ~12×/min on a hot tier. **(TICKET-104)**
+  `fine_tune_max_pause_s` bumped 1.0 → 3.0 (user-requested) — holding a line
+  still up to 3 s is visually quieter than the equivalent backward nudge that
+  re-scrolls already-shown text; `fine_tune_exit_drift_s` follows to 3.5 so a
+  drift just under the new cap doesn't immediately hand back to the regular tier.
+  **(TICKET-103 followups)** `gpu_solo_override` tune knob added (default 0) so a
+  user on a single-GPU machine can opt back into GPU acceleration; `/tune` flip
+  re-applies via `align.set_gpu_solo_override(bool)` immediately. GPU device +
+  index + reason + count now surface in `/diag`. **(TICKET-105)** Start Menu
+  shortcut self-heal at startup — when `getattr(sys, 'frozen', False)` AND the
+  old `Desktop Karaoke.lnk` target doesn't exist on disk, delete it; if no
+  `Lyric Immersion and Karaoke.lnk` exists in the same dir, create one pointing
+  at `sys.executable` (WindowStyle 7, minimized + no-activate per CLAUDE.md
+  app-launch etiquette). Skipped in dev (sys.frozen=False) to avoid noise.
+  No new modules — every change is in main.py — so `DesktopKaraoke.spec`
+  hiddenimports needed no edit. **Follow-up to measure post-restart:** A1 should
+  reduce the per-IDX-transition spikes (cluster B 1:1 correlation) substantially;
+  re-run perf capture and confirm p99 drops from 78.5 ms toward the 33-40 ms
+  baseline. If A1 alone is insufficient, schedule `render_idx_change_budget_ms`
+  (defer to v1.0.92 — soft-budget `_render()` and re-queue residual segment
+  work via `root.after(0, …)` so the next eased belt frame renders unblocked).
 - **v1.0.90 — Window-title scraper for Steam Overlay / Discord / Slack / Teams CEF hosts
   (TICKET-102):** the Steam Overlay's embedded CEF browser (steamwebhelper.exe), Discord's
   embedded YouTube/Spotify iframes, and Slack/Teams media tiles do NOT publish to SMTC,
