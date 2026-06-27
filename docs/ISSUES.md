@@ -8,6 +8,45 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-080 — Romaji↔CJK title equivalence + lopsided decide-by-ear win + GPU picker by utilization 🟢
+**Symptom (kamone took ~41 s):**
+```
+01:13:23 track change: 'kamone' / 'Kizuna AI' (dur None)
+01:13:23 no confident title-match for 'kamone' (best 0); will use sound
+01:14:04 decide-by-ear[library]: heard … → best かもね.json (69) vs loaded (20)
+01:14:04 decide-by-ear: loaded doesn't match the singing (20) and no library song fits → re-fetching 'kamone'
+```
+Two compounding misses:
+1. The cache has `かもね.json` (and a separate `kamone.json` provider variant) but a
+   ROMAJI player title 'kamone' couldn't title-match a JP-script cached file → fell
+   through to a 22 s wait for decide-by-ear, then 12 s for Whisper transcribe.
+2. Whisper found the right song (`かもね.json` at 69 vs loaded 20 — 49-point margin)
+   but the library-scope `MIN=70` rejected it by 1 point → triggered a slow re-fetch.
+
+**Fix (v1.0.80):**
+- **Hepburn romaji form on every JP-titled cache entry** (`_to_hepburn` via pykakasi).
+  `かもね` is indexed under `kamone` too so a romanized YouTube title hits it.
+  Stored in a SEPARATE `forms_alt` set so the matcher can prefer a same-script entry
+  when both exist — `_title_forms_split` returns `(native, alt)` and `LyricsIndex.match`
+  applies −3 when either side of the match used the cross-script bridge. Verified:
+  `kamone` → `kamone.json`, `かもね` → `かもね.json`, `Kireigoto` → `kireigoto.json`,
+  `綺麗事` → `綺麗事.json` (each picks its native-script entry when both cached).
+- **Lopsided-win override in `_apply_decision`:** when `loaded_score < wrong_floor`
+  AND `best_score >= MIN−10` AND `best − loaded >= 3·MARGIN`, accept even when below
+  the library MIN. The kamone case (69 vs 20, MIN 70, MARGIN 12 → 3× = 36) qualifies
+  by every condition — the strict gate was throwing away a clear net win for a slow
+  re-fetch.
+- **`pick_inference_device` is now utilization-based always**, not just under games.
+  Drops the "game is on cuda:0" assumption (broken on this rig: 3080 eGPU is cuda:1
+  and gets the game; the old rule put Whisper RIGHT on the game's card). Picks the
+  idlest GPU with a small cache-locality bias toward cuda:0. Under a fullscreen game,
+  any GPU at >=30% util is skipped; if all are busy → CPU. Verified live: cuda:0 (2080
+  Max-Q, idle) wins by cache-locality when 3080 is at low util; the dual-GPU swap
+  triggers only when the spread widens. Now both GPUs are usable for Whisper since
+  the Code 31 fix landed.
+
+---
+
 ## TICKET-079 — Concert SMTC wrapper defeats song-ID 🟡 (a+c landed; b+d open)
 **Symptom (VESPERBELL 3rd ONE-MAN LIVE BEYOND):** the app was alive for the entire
 6-minute window inside the concert (00:50:37 → 00:56:34) without showing a single lyric.

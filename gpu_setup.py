@@ -191,21 +191,35 @@ def _gpu_utils() -> dict:
 def pick_inference_device(avoid_when_gaming: bool = True):
     """Where Whisper should run RIGHT NOW → ``(device, index, reason)``.
 
-    No game → the fast path ``('cuda', 0)``. Fullscreen game (and ``avoid_when_gaming``)
-    → keep off the game's card: an IDLE second NVIDIA GPU if present, otherwise
-    ``('cpu', 0)`` so the transcription never competes with the game for the GPU."""
+    Picks the LEAST-utilized CUDA GPU instead of assuming the game is always on
+    GPU 0 (TICKET-080 — on this rig the eGPU 3080 is cuda:1 and gets the game,
+    so the old 'skip 0' rule put Whisper right on the game's card). When a
+    fullscreen game is active, any GPU at >=30% util is treated as the game's
+    and skipped; if everything is busy we fall to CPU so the transcribe can't
+    hitch the game. When not gaming, prefers the idlest GPU but stays on cuda:0
+    when the difference is small so the model cache stays warm there."""
     n = cuda_device_count()
     if n <= 0:
         return ("cpu", 0, "no CUDA GPU")
-    if not (avoid_when_gaming and game_active()):
-        return ("cuda", 0, "default")
-    if n <= 1:
-        return ("cpu", 0, "game: single GPU → CPU")
-    utils = _gpu_utils()
-    for i in range(1, n):                    # the game is almost always on GPU 0
-        if utils.get(i, 100) < 30:
-            return ("cuda", i, f"game: using idle GPU {i}")
-    return ("cpu", 0, "game: spare GPUs busy → CPU")
+    if n == 1:
+        if avoid_when_gaming and game_active():
+            return ("cpu", 0, "game: single GPU → CPU")
+        return ("cuda", 0, "default (single GPU)")
+    utils = _gpu_utils()                              # {idx: util%} — missing = idle
+    gaming = avoid_when_gaming and game_active()
+    BUSY = 30
+    ranked = sorted(range(n), key=lambda i: utils.get(i, 0))
+    if gaming:
+        free = [i for i in ranked if utils.get(i, 0) < BUSY]
+        if not free:
+            return ("cpu", 0, "game: all GPUs busy → CPU")
+        i = free[0]
+        return ("cuda", i, f"game: idlest GPU {i} ({utils.get(i, 0)}%)")
+    best = ranked[0]
+    if utils.get(best, 0) + 5 >= utils.get(0, 0):
+        return ("cuda", 0, "default")                 # tied or cuda:0 idle enough
+    return ("cuda", best,
+            f"idle GPU {best} ({utils.get(best, 0)}% vs cuda:0 {utils.get(0, 0)}%)")
 
 
 def _is_pypi_https(url: str) -> bool:
