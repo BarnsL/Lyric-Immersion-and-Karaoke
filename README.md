@@ -23,8 +23,6 @@ while it runs.
 - 🎤 **Karaoke** — *big, bold, flowing* lyrics across the **bottom** that a whole
   room can read and sing along to, scrolling in time with the music.
 
-![overlay](docs/preview.png)
-
 ## ▶️ Demo
 
 [![Desktop Karaoke — AI song recognition & lyric synchronization](https://img.youtube.com/vi/AQfNzmsx1qU/hqdefault.jpg)](https://youtu.be/AQfNzmsx1qU)
