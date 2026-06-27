@@ -1277,9 +1277,10 @@ class Overlay:
             "confirmed_recal_s":     45.0,  # confirmed+watched song → slow Shazam re-lock (tier handles drift)
             "wrong_song_strikes":     5,    # heard the SAME other song this many × → loaded song is wrong, switch
             # ── SMART song decision by ear (Whisper 'small' + rapidfuzz, ~250 MB) ──
-            "decide_min_score":      55.0,  # a candidate must match the heard singing ≥ this to win
+            "decide_min_score":      55.0,  # a title candidate must match the heard singing ≥ this to win
+            "decide_library_min":    70.0,  # a WHOLE-LIBRARY identification must clear this higher bar
             "decide_margin":         12.0,  # …and beat the loaded song's match by this much to switch
-            "decide_wrong_floor":    32.0,  # loaded match below this = the lyrics are the wrong song
+            "decide_wrong_floor":    32.0,  # loaded match below this = the lyrics are the wrong song → search the library
             "decide_listen_s":       12.0,  # seconds of vocals to transcribe for the decision
             "decide_at_s":           20.0,  # run the by-ear decision this many s into a new track
             "continuous_recal_ms": 15000,   # legacy fixed cadence (superseded by the adaptive tier)
@@ -4852,17 +4853,44 @@ class Overlay:
                 seen.add(k)
         except Exception:
             pass
-        if len(pool) < 2:
-            return                                    # nothing to compare against
+        # (a pool of just the loaded song is fine — a clearly-wrong loaded song is
+        # then identified against the WHOLE library below.)
         self._deciding = True
         lang = self.meta.get("lang", "ja")
         secs = float(self._tune.get("decide_listen_s", 12.0))
-        log.info("decide-by-ear (%s): listening to pick among %d candidates", reason, len(pool))
+        wrong_floor = float(self._tune.get("decide_wrong_floor", 32.0))
+        lib_paths = [str(e["path"]) for e in self.index.entries][:600]
+        log.info("decide-by-ear (%s): listening among %d title candidates "
+                 "(whole library of %d ready if the loaded song is wrong)",
+                 reason, len(pool), len(lib_paths))
 
         def work():
             res = None
             try:
-                res = align.decide_song_by_lyrics(pool, lang=lang, seconds=secs)
+                import align
+                heard = align.transcribe_vocals(lang, seconds=secs)
+                if heard:
+                    ranked = align.score_candidates(heard, pool)
+                    loaded_score = next((s for s, k in ranked if k == loaded_key), 0.0)
+                    expanded = False
+                    if loaded_score < wrong_floor:
+                        # The loaded lyrics DON'T match the singing → identify against
+                        # the WHOLE cached library (the model "trained on everything we
+                        # have"): score the SAME transcript against every cached song.
+                        libpool = []
+                        for k in lib_paths:
+                            if k == loaded_key:
+                                continue
+                            try:
+                                d = json.loads(Path(k).read_text("utf-8"))
+                            except Exception:
+                                continue
+                            libpool.append((k, self._lyric_text(d.get("lines"))))
+                        if libpool:
+                            ranked = sorted(align.score_candidates(heard, libpool)
+                                            + [(loaded_score, loaded_key)], reverse=True)
+                            expanded = True
+                    res = {"heard": heard, "ranked": ranked, "expanded": expanded}
             except Exception as e:
                 log.info("decide-by-ear error: %s", e)
             self.root.after(0, lambda: self._apply_decision(res, track_seq, loaded_key))
@@ -4873,20 +4901,28 @@ class Overlay:
         self._deciding = False
         if not res or not res.get("ranked"):
             return
-        self._last_decision = {"heard": res["heard"][:60],
-                               "ranked": [(s, Path(k).name if k != "loaded" else k)
-                                          for s, k in res["ranked"][:4]],
-                               "t": time.time()}
+        expanded = bool(res.get("expanded"))
+        self._last_decision = {
+            "heard": res["heard"][:60],
+            "scope": "library" if expanded else "title",
+            "ranked": [(s, Path(k).name if k not in ("loaded",) else k)
+                       for s, k in res["ranked"][:4]],
+            "t": time.time(),
+        }
         if track_seq != self._track_seq:
             return                                    # track changed mid-transcribe
         ranked = res["ranked"]
         best_score, best_key = ranked[0]
         loaded_score = next((s for s, k in ranked if k == loaded_key), 0.0)
-        log.info("decide-by-ear: heard %r → best %s (%.0f) vs loaded (%.0f)",
-                 res["heard"][:40],
+        log.info("decide-by-ear[%s]: heard %r → best %s (%.0f) vs loaded (%.0f)",
+                 "library" if expanded else "title", res["heard"][:40],
                  Path(best_key).name if best_key not in ("loaded",) else best_key,
                  best_score, loaded_score)
-        MIN = self._tune.get("decide_min_score", 55.0)
+        # A LIBRARY-WIDE identification (broad search over every cached song) must
+        # clear a HIGHER bar than a title-confined check, so a short transcript can't
+        # latch onto a stray song among hundreds.
+        MIN = (self._tune.get("decide_library_min", 70.0) if expanded
+               else self._tune.get("decide_min_score", 55.0))
         MARGIN = self._tune.get("decide_margin", 12.0)
         if (best_key not in ("loaded", loaded_key) and best_score >= MIN
                 and best_score - loaded_score >= MARGIN):
@@ -4901,17 +4937,16 @@ class Overlay:
                     self.offset = 0.0
                     self.idx = -1
                     self._hint("🎯 Corrected to the song being sung")
+                    return
             except Exception as e:
                 log.info("decide-by-ear: switch failed: %s", e)
-        elif loaded_score < self._tune.get("decide_wrong_floor", 32.0):
-            # the loaded lyrics match the singing POORLY and nothing in the library
-            # is better → the right song isn't cached. Fetch fresh by the title.
-            log.info("decide-by-ear: loaded lyrics match the singing poorly (%.0f) and no "
-                     "candidate fits → re-fetching by title %r", loaded_score, self._clean_title_cache)
+        if loaded_score < self._tune.get("decide_wrong_floor", 32.0) and best_score < MIN:
+            # loaded matches the singing POORLY and NOTHING cached fits → the right
+            # song isn't in the library yet. Fetch fresh (qualified by the cover's
+            # original artist when it's a cover, so a generic title finds the right one).
+            log.info("decide-by-ear: loaded doesn't match the singing (%.0f) and no library "
+                     "song fits → re-fetching %r", loaded_score, self._clean_title_cache)
             if self._track:
-                # For a COVER, qualify the search with the ORIGINAL artist parsed from
-                # the title ("Rebellion / hololive English -Advent-") so a generic
-                # title finds the right same-titled song, not another collision.
                 art = (self._cover_original_artist if self._is_cover
                        else self._clean_artist_cache) or ""
                 self._hint("🎯 Wrong lyrics — re-identifying…")

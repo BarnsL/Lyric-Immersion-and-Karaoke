@@ -68,3 +68,4 @@ _monitor*.jsonl
 _zip_release.py
 DesktopKaraoke-portable.zip
 DesktopKaraoke-portable.zip.sha256
+*.bak
