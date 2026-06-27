@@ -49,9 +49,17 @@ while it runs.
   romanized and translated on its own.
 - **Karaoke fill** that sweeps each line at singing speed, kept in time by the
   **real song position** — not a guess from when the app launched.
-- **Identify by sound.** When a title is wrong (covers, mislabeled uploads, DJ
-  mixes), it listens with Shazam and fetches the lyrics for what's *actually*
-  playing.
+- **Gets the right song, many ways.** A layered decision picks the correct lyrics
+  even for covers, mislabeled uploads, and same-title collisions: title + the cover's
+  *original* artist, the artist's usual language, Shazam, and — as the clincher — it
+  **listens and matches the actual singing against your whole lyric library** (a local
+  "Shazam by lyrics"), so it can identify the song from what's being sung even when the
+  title and Shazam both fail (MMD covers, "Performance Video" cuts). *(The listen-by-ear
+  parts use the optional AI add-on; see Install.)*
+- **Waveform + transcript sync.** Lyrics are kept in time by the **real song position**
+  and a vocal-band **waveform** analysis (energy + onsets), refined by the transcript so
+  the *what* (sung line) and the *when* (waveform onset) agree. **Live versions** resync
+  continuously to follow tempo shifts and the odd applause pause.
 - **Seamless switching in compilations.** In one long video with many songs
   back-to-back ("openings 1-26", an album upload, a DJ set, a concert) the
   player's title never changes — so a lightweight audio **song-change detector**
@@ -324,8 +332,8 @@ python add_lrc.py --folder manual
 ## 🛠️ From source (developers)
 
 ```bash
-git clone https://github.com/BarnsL/Desktop-Karaoke.git
-cd Desktop-Karaoke
+git clone https://github.com/BarnsL/Lyric-Immersion-and-Karaoke.git
+cd Lyric-Immersion-and-Karaoke
 pip install -r requirements.txt
 install_extras.bat               # optional: installs faster-whisper, yt-dlp, GPU libs
 pythonw main.py                  # start the overlay (no console window)

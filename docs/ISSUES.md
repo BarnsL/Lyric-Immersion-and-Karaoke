@@ -8,6 +8,31 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-073 — Add waveform analysis to the sync + matching algorithms 🟢
+**Ask:** use waveform analysis (not just the transcript) in syncing and song matching.
+**Already there:** vocal-band energy (FFT) + **spectral flatness** + vocal-onset detection
++ baseline (`songchange.py`) already power the energy-correlation sync and the
+song-change/applause detection.
+**Added (fusion):** (1) **waveform-gated listening** — the periodic Whisper listens
+(live-resync, the tier) only transcribe when the vocal-band energy says singing is
+happening NOW (`_vocals_active_now`), so a clip is never an instrumental break (cleaner
+transcript → better sync AND by-ear match). (2) **waveform-pinned offset** — after
+`_decide_by_ear` identifies the song by its lyrics (the *what*), the energy correlation
+pins the precise OFFSET (the *when*). **Scope note:** local audio FINGERPRINTING for
+matching is NOT added — it needs reference audio we don't store, and a cover/MMD differs
+from the original anyway; Shazam covers online fingerprinting, the lyric-match stays primary.
+
+## TICKET-072 — Live/concert versions: resync by ear ~5×/min 🟢
+**Ask:** a 【LIVE MV】 / ONE-MAN LIVE cut should expect resyncs + odd pauses; have live
+versions lyric-match ~5×/min.
+**Cause:** live cuts DO register (`is_live_arrangement`) but only polled Shazam, which
+can't fingerprint the (usually MMD) performance — so tempo shifts + applause pauses
+drifted the timing with no recovery.
+**Fix:** `_live_resync_loop` — for a registered live arrangement/concert with lyrics
+loaded, transcribe + match to the loaded lyrics ~5×/min (`live_resync_s=12s`), FOLLOWING
+the measured live offset. Waveform-gated (only when vocals are active) so it doesn't
+waste a transcription on an instrumental/applause gap.
+
 ## TICKET-071 — Smart song decision by ear (Whisper 'small' + rapidfuzz) 🟢
 **Ask:** a small (~250 MB) model that makes smart decisions about WHICH song's lyrics to
 show — the title/Shazam signals keep failing on MMD/cover/performance videos and

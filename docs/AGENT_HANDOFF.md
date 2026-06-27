@@ -82,7 +82,16 @@ LAYERED, each layer a fallback for the last:
    canonical Genius lyrics before trusting it** (feelingradation's first bake was a wrong song).
    Currently baked: feelingradation, サクラミラージュ.
 
-## What this session shipped (all deployed + pushed)
+## What this session shipped (all deployed + pushed) — current build **v1.0.68**
+- **Waveform + transcript fusion** (TICKET-073) — Whisper listens are waveform-GATED to
+  vocal-active windows (`_vocals_active_now`); after a by-ear match the energy correlation
+  pins the precise offset. (No local audio fingerprinting — needs reference audio we lack.)
+- **Live-version resync ~5×/min** (TICKET-072) — `_live_resync_loop` follows a live cut's
+  drifting offset by ear; waveform-gated. `live_resync_s`.
+- **Portable RELEASE** — `LEAN_BUILD=1` spec flag → ~120 MB Whisper-free portable zip;
+  GitHub release per tag (`gh release create v#`). Whisper is a from-source extra (can't be
+  pip'd into a frozen build). Default branch `claude/caption-sync-perf-fixes` IS the repo
+  homepage. README/ARCHITECTURE/About renamed + de-stale'd.
 - **Decide-by-ear / library-wide song ID** (TICKET-071) — see the decision system above.
 - **Baked-lyrics mechanism + authoritative guard** (TICKET-070) — feelingradation + サクラミラージュ.
 - **Cover original-artist for "Song / Artist covered by X"** — Rebellion case.
