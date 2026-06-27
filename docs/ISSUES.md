@@ -8,6 +8,24 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-071 — Smart song decision by ear (Whisper 'small' + rapidfuzz) 🟢
+**Ask:** a small (~250 MB) model that makes smart decisions about WHICH song's lyrics to
+show — the title/Shazam signals keep failing on MMD/cover/performance videos and
+mislabeled provider LRCs.
+**Researched:** Whisper does SOTA zero-shot lyric transcription with no fine-tuning
+(LyricWhiz, ISMIR'23); rapidfuzz partial/token-ratio is the recommended transcript matcher.
+Neural audio fingerprinting needs a reference DB of the exact tracks (useless for MMD
+covers); CLAP embeddings are ~600 MB and match audio→text descriptions, not exact songs.
+So: **faster-whisper 'small' (~250 MB int8, already bundled) + rapidfuzz**.
+**Fix:** `align.decide_song_by_lyrics(candidates, …)` captures ~12 s of vocals, transcribes
+with the *small* model, and scores each candidate's lyrics with `partial_ratio`
+(char-level → works for Japanese) and `token_set_ratio`. `_decide_by_ear` runs ~20 s into
+a track (and on demand via `POST /decide`): pool = loaded cache + title-similar library
+caches; if a candidate beats the loaded song by `decide_margin` and clears
+`decide_min_score`, it SWITCHES; if the loaded lyrics match the singing below
+`decide_wrong_floor` and nothing fits, it re-fetches by title. Verified: feelingradation
+vocals score 100 vs 13-28 for wrong songs. Skips baked/caption songs. `/diag.decision`.
+
 ## TICKET-070 — ReGLOSS songs always wrong (feelingradation, サクラミラージュ) → baked in 🟢
 **Symptom:** "feelingradation" and "サクラミラージュ Performance Video" (hololive DEV_IS
 ReGLOSS) were always wrong — feelingradation fell back to a poor Whisper transcription;
