@@ -80,7 +80,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,    # onedir — binaries live alongside, not inside
-    name="DesktopKaraoke",
+    name="Lyric-Immersion-and-Karaoke",   # exe filename = the repo name (was DesktopKaraoke)
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
