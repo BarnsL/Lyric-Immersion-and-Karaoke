@@ -1367,7 +1367,7 @@ class Overlay:
         self._display_fp = s.get("display_fp")         # fingerprint for monitor identity
         self._mon_snapshot = ()                         # current monitor topology
         self._last_mon_check = 0.0                     # throttle for _check_monitors
-        self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'|'lr'|'rl'
+        self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'|'top'|'bottom'|'lr'|'rl'|'tb'|'bt'
         self.scroll_speed = float(s.get("scroll_speed", SCROLL_SPEED))
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
         self.perf = s.get("perf", "smooth")            # 'smooth' | 'fast'
@@ -1378,7 +1378,24 @@ class Overlay:
         self.boundary_on = bool(s.get("boundary", True))  # fast song-change detect
         self.generate_on = bool(s.get("generate", True))  # generate lyrics by ear
         self.captions_on = bool(s.get("captions", True))   # prefer YouTube caption track for browser videos
-        self.concert_ocr = bool(s.get("concert_ocr", True))  # read the on-screen song banner in concerts
+        self.concert_ocr = bool(s.get("concert_ocr", True)) # banner-text fallback song-ID during concerts
+        # TICKET-100: opt-in Discord Rich Presence reader; default OFF (mirrors
+        # generate_on — both are "extra effort" features users opt into). Persists
+        # under settings key 'discord_rpc'. Tray toggle and tune knob both write
+        # the same runtime flag; whichever changes persists via _persist().
+        self.discord_rpc_on = bool(s.get("discord_rpc", False))
+        # Throttle state for the Discord RP poll (own clock, decoupled from the
+        # tick rate so the GET_ACTIVITY round-trip can't run more than every
+        # discord_rpc_poll_s seconds even if the Tk loop is ticking at 60 Hz).
+        self._discord_last_poll_t = 0.0
+        # Last (title, artist) seen on the Discord pipe — kept so a quiet poll
+        # doesn't drop the loaded lyrics the moment the round-trip times out.
+        self._discord_last_track = None
+        # Last wall-time the SMTC OR Shazam source produced a usable track; the
+        # Discord fallback only contributes after a continuous silent gap of
+        # `discord_rpc_silent_gap_s` seconds (default 8.0). Bumped on the tick
+        # loop whenever SMTC has a title OR Shazam's _sound_song is set.
+        self._music_source_last_t = time.time()
         self._last_ocr_t = 0.0        # throttle the concert OCR check
         self._ocr_song = None         # last song the banner OCR confidently read
         self._generating = False      # Whisper lyric-generation in progress
@@ -1495,7 +1512,24 @@ class Overlay:
         self._translate_result = None
         self._translating = None
         self._cur_duration = None
-        self._verified = False
+        # TICKET-099: split verification into TENTATIVE (duration/title check at
+        # load time — _verified_meta) and CONFIRMED (sound has corroborated the
+        # loaded title at least once — _sound_corroborated). The public-facing
+        # /status.verified is `_verified` (both true). Old offline-only paths
+        # (title-lock gate, decide-by-ear gate) keep using `_verified_meta` so
+        # an offline / Shazam-fails session doesn't regress.
+        self._verified = False           # public api.verified: meta AND sound-corroborated
+        self._verified_meta = False      # internal: duration/title match at load time
+        self._sound_corroborated = False # internal: ≥1 Shazam read agreed with loaded title
+        # TICKET-099: paused-SMTC Shazam takeover tracking.
+        # _smtc_paused_since: wall-clock when SMTC most recently EDGED PLAYING→not-PLAYING (0 = currently playing or unknown)
+        # _last_takeover_t:   wall-clock of the last takeover swap (debounces back-to-back swaps)
+        # _last_smtc_playing: edge detector for the pause-since timer
+        self._smtc_paused_since = 0.0
+        self._last_takeover_t = 0.0
+        self._last_smtc_playing = None
+        # _source_priority: telemetry for /diag — last decision from _resolve_source_priority()
+        self._source_priority = "agree"
         self._health_attempts = 0
         self._identifying = False
         self._aligning = False        # sync-by-listening (Whisper) in progress
@@ -1554,6 +1588,22 @@ class Overlay:
             "auto_align_cooldown":  14.0,   # min s between auto-aligns (< fast tier so it doesn't throttle it)
             "auto_align_min_pos":   12.0,   # min player pos before auto-align
             "shazam_lock_grace":    30.0,   # auto-align skipped within N s of lock
+            # ── TICKET-099: SMTC-paused Shazam takeover ──
+            # When SMTC reports the session is NOT playing (paused / stopped) and
+            # Shazam confidently hears a DIFFERENT song from what's loaded, the
+            # paused SMTC tab cannot be what's actually audible in the room. After
+            # smtc_paused_min_s seconds of continuous non-PLAYING SMTC AND two
+            # Shazam reads that agree on the heard (title, artist), drop the
+            # paused-SMTC lyrics and switch to what we hear. Debounced by
+            # smtc_takeover_debounce_s so a fresh takeover gets time to settle
+            # before another can fire; an SMTC PAUSED→PLAYING flip bypasses the
+            # debounce (a real user un-pause is the authoritative cancel signal).
+            # Set smtc_paused_shazam_takeover=0 to disable entirely (preserves
+            # v1.0.88 behavior: paused SMTC stays loaded, decide-by-ear is the
+            # only override).
+            "smtc_paused_shazam_takeover": 1,    # 1 = enable takeover; 0 = disable
+            "smtc_paused_min_s":           8.0,  # continuous non-PLAYING floor before takeover may fire
+            "smtc_takeover_debounce_s":   20.0,  # min seconds between consecutive takeovers
             "unconfirmed_backoff_s": 30.0,  # settled-but-unconfirmable song → slow the Shazam poll (anti-stutter)
             "confirmed_recal_s":     45.0,  # confirmed+watched song → slow Shazam re-lock (tier handles drift)
             "wrong_song_strikes":     5,    # heard the SAME other song this many × → loaded song is wrong, switch
@@ -1671,9 +1721,53 @@ class Overlay:
             # left on auto since the library is mostly Japanese already and the
             # current per-chunk detection is working there.
             "whisper_lang_lock":            1,  # 1=lock to self._gen_lang/meta lang, 0=auto-detect
+            # ── TICKET-100: Discord Rich Presence reader (Spotify Listening) ──
+            # Opt-in (default OFF) third-priority music-source. Only contributes
+            # (title, artist) when BOTH SMTC and the live Shazam source are silent
+            # for >= 8s; never overrides a real SMTC track and never supplies a
+            # position/clock. Useful when audio plays on a device that does NOT
+            # expose SMTC (e.g. iPhone Spotify → BT speaker, while the laptop's
+            # Discord client shows "Listening to Spotify"). Tray toggle and tune
+            # knob both write the same runtime flag (self.discord_rpc_on); when
+            # either changes it persists to settings. Lazy: no thread, no pipe
+            # probes, no module import until first poll while ON.
+            #
+            # NOTE TICKET-101 (out of scope for TICKET-100): per-game Rich
+            # Presence parsing (rhythm games publishing 'now playing' in their
+            # RP, e.g. Muse Dash, beatmania) would land behind a SEPARATE
+            # 'discord_game_rpc' knob (default 0) plus a per-application_id
+            # allowlist. Most games don't populate music info in RP and those
+            # that do use ad-hoc string formats requiring per-game parsers, so
+            # deferring keeps this ticket focused on the high-value Spotify case.
+            "discord_rpc_on":               0,  # 1 = read Discord RP as a fallback source, 0 = off
+            "discord_rpc_silent_gap_s":   8.0,  # SMTC+Shazam must be silent this long before Discord can speak
+            "discord_rpc_poll_s":         5.0,  # min seconds between GET_ACTIVITY probes (matches Discord's RP min interval)
+            "discord_rpc_timeout_s":      0.5,  # hard cap on a single IPC call — must never block the Tk loop
         }
+        # TICKET-100: mirror the persisted toggle into the tune dict so a user
+        # who flipped the tray menu ON in v1.0.89 boots back into the same
+        # state at v1.0.90+ (the dict literal above defaults to 0; the persisted
+        # bool is the source of truth at startup).
+        try:
+            self._tune["discord_rpc_on"] = 1 if self.discord_rpc_on else 0
+        except Exception:
+            pass
+        # BUG-2/5/6: if the persisted toggle is ON at startup, kick off the
+        # long-lived watcher daemon now so the first _tick poll already has
+        # a fresh slot to read. Failures (e.g. discord_rpc import error) are
+        # swallowed — the feature is best-effort.
+        if self.discord_rpc_on:
+            try:
+                import discord_rpc as _drpc
+                _drpc.start_watcher(
+                    poll_s=float(self._tune.get("discord_rpc_poll_s", 5.0)))
+            except Exception:
+                pass
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
+        # (_last_sound_lock_t is initialized earlier with the rest of the
+        # sync-state; the Discord RP fallback in _tick also keys off it so
+        # the "is Shazam ACTIVELY producing music?" gate decays cleanly.)
         self._pending_corr = 1e9      # a large sound offset awaiting a 2nd confirming read
         self._sync_confirm_after = None  # pending 2s "confirm with a 2nd listen" timer
         self._recent_corr = []        # last few audio offsets — spot repeated-chorus ambiguity
@@ -1798,6 +1892,17 @@ class Overlay:
         #                            with no lyrics yet can't show its stale source
         #                            (e.g. "youtube-captions / 0 lines")
         self._sound_song = None    # new video → re-identify by ear
+        # TICKET-099: new SMTC track → reset confirmation flags + takeover
+        # bookkeeping. Sound has not yet been heard for THIS song, and a fresh
+        # SMTC PLAYING tab cancels any pending takeover state from the previous
+        # track. The _last_takeover_t debounce intentionally stays — a song
+        # change does not authorize an immediate second takeover.
+        self._sound_corroborated = False
+        self._verified_meta = False
+        self._verified = False
+        self._smtc_paused_since = 0.0
+        self._last_smtc_playing = None
+        self._source_priority = "agree"
         self._pending_corr = 1e9   # drop any pending large-offset confirmation
         self._pending_offset = None  # drop any deferred sync-offset commit from prev track
         # FINE-TUNE: force-clear pause buffers AFTER the offset reset above so no
@@ -1901,6 +2006,8 @@ class Overlay:
             self.lines, self._lyrics_path, self.idx = [], None, -1
             self._kara = []
             self._verified = False
+            self._verified_meta = False           # TICKET-099
+            self._sound_corroborated = False      # TICKET-099
             self._hint("🎤 Live set — listening for each song…")
         else:
             # Provisional: show the title/artist match instantly (so there's no
@@ -1938,6 +2045,8 @@ class Overlay:
                 self.lines, self._lyrics_path, self.idx = [], None, -1
                 self._kara = []
                 self._verified = False
+                self._verified_meta = False           # TICKET-099
+                self._sound_corroborated = False      # TICKET-099
                 self._title_locked = False
                 self._hint(f"♪ {title} — identifying…")
                 self._start_fetch(fetch_artist, title, duration, cover=self._is_cover,
@@ -2070,12 +2179,170 @@ class Overlay:
             return rawa.strip().lower().endswith("- topic")
         return bool(src)
 
-    def _mark_verified(self):
+    def _mark_verified(self, confirmed=False):
+        """TICKET-099: split into TENTATIVE (meta — duration/title at load time)
+        and CONFIRMED (sound has corroborated the loaded title at least once).
+
+        Called WITHOUT confirmed at load time → updates _verified_meta only; the
+        public-facing `_verified` flag stays False until a Shazam read agrees
+        with the loaded title (see _consume_async loaded_ok branch which calls
+        _mark_verified(confirmed=True)).
+
+        This closes the v1.0.88 bug where _verified=True the moment a cache
+        passed the duration check — even if Shazam never heard the song and
+        SMTC was just a stale paused tab pointing at the wrong title.
+        """
         md = self.meta.get("duration")
         if self._cur_duration:
-            self._verified = bool(md and abs(md - self._cur_duration) <= 12)
+            self._verified_meta = bool(md and abs(md - self._cur_duration) <= 12)
         else:
-            self._verified = True   # title+language match is the best signal here
+            self._verified_meta = True   # title+language match is the best signal here
+        if confirmed:
+            self._sound_corroborated = True
+        # Public verified = meta AND sound-corroborated (TICKET-099). A duration
+        # match alone is no longer enough — Shazam must agree at least once.
+        self._verified = bool(self._verified_meta and self._sound_corroborated)
+
+    def _update_smtc_pause_state(self, st):
+        """TICKET-099: edge-detect SMTC PLAYING/not-PLAYING transitions.
+
+        Sets `_smtc_paused_since` to wall-clock on PLAYING→not-PLAYING and
+        resets it (plus clears the takeover debounce) on not-PLAYING→PLAYING.
+        Called from the tick loop after media.get(); kept tiny + idempotent so
+        it can run every frame. `st` is the raw media-watcher dict (may be
+        None / empty)."""
+        try:
+            playing = bool(st and st.get("status") == PLAYING)
+        except Exception:
+            playing = False
+        # Edge detect: only act on a TRANSITION (not every frame at the same state).
+        prev = self._last_smtc_playing
+        if prev is None:
+            # first observation — seed without firing an edge so we don't claim
+            # a pause-since for a session that's been paused forever
+            self._last_smtc_playing = playing
+            if not playing:
+                # treat the very first observed paused-state as starting now;
+                # without this, an app launched into a paused tab would have
+                # _smtc_paused_since=0 forever and never satisfy the floor.
+                self._smtc_paused_since = time.time()
+            return
+        if prev and not playing:
+            # PLAYING → not PLAYING: start the pause clock
+            self._smtc_paused_since = time.time()
+        elif (not prev) and playing:
+            # not PLAYING → PLAYING: clear pause clock AND debounce (a real
+            # user un-pause is the authoritative cancel signal — see TICKET-099
+            # decision on the debounce bypass).
+            self._smtc_paused_since = 0.0
+            self._last_takeover_t = 0.0
+        self._last_smtc_playing = playing
+
+    def _resolve_source_priority(self, st, heard):
+        """TICKET-099: decide who wins between SMTC and Shazam when Shazam
+        delivers a new sound_song result that DISAGREES with what's loaded.
+
+        Returns one of:
+          'agree'        — heard matches loaded (existing loaded_ok branch
+                           handles it; we just record the decision).
+          'smtc'         — SMTC is currently PLAYING; the user is actively
+                           streaming this audio, so SMTC stays primary and
+                           the existing strike/pending-switch flow handles
+                           any real disagreement.
+          'shazam-live'  — SMTC has been NOT-PLAYING for at least
+                           smtc_paused_min_s AND the takeover debounce has
+                           expired (or hasn't fired yet). Caller may execute
+                           a takeover swap to `heard`.
+          'confused'     — neither side is authoritative right now (e.g.
+                           SMTC paused but takeover gated by debounce / floor).
+                           Caller should keep current state and log.
+
+        Does NOT mutate any state apart from `self._source_priority` (telemetry).
+        """
+        try:
+            playing = bool(st and st.get("status") == PLAYING)
+        except Exception:
+            playing = False
+        loaded_t = self.meta.get("title", "") or ""
+        heard_t = (heard or (None, None))[0]
+        # Quick agree check (mirrors loaded_ok in _consume_async but cheaper —
+        # no alias path, which the caller has already tried).
+        if (heard_t and loaded_t and self._titles_match(loaded_t, heard_t)):
+            self._source_priority = "agree"
+            return "agree"
+        # SMTC.playing=true → user IS streaming THIS audio; SMTC wins.
+        if playing:
+            self._source_priority = "smtc"
+            return "smtc"
+        # Master switch — feature off → never take over from a paused SMTC.
+        if not int(self._tune.get("smtc_paused_shazam_takeover", 1) or 0):
+            self._source_priority = "confused"
+            return "confused"
+        # Paused-SMTC: require a continuous paused-floor and respect debounce.
+        floor = float(self._tune.get("smtc_paused_min_s", 8.0))
+        debounce = float(self._tune.get("smtc_takeover_debounce_s", 20.0))
+        now = time.time()
+        paused_for = (now - self._smtc_paused_since) if self._smtc_paused_since else 0.0
+        since_takeover = (now - self._last_takeover_t) if self._last_takeover_t else 1e9
+        if paused_for >= floor and since_takeover >= debounce:
+            self._source_priority = "shazam-live"
+            return "shazam-live"
+        self._source_priority = "confused"
+        return "confused"
+
+    def _smtc_paused_takeover(self, heard, f_title, f_artist):
+        """TICKET-099: drop the (paused-SMTC) loaded lyrics and switch to the
+        Shazam-heard song. Reuses the wrong-song correction path so reviewers
+        only have to learn one set of switch-mechanics. Bumps _track_seq to
+        cancel in-flight generation / translation / decide-by-ear for the
+        previous (SMTC) title. Caller has already confirmed the 2-read agreement
+        and the paused-floor / debounce gates (see _resolve_source_priority +
+        the takeover branch in _consume_async)."""
+        log.info("smtc-paused-takeover: dropping loaded %r — heard %r / %r "
+                 "(paused %.1fs, debounce ok) — swapping",
+                 self.meta.get("title", ""), f_title, f_artist,
+                 (time.time() - self._smtc_paused_since)
+                 if self._smtc_paused_since else 0.0)
+        self._last_takeover_t = time.time()
+        # Mirror the wrong-song correction path (line 2876-2894 in v1.0.88):
+        self._title_locked = False
+        self._sound_fail_streak = 0
+        self._last_heard_contra = None
+        self._pending_switch = None
+        self._sound_song = heard
+        self._last_sound_lock_t = time.time()
+        # Public verified must drop the moment we admit the lyrics on screen
+        # are not what we hear — even if meta still passes, sound_corroborated
+        # is being repudiated by THIS very swap. Both flags reset; the new
+        # song's verification re-earns through the normal loaded_ok flow.
+        self._sound_corroborated = False
+        self._verified_meta = False
+        self._verified = False
+        self.offset = 0.0
+        self._fast_calib = max(self._fast_calib, 2)
+        self._arm_recal(7)
+        # Cancel in-flight per-track work for the OLD (SMTC) title so a slow
+        # translate / generate / deep-transcribe can't land on the new lyrics.
+        # Mirrors _on_track_change's discipline (line ~1842-1844 v1.0.88).
+        self._track_seq += 1
+        self._gen_token += 1
+        self._deep_token += 1
+        self._generating = False
+        self._gen_defers = 0
+        # Look up the heard song's cache and load / fetch — same as the
+        # wrong-song correction's tail. _prefer_cjk_cache covers the
+        # romanized-vs-CJK title case.
+        cached = self._prefer_cjk_cache(f_artist, f_title, self._cur_duration) \
+            or self.index.match(f_artist, f_title, self._cur_duration)
+        if cached and self._file_valid(cached, self._cur_duration):
+            if cached != self._lyrics_path:
+                log.info("smtc-paused-takeover → cached %s", cached.name)
+                self.load(cached)
+            self._maybe_translate()
+        else:
+            log.info("smtc-paused-takeover → fetching %r / %r", f_title, f_artist)
+            self._hint(f"🔄 Heard a different song — switching to {f_title}…")
+            self._start_fetch(f_artist, f_title, self._cur_duration)
 
     def _file_valid(self, path, duration):
         try:
@@ -2499,9 +2766,15 @@ class Overlay:
                 log.info("concert OCR read %r (%.2f) → %s", title, score, cached.name)
                 self.load(cached)
                 self._maybe_translate()
+                # TICKET-099: concert OCR is the authoritative source in a live
+                # set — treat it as a corroborated source so the public verified
+                # flag goes true even before Shazam fingerprints the live cut.
+                self._verified_meta = True
+                self._sound_corroborated = True
                 self._verified = True
                 self._title_locked = True          # OCR is authoritative in a concert
                 self._sound_song = (title, artist)
+                self._last_sound_lock_t = time.time()
                 self.offset = 0.0
                 self._fast_calib = max(self._fast_calib, 2)
                 self._arm_recal(5)
@@ -2616,6 +2889,11 @@ class Overlay:
                                  "— trusting Shazam (player session likely stale)",
                                  g_title, title)
                 heard = (f_title, f_artist)
+                # TICKET-099: fetch SMTC state once at the top so the disagreement
+                # branches below can route by source priority (paused-SMTC takeover
+                # vs the normal SMTC-playing wrong-song flow). Cached locally so
+                # we don't hit the cross-thread media getter twice per result.
+                st_now = self.media.get() or {}
                 # Does the song we HEARD match the lyrics currently loaded?
                 # Title match OR the romanized-title alias: when we loaded an
                 # original-script (CJK) cache for a romanized heard title (e.g.
@@ -2635,9 +2913,17 @@ class Overlay:
                     # (Applying a heard song's offset to *different* lyrics — e.g.
                     # a Shazam mis-ID on a mix — was what produced wild offsets.)
                     self._sound_song = heard
+                    self._last_sound_lock_t = time.time()
                     self._pending_switch = None     # current song reconfirmed
                     self._sound_fail_streak = 0     # heard == loaded → sync works, clear strikes
                     self._last_heard_contra = None
+                    # TICKET-099: Shazam has now corroborated the loaded title at
+                    # least once → promote public `verified` from False (meta-only)
+                    # to True (meta AND sound-corroborated). This is the gate
+                    # that v1.0.88 was missing: a duration-match alone was being
+                    # reported as verified before sound ever heard the song.
+                    self._mark_verified(confirmed=True)
+                    self._source_priority = "agree"
                     # TICKET-090: Verified-Shazam WINS. When the Shazam fingerprint
                     # matched (we're in the loaded_ok branch ⇒ heard == loaded) AND
                     # the song has been verified by duration/title (_mark_verified
@@ -2821,6 +3107,56 @@ class Overlay:
                     # NEVER let a heard mis-ID override it (no switch, no strikes).
                     log.info("ignoring sound %r — bundled (baked) lyrics are "
                              "authoritative for %r", f_title, self.meta.get("title", ""))
+                elif (self.lines
+                      and self._resolve_source_priority(st_now, heard) == "shazam-live"
+                      and (heard == self._pending_switch
+                           or heard == self._last_heard_contra)):
+                    # TICKET-099: SMTC has been NOT-PLAYING for ≥ smtc_paused_min_s
+                    # AND a 2nd Shazam read AGREES with a previously-held heard
+                    # song (either pending_switch from the normal flow OR the
+                    # last_heard_contra from the title-lock strike flow). A
+                    # paused SMTC tab cannot be what's audible in the room, so
+                    # SMTC's authority is forfeit and we take over with what we
+                    # actually hear. Mirrors the wrong-song correction path but
+                    # bypasses the 5-strike count (the paused-floor + 2-read
+                    # agreement are the gates here). Debounced by
+                    # smtc_takeover_debounce_s so a fresh swap gets time to
+                    # settle. A SMTC PLAYING flip clears _smtc_paused_since and
+                    # _last_takeover_t (see _update_smtc_pause_state) so a real
+                    # user un-pause is heard immediately.
+                    self._smtc_paused_takeover(heard, f_title, f_artist)
+                elif (self.lines
+                      and self._resolve_source_priority(st_now, heard) == "shazam-live"
+                      and heard != self._pending_switch
+                      and heard != self._last_heard_contra):
+                    # TICKET-099: SMTC paused + Shazam disagrees, FIRST read. Hold
+                    # for a 2nd agreeing read before we drop the loaded lyrics
+                    # (Shazam mis-IDs niche audio — CS2 menu music reads as
+                    # 'Crosshair Kings' one call and the original menu music the
+                    # next; neither alone is enough). Mirror the normal pending_switch
+                    # 2-read flow; the takeover above will fire on the agreeing 2nd read.
+                    # Per design: even a SINGLE contradicting read from a paused
+                    # SMTC source DEMOTES verified=true to false and DROPS the
+                    # title-lock (lyrics stay on screen but no longer carry the
+                    # verified badge), because a paused tab can't be the room
+                    # audio so Shazam's reading is more trustworthy than SMTC.
+                    if self._verified or self._sound_corroborated or self._title_locked:
+                        log.info("smtc-paused-takeover: demoting verified/title-lock — "
+                                 "SMTC paused + Shazam contradicts loaded %r with %r",
+                                 self.meta.get("title", ""), f_title)
+                    self._sound_corroborated = False
+                    self._verified = False
+                    self._title_locked = False
+                    self._pending_switch = heard
+                    # Also seed last_heard_contra so the title-lock strike flow
+                    # would also count this; both paths funnel into the takeover
+                    # branch on the next agreeing read.
+                    if heard != self._last_heard_contra:
+                        self._last_heard_contra = heard
+                        self._sound_fail_streak = 1
+                    log.info("smtc-paused-takeover: heard %r ≠ loaded %r (SMTC paused) "
+                             "— awaiting 2nd agreeing read",
+                             f_title, self.meta.get("title", ""))
                 elif self._title_locked:
                     # The lyrics came from a confident EXACT match on a clean
                     # official title, but Shazam heard a DIFFERENT song — usually a
@@ -2845,6 +3181,7 @@ class Overlay:
                         self._last_heard_contra = None
                         self._sound_fail_streak = 0
                         self._sound_song = heard           # treat as same song confirmed
+                        self._last_sound_lock_t = time.time()
                         return
                     if heard == self._last_heard_contra:
                         self._sound_fail_streak += 1
@@ -2878,6 +3215,7 @@ class Overlay:
                         self._last_heard_contra = None
                         self._pending_switch = None
                         self._sound_song = heard
+                        self._last_sound_lock_t = time.time()
                         self.offset = 0.0
                         self._fast_calib = max(self._fast_calib, 2)
                         self._arm_recal(7)
@@ -2917,6 +3255,7 @@ class Overlay:
                     # it; start its timing fresh rather than carrying the old offset.
                     self._pending_switch = None
                     self._sound_song = heard
+                    self._last_sound_lock_t = time.time()
                     self.offset = 0.0
                     self._fast_calib = max(self._fast_calib, 2)
                     self._arm_recal(7)
@@ -2974,6 +3313,8 @@ class Overlay:
         self.lines, self.idx, self._kara = [], -1, []
         self._lyrics_path = None
         self._verified = False
+        self._verified_meta = False           # TICKET-099
+        self._sound_corroborated = False      # TICKET-099
         self.meta = {"title": self._gen_title, "artist": self._gen_artist,
                      "lang": "ja", "duration": self._cur_duration, "source": "generated"}
         self._hint("✨ Generating lyrics by ear… (AI — marked ***)")
@@ -3355,13 +3696,124 @@ class Overlay:
                 pass
         self._check_monitors(now)
         state = self.media.get()
+        # TICKET-099: edge-detect SMTC PLAYING/not-PLAYING transitions for the
+        # paused-Shazam takeover. Cheap (one bool compare + one timestamp);
+        # idempotent every frame.
+        self._update_smtc_pause_state(state)
+
+        # ── TICKET-100: source-merge bookkeeping ────────────────────────────
+        # Stamp wall-time the moment either authoritative source (SMTC or
+        # Shazam-live) has spoken, so the Discord RP fallback can require a
+        # CONTINUOUS silent gap before contributing. Cheap (one compare + one
+        # timestamp). Runs every tick, BEFORE the silent-state early-return so
+        # the timestamp is bumped on the same frame SMTC went silent — not on
+        # the frame AFTER, which would shorten the gap by one tick.
+        #
+        # BUG-3 (v1.0.89): the old check was `_sound_song is not None`, but
+        # _sound_song only clears on a NEW SMTC track. When SMTC goes silent
+        # entirely (no published session), _sound_song retains its last value
+        # forever, so this stamp re-fired every tick and silent_for stayed at
+        # ~0 indefinitely → the Discord RP fallback could never activate.
+        # Use _last_sound_lock_t (wall-time of the LAST Shazam lock) with a
+        # 60s window so "Shazam ACTIVELY producing music" actually decays.
+        now_src = time.time()
+        sound_recent = (self._last_sound_lock_t
+                        and (now_src - self._last_sound_lock_t) < 60.0)
+        if (state and state.get("title")) or sound_recent:
+            self._music_source_last_t = now_src
 
         if not state or not state["title"]:
-            if self._track is not None:
-                self._track = None
-                self._hint("Waiting for music…")
-            self.root.after(120, self._tick)
-            return
+            # ── TICKET-100: Discord Rich Presence fallback ──────────────────
+            # When SMTC is silent (no session OR a session with no title), AND
+            # Shazam-live has nothing, AND the toggle is on, AND the silent
+            # gap has elapsed: try to pull the user's own Spotify Listening
+            # activity from Discord and SYNTHESIZE a state dict that flows
+            # through the rest of _tick exactly like an SMTC session would.
+            # The synthesized dict carries source="discord-rpc:<sub>" so the
+            # downstream code paths (clean_title source-aware bypass, diag,
+            # boundary detector) can recognize it.
+            #
+            # Strict gating:
+            #   - feature OFF (toggle or tune knob = 0)        → skip
+            #   - silent gap < tune discord_rpc_silent_gap_s   → skip
+            #   - poll throttle < discord_rpc_poll_s           → reuse cached
+            #     last_track if recent enough (no IPC round-trip)
+            # The IPC call itself has a hard 500 ms timeout — see discord_rpc.
+            disc_state = None
+            try:
+                # Either control surface enables the feature (tray flag OR tune
+                # knob). set_discord_rpc keeps them in sync, but a /tune POST
+                # that flips the knob alone must still take effect.
+                if (bool(self.discord_rpc_on)
+                        or int(self._tune.get("discord_rpc_on", 0) or 0)):
+                    gap_s = float(self._tune.get("discord_rpc_silent_gap_s", 8.0))
+                    poll_s = float(self._tune.get("discord_rpc_poll_s", 5.0))
+                    timeout_s = float(self._tune.get("discord_rpc_timeout_s", 0.5))
+                    now_w = time.time()
+                    silent_for = now_w - getattr(self, "_music_source_last_t", now_w)
+                    if silent_for >= gap_s:
+                        # Lazy import (zero cold-start cost when feature is off).
+                        # Module-level state lives in discord_rpc.py.
+                        try:
+                            import discord_rpc as _drpc
+                        except Exception:
+                            _drpc = None
+                        if _drpc is not None:
+                            # BUG-2/5/6 (v1.0.89): get_listening_track() is now
+                            # a non-blocking slot read served by the long-lived
+                            # watcher daemon. The Tk thread NEVER spawns a
+                            # worker or .join()s the pipe. If the toggle was
+                            # flipped on via /tune alone (bypassing
+                            # set_discord_rpc), make sure the watcher is up.
+                            try:
+                                _drpc.start_watcher(poll_s=poll_s)
+                            except Exception:
+                                pass
+                            track = None
+                            if (now_w - self._discord_last_poll_t) >= poll_s:
+                                self._discord_last_poll_t = now_w
+                                try:
+                                    # timeout_s kept for API compat; ignored.
+                                    track = _drpc.get_listening_track(timeout_s=timeout_s)
+                                except Exception:
+                                    track = None
+                                self._discord_last_track = track
+                            else:
+                                # Throttle window: reuse the last track for
+                                # continuity, so a quiet 5-second window
+                                # between polls doesn't strobe the overlay.
+                                track = self._discord_last_track
+                            if track and track.get("title") and track.get("artist"):
+                                sub = (track.get("source") or "other").lower()
+                                # SMTC-shaped synthetic state. position/duration
+                                # are 0 (Discord RP carries no real clock), and
+                                # status=PLAYING so the rest of _tick treats it
+                                # as a live source rather than a paused tab.
+                                disc_state = {
+                                    "title": track["title"],
+                                    "artist": track["artist"],
+                                    "album": "",
+                                    "status": PLAYING,
+                                    "position": 0.0,
+                                    "duration": 0.0,
+                                    "rate": 1.0,
+                                    "source": "discord-rpc:" + sub,
+                                    "ts": now_w,
+                                }
+            except Exception:
+                disc_state = None
+            if disc_state is not None:
+                # Hand the synthesized state to the rest of the tick. Bump the
+                # source-last-spoken timestamp so we don't re-enter this branch
+                # on the next frame and re-probe Discord.
+                state = disc_state
+                self._music_source_last_t = time.time()
+            else:
+                if self._track is not None:
+                    self._track = None
+                    self._hint("Waiting for music…")
+                self.root.after(120, self._tick)
+                return
 
         # Scrolling Instagram/TikTok/etc. Reels: the tab reports the SITE NAME as
         # the title (no artist). That's not a song — keep the overlay OFF so it
@@ -3719,11 +4171,26 @@ class Overlay:
 
     def _animate_in(self):
         d = self.scroll_dir
-        if d in ("lr", "rl", "none", "off", "stationary"):
+        if d in ("lr", "rl", "tb", "bt", "none", "off", "stationary"):
             return                               # scroll handled by the ticker
-        ox = 460 if d == "right" else -460       # slide in from right / left, once
-        self.cv.move("cur", ox, 0)
-        self._anim_step(ox, 0)
+        # Per-line slide-in: horizontal for left/right, vertical for top/bottom.
+        # The line is offset BEFORE paint, then _anim_step interpolates it back
+        # to the anchored position with an ease-out cubic.
+        ox, oy = 0, 0
+        if d == "right":
+            ox = 460                             # start off-screen RIGHT, slide LEFT
+        elif d == "left":
+            ox = -460                            # start off-screen LEFT, slide RIGHT
+        elif d == "top":
+            # Slide DOWN from above. Use ~one block height for a snappy drop;
+            # _block_h is set by _relayout_song, with a sane fallback if missing.
+            oy = -max(80, round(getattr(self, "_block_h", 120) * 0.9))
+        elif d == "bottom":
+            oy = max(80, round(getattr(self, "_block_h", 120) * 0.9))   # slide UP from below
+        else:
+            return                               # unknown mode: no entrance animation
+        self.cv.move("cur", ox, oy)
+        self._anim_step(ox, oy, 0)
 
     # ── image-based scroll blocks (fast: scroll one bitmap, not 100+ items) ──
 
@@ -4349,15 +4816,17 @@ class Overlay:
             self.cv.delete(b["tag"])
         self._stream = []
 
-    def _anim_step(self, ox, step=0):
+    def _anim_step(self, ox, oy=0, step=0):
         steps = 20
         if step >= steps:
             self._anim_id = None
             return
         e0 = 1 - (1 - step / steps) ** 3
         e1 = 1 - (1 - (step + 1) / steps) ** 3
-        self.cv.move("cur", -(e1 - e0) * ox, 0)
-        self._anim_id = self.root.after(16, self._anim_step, ox, step + 1)
+        dx = -(e1 - e0) * ox
+        dy = -(e1 - e0) * oy
+        self.cv.move("cur", dx, dy)
+        self._anim_id = self.root.after(16, self._anim_step, ox, oy, step + 1)
 
     def _commit_offset(self, new_off, reset_display=True):
         """TICKET-088: ATOMIC offset commit used by the deferred-commit and
@@ -4616,6 +5085,14 @@ class Overlay:
                 "sound_song": self._sound_song,
                 "sound_title_alias": self._sound_title_alias,
                 "title_locked": self._title_locked,
+                # TICKET-099: SMTC vs Shazam priority telemetry
+                "source_priority": self._source_priority,
+                "verified_meta": bool(self._verified_meta),
+                "sound_corroborated": bool(self._sound_corroborated),
+                "smtc_paused_for_s": (round(time.time() - self._smtc_paused_since, 1)
+                                      if self._smtc_paused_since else 0.0),
+                "last_takeover_age_s": (round(time.time() - self._last_takeover_t, 1)
+                                        if self._last_takeover_t else None),
                 "live_arrangement": self._live_arrangement,
                 "effective_song_time": round(eff, 2) if eff is not None else None,
                 "showing_idx": self.idx,
@@ -5111,6 +5588,7 @@ class Overlay:
                         "character": self.character_on, "api": self.api_on,
                         "boundary": self.boundary_on, "generate": self.generate_on,
                         "captions": self.captions_on,
+                        "discord_rpc": self.discord_rpc_on,
                         "concert_ocr": self.concert_ocr,
                         "display": self.display,
                         "display_fp": getattr(self, "_display_fp", None)})
@@ -5123,6 +5601,33 @@ class Overlay:
     def set_captions(self, on):
         """Toggle auto-using a YouTube video's caption track for browser videos."""
         self.captions_on = bool(on)
+        self._persist()
+
+    def set_discord_rpc(self, on):
+        """TICKET-100: toggle the Discord Rich Presence reader (read the user's
+        own Spotify Listening activity as a 3rd-priority lyric-name source).
+        Mirrors set_captions: bool flag + _persist; the runtime poll in _tick
+        reads self.discord_rpc_on every frame. Also mirror into the tune dict
+        so /tune queries reflect the live state.
+
+        BUG-2/5/6 (v1.0.89): start (or stop) the long-lived watcher daemon so
+        the Tk-thread poll in _tick is a non-blocking slot read. The watcher
+        is the ONLY thing that touches the IPC pipe; spawning it here keeps
+        the per-frame cost in _tick to a single mutex acquire + dict copy."""
+        self.discord_rpc_on = bool(on)
+        try:
+            self._tune["discord_rpc_on"] = 1 if self.discord_rpc_on else 0
+        except Exception:
+            pass
+        try:
+            import discord_rpc as _drpc
+            if self.discord_rpc_on:
+                poll_s = float(self._tune.get("discord_rpc_poll_s", 5.0))
+                _drpc.start_watcher(poll_s=poll_s)
+            else:
+                _drpc.stop_watcher()
+        except Exception:
+            pass
         self._persist()
 
     def set_now_url(self, url):
@@ -5362,6 +5867,19 @@ class Overlay:
 
     def set_scroll(self, d):
         self.scroll_dir = d
+        # Auto-orient pos_x for the per-line slide modes ONLY. The direction the
+        # line slides FROM implies a natural horizontal anchor:
+        #   left  -> anchor LEFT   (slides in from the left edge)
+        #   right -> anchor RIGHT  (slides in from the right edge)
+        #   top   -> anchor CENTER (drops straight down)
+        #   bottom-> anchor CENTER (rises straight up)
+        # Continuous scroll modes ('lr','rl','tb','bt') and 'none' keep whatever
+        # pos_x the user already chose — auto-orient is a slide-in-only contract.
+        # pos_y is left alone in all cases so the user's vertical anchor stays
+        # independent of the slide axis.
+        _orient = {"left": "left", "right": "right", "top": "center", "bottom": "center"}
+        if d in _orient:
+            self.pos_x = _orient[d]
         self._apply_scale()                # scroll mode is a taller, laned window
         self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
         self.root.attributes("-topmost", True)
@@ -6991,6 +7509,15 @@ class Overlay:
                 self._boundary.stop()
             except Exception:
                 pass
+        # BUG-2/5/6: shut down the long-lived Discord RP watcher so its
+        # blocking _recv_one doesn't survive process exit (the daemon flag
+        # tears it down regardless, but closing the pipe handle here lets
+        # the worker exit promptly rather than waiting on an indefinite read).
+        try:
+            import discord_rpc as _drpc
+            _drpc.stop_watcher()
+        except Exception:
+            pass
         self.media.stop()
         self.root.quit()
 
@@ -7182,6 +7709,8 @@ def main():
         _scr_item("Stationary (appear in place)", "none"),
         _scr_item("Slide in from left", "left"),
         _scr_item("Slide in from right", "right"),
+        _scr_item("Slide in from top  ↓  (centered)", "top"),
+        _scr_item("Slide in from bottom  ↑  (centered)", "bottom"),
         pystray.Menu.SEPARATOR,
         _scr_item("Scroll through  →  (left to right)", "lr"),
         _scr_item("Scroll through  ←  (right to left)", "rl"),
@@ -7228,6 +7757,9 @@ def main():
     def _toggle_bound(*_): ov.root.after(0, lambda: ov.set_boundary(not ov.boundary_on))
     def _toggle_gen(*_):   ov.root.after(0, lambda: ov.set_generate(not ov.generate_on))
     def _toggle_caps(*_):  ov.root.after(0, lambda: ov.set_captions(not ov.captions_on))
+    # TICKET-100: Discord Rich Presence reader toggle (default OFF, opt-in).
+    def _toggle_discord_rpc(*_):
+        ov.root.after(0, lambda: ov.set_discord_rpc(not ov.discord_rpc_on))
     def _get_caps(*_):     ov.root.after(0, ov.load_youtube_captions)
 
     # ── Optional GPU acceleration ────────────────────────────────────────
@@ -7347,6 +7879,11 @@ def main():
                          checked=lambda i: ov.captions_on),
         pystray.MenuItem("Generate lyrics by ear when none found (AI, ***)", _toggle_gen,
                          checked=lambda i: ov.generate_on),
+        # TICKET-100: Discord RP reader. Only contributes when SMTC + Shazam are
+        # both silent for >= 8s, so it never fights an actual local player.
+        pystray.MenuItem("Read Discord Rich Presence (Spotify, when no other source)",
+                         _toggle_discord_rpc,
+                         checked=lambda i: ov.discord_rpc_on),
         pystray.Menu.SEPARATOR,
         # 3. SYNC BEHAVIOR ────────────────────────────────────────────────
         pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),
