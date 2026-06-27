@@ -69,6 +69,7 @@ _ROUTES = {
         "/nudge": "shift sync by ?s=2.5 seconds (+ = lyrics later)",
         "/reset": "reset the sync offset to 0",
         "/align": "sync by listening — transcribe the audio + match to lyrics (needs faster-whisper)",
+        "/decide": "smart song decision — transcribe vocals + pick which candidate's lyrics they match",
         "/captions": "pull THIS video's caption track (accurate text+timing); ?url=<exact video> beats a title search",
         "/nowplaying": "browser pushes the exact current video URL (?url=...) so auto-captions hit the right upload",
         "/tune": "set sync param: ?key=drift_fastpath&value=3.0 (one per call); or POST JSON {k:v,...}",
@@ -274,6 +275,11 @@ def make_handler(app, log_file, token):
                 elif path == "/align":
                     self._run(app.align_by_listening)
                     self._send(200, {"ok": True, "action": "syncing by listening (transcribe + match)"})
+                elif path == "/decide":
+                    # SMART song decision: transcribe the vocals + pick which candidate
+                    # song's lyrics they match (corrects Shazam mis-IDs / mislabeled LRCs)
+                    self._run(lambda: app._decide_by_ear(app._track_seq, reason="api"))
+                    self._send(200, {"ok": True, "action": "deciding the song by ear (transcribe + lyric-match)"})
                 elif path == "/captions":
                     u = q.get("url", [""])[0].strip() or None
                     self._run(lambda: app.load_youtube_captions(url=u))
