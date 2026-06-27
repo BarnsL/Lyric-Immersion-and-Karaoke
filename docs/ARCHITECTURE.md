@@ -1,4 +1,5 @@
-# Desktop Karaoke — Architecture
+# Lyric Immersion and Karaoke — Architecture
+<sub>*(repo: `BarnsL/Lyric-Immersion-and-Karaoke`; formerly Desktop Karaoke)*</sub>
 
 The authoritative map of the app's parts. Each subsystem below lists its
 **methods** and how each lands on a **confidence score** that decides whether the
@@ -36,13 +37,18 @@ The player title is a HINT; **sound is the authority**. Methods → confidence:
 | **Player metadata** (SMTC) | MediaWatcher (winsdk) | `confidence.title_distinctiveness()` 0–1: generic ("Awake","Lucky Star")→low→don't lock; distinctive→high→may `_title_locked` |
 | **Sound fingerprint** | `recognize.py`→shazamio | a (title,artist,offset) hit is high, but one read needs the 2-read agreement gate before it overrides a locked title |
 | **Concert banner OCR** | `concert_ocr.py` (Windows.Media.Ocr) | fuzzy match on-screen song→library; accept only `score ≥ 0.85` |
-| **Title cleaning** | clean_title/clean_artist, extract_cover_original | pulls the real song out of MV/cover/bilingual titles; covers route to the original artist |
+| **Title cleaning** | clean_title/clean_artist, `extract_cover_original` | pulls the real song out of MV/cover/bilingual titles; covers route to the ORIGINAL artist (incl. "Song / Artist covered by X") |
+| **Language confidence** | `confidence.language_confidence` (`_ALWAYS_JA`/`_KNOWN_JA`) | the artist's usual language (Suisei/ReGLOSS → full JA) rejects an English same-title collision |
+| **Decide-by-ear / library match** | `align.transcribe_vocals`+`score_candidates`, `_decide_by_ear` | transcribe the live vocals (faster-whisper *small*) + rapidfuzz-match against the WHOLE cached library — identifies the song from what's SUNG when title+Shazam fail (MMD/cover cuts). Waveform-gated to vocal-active windows |
+| **Bundled (baked) lyrics** | `bundled_lyrics/`, `_seed_bundled_lyrics` | shipped LRCs for songs that always fail to fetch; AUTHORITATIVE — a `source: bundled` song can't be overridden by a sound mis-ID |
 
 **Reconciliation:** in `_consume_async`, a heard song matching the loaded lyrics →
-calibrate timing; a heard *different* song needs a 2nd confirming read to switch;
-a `_title_locked` distinctive title ignores a one-off Shazam mis-ID of a
-same-artist track. Reels/site audio (bare site name, no artist) → suppressed
-(`is_non_music_source`).
+calibrate timing; a heard *different* song needs a 2nd confirming read to switch; a
+`_title_locked` distinctive title ignores a one-off Shazam mis-ID of a same-artist
+track, BUT hearing the same other song **5× breaks the lock** (`wrong_song_strikes`)
+and switches; a `source: bundled` song ignores sound entirely. ~20 s in, `_decide_by_ear`
+verifies the loaded lyrics actually match the singing and corrects from the library if
+not. Reels/site audio (bare site name, no artist) → suppressed (`is_non_music_source`).
 
 ---
 
@@ -80,11 +86,16 @@ Accuracy hinges on the morphological analyzer's segmentation (今生きて→今
 | Method | How | Confidence gate before it moves the offset |
 |---|---|---|
 | **Shazam offset** | shazamio returns position-into-song | **Two-point verification**: a non-zero offset is HELD, then a confirming listen ~2 s later must AGREE before committing (anti-chorus). Deadband; studio-vs-live mode; ambiguity-spread reset. |
-| **Energy correlation** | cross-correlate audio vocal-band on/off mask vs LRC line intervals | small-shift prior, peak **uniqueness** (reject near-equal distant rival = chorus), lift-vs-median floor, agree-with-Shazam band. The cheap, always-on automatic method. |
-| **Whisper align** | transcribe a clip, fuzzy-match lyric lines | match-ratio floor scaled by jump size. HEAVY → **explicit "Sync by listening" button + last-resort generation only**, never the automatic loop. |
+| **Energy correlation (waveform)** | cross-correlate audio vocal-band on/off mask vs LRC line intervals | small-shift prior, peak **uniqueness** (reject near-equal distant rival = chorus), lift-vs-median floor, agree-with-Shazam band. The cheap, always-on automatic method. |
+| **Adaptive verify tier** | `_periodic_auto_align` runs the energy check ~3×/min while syncing, relaxes to 1×/min once confirmed, snaps back on a miss (`_note_sync_verdict`) | when energy is blind on a song it escalates to a short **two-point-verified Whisper listen** (`_tier_listen_now`); Whisper CPU capped (`cpu_threads=4`). |
+| **Whisper align (waveform-gated)** | transcribe a clip, fuzzy-match lyric lines → offset | match-ratio floor scaled by jump size. Now used automatically (tier + the explicit button + live-resync), but **only when the waveform says vocals are active** (`_vocals_active_now`) so the clip isn't an instrumental break. |
+| **Live-version resync** | `_live_resync_loop` ~5×/min for LIVE/concert cuts | follows the live offset through tempo shifts + applause pauses; the studio LRC timing won't hold, so it FOLLOWS the measured offset. |
 
-Player clock carries between corrections; captions are video-locked so the
-correlator is skipped for them.
+**Waveform + transcript fusion:** the transcript answers *what* line is sung; the
+vocal-energy waveform answers *exactly when*. After `_decide_by_ear` picks the song by
+its lyrics, the energy correlation pins the precise offset for the new lyrics. Player
+clock carries between corrections; captions are video-locked so the correlator is
+skipped for them.
 
 ---
 

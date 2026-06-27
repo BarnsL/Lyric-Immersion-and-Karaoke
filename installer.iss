@@ -2,8 +2,8 @@
 ; Install Inno Setup (free), then run:  iscc installer.iss
 ; (build.bat does this automatically if iscc is on PATH.)
 
-#define AppName "Desktop Karaoke"
-#define AppVer  "1.0.25"
+#define AppName "Lyric Immersion and Karaoke"
+#define AppVer  "1.0.68"
 #define AppExe  "DesktopKaraoke.exe"
 
 [Setup]
