@@ -743,9 +743,11 @@ def is_mv_version(title):
 # a multi-song event we drive by sound alone.)
 _LIVE_VER_RE = re.compile(
     r"\b(?:live(?:\s*(?:mv|ver(?:sion)?|performance|stage|clip))?|short\s*ver(?:sion)?|"
-    r"acoustic|unplugged|orchestral?|piano\s*ver|ballad\s*ver|spinning\s*ver)\b"
+    r"acoustic|unplugged|orchestral?|piano\s*ver|ballad\s*ver|spinning\s*ver|"
+    r"one[\s-]?man(?:\s*live)?)\b"               # 'ONE-MAN LIVE' = a solo concert (JP term)
+    r"|【\s*live\b|\[\s*live\b"                   # 【LIVE MV】 / [LIVE] bracket tags
     r"|from\s+[\"'“”『「]"                       # 'from "<concert/album>"'
-    r"|ライブ|ﾗｲﾌﾞ|生歌|ショート(?:バージョン|ver)|アコースティック|弾き語り",
+    r"|ライブ|ﾗｲﾌﾞ|生歌|ワンマン|ショート(?:バージョン|ver)|アコースティック|弾き語り",
     re.I,
 )
 
@@ -1164,7 +1166,8 @@ class Overlay:
                                      # PhotoImage — the priciest op; off-screen, so
                                      # spreading it across frames is invisible)
         self._repaint_budget = 2     # max karaoke-fill repaints per heavy frame
-        self._fill_interval = 0.2    # min seconds between a block's fill repaints (~5fps)
+        self._fill_interval = 0.06   # min seconds between a block's fill repaints (~16fps —
+                                     # smoother sung-fill; the sliver paste is cheap, see _advance_fill)
         self._apply_perf()
         self._anim_id = None
         self._scroll_x = self._scroll_start = self._scroll_end = 0
@@ -1241,6 +1244,9 @@ class Overlay:
         self._offset_hist_last = None # last offset recorded (only log on change)
         self._auto_align_after = None # pending auto-align timer id
         self._live_resync_after = None # pending live lyric-resync timer id
+        self._live_resync_inflight = False  # the in-flight align IS a live resync (for cadence verdicts)
+        self._live_sync_streak = 0     # consecutive GOOD live resyncs (drives the de-escalation)
+        self._live_resync_gap = None   # current post-listen gap, seconds (None → fast/8×min)
         self._last_sound_lock_t = 0.0 # wall-clock of last confirmed Shazam offset
         # ── Algorithmic offset state (continuous, no strike counters) ──
         # `_drift_integral` accumulates |drift| × time between Shazam reads:
@@ -1267,7 +1273,16 @@ class Overlay:
             "sync_confirm_hold_ms": 2600,   # hesitation before the confirming listen
             "sync_confirm_listen_s": 5.0,   # confirming-listen capture length
             "applause_min_s":        2.5,   # loud-non-vocal seconds = a concert applause gap
-            "live_resync_s":        12.0,   # LIVE/concert versions: lyric-match RESYNC cadence (≈5×/min)
+            "live_resync_s":        12.0,   # (legacy) LIVE/concert lyric-match RESYNC cadence
+            # Concert/live ARRANGEMENTS resync on a rolling, aggressive de-escalation:
+            # start ~8×/min; after 3 good reads in a row relax to ~5×/min; after 3 more
+            # to ~3×/min; ANY miss snaps straight back to ~8×/min so a drifting concert
+            # gets hammered until it re-locks. (gap = pause AFTER a listen; period≈listen+gap)
+            "live_resync_listen_s":  6.0,   # shorter capture for live (faster cycle than the 9 s default)
+            "live_resync_fast_gap_s": 1.5,  # ~8×/min  (fresh song / while missing)
+            "live_resync_mid_gap_s":  6.0,  # ~5×/min  (after 3 good reads)
+            "live_resync_slow_gap_s": 14.0, # ~3×/min  (after 6 good reads — locked in)
+            "live_resync_relax_n":     3,   # good reads per de-escalation step
             "spread_reset":         20.0,   # chorus-ambiguity spread threshold
             "reset_offset_max":      5.0,   # only reset when |offset| < this
             "drift_align_trigger":   6.0,   # integral → trigger auto-align
@@ -1296,9 +1311,12 @@ class Overlay:
             "sync_tier_ok_drift":    0.8,   # |measured drift| ≤ this on a check = in sync
             "sync_tier_listen_s":    6.0,   # Whisper capture length for a tier check (short = light)
             # ── FORCE SYNC (manual nuclear resync) ──
-            "force_sync_streak":       3,   # reads that must AGREE in a row before it locks
+            "force_sync_streak":       3,   # confirming reads in a row before a candidate locks
             "force_sync_listen_s":   8.0,   # transcribe capture length per Force-Sync read
-            "force_sync_agree_s":    1.0,   # two reads within this = "agree" (two-point verify)
+            "force_sync_agree_s":    1.0,   # a fresh read within this of the tried offset = "still matches"
+            "force_sync_span_s":    16.0,   # confirms must span this many player-seconds before locking
+                                            # (so it can't lock inside ONE repeating chorus pass)
+            "force_sync_top_n":        6,   # candidate offsets ranked per read (try best→next on failure)
             "energy_apply_min":      0.4,   # min |new-old| to apply correlation
             "energy_lift_floor":     0.10,  # min peak-vs-median lift to accept
             "energy_max_offset":    60.0,   # |new_off| < this for sanity
@@ -1308,11 +1326,15 @@ class Overlay:
             # heavy_budget_ms caps the per-frame spawn/repaint work so a PIL
             # paste can't stall the scroll belt; 0 disables the cap.
             "heavy_budget_ms":      10.0,   # max ms of spawn+repaint work per heavy frame
-            "repaint_budget":        4.0,   # max karaoke-fill SLIVER pastes per heavy frame (cheap now)
+            "repaint_budget":        6.0,   # max karaoke-fill SLIVER pastes per heavy frame (cheap now)
+            "fill_interval":        0.06,   # min seconds between a block's fill repaints (smoothness)
             "spawn_budget":          1.0,   # max block PIL-renders per heavy frame
             "fill_skip":             2.0,   # heavy work runs every Nth frame (fills are sliver-cheap)
             # PERF-102 — scroll bitmap-area controls (the dominant scroll cost):
             "scroll_max_lanes":      3,     # stacked scrolling lines (capped to what fits on screen)
+            "scroll_v_stagger":    250,     # VERTICAL scroll: horizontal stagger (px@scale1) between
+                                            # the 2-3 staggered columns so lines cascade diagonally
+                                            # (centre mode isn't bound by the L/R pad — it fans wide)
             "scroll_spawn_margin": 1100,    # px off-screen a block is pre-rendered (avoid pop-in)
             # MV/cinematic intro hold backstop (primary release is the vocal poll).
             # Kept SHORT: a false "waiting for vocals" while the song is already
@@ -1354,7 +1376,12 @@ class Overlay:
         self._last_heard_contra = None  # the last contradicting heard song (for the strike streak)
         self._deciding = False        # a by-ear song decision (Whisper) is in flight
         self._force_sync_active = False  # FORCE SYNC nuclear resync running
-        self._force_sync_streak = 0; self._force_sync_last = None; self._force_sync_tries = 0
+        self._fs_current = None       # offset of the candidate currently being verified
+        self._fs_confirms = 0         # consecutive fresh reads that still match _fs_current
+        self._fs_line_lo = self._fs_line_hi = None  # player-pos span the confirms cover
+        self._fs_blacklist = []       # offsets that FAILED to keep matching (chorus traps)
+        self._fs_misses = 0           # consecutive fresh reads the current candidate missed
+        self._fs_tries = 0; self._fs_empties = 0
         self._force_sync_after = None
         self._last_decision = None    # last decide_song_by_lyrics result (telemetry)
         self._fast_calib = 0          # remaining quick re-locks after a song change
@@ -1430,6 +1457,8 @@ class Overlay:
             self._sync_confirm_after = None
         self._pending_switch = None  # drop any pending song-switch confirmation
         self._force_sync_active = False  # cancel any Force Sync from the previous track
+        self._fs_current = None; self._fs_confirms = 0; self._fs_blacklist = []
+        self._fs_misses = 0; self._fs_line_lo = self._fs_line_hi = None
         self._sound_fail_streak = 0  # fresh wrong-song strike count for the new track
         self._last_heard_contra = None
         self._gen_token += 1       # cancel any in-flight lyric generation
@@ -1452,6 +1481,9 @@ class Overlay:
         self._tier_tpvr = None
         self._tier_listen = False
         self._live_arrangement = is_live_arrangement(title)  # LIVE/short/alt → follow offset
+        self._live_sync_streak = 0          # new song → resync aggressively again (~8×/min)
+        self._live_resync_gap = None
+        self._live_resync_inflight = False
         log.info("track change: %r / %r (dur %s)%s", title, artist, duration,
                  " [live-arrangement]" if self._live_arrangement else "")
 
@@ -3535,7 +3567,7 @@ class Overlay:
                 # repaints per frame, each block's repaint rate, AND the total
                 # heavy-frame time — a karaoke sweep at ~5fps reads fine.
                 if (n != b["sung_n"] and repaints < repaint_budget
-                        and now - b.get("paint_t", 0.0) >= self._fill_interval
+                        and now - b.get("paint_t", 0.0) >= self._tune.get("fill_interval", self._fill_interval)
                         and not _over_budget()):
                     b["sung_n"] = n
                     b["paint_t"] = now
@@ -3553,14 +3585,28 @@ class Overlay:
             else:
                 self._highlight_block(b, frac)
 
-    def _block_x_v(self, w):
+    def _block_x_v(self, w, i=None):
         """Horizontal X for a block in VERTICAL scroll, from the `position`
-        setting: hug the left edge, the right edge, or centre the column."""
+        setting: hug the left edge, the right edge, or centre the column.
+
+        When CENTRED, consecutive lines are STAGGERED across `_lanes` horizontal
+        columns (the vertical-scroll analogue of horizontal scroll's vertical
+        lanes), so 2-3 lines cascade diagonally down instead of stacking in one
+        rigid column. Left/right anchoring keeps the single column."""
         if self.pos_x == "left":
             return self.pad
         if self.pos_x == "right":
             return max(self.pad, self.W - w - self.pad)
-        return max(0, round((self.W - w) / 2))            # center (default)
+        base = (self.W - w) / 2.0                          # centre each line first
+        L = max(1, getattr(self, "_lanes", 1))
+        step = getattr(self, "_v_stagger", 0)
+        if i is None or L <= 1 or not step:
+            return max(0, round(base))                     # single-column centre (unchanged)
+        base += (i % L - (L - 1) / 2.0) * step             # offset by this line's lane
+        # Centre mode is exclusive of the L/R anchors, so the stagger isn't bound by
+        # their padding — lines fan out across the FULL width. Clamp only to the true
+        # screen edges (0 … W-w) so a fanned line is never pushed partly off-screen.
+        return max(0, min(round(base), max(0, self.W - w)))
 
     def _ticker_update_v(self, pos):
         """VERTICAL scroll: lines stacked in one column that scrolls up ('bt' —
@@ -3605,7 +3651,7 @@ class Overlay:
             frac = (pos - ln.start) / dur if (ln.start <= pos < ln.end and dur > 0) else 0.0
             # spawn at the right Y; then shift X to the column (width known after spawn)
             b = self._spawn_block(i, frac, place=(0, round(cy - bh / 2)))
-            x = self._block_x_v(b["w"])
+            x = self._block_x_v(b["w"], i)                  # lane-staggered when centred
             if x:
                 self.cv.move(b["tag"], x, 0)
                 b["x"] = x
@@ -3631,7 +3677,7 @@ class Overlay:
             if b.get("img"):
                 n = int(frac * b["nchars"] + 0.5)
                 if (n != b["sung_n"] and repaints < repaint_budget
-                        and now - b.get("paint_t", 0.0) >= self._fill_interval
+                        and now - b.get("paint_t", 0.0) >= self._tune.get("fill_interval", self._fill_interval)
                         and not _over_budget()):
                     b["sung_n"] = n
                     b["paint_t"] = now
@@ -4525,6 +4571,11 @@ class Overlay:
         # /tune `scroll_max_lanes` so it can be dialled per machine without a rebuild.
         cap = int(getattr(self, "_tune", {}).get("scroll_max_lanes", 2) or 2)
         self._lanes = max(1, min(cap, int(fit)))
+        # VERTICAL scroll: horizontal stagger step so consecutive lines cascade
+        # across `_lanes` columns (the mirror of horizontal scroll's vertical
+        # lanes). Scaled with the font; live-tunable via /tune scroll_v_stagger.
+        self._v_stagger = round(float(getattr(self, "_tune", {})
+                                      .get("scroll_v_stagger", 170)) * s)
         # First-lane Y inside the fixed window: top-anchored or bottom-anchored.
         stack = self._block_h + self._lane_gap * (self._lanes - 1)
         if self.pos_y == "top":
@@ -4756,7 +4807,7 @@ class Overlay:
         else:
             self._applause_for = max(0.0, self._applause_for - dt)
 
-    def align_by_listening(self, silent=False):
+    def align_by_listening(self, silent=False, seconds=None):
         """On-demand: transcribe a few seconds of the live vocals and match them
         to the loaded lyrics to set the sync offset — fixes timing when Shazam
         can't identify the exact cut. Opt-in, runs once in a background thread,
@@ -4764,7 +4815,8 @@ class Overlay:
 
         ``silent=True`` suppresses hints for the background auto-align that runs
         periodically — the user shouldn't see "Listening to sync…" every minute
-        when nothing's wrong."""
+        when nothing's wrong. ``seconds`` overrides the capture length (the live
+        concert resync uses a shorter clip to cycle faster)."""
         if self._aligning:
             return
         try:
@@ -4786,11 +4838,15 @@ class Overlay:
         if not silent:
             self._hint("🎧 Listening to sync the lyrics…")
         lines, lang = self.lines, self.meta.get("lang", "ja")
+        cap_s = seconds
 
         def work():
             res = None
             try:
-                res = align.capture_and_align(lines, lang=lang, get_pos=self._align_pos)
+                kw = {"get_pos": self._align_pos}
+                if cap_s:
+                    kw["seconds"] = cap_s
+                res = align.capture_and_align(lines, lang=lang, **kw)
             except Exception as e:
                 log.info("align error: %s", e)
             self.root.after(0, lambda: self._apply_align(res))
@@ -4799,12 +4855,17 @@ class Overlay:
 
     # ── FORCE SYNC — the manual "nuclear" resync ──────────────────────────────
     def force_sync(self):
-        """FORCE SYNC — for "right song, stubborn timing" where the automatic sync
-        (which already runs in the background) won't catch it. Resets the offset to 0
-        as a clean baseline, then transcribes + matches the live vocals REPEATEDLY,
-        two-point verified, until THREE reads in a row AGREE on the timing — then
-        stops. A failed or disagreeing read resets the streak and it keeps hammering.
-        Manual, opt-in; needs the AI add-on (faster-whisper)."""
+        """FORCE SYNC — the manual "nuclear" resync for the "right song, stubborn
+        timing" case the background auto-sync won't catch.
+
+        It resets the offset to 0 as a clean baseline, then repeatedly transcribes
+        the live vocals and matches them to the loaded lyrics. Crucially it does NOT
+        trust one match: each read yields a RANKED list of candidate offsets (a
+        recurring chorus hook legitimately matches several timestamps), and it tries
+        them best→next. A candidate has to keep matching FRESH reads — spanning
+        enough of the song to clear a whole chorus pass — before it locks. One that
+        stops lining up (a "chorus trap" the lyrics then run past) is blacklisted and
+        the next candidate is tried. Manual, opt-in; needs the AI add-on."""
         if not self.lines:
             self._hint("Play a recognised song first, then Force Sync")
             return
@@ -4816,15 +4877,20 @@ class Overlay:
         except Exception:
             self._hint("Force Sync needs the AI add-on (faster-whisper)")
             return
-        log.info("FORCE SYNC engaged: offset → 0, then transcribe-match until %d agree",
-                 int(self._tune.get("force_sync_streak", 3)))
+        log.info("FORCE SYNC engaged: offset → 0, then try ranked matches until one holds %d× over %.0fs",
+                 int(self._tune.get("force_sync_streak", 3)),
+                 float(self._tune.get("force_sync_span_s", 16.0)))
         self.offset = 0.0                       # set sync timing to 0 as the first resort
         self.idx = -1
         self._force_sync_active = True
-        self._force_sync_streak = 0
-        self._force_sync_last = None
-        self._force_sync_tries = 0
-        self._hint("🚀 Force Sync — listening until it locks…")
+        self._fs_current = None
+        self._fs_confirms = 0
+        self._fs_misses = 0
+        self._fs_line_lo = self._fs_line_hi = None
+        self._fs_blacklist = []
+        self._fs_tries = 0
+        self._fs_empties = 0
+        self._hint("🚀 Force Sync — listening for the right timing…")
         self._force_sync_tick()
 
     def _force_sync_tick(self):
@@ -4836,54 +4902,100 @@ class Overlay:
             self._force_sync_after = self.root.after(1200, self._force_sync_tick)  # paused/busy → wait
             return
         self._aligning = True
-        self._force_sync_tries += 1
+        self._fs_tries += 1
         lines, lang = self.lines, self.meta.get("lang", "ja")
         secs = float(self._tune.get("force_sync_listen_s", 8.0))
+        top_n = int(self._tune.get("force_sync_top_n", 6))
+        pos0 = self._align_pos()                 # capture-start position (drives the confirm span)
 
         def work():
-            res = None
+            ranked = []
             try:
                 import align
-                res = align.capture_and_align(lines, lang=lang,
-                                              get_pos=self._align_pos, seconds=secs)
+                ranked = align.rank_offsets(lines, lang=lang, get_pos=self._align_pos,
+                                            seconds=secs, top_n=top_n) or []
             except Exception as e:
                 log.info("force-sync listen error: %s", e)
-            self.root.after(0, lambda: self._force_sync_apply(res))
+            self.root.after(0, lambda: self._force_sync_apply(ranked, pos0))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _force_sync_apply(self, res):
+    def _force_sync_apply(self, ranked, pos0):
         self._aligning = False
         if not self._force_sync_active:
             return
-        need = int(self._tune.get("force_sync_streak", 3))
-        if not res:
-            # no confident match this read → streak resets, keep hammering (nuclear)
-            self._force_sync_last, self._force_sync_streak = None, 0
-            log.info("force-sync: no match (try %d) — retrying, offset stays %+.2fs",
-                     self._force_sync_tries, self.offset)
-            self._hint(f"🚀 Force Sync — retrying… ({self.offset:+.1f}s)")
+        need   = int(self._tune.get("force_sync_streak", 3))
+        agree  = float(self._tune.get("force_sync_agree_s", 1.0))
+        span_s = float(self._tune.get("force_sync_span_s", 16.0))
+        # Drop candidates sitting on a known chorus-trap offset.
+        cands = [(o, r, ls) for (o, r, ls) in (ranked or [])
+                 if not any(abs(o - b) <= agree for b in self._fs_blacklist)]
+
+        if not cands:                            # silence / instrumental / no confident match
+            self._fs_empties += 1
+            tag = f"{self._fs_current:+.1f}s" if self._fs_current is not None else f"{self.offset:+.1f}s"
+            log.info("force-sync: no usable match (try %d, empty %d) — holding %s",
+                     self._fs_tries, self._fs_empties, tag)
+            self._hint(f"🚀 Force Sync — listening… ({tag})")
             self._force_sync_after = self.root.after(1300, self._force_sync_tick)
             return
-        offset, ratio, _start = res
-        # TWO-POINT: this read must AGREE with the previous to extend the streak.
-        prev = self._force_sync_last
-        self._force_sync_last = offset
-        if prev is not None and abs(offset - prev) <= self._tune.get("force_sync_agree_s", 1.0):
-            self._force_sync_streak += 1
-        else:
-            self._force_sync_streak = 1
-        if abs(offset - self.offset) > 0.15:        # follow what we hear (song is right)
-            self.offset = round(offset, 2)
-            self.idx = -1
-        log.info("force-sync: read %+.2fs (match %.2f) — agree-streak %d/%d",
-                 offset, ratio, self._force_sync_streak, need)
-        if self._force_sync_streak >= need:
-            self._force_sync_active = False
-            log.info("FORCE SYNC LOCKED at %+.2fs (%d agreeing reads)", self.offset, need)
-            self._hint(f"✅ Force Sync locked ({self.offset:+.1f}s)")
+        self._fs_empties = 0
+
+        if self._fs_current is None:             # ── pick the first (highest-probability) candidate
+            off, ratio, _ls = cands[0]
+            self._fs_current = round(off, 2)
+            self._fs_confirms = 1
+            self._fs_misses = 0
+            self._fs_line_lo = self._fs_line_hi = pos0
+            self.offset = self._fs_current; self.idx = -1
+            log.info("force-sync: try #1 %+.2fs (match %.2f, %d cands)", off, ratio, len(cands))
+            self._hint(f"🚀 Force Sync — trying {off:+.1f}s…")
+            self._force_sync_after = self.root.after(1000, self._force_sync_tick)
             return
-        self._hint(f"🚀 Force Sync {self._force_sync_streak}/{need} ({self.offset:+.1f}s)…")
+
+        # ── verify the current candidate against this FRESH read ──
+        match = next(((o, r) for (o, r, _ls) in cands
+                      if abs(o - self._fs_current) <= agree), None)
+        if match:                                # it STILL lines up here → confirm
+            self._fs_current = round(match[0], 2)   # follow small drift
+            self._fs_confirms += 1
+            self._fs_misses = 0
+            self._fs_line_lo = min(self._fs_line_lo, pos0)
+            self._fs_line_hi = max(self._fs_line_hi, pos0)
+            self.offset = self._fs_current; self.idx = -1
+            span = max(0.0, self._fs_line_hi - self._fs_line_lo)
+            log.info("force-sync: %+.2fs still matches — confirm %d/%d, span %.0f/%.0fs",
+                     self._fs_current, self._fs_confirms, need, span, span_s)
+            if self._fs_confirms >= need and span >= span_s:
+                self._force_sync_active = False
+                log.info("FORCE SYNC LOCKED at %+.2fs (%d confirms over %.0fs)",
+                         self.offset, self._fs_confirms, span)
+                self._hint(f"✅ Force Sync locked ({self.offset:+.1f}s)")
+                return
+            self._hint(f"🚀 Force Sync {self._fs_confirms}/{need} ({self.offset:+.1f}s)…")
+            self._force_sync_after = self.root.after(1000, self._force_sync_tick)
+            return
+
+        # ── current candidate did NOT line up here ──
+        self._fs_misses += 1
+        if self._fs_misses < 2:                  # one noisy read → hold, give it another chance
+            log.info("force-sync: %+.2fs missed once — holding (grace), confirms stay %d",
+                     self._fs_current, self._fs_confirms)
+            self._hint(f"🚀 Force Sync {self._fs_confirms}/{need} ({self.offset:+.1f}s)…")
+            self._force_sync_after = self.root.after(1000, self._force_sync_tick)
+            return
+        # missed twice → the lyrics have run past it: it was a trap. Blacklist & advance.
+        bad = self._fs_current
+        self._fs_blacklist.append(bad)
+        nxt = cands[0]                           # freshest match at the song's CURRENT spot
+        self._fs_current = round(nxt[0], 2)
+        self._fs_confirms = 1
+        self._fs_misses = 0
+        self._fs_line_lo = self._fs_line_hi = pos0
+        self.offset = self._fs_current; self.idx = -1
+        log.info("force-sync: %+.2fs ran past (chorus trap) — blacklisted; now trying %+.2fs (match %.2f)",
+                 bad, nxt[0], nxt[1])
+        self._hint(f"🚀 Force Sync — {bad:+.1f}s missed, trying {self._fs_current:+.1f}s…")
         self._force_sync_after = self.root.after(1000, self._force_sync_tick)
 
     def _track_start_auto_align(self, track_seq):
@@ -4895,13 +5007,15 @@ class Overlay:
         self._maybe_auto_align(reason="track-start")
 
     def _live_resync_loop(self):
-        """LIVE / concert versions drift — odd pauses for cheering, tempo shifts and
-        live edits mean the studio LRC timing won't hold and Shazam can't fingerprint
-        the (often MMD) cut. So for a registered live arrangement we RESYNC BY EAR
-        ~5×/min (`live_resync_s`): transcribe a few seconds and match to the loaded
-        lyrics, FOLLOWING the measured live offset instead of trusting the studio
-        timing. Only fires for a live version with lyrics loaded and nothing else
-        listening; a no-op otherwise. This is the active resync the studio path lacks."""
+        """LIVE / concert arrangements drift — applause pauses, tempo shifts and live
+        edits mean the studio LRC timing won't hold and Shazam can't fingerprint the
+        (often MMD) cut. So for a registered live arrangement we RESYNC BY EAR on a
+        ROLLING, aggressive cadence: ~8×/min while the song is fresh or a read just
+        MISSED, relaxing to ~5×/min after 3 good reads in a row and ~3×/min after 6 —
+        any miss snaps straight back to ~8×/min (`_note_live_resync`). Each listen
+        FOLLOWS the measured live offset instead of trusting the studio timing, and is
+        waveform-gated so it never lands on an instrumental / applause gap. No-op
+        unless a live version has lyrics loaded and nothing else is listening."""
         try:
             if ((self._live_arrangement or self._live_mode) and self.lines
                     and not self._aligning and not self._deciding
@@ -4917,13 +5031,42 @@ class Overlay:
                     try:
                         import align
                         if align.available():
-                            log.info("live resync (≈5×/min): vocals active → listening to follow the live timing")
-                            self.align_by_listening(silent=True)
+                            log.info("live resync: vocals active → following live timing (good-streak %d)",
+                                     self._live_sync_streak)
+                            self._live_resync_inflight = True
+                            self.align_by_listening(
+                                silent=True,
+                                seconds=float(self._tune.get("live_resync_listen_s", 6.0)))
                     except Exception:
-                        pass
+                        self._live_resync_inflight = False
         finally:
-            nxt = int(max(6.0, self._tune.get("live_resync_s", 12.0)) * 1000)
-            self._live_resync_after = self.root.after(nxt, self._live_resync_loop)
+            gap = self._live_resync_gap
+            if gap is None:
+                gap = float(self._tune.get("live_resync_fast_gap_s", 1.5))
+            self._live_resync_after = self.root.after(int(max(1.0, gap) * 1000),
+                                                      self._live_resync_loop)
+
+    def _note_live_resync(self, ok):
+        """Verdict from a live/concert resync → roll the cadence. ``live_resync_relax_n``
+        (3) good reads in a row relax one step (8×/min → 5×/min → 3×/min); ANY miss
+        resets the streak and snaps back to 8×/min, so a drifting concert is hammered
+        until it re-locks, then backs off once it's holding."""
+        fast = float(self._tune.get("live_resync_fast_gap_s", 1.5))
+        mid  = float(self._tune.get("live_resync_mid_gap_s", 6.0))
+        slow = float(self._tune.get("live_resync_slow_gap_s", 14.0))
+        step = max(1, int(self._tune.get("live_resync_relax_n", 3)))
+        if ok:
+            self._live_sync_streak += 1
+            self._live_resync_gap = (slow if self._live_sync_streak >= 2 * step
+                                     else mid if self._live_sync_streak >= step
+                                     else fast)
+        else:
+            self._live_sync_streak = 0
+            self._live_resync_gap = fast
+        listen = float(self._tune.get("live_resync_listen_s", 6.0))
+        log.info("live resync %s → good-streak %d, next gap %.1fs (~%.0f×/min)",
+                 "OK" if ok else "miss", self._live_sync_streak, self._live_resync_gap,
+                 60.0 / max(0.1, self._live_resync_gap + listen))
 
     # ── SMART song decision by ear (Whisper 'small' + rapidfuzz) ──────────────
     #
@@ -5055,6 +5198,14 @@ class Overlay:
         MIN = (self._tune.get("decide_library_min", 70.0) if expanded
                else self._tune.get("decide_min_score", 55.0))
         MARGIN = self._tune.get("decide_margin", 12.0)
+        # GUARD: a title-LOCKED song came from a confident title match — strong ground
+        # truth. Require an OVERWHELMING library match before a by-ear read may override
+        # it, so one noisy/short clip can't switch away from the right song (the Suisei
+        # 綺麗事 → Tip Taps Tip case — the hallucination filter is the primary fix; this
+        # is defense-in-depth for any garbage transcript that still slips through).
+        if getattr(self, "_title_locked", False) and loaded_key not in ("loaded",):
+            MIN += self._tune.get("decide_titlelock_bump", 15.0)
+            MARGIN = max(MARGIN, self._tune.get("decide_titlelock_margin", 28.0))
         if (best_key not in ("loaded", loaded_key) and best_score >= MIN
                 and best_score - loaded_score >= MARGIN):
             try:
@@ -5498,6 +5649,11 @@ class Overlay:
         self._aligning = False
         silent = getattr(self, "_auto_align_silent", False)
         self._auto_align_silent = False
+        # If this listen was a live/concert resync, score it for the rolling cadence
+        # (a confident match = good read → relax a step; nothing heard = miss → hammer).
+        if getattr(self, "_live_resync_inflight", False):
+            self._live_resync_inflight = False
+            self._note_live_resync(res is not None)
         # APPLAUSE two-point resync (TICKET-061): HOLD the 1st read, confirm with a
         # 2nd ~2.5 s later, and apply only if they agree — a chorus-matched mis-read
         # on resume can't jump the sync. Falls through to the normal apply when the
@@ -5887,7 +6043,7 @@ def main():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
         pystray.MenuItem("🎧  Identify by sound", _ident),
-        pystray.MenuItem("🚀  Force Sync  (hammer transcribe+match until it locks)", _align),
+        pystray.MenuItem("🚀  Force Sync  (try ranked matches, skip chorus traps, until it locks)", _align),
         pystray.MenuItem("Fast song-change detect (compilations)", _toggle_bound,
                          checked=lambda i: ov.boundary_on),
         pystray.MenuItem("Use YouTube captions (accurate, for browser videos)", _toggle_caps,
