@@ -27,6 +27,12 @@ spotify_config.json
 lyrics/*
 !lyrics/.gitkeep
 
+# Baked-in fallback lyrics shipped with the app are copyrighted third-party
+# content. Kept LOCALLY (so YOUR own builds can still bundle them via the spec's
+# optional include) but never committed — a clean clone, and any public/sold
+# build made from it, ships with NONE baked in. See docs/SALES_CONSIDERATIONS.md.
+bundled_lyrics/
+
 # OS
 Thumbs.db
 desktop.ini
