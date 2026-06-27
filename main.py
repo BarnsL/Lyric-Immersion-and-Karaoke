@@ -1240,6 +1240,7 @@ class Overlay:
         self._offset_hist = []        # ring buffer of (wall_t, offset) — catches jumps
         self._offset_hist_last = None # last offset recorded (only log on change)
         self._auto_align_after = None # pending auto-align timer id
+        self._live_resync_after = None # pending live lyric-resync timer id
         self._last_sound_lock_t = 0.0 # wall-clock of last confirmed Shazam offset
         # ── Algorithmic offset state (continuous, no strike counters) ──
         # `_drift_integral` accumulates |drift| × time between Shazam reads:
@@ -1266,6 +1267,7 @@ class Overlay:
             "sync_confirm_hold_ms": 2600,   # hesitation before the confirming listen
             "sync_confirm_listen_s": 5.0,   # confirming-listen capture length
             "applause_min_s":        2.5,   # loud-non-vocal seconds = a concert applause gap
+            "live_resync_s":        12.0,   # LIVE/concert versions: lyric-match RESYNC cadence (≈5×/min)
             "spread_reset":         20.0,   # chorus-ambiguity spread threshold
             "reset_offset_max":      5.0,   # only reset when |offset| < this
             "drift_align_trigger":   6.0,   # integral → trigger auto-align
@@ -1381,6 +1383,7 @@ class Overlay:
         # lyrics tight on cuts Shazam can't fingerprint (karaoke versions,
         # live arrangements, off-vocal mixes — Niconico karaoke videos).
         self._auto_align_after = self.root.after(45000, self._periodic_auto_align)
+        self._live_resync_after = self.root.after(15000, self._live_resync_loop)
 
     # ── per-track ──
 
@@ -4793,6 +4796,31 @@ class Overlay:
         if track_seq != self._track_seq:
             return
         self._maybe_auto_align(reason="track-start")
+
+    def _live_resync_loop(self):
+        """LIVE / concert versions drift — odd pauses for cheering, tempo shifts and
+        live edits mean the studio LRC timing won't hold and Shazam can't fingerprint
+        the (often MMD) cut. So for a registered live arrangement we RESYNC BY EAR
+        ~5×/min (`live_resync_s`): transcribe a few seconds and match to the loaded
+        lyrics, FOLLOWING the measured live offset instead of trusting the studio
+        timing. Only fires for a live version with lyrics loaded and nothing else
+        listening; a no-op otherwise. This is the active resync the studio path lacks."""
+        try:
+            if ((self._live_arrangement or self._live_mode) and self.lines
+                    and not self._aligning and not self._deciding
+                    and (self.meta.get("source") or "") != "youtube-captions"):
+                st = self.media.get()
+                if st and st.get("status") == PLAYING and float(st.get("position") or 0.0) > 8:
+                    try:
+                        import align
+                        if align.available():
+                            log.info("live resync (≈5×/min): listening to follow the live timing")
+                            self.align_by_listening(silent=True)
+                    except Exception:
+                        pass
+        finally:
+            nxt = int(max(6.0, self._tune.get("live_resync_s", 12.0)) * 1000)
+            self._live_resync_after = self.root.after(nxt, self._live_resync_loop)
 
     # ── SMART song decision by ear (Whisper 'small' + rapidfuzz) ──────────────
     #
