@@ -18,6 +18,82 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-105 — Self-heal Start Menu shortcut on app startup (rebrand migration) 🔴
+**Symptom (user, 2026-06-27):** "i dont see the exe on my start menu". After the rebrand from "Desktop Karaoke" → "Lyric Immersion and Karaoke" (and exe rename `DesktopKaraoke.exe` → `Lyric-Immersion-and-Karaoke.exe`), the old `Desktop Karaoke.lnk` in the user's Start Menu still pointed to the now-deleted `D:\DesktopKaraoke\DesktopKaraoke.exe`. Clicking did nothing, and searching "lyric" found nothing.
+**Inline fix this session:** deleted the broken `Desktop Karaoke.lnk`, created fresh `Lyric Immersion and Karaoke.lnk` pointing to the new exe.
+**Permanent fix:** add a startup migration in main.py (only when `getattr(sys, 'frozen', False)`):
+- Probe `$APPDATA\Microsoft\Windows\Start Menu\Programs\` for any `Desktop Karaoke.lnk`.
+- If found AND its target doesn't exist on disk, delete it.
+- If no `Lyric Immersion and Karaoke.lnk` exists in the same dir, create one pointing to `sys.executable` (the running exe path).
+- WindowStyle = 7 (minimized, no-activate) per CLAUDE.md app-launch etiquette.
+**Why this matters:** any future rename or deploy-path move will leave broken shortcuts that the existing autostart path (already at main.py:177) doesn't touch. Self-heal makes upgrades silent for the user.
+**Verify:** simulate by renaming the lnk back and relaunching; should restore. Don't run in dev (sys.frozen=False) to avoid noise during development.
+
+---
+
+## TICKET-104 — Fine-tune pause range: max 1.0 → 3.0 seconds 🔴
+**User request:** the fine-tune mode's max forward-drift pause is too short — bump to 3.0 s.
+**Current (main.py self._tune):**
+- `fine_tune_max_pause_s = 1.0` — biggest forward-drift pause when lyrics are ahead of vocals.
+**Change:**
+- `fine_tune_max_pause_s = 3.0` (3× current).
+- Re-check `fine_tune_exit_drift_s` (currently 2.5) — must be GREATER than the new pause ceiling so a drift just under 3.0 doesn't immediately hand back to the regular tier. Proposed: bump to 3.5 (3.0 cap + 0.5 buffer).
+**Why bigger pauses help:** holding the current line still for up to 3 s is visually quieter than a 3-s backward nudge that re-scrolls already-shown text. The fine-tune was designed to bias toward pauses over jumps; this just raises the ceiling on that bias.
+**Risk:** a 3-s pause feels like a freeze if the song is fast (≥4 lyrics/s). Mitigation: existing `fine_tune_min_step_s` (0.2) keeps small corrections proportional; the 3-s cap only fires for big drifts where the alternative (backward nudge) is worse.
+**Status:** queued behind TICKET-102's workflow (avoid concurrent main.py edits); apply in the v1.0.90 commit.
+
+---
+
+## TICKET-103 — GPU policy: secondary GPU when gaming, disabled on single-GPU 🟡
+**User request:** "make sure any gpu acceleration is on the secondary gpu when gaming or otherwise disabled when single gpu".
+**Current state (gpu_setup.pick_inference_device):**
+- Multi-GPU + gaming → idlest GPU (any GPU >=30% util treated as the game's, skipped) ✓
+- Multi-GPU + not gaming → cuda:0 preferred for model-cache stickiness ✓
+- Single-GPU + gaming → CPU ✓
+- Single-GPU + not gaming → was that GPU; **CHANGED inline to CPU** per user policy.
+**Inline change (this session):** modified `pick_inference_device` so `n == 1 → ("cpu", 0, "single GPU → CPU")` regardless of gaming. The lone card stays free for the game/system; the marginal Whisper speed-up isn't worth competing for the only GPU available.
+**Followups (need main.py edits, queued behind TICKET-102):**
+- Add tune knob `gpu_solo_override` default 0 — user who explicitly wants GPU on single-GPU machine can flip it.
+- Expose current device + reason in /diag: `gpu_device`, `gpu_index`, `gpu_reason`, `gpu_count`.
+- Richer tray label dynamically reflecting state: "⚡ GPU: cuda:1 (3080, active)" / "⚡ GPU: CPU (game running)" / "⚡ GPU: CPU (single-GPU policy)".
+**Status:** core policy change applied 🟢; followups 🟡.
+
+---
+
+## TICKET-102 — Window title scraping (Steam Overlay browser + generic Chromium fallback) 🟢 (v1.0.90)
+**Shipped in v1.0.90.** New module `window_titles.py` (stdlib + ctypes, mirrors `discord_rpc.py`'s daemon-watcher + lock-guarded-slot style). EnumWindows on a 2s background daemon, allowlist-first PID→exe gate (privacy: non-allowlisted window text is never read), `SendMessageTimeoutW(WM_GETTEXT, SMTO_ABORTIFHUNG, 100ms)` for the title text, suffix-based music-marker filter, negative-suffix and bare-hostname rejection, foreground-preferred candidate selection within a tier. HIGH tier (default ON): steamwebhelper.exe, discord(.exe|canary|ptb), slack.exe, teams.exe, ms-teams.exe. LOW tier (default OFF, opt-in via `window_titles_generic_browsers`): chrome/edge/brave/firefox/opera/vivaldi/arc. Wired into `_tick` as a NEW source between SMTC (`playing=true` still wins) and Shazam-live for HIGH, below Shazam for LOW. 3 tune knobs (`window_titles_on` default 1, `window_titles_generic_browsers` default 0, `window_titles_poll_s` default 2.0); two tray items under detection group; `/diag.window_titles` + `/source.capabilities` mirror state. Pinned in `DesktopKaraoke.spec` hiddenimports. No new requirements (ctypes is stdlib). Teardown mirrors `discord_rpc.stop_watcher()`.
+
+
+**Symptom (live observation, 2026-06-27, ReGLOSS Hour Time Yellow in Steam Overlay browser):**
+- User has YouTube open inside Steam Overlay (steamwebhelper.exe). Window title bar reads `ReGLOSS - Hour Time Yellow OFFICIAL MV - YouTube` — perfect metadata.
+- Steam's embedded CEF browser does NOT register with Windows SMTC (unlike Chrome/Edge/Firefox).
+- SMTC remains locked on a STALE track from earlier (`BANG BANG / IVE`, playing=false).
+- Shazam picks up the audio but matches a DIFFERENT ReGLOSS song (`FG ROADSTER` → FLOW GLOW), likely because Hour Time Yellow isn't in Shazam's DB yet.
+- Result: app is locked to the wrong song while the WINDOW TITLE has the right answer right there.
+
+**Fix:** new module `window_titles.py` using ctypes (no new deps) for Win32 EnumWindows + GetWindowText + GetWindowThreadProcessId + QueryFullProcessImageNameW. Filter:
+- Process names (high priority): `steamwebhelper.exe` (Steam Overlay), `Discord.exe` / `DiscordCanary.exe` / `DiscordPTB.exe`.
+- Process names (low priority, generic fallback): `chrome.exe`, `msedge.exe`, `brave.exe`, `firefox.exe`, `opera.exe` (these usually hit SMTC; only kick in if SMTC silent).
+- Title suffix patterns: ` - YouTube`, ` - Spotify`, ` - SoundCloud`, ` - Bandcamp`, ` - Apple Music`, ` - Tidal`, ` - YouTube Music`.
+- Parse: strip the suffix, split title on ` - ` / ` | `. Run through existing `clean_title` / `clean_artist` heuristics for VTuber / official-channel cruft.
+
+**Priority slot:**
+1. SMTC `playing=true` (authoritative player clock)
+2. **Steam Overlay window-title** (explicit metadata, player Windows can't see otherwise — slots between SMTC and Shazam)
+3. Shazam-live (sound-truth fallback)
+4. Generic-browser window-title (lowest — most browsers ARE in SMTC; this only matters if SMTC silent)
+5. Discord RP (TICKET-100/A)
+
+**Polling:** 2s on a background daemon thread. Window enumeration is fast (~5ms for ~100 windows). Lock-guarded slot exactly like discord_rpc.py — Tk thread reads in <1ms.
+
+**Tray toggle:** under section 2 (Detection / Lyric Sources) — "Read browser window titles (Steam Overlay, etc.)". Default ON for the high-priority processes (Steam Overlay is unambiguously music when title matches a music host); separate tune knob `window_titles_generic_browsers = 0` (default OFF) to enable the generic browser fallback.
+
+**Verify:** open Steam Overlay → YouTube ReGLOSS Hour Time Yellow → app switches to that track within 2-5s. Open Spotify in browser → SMTC still wins. Open Spotify desktop app → SMTC still wins. Open a non-music YouTube tutorial in Steam Overlay → don't claim it as music (require either Shazam-confirmed audio OR a music-host suffix).
+
+**Risk:** false positives on non-music YouTube videos. Mitigation: combine the title source with Shazam — if Shazam catches recognizable audio AND title matches a music-host pattern, accept. If Shazam returns nothing AND title is just generic YouTube, hold off until Shazam corroborates.
+
+---
+
 ## TICKET-101 — Game Rich Presence + Steam SteamWorks music ingestion 🔵
 **Spun off from TICKET-100 (v1.0.89 shipped the Spotify-Listening Discord RP reader; this ticket owns the deferred parts).**
 **(A) Per-game Discord Rich Presence:** rhythm/music games (Muse Dash, beatmania, BMS clients, some VRChat worlds) publish "now playing" track info in their Discord RP `details`/`state`/`large_text`. Each game uses an ad-hoc string format, so this needs a per-`application_id` allowlist + per-game parser. Gate behind a new tune knob `discord_game_rpc = 0` (default OFF) and a separate menu item so a wrong parser can't poison the Spotify-Listening path that already works.
