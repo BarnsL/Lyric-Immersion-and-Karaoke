@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.91.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.93.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -53,7 +53,45 @@ Suisei). **Current build: v1.0.91.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.91, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.93, all deployed + on master)
+- **v1.0.93 — Boundary-deferred lyrics swap (TICKET-111):** the v1.0.92 decision-engine
+  SWITCH/REGEN actions, the long-standing wrong-song-strike teardown (Site D), and the
+  user-driven `/wrong` path (Site G) all USED to blank `self.lines` IMMEDIATELY and re-fetch,
+  producing a 1-5s on-screen blackout while the new lyrics arrived. v1.0.93 queues the swap
+  on a new `self._pending_swap` state, kicks off the fetch/gen in parallel so latency
+  overlaps, and KEEPS rendering the old lines until the boundary fires (LINE-mode current
+  line ends, SCROLL-mode belt drains, or a 2s+ instrumental gap on `idx==-1`). When the
+  fetch completes, `_consume_async` (and the AI-gen `_apply_generated` for REGEN) routes
+  the result into `pending_swap["lines"]` instead of `self.lines`; the `_tick_body`
+  consumer commits atomically via `_apply_pending_swap` once the boundary lands. Same
+  shape as TICKET-078's `_pending_offset` (the precedent for offset corrections); the
+  TICKET-088 same-tick ordering doc in `_tick_body` is preserved (offset commits first
+  so the swap commits against the fresh offset). Stale fetch tokens are dropped (rapid
+  double `/wrong` no longer races); a real track change calls `_cancel_pending_swap`
+  to invalidate in-flight targets. Safety cap (`swap_defer_max_s`, default 8.0s) forces
+  a commit even if the boundary never lands; user-driven `/wrong` uses a tighter cap
+  (`swap_defer_user_max_s`, default 3.0s) since the user explicitly asked for it fixed
+  fast. Kill-switch via `swap_defer_enabled` (default 1 = on, set 0 via `/tune` to
+  restore v1.0.92 immediate-clear behavior without a re-release). `/diag.pending_swap`
+  exposes queue state, age, blocked-by reason, and `last_commit_seq` for live observability;
+  `api.py` `/diag` help blurb updated to mention pending-swap (no other api.py changes
+  required, the dict passes through as-is). Four new tune knobs: `swap_defer_enabled`,
+  `swap_defer_max_s`, `swap_defer_instrumental_gap_s`, `swap_defer_user_max_s`.
+- **v1.0.92 — Continuous decision engine (TICKET-109):** new background watcher
+  (`_decision_tick` self-throttled to `decision_tick_interval_s`, default 2.0s) that
+  aggregates four signal dimensions (SMTC<->Shazam agreement, drift trend, lyric-quality
+  flags, decide-by-ear corroboration) into a strike score over a rolling window
+  (`decision_score_window`, default 12 samples). State promotes TRUST -> CAUTION -> SWITCH
+  -> REGEN at thresholds `decision_caution_strikes` (3), `decision_switch_strikes` (5),
+  `decision_regen_strikes` (8). `_fire_decision_action` executes SWITCH (re-fetch from
+  alternative source) or REGEN (force AI generation); separated by
+  `decision_action_cooldown_s` (default 30.0s) so a flaky read can't ping-pong actions.
+  Engine forgets prior song's strikes on track change (`_reset_decision_engine`). User
+  surface: tray hint + `/diag.decision_engine` (state, strikes, last_action_age_s,
+  dim scores). Knobs: `decision_engine_on` (default 1), the five threshold/window knobs,
+  and the cooldown. **Known gap fixed in v1.0.93:** the SWITCH/REGEN branches in
+  `_fire_decision_action` cleared `self.lines = []` immediately on fire, which produced
+  the 1-5s blackout TICKET-111 addressed.
 - **v1.0.91 — LINE-mode render perf (A1) + perf instrumentation (A2) + title-alias album
   fallback + verified-render grace (A3) + scroll_ knob rename + concert-detection regex
   expansion (TICKETs 103-followups / 104 / 105 / 106 / batch4 A1+A2+A3):** seven workflow-driven

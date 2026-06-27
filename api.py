@@ -57,7 +57,7 @@ _ROUTES = {
         "/logs": "recent log lines (?n=200) — the matching decisions",
         "/lyrics": "the full loaded lyric lines",
         "/tune": "live sync-tuning parameters (drift_fastpath, agree, spread_reset, …)",
-        "/diag": "deep diagnostics: full sync state machine, last energy-correlation, FPS/frame-timing",
+        "/diag": "deep diagnostics: full sync state machine, last energy-correlation, FPS/frame-timing, pending-swap (TICKET-111)",
         "/source": "video/music source view: raw SMTC data + what the app derived from it",
         "/audio": "audio listener: live loudness + vocal-band ratio + recent on/off pattern",
         "/lyricstate": "lyric current-state analyzer: current/prev/next lines, fill, structural checks",

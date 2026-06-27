@@ -1832,6 +1832,19 @@ class Overlay:
             "decision_score_window":       12,
             "decision_tick_interval_s":   2.0,
             "decision_action_cooldown_s": 30.0,   # min seconds between SWITCH/REGEN actions
+            # ── TICKET-111: boundary-deferred lyrics swap ──
+            # When the decision engine (SWITCH/REGEN), the wrong-song strike, or
+            # the user's /wrong has to replace the loaded lyrics, the v1.0.92 code
+            # blanked self.lines IMMEDIATELY and re-fetched, producing a 1-5s
+            # blackout on screen. Instead, QUEUE the swap on self._pending_swap,
+            # start the fetch right now (so latency overlaps), and KEEP rendering
+            # the old lines until either the current line ends (LINE mode), the
+            # scroll belt drains (SCROLL mode), or the safety cap fires.
+            # Mirrors the TICKET-078 _pending_offset state machine.
+            "swap_defer_enabled":            1,   # 0 = legacy immediate clear
+            "swap_defer_max_s":            8.0,   # safety cap: force commit after this
+            "swap_defer_instrumental_gap_s": 2.0, # idx==-1 LINE-mode gap that counts as a boundary
+            "swap_defer_user_max_s":       3.0,   # tighter cap for user-driven /wrong
             "continuous_recal_ms": 15000,   # legacy fixed cadence (superseded by the adaptive tier)
             # ── ADAPTIVE sync-verification tier (escalation / de-escalation) ──
             # Verify sync ~3×/min while syncing or after a miss; once a check CONFIRMS
@@ -2017,6 +2030,16 @@ class Overlay:
         # appears under the new offset. Less jarring than a mid-line snap.
         self._pending_offset = None   # queued new offset; commits when current line ends
         self._pending_offset_t = 0.0  # when it was queued (capped so it can't stall forever)
+        # TICKET-111: deferred WHOLE-LYRICS swap (SWITCH/REGEN/wrong-song/user-wrong).
+        # Dict: kind, source_site, artist, title, cover, queued_t, hint,
+        # fetch_token, lines, meta, lyrics_path, force_ai_gen, max_s, set_gate.
+        # `lines/meta/lyrics_path` are populated by the fetch/gen completion
+        # handler; the _tick consumer commits atomically once the boundary hits.
+        self._pending_swap = None
+        self._pending_swap_t = 0.0
+        self._swap_fetch_token = 0       # monotonic; older fetch completions are dropped
+        self._swap_commit_seq = 0        # /diag counter
+        self._idx_minus_one_since = 0.0  # wall-time of the first tick idx hit -1 (for instrumental-gap boundary)
         self._live_arrangement = False  # LIVE/short/alt version → FOLLOW the offset, don't reset
         # Concert applause/cheering-pause detection (TICKET-061): a live cut pauses
         # for applause while the player clock runs on, drifting the lyrics ahead.
@@ -2168,6 +2191,13 @@ class Overlay:
         self._source_priority = "agree"
         self._pending_corr = 1e9   # drop any pending large-offset confirmation
         self._pending_offset = None  # drop any deferred sync-offset commit from prev track
+        # TICKET-111: a real new track invalidates any in-flight swap target
+        # (those lyrics are for the OLD song). Cancel; the new track's flow
+        # below will run through the normal load/_start_fetch path.
+        try:
+            self._cancel_pending_swap("track-change")
+        except Exception:
+            pass
         # FINE-TUNE: force-clear pause buffers AFTER the offset reset above so no
         # queued pause subtraction can fire against the fresh-song offset (the
         # subtraction-vs-reset order is intentional: clearing _fine_pause_amount=0
@@ -2851,12 +2881,17 @@ class Overlay:
         if need_rm or (want_en and have_en < len(want_en) * 0.5):
             self._start_translate(self._lyrics_path)
 
-    def _start_fetch(self, artist, title, duration=None, cover=False, strict=False):
+    def _start_fetch(self, artist, title, duration=None, cover=False, strict=False,
+                     swap_token=None):
         key = (artist, title)
         if self._fetch_key == key:
             return
         self._fetch_key = key
         self._fetching = True       # in flight → generation defers until this resolves
+        # TICKET-111: capture swap_token at queue time so the completion can
+        # route into self._pending_swap['lines'] instead of self.lines when the
+        # token still matches the in-flight pending swap.
+        captured_swap_token = swap_token
 
         def work():
             try:
@@ -2865,7 +2900,8 @@ class Overlay:
                                    cover=cover, strict=strict)
             except Exception:
                 p = None
-            self._fetch_result = (key, p)
+            # 3-tuple (key, path, swap_token); _consume_async tolerates legacy 2-tuples.
+            self._fetch_result = (key, p, captured_swap_token)
             self._fetching = False
 
         threading.Thread(target=work, daemon=True).start()
@@ -3137,7 +3173,13 @@ class Overlay:
 
     def _consume_async(self):
         if self._fetch_result:
-            key, p = self._fetch_result
+            # TICKET-111: tolerate both legacy 2-tuple and new 3-tuple shape
+            fr = self._fetch_result
+            if len(fr) == 3:
+                key, p, completion_swap_token = fr
+            else:
+                key, p = fr
+                completion_swap_token = None
             self._fetch_result = None
             if key == self._fetch_key:
                 if p:
@@ -3148,10 +3190,45 @@ class Overlay:
                         self.index.add(p)
                     else:
                         self.index.add(p)
-                        self.load(Path(p))
-                        self._start_translate(Path(p))
-                        if self.git_sync:           # back up the new song if opted in
-                            self.git_backup()
+                        # TICKET-111: if a swap is pending and the token matches,
+                        # route the loaded lines into the pending dict so the
+                        # _tick consumer can commit atomically at the next
+                        # boundary. Otherwise it's a normal fetch load now.
+                        if (self._pending_swap is not None
+                                and completion_swap_token is not None
+                                and completion_swap_token
+                                    == self._pending_swap.get("fetch_token")):
+                            try:
+                                meta_l, lines_l = load_lyrics(Path(p))
+                                self._pending_swap["lines"] = lines_l
+                                self._pending_swap["meta"]  = meta_l
+                                self._pending_swap["lyrics_path"] = Path(p)
+                                log.info("swap: target ready token=%d age=%.2fs "
+                                         "src=fetch lines=%d",
+                                         completion_swap_token,
+                                         time.time() - self._pending_swap_t,
+                                         len(lines_l))
+                                # still kick off translation backfill against the cache file
+                                self._start_translate(Path(p))
+                                if self.git_sync:
+                                    self.git_backup()
+                            except Exception as e:
+                                log.info("swap: pending-load failed (%s) "
+                                         "falling back to direct load", e)
+                                self.load(Path(p))
+                                self._start_translate(Path(p))
+                                if self.git_sync:
+                                    self.git_backup()
+                        else:
+                            if completion_swap_token is not None:
+                                log.info("swap: stale fetch completion token=%d "
+                                         "current=%s dropping",
+                                         completion_swap_token,
+                                         (self._pending_swap or {}).get("fetch_token"))
+                            self.load(Path(p))
+                            self._start_translate(Path(p))
+                            if self.git_sync:           # back up the new song if opted in
+                                self.git_backup()
                 elif self._identifying:
                     pass                       # sound-ID running → wait for it
                 elif self._sound_song is None:
@@ -3600,15 +3677,48 @@ class Overlay:
                         self._arm_recal(7)
                         cached = self._prefer_cjk_cache(f_artist, f_title, self._cur_duration) \
                             or self.index.match(f_artist, f_title, self._cur_duration)
-                        if cached and self._file_valid(cached, self._cur_duration):
-                            if cached != self._lyrics_path:
-                                log.info("wrong-song correction → cached %s", cached.name)
-                                self.load(cached)
-                            self._maybe_translate()
+                        # TICKET-111: defer the actual swap to the next line/belt
+                        # boundary so the user doesn't see a 1-5s blackout while
+                        # the new lyrics arrive. The fetch (or cache load) starts
+                        # NOW; old lines keep rendering until the boundary fires.
+                        deferred = (int(self._tune.get("swap_defer_enabled", 1) or 0) == 1
+                                    and bool(self.lines))
+                        if deferred:
+                            self._queue_swap(
+                                kind="wrong-strike", source_site="D",
+                                artist=f_artist, title=f_title, cover=False,
+                                hint=f"🔄 Wrong song — switching to {f_title}…",
+                                set_gate=True)
+                            if cached and self._file_valid(cached, self._cur_duration):
+                                if cached != self._lyrics_path:
+                                    log.info("wrong-song correction → cached %s (deferred swap)", cached.name)
+                                    try:
+                                        meta_l, lines_l = load_lyrics(cached)
+                                        self._pending_swap["lines"] = lines_l
+                                        self._pending_swap["meta"]  = meta_l
+                                        self._pending_swap["lyrics_path"] = Path(cached)
+                                        log.info("swap: target ready token=%d age=0.00s src=cache lines=%d",
+                                                 self._pending_swap["fetch_token"], len(lines_l))
+                                    except Exception as e:
+                                        log.info("swap: cache-preload failed (%s) — falling back to immediate", e)
+                                        self.load(cached)
+                                        self._cancel_pending_swap("cache-preload-failed")
+                                self._maybe_translate()
+                            else:
+                                log.info("wrong-song correction → fetching %r / %r (deferred swap)", f_title, f_artist)
+                                self._start_fetch(f_artist, f_title, self._cur_duration,
+                                                  swap_token=self._pending_swap["fetch_token"])
                         else:
-                            log.info("wrong-song correction → fetching %r / %r", f_title, f_artist)
-                            self._hint(f"🔄 Wrong song — switching to {f_title}…")
-                            self._start_fetch(f_artist, f_title, self._cur_duration)
+                            # legacy immediate-teardown path (kill-switch or no current lines)
+                            if cached and self._file_valid(cached, self._cur_duration):
+                                if cached != self._lyrics_path:
+                                    log.info("wrong-song correction → cached %s", cached.name)
+                                    self.load(cached)
+                                self._maybe_translate()
+                            else:
+                                log.info("wrong-song correction → fetching %r / %r", f_title, f_artist)
+                                self._hint(f"🔄 Wrong song — switching to {f_title}…")
+                                self._start_fetch(f_artist, f_title, self._cur_duration)
                     else:
                         log.info("ignoring sound %r — title-locked to %r (strike %d/%d)",
                                  f_title, self.meta.get("title", ""),
@@ -3689,12 +3799,22 @@ class Overlay:
         self._gen_title, self._gen_artist = (title or "song"), (artist or "")
         self._gen_lines = []
         self._gen_lang = None          # first chunk auto-detects the sung language
-        self.lines, self.idx, self._kara = [], -1, []
-        self._lyrics_path = None
-        self._verified = False
-        self._verified_meta = False           # TICKET-099
-        self._sound_corroborated = False      # TICKET-099
-        self._verified_gate_t = 0.0           # TICKET batch4: explicit teardown, no gate
+        # TICKET-111: if a REGEN swap is pending (force_ai_gen=True), do NOT
+        # blow away self.lines yet the deferred-swap consumer will commit the
+        # generated output atomically at the next boundary. Skip the verified-
+        # flag wipe too, for the same reason; _apply_pending_swap handles it.
+        regen_pending = (self._pending_swap is not None
+                         and self._pending_swap.get("force_ai_gen"))
+        if regen_pending:
+            # Tag the pending dict so _apply_generated routes into it.
+            self._pending_swap["gen_token"] = self._gen_token
+        else:
+            self.lines, self.idx, self._kara = [], -1, []
+            self._lyrics_path = None
+            self._verified = False
+            self._verified_meta = False           # TICKET-099
+            self._sound_corroborated = False      # TICKET-099
+            self._verified_gate_t = 0.0           # TICKET batch4: explicit teardown, no gate
         self.meta = {"title": self._gen_title, "artist": self._gen_artist,
                      "lang": "ja", "duration": self._cur_duration, "source": "generated"}
         self._hint("✨ Generating lyrics by ear… (AI — marked ***)")
@@ -3912,9 +4032,30 @@ class Overlay:
                 continue
             seen.add(k)
             merged.append(d)
-        self.lines = [Line(start=d["t"][0], end=d["t"][1], jp=d.get("jp", ""),
-                           rm=d.get("rm", ""), en=d.get("en", "")) for d in merged]
+        new_lines = [Line(start=d["t"][0], end=d["t"][1], jp=d.get("jp", ""),
+                          rm=d.get("rm", ""), en=d.get("en", "")) for d in merged]
+        # TICKET-111: if a REGEN swap queued this generation, write the result
+        # into the pending dict instead of self.lines and let the boundary
+        # consumer commit atomically. Otherwise behave as before.
+        if (self._pending_swap is not None
+                and self._pending_swap.get("force_ai_gen")
+                and self._pending_swap.get("gen_token") == token):
+            self._pending_swap["lines"] = new_lines
+            self._pending_swap["meta"]  = dict(self.meta) if self.meta else {}
+            # _lyrics_path is set further down in the save block; capture it then.
+            log.info("swap: target ready token=%d gen_token=%d age=%.2fs src=ai-gen lines=%d",
+                     self._pending_swap["fetch_token"], token,
+                     time.time() - self._pending_swap_t, len(new_lines))
+            self._save_generated_only(merged, into_pending=True)
+            return
+        self.lines = new_lines
         self._relayout_song()
+        self._save_generated_only(merged, into_pending=False)
+
+    def _save_generated_only(self, merged, into_pending=False):
+        """TICKET-111: save the generated lyrics to disk + index.  When
+        into_pending=True, write the resulting path into the pending swap
+        dict's lyrics_path field instead of self._lyrics_path."""
         try:
             from fetch_lyrics import slugify
             out = LYRICS_DIR / f"{slugify(self._gen_title)}.json"
@@ -3924,7 +4065,10 @@ class Overlay:
                     "lines": [{"t": d["t"], "jp": d.get("jp", ""), "rm": d.get("rm", ""),
                                "en": d.get("en", "")} for d in merged]}
             out.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-            self._lyrics_path = out
+            if into_pending and self._pending_swap is not None:
+                self._pending_swap["lyrics_path"] = out
+            else:
+                self._lyrics_path = out
             self.index.add(out)
         except Exception as e:
             log.info("saving generated lyrics failed: %s", e)
@@ -4420,6 +4564,20 @@ class Overlay:
                 self._commit_offset(new_off, reset_display=False)
                 self.idx = -1
                 self._drift_integral = 0.0
+        # ── TICKET-111: deferred whole-lyrics swap consumer ──────────────────
+        # Placed RIGHT AFTER the _pending_offset consumer so TICKET-088 same-
+        # tick ordering still holds (offset commits first; then the swap
+        # commits against the fresh offset). Maintains the idx==-1 gap timer
+        # used by _swap_ready for the LINE-mode instrumental-gap boundary.
+        if self.idx == -1:
+            if self._idx_minus_one_since == 0.0:
+                self._idx_minus_one_since = time.time()
+        else:
+            self._idx_minus_one_since = 0.0
+        try:
+            self._try_apply_swap()
+        except Exception as e:
+            log.info("swap: _try_apply_swap raised %s", e)
         # FINE-TUNE pause EXPIRY (placed ABOVE the pos computation so the offset
         # adjustment is reflected in THIS frame's pos / pos_raw — zero visible
         # discontinuity: the held frame becomes the resumed frame).
@@ -5700,6 +5858,8 @@ class Overlay:
             "energy_align": self._last_energy,
             "decision": self._last_decision,        # last by-ear song decision (Whisper+rapidfuzz)
             "deciding": self._deciding,
+            # TICKET-111: deferred whole-lyrics swap state
+            "pending_swap": self._diag_pending_swap(),
             "fps": {
                 "target": target_fps,
                 "render": render_fps,
@@ -6722,12 +6882,43 @@ class Overlay:
                 pass
             self.index.refresh()
         self._fetch_key = None
+        # TICKET-111: defer the visible clear so the current line / belt finishes
+        # before the new lyrics drop in. User-driven path uses a TIGHTER safety
+        # cap (swap_defer_user_max_s, default 3.0s) when the user explicitly
+        # says "wrong", they want it fixed fast, even at the cost of some snap.
+        deferred = (int(self._tune.get("swap_defer_enabled", 1) or 0) == 1
+                    and bool(self.lines))
+        if deferred:
+            if self._is_cover and self._cover_original_artist and self._track:
+                _, t = self._track
+                hint = f"🔄 Re-fetching as {self._cover_original_artist} — {t}…"
+                q_artist, q_title, q_cover = self._cover_original_artist, t, True
+            else:
+                q_artist, q_title, q_cover = "", "", False
+                hint = "🎧 Listening to identify the song…"
+            self._queue_swap(
+                kind="wrong-user", source_site="G",
+                artist=q_artist, title=q_title, cover=q_cover,
+                hint=hint, set_gate=False,
+                max_s=float(self._tune.get("swap_defer_user_max_s", 3.0)))
+            self._sound_song = None
+            self._title_locked = False
+            # Kick off the actual identification / re-fetch NOW so the boundary
+            # has a real target by the time it hits.
+            if self._is_cover and self._cover_original_artist and self._track:
+                _, title = self._track
+                log.info("wrong-song on cover: re-fetching %r by original artist %r (deferred swap)",
+                         title, self._cover_original_artist)
+                self._start_fetch(self._cover_original_artist, title,
+                                  self._cur_duration, cover=True,
+                                  swap_token=self._pending_swap["fetch_token"])
+            self._start_identify()
+            return
+        # legacy immediate path
         self._lyrics_path = None
         self.lines, self.idx, self._kara = [], -1, []
         self._sound_song = None
         self._title_locked = False     # let sound override after a manual reject
-        # For covers, try re-fetching with the original artist from the title
-        # before falling back to sound (which often fails on covers)
         if self._is_cover and self._cover_original_artist and self._track:
             artist, title = self._track
             log.info("wrong-song on cover: re-fetching %r by original artist %r",
@@ -7337,25 +7528,269 @@ class Overlay:
         track = getattr(self, "_track", None)
         if state == "SWITCH" and track:
             artist, title = track
-            self._hint(f"🔁 Switched to alternative lyric source for {title}…")
+            hint = f"🔁 Switched to alternative lyric source for {title}…"
             if getattr(self, "_lyrics_path", None):
                 try: Path(self._lyrics_path).unlink(missing_ok=True)
                 except Exception: pass
                 try: self.index.refresh()
                 except Exception: pass
             self._fetch_key = None
-            self._lyrics_path = None
-            self.lines, self.idx, self._kara = [], -1, []
-            self._start_fetch(artist, title, self._cur_duration,
-                              cover=getattr(self, "_is_cover", False))
+            deferred = (int(self._tune.get("swap_defer_enabled", 1) or 0) == 1
+                        and bool(self.lines))
+            if deferred:
+                # TICKET-111: queue the swap; keep rendering current lyrics
+                # while the new fetch runs in parallel.
+                self._queue_swap(
+                    kind="switch", source_site="H",
+                    artist=artist, title=title,
+                    cover=getattr(self, "_is_cover", False),
+                    hint=hint, set_gate=False)
+                self._start_fetch(artist, title, self._cur_duration,
+                                  cover=getattr(self, "_is_cover", False),
+                                  swap_token=self._pending_swap["fetch_token"])
+            else:
+                self._hint(hint)
+                self._lyrics_path = None
+                self.lines, self.idx, self._kara = [], -1, []
+                self._start_fetch(artist, title, self._cur_duration,
+                                  cover=getattr(self, "_is_cover", False))
             self._decision_strikes = max(0, self._decision_strikes - 3)
         elif state == "REGEN" and track:
-            self._hint("✨ Regenerating lyrics via AI…")
+            hint = "✨ Regenerating lyrics via AI…"
             self._fetch_key = None
-            self._lyrics_path = None
-            self.lines, self.idx, self._kara = [], -1, []
-            self._force_ai_gen = True
+            deferred = (int(self._tune.get("swap_defer_enabled", 1) or 0) == 1
+                        and bool(self.lines))
+            if deferred:
+                # TICKET-111: queue the regen swap. The AI-gen consumer (Site C
+                # in _begin_generation / _apply_generated) checks this flag and
+                # writes into pending['lines'] instead of self.lines.
+                artist, title = track
+                self._queue_swap(
+                    kind="regen", source_site="I",
+                    artist=artist, title=title, cover=False,
+                    hint=hint, set_gate=False, force_ai_gen=True)
+                self._force_ai_gen = True
+            else:
+                self._hint(hint)
+                self._lyrics_path = None
+                self.lines, self.idx, self._kara = [], -1, []
+                self._force_ai_gen = True
             self._decision_strikes = 0
+
+    # ─────────────────────── TICKET-111 deferred swap helpers ───────────────────
+    def _queue_swap(self, kind, source_site, artist, title, cover=False,
+                    hint="", set_gate=False, force_ai_gen=False, max_s=None):
+        """Queue a deferred whole-lyrics swap. Caller is responsible for kicking
+        off the fetch / gen with swap_token=self._pending_swap['fetch_token'].
+        If a swap is already pending, this REPLACES it (supersedes) the old
+        fetch's completion will fail the token check and be dropped."""
+        if self._pending_swap is not None:
+            old = self._pending_swap
+            log.info("swap: superseded prior kind=%s site=%s token=%d age=%.2fs",
+                     old.get("kind"), old.get("source_site"),
+                     old.get("fetch_token"),
+                     time.time() - self._pending_swap_t)
+        self._swap_fetch_token += 1
+        token = self._swap_fetch_token
+        cap = float(max_s) if max_s is not None else float(
+            self._tune.get("swap_defer_max_s", 8.0))
+        self._pending_swap = {
+            "kind": kind, "source_site": source_site,
+            "artist": artist, "title": title, "cover": cover,
+            "queued_t": time.time(),
+            "hint": hint,
+            "fetch_token": token,
+            "lines": None, "meta": None, "lyrics_path": None,
+            "force_ai_gen": bool(force_ai_gen),
+            "set_gate": bool(set_gate),
+            "max_s": cap,
+            "cancelled": False,
+            "gen_token": None,
+        }
+        self._pending_swap_t = time.time()
+        if hint:
+            try:
+                self._hint(hint)
+            except Exception:
+                pass
+        log.info("swap: queued kind=%s site=%s token=%d cap=%.1fs%s",
+                 kind, source_site, token, cap,
+                 " force_ai_gen" if force_ai_gen else "")
+        return token
+
+    def _cancel_pending_swap(self, reason):
+        """Drop the pending swap (e.g. real track change, user cancel)."""
+        if self._pending_swap is None:
+            return
+        p = self._pending_swap
+        log.info("swap: cancelled kind=%s site=%s token=%d reason=%s age=%.2fs",
+                 p.get("kind"), p.get("source_site"), p.get("fetch_token"),
+                 reason, time.time() - self._pending_swap_t)
+        self._pending_swap = None
+        self._pending_swap_t = 0.0
+
+    def _swap_ready(self):
+        """Returns (ready: bool, reason: str). Reason surfaces in /diag.blocked_by.
+        Boundary depends on render mode:
+          LINE  (none/left/right/top/bottom) current line end OR instrumental gap
+          SCROLL (lr/rl/tb/bt)              belt drained OR instrumental gap
+        """
+        if not self.lines:
+            return True, "no-current-lines"
+        mode = self.scroll_dir
+        now = time.time()
+        gap_thr = float(self._tune.get("swap_defer_instrumental_gap_s", 2.0))
+        if mode in ("lr", "rl", "tb", "bt"):
+            stream_n = len(getattr(self, "_stream", []) or [])
+            if stream_n == 0:
+                return True, "belt-drained"
+            if (self.idx == -1 and self._idx_minus_one_since
+                    and (now - self._idx_minus_one_since) >= gap_thr):
+                return True, f"instrumental-gap({now - self._idx_minus_one_since:.1f}s)"
+            return False, f"belt={stream_n} idx={self.idx}"
+        # LINE modes
+        if getattr(self, "_anim_id", None) is not None:
+            return False, "anim-in-progress"
+        if self.idx == -1:
+            if (self._idx_minus_one_since
+                    and (now - self._idx_minus_one_since) >= gap_thr):
+                return True, f"instrumental-gap({now - self._idx_minus_one_since:.1f}s)"
+            wait = (gap_thr - (now - self._idx_minus_one_since)
+                    if self._idx_minus_one_since else gap_thr)
+            return False, f"gap-too-short(wait {wait:.1f}s)"
+        # In-line must wait for line end. Fast path: post-last-line.
+        try:
+            ln = self.lines[self.idx]
+        except Exception:
+            return True, "idx-out-of-range"
+        last_pos = getattr(self, "_last_pos", 0.0) or 0.0
+        ends_in = ln.end - last_pos
+        if self.idx >= len(self.lines) - 1 and ends_in <= 0.0:
+            return True, "post-last-line"
+        return False, f"in-line idx={self.idx} ends-in={ends_in:.1f}s"
+
+    def _try_apply_swap(self):
+        """Called every _tick. If a pending swap has its target loaded AND the
+        per-mode boundary is reached (or the safety cap expired), commit it
+        atomically via _apply_pending_swap."""
+        p = self._pending_swap
+        if p is None:
+            return
+        # Kill-switch flipped off while a swap is in flight flush now if
+        # there's a target, or cancel if not.
+        if int(self._tune.get("swap_defer_enabled", 1) or 0) != 1:
+            if p.get("lines") is not None:
+                self._apply_pending_swap("disabled")
+            else:
+                self._cancel_pending_swap("disabled-no-target")
+            return
+        age = time.time() - self._pending_swap_t
+        cap = float(p.get("max_s") or self._tune.get("swap_defer_max_s", 8.0))
+        if p.get("lines") is None:
+            # Fetch / gen still running.
+            if age > 2 * cap:
+                log.info("swap: fetch still pending after %.1fs (cap=%.1fs) token=%d",
+                         age, cap, p.get("fetch_token"))
+            return
+        ready, reason = self._swap_ready()
+        if not ready and age > cap:
+            ready, reason = True, f"timeout({age:.1f}s)"
+        if ready:
+            self._apply_pending_swap(reason)
+
+    def _apply_pending_swap(self, reason):
+        """Atomic commit: in one tick, replace self.lines/meta/_lyrics_path
+        with the pending target. No observable intermediate state."""
+        p = self._pending_swap
+        if p is None:
+            return
+        age = time.time() - self._pending_swap_t
+        kind = p.get("kind"); site = p.get("source_site")
+        token = p.get("fetch_token")
+        # 1. Cancel any in-flight LINE-mode slide-in so it can't snap the new line.
+        if getattr(self, "_anim_id", None) is not None:
+            try:
+                self.root.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+        # 2. Clear scroll belt (cv.deletes per-block tags + resets list).
+        try:
+            self._clear_stream()
+        except Exception:
+            pass
+        # 3. Wipe LINE-mode canvas. (For scroll mode _clear_stream already did it.)
+        try:
+            self.cv.delete("all")
+        except Exception:
+            pass
+        # 4. Apply atomically.
+        new_meta = p.get("meta") or {}
+        new_lines = p.get("lines") or []
+        new_path  = p.get("lyrics_path")
+        self.meta = new_meta
+        self.lines = new_lines
+        self._lyrics_path = new_path
+        self.idx = -1
+        self._kara = []
+        self._idx_minus_one_since = 0.0
+        # 5. Drop the verified gate ONLY if this swap was the one that set it.
+        if p.get("set_gate"):
+            self._verified_gate_t = 0.0
+        # 6. PERF-102 invalidation, mirroring load()'s post-load housekeeping.
+        try:
+            self._block_cache.clear()
+            self._prewarm_token += 1
+            self._block_cache_max = max(32, min(72, len(self.lines) + 2))
+        except Exception:
+            pass
+        try:
+            self._relayout_song()
+        except Exception:
+            pass
+        # 7. Cancel a sibling _pending_offset write line timings just changed
+        # under it, so its target is meaningless against the new lines.
+        if self._pending_offset is not None:
+            self._pending_offset = None
+        # 8. Clear pending state BEFORE the log so /diag reflects committed.
+        self._pending_swap = None
+        self._pending_swap_t = 0.0
+        self._swap_commit_seq += 1
+        log.info("swap: committed kind=%s site=%s token=%s reason=%s "
+                 "age=%.2fs lines=%d seq=%d",
+                 kind, site, token, reason, age, len(self.lines),
+                 self._swap_commit_seq)
+
+    def _diag_pending_swap(self):
+        p = self._pending_swap
+        if p is None:
+            return {
+                "queued": False,
+                "last_commit_seq": self._swap_commit_seq,
+            }
+        try:
+            ready, blocked_by = self._swap_ready()
+        except Exception as e:
+            ready, blocked_by = False, f"ready-check-error: {e}"
+        age = time.time() - self._pending_swap_t
+        cap = float(p.get("max_s") or self._tune.get("swap_defer_max_s", 8.0))
+        return {
+            "queued": True,
+            "kind": p.get("kind"),
+            "source_site": p.get("source_site"),
+            "artist": p.get("artist"),
+            "title": p.get("title"),
+            "queued_age_s": round(age, 2),
+            "fetch_ready": bool(p.get("lines") is not None),
+            "ready_for_swap": bool(ready),
+            "blocked_by": blocked_by,
+            "force_ai_gen": bool(p.get("force_ai_gen")),
+            "fetch_token": p.get("fetch_token"),
+            "will_force_commit_in_s": round(max(0.0, cap - age), 2),
+            "set_gate": bool(p.get("set_gate")),
+            "last_commit_seq": self._swap_commit_seq,
+        }
+    # ───────────────────── end TICKET-111 deferred swap helpers ─────────────────
 
     def _reset_decision_engine(self):
         """TICKET-109: new track => engine forgets everything from the prior song."""
