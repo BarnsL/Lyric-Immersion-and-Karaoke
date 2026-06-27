@@ -10,7 +10,7 @@ from PyInstaller.utils.hooks import collect_all
 # faster-whisper" hint; with it the .exe is self-contained (~650 MB) and the
 # feature works out of the box. PyInstaller's hooks place the ctranslate2/PyAV
 # DLLs correctly — a loose sys.path vendor fails on av._core.
-WHISPER = os.path.isdir(".deps")
+WHISPER = os.path.isdir(".deps") and os.environ.get("LEAN_BUILD") != "1"
 
 datas = [("icon.ico", ".")]
 # Lyrics baked into the app for songs the providers always miss (feelingradation):
