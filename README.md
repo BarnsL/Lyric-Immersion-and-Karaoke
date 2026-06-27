@@ -535,4 +535,9 @@ drawn avatar, not any artist's actual model. Please support the artists. 💜
 
 ## 📄 License
 
-MIT for the code. Lyrics and any artwork belong to their respective owners.
+MIT for the code in this and prior releases (see [LICENSE](LICENSE)). Lyrics
+and any artwork belong to their respective owners.
+
+> ⚠️ **Heads up — future releases will move to a proprietary
+> (all-rights-reserved) license.** If you need the open MIT terms, pin to the
+> **v1.0.93** tag or earlier. © 2026 BarnsL.
