@@ -1295,6 +1295,10 @@ class Overlay:
             "sync_tier_slow_s":     60.0,   # relaxed cadence (1×/min) once sync holds
             "sync_tier_ok_drift":    0.8,   # |measured drift| ≤ this on a check = in sync
             "sync_tier_listen_s":    6.0,   # Whisper capture length for a tier check (short = light)
+            # ── FORCE SYNC (manual nuclear resync) ──
+            "force_sync_streak":       3,   # reads that must AGREE in a row before it locks
+            "force_sync_listen_s":   8.0,   # transcribe capture length per Force-Sync read
+            "force_sync_agree_s":    1.0,   # two reads within this = "agree" (two-point verify)
             "energy_apply_min":      0.4,   # min |new-old| to apply correlation
             "energy_lift_floor":     0.10,  # min peak-vs-median lift to accept
             "energy_max_offset":    60.0,   # |new_off| < this for sanity
@@ -1349,6 +1353,9 @@ class Overlay:
         self._sound_fail_streak = 0   # consecutive times the SAME other song was heard (wrong-song strikes)
         self._last_heard_contra = None  # the last contradicting heard song (for the strike streak)
         self._deciding = False        # a by-ear song decision (Whisper) is in flight
+        self._force_sync_active = False  # FORCE SYNC nuclear resync running
+        self._force_sync_streak = 0; self._force_sync_last = None; self._force_sync_tries = 0
+        self._force_sync_after = None
         self._last_decision = None    # last decide_song_by_lyrics result (telemetry)
         self._fast_calib = 0          # remaining quick re-locks after a song change
         self._recal_after = None      # pending recalibrate timer id
@@ -1422,6 +1429,7 @@ class Overlay:
                 pass
             self._sync_confirm_after = None
         self._pending_switch = None  # drop any pending song-switch confirmation
+        self._force_sync_active = False  # cancel any Force Sync from the previous track
         self._sound_fail_streak = 0  # fresh wrong-song strike count for the new track
         self._last_heard_contra = None
         self._gen_token += 1       # cancel any in-flight lyric generation
@@ -4789,6 +4797,95 @@ class Overlay:
 
         threading.Thread(target=work, daemon=True).start()
 
+    # ── FORCE SYNC — the manual "nuclear" resync ──────────────────────────────
+    def force_sync(self):
+        """FORCE SYNC — for "right song, stubborn timing" where the automatic sync
+        (which already runs in the background) won't catch it. Resets the offset to 0
+        as a clean baseline, then transcribes + matches the live vocals REPEATEDLY,
+        two-point verified, until THREE reads in a row AGREE on the timing — then
+        stops. A failed or disagreeing read resets the streak and it keeps hammering.
+        Manual, opt-in; needs the AI add-on (faster-whisper)."""
+        if not self.lines:
+            self._hint("Play a recognised song first, then Force Sync")
+            return
+        try:
+            import align
+            if not align.available():
+                self._hint("Force Sync needs the AI add-on (faster-whisper) — see the README")
+                return
+        except Exception:
+            self._hint("Force Sync needs the AI add-on (faster-whisper)")
+            return
+        log.info("FORCE SYNC engaged: offset → 0, then transcribe-match until %d agree",
+                 int(self._tune.get("force_sync_streak", 3)))
+        self.offset = 0.0                       # set sync timing to 0 as the first resort
+        self.idx = -1
+        self._force_sync_active = True
+        self._force_sync_streak = 0
+        self._force_sync_last = None
+        self._force_sync_tries = 0
+        self._hint("🚀 Force Sync — listening until it locks…")
+        self._force_sync_tick()
+
+    def _force_sync_tick(self):
+        if not self._force_sync_active or not self.lines:
+            self._force_sync_active = False
+            return
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING) or self._aligning:
+            self._force_sync_after = self.root.after(1200, self._force_sync_tick)  # paused/busy → wait
+            return
+        self._aligning = True
+        self._force_sync_tries += 1
+        lines, lang = self.lines, self.meta.get("lang", "ja")
+        secs = float(self._tune.get("force_sync_listen_s", 8.0))
+
+        def work():
+            res = None
+            try:
+                import align
+                res = align.capture_and_align(lines, lang=lang,
+                                              get_pos=self._align_pos, seconds=secs)
+            except Exception as e:
+                log.info("force-sync listen error: %s", e)
+            self.root.after(0, lambda: self._force_sync_apply(res))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _force_sync_apply(self, res):
+        self._aligning = False
+        if not self._force_sync_active:
+            return
+        need = int(self._tune.get("force_sync_streak", 3))
+        if not res:
+            # no confident match this read → streak resets, keep hammering (nuclear)
+            self._force_sync_last, self._force_sync_streak = None, 0
+            log.info("force-sync: no match (try %d) — retrying, offset stays %+.2fs",
+                     self._force_sync_tries, self.offset)
+            self._hint(f"🚀 Force Sync — retrying… ({self.offset:+.1f}s)")
+            self._force_sync_after = self.root.after(1300, self._force_sync_tick)
+            return
+        offset, ratio, _start = res
+        # TWO-POINT: this read must AGREE with the previous to extend the streak.
+        prev = self._force_sync_last
+        self._force_sync_last = offset
+        if prev is not None and abs(offset - prev) <= self._tune.get("force_sync_agree_s", 1.0):
+            self._force_sync_streak += 1
+        else:
+            self._force_sync_streak = 1
+        if abs(offset - self.offset) > 0.15:        # follow what we hear (song is right)
+            self.offset = round(offset, 2)
+            self.idx = -1
+        log.info("force-sync: read %+.2fs (match %.2f) — agree-streak %d/%d",
+                 offset, ratio, self._force_sync_streak, need)
+        if self._force_sync_streak >= need:
+            self._force_sync_active = False
+            log.info("FORCE SYNC LOCKED at %+.2fs (%d agreeing reads)", self.offset, need)
+            self._hint(f"✅ Force Sync locked ({self.offset:+.1f}s)")
+            return
+        self._hint(f"🚀 Force Sync {self._force_sync_streak}/{need} ({self.offset:+.1f}s)…")
+        self._force_sync_after = self.root.after(1000, self._force_sync_tick)
+
     def _track_start_auto_align(self, track_seq):
         """Fires once ~25 s into a new track, IF this is still that track. A
         quick early sync-by-ear catches cuts Shazam can't fingerprint right
@@ -5293,7 +5390,9 @@ class Overlay:
         try:
             mid = self._tune.get("sync_tier_mid_s", 40.0)
             fast_tier = self._sync_tier_interval <= mid
-            if (self._energy_blind >= 1 and fast_tier and not self._live_mode
+            if self._force_sync_active:
+                pass                                # Force Sync owns the offset — don't fight it
+            elif (self._energy_blind >= 1 and fast_tier and not self._live_mode
                     and not self._aligning and not self._tier_listen):
                 self._tier_listen_now()             # energy can't read this song → use ears
             else:
@@ -5568,7 +5667,7 @@ def main():
     def _refetch(*_): ov.root.after(0, ov.refetch)
     def _wrong(*_):   ov.root.after(0, ov.report_wrong)
     def _ident(*_):   ov.root.after(0, ov.identify_by_sound)
-    def _align(*_):   ov.root.after(0, ov.align_by_listening)
+    def _align(*_):   ov.root.after(0, ov.force_sync)
     def _about(*_):
         import webbrowser
         webbrowser.open("https://github.com/BarnsL/Desktop-Karaoke#readme")
@@ -5788,7 +5887,7 @@ def main():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
         pystray.MenuItem("🎧  Identify by sound", _ident),
-        pystray.MenuItem("🎤  Sync by listening  (match lyrics to the audio)", _align),
+        pystray.MenuItem("🚀  Force Sync  (hammer transcribe+match until it locks)", _align),
         pystray.MenuItem("Fast song-change detect (compilations)", _toggle_bound,
                          checked=lambda i: ov.boundary_on),
         pystray.MenuItem("Use YouTube captions (accurate, for browser videos)", _toggle_caps,

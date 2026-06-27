@@ -68,7 +68,8 @@ _ROUTES = {
         "/wrong": "mark current lyrics wrong → re-identify + re-fetch",
         "/nudge": "shift sync by ?s=2.5 seconds (+ = lyrics later)",
         "/reset": "reset the sync offset to 0",
-        "/align": "sync by listening — transcribe the audio + match to lyrics (needs faster-whisper)",
+        "/align": "sync by listening — transcribe the audio + match to lyrics, one-shot (needs faster-whisper)",
+        "/forcesync": "FORCE SYNC — reset to 0, then transcribe+match (two-point) until 3 reads agree; nuclear",
         "/decide": "smart song decision — transcribe vocals + pick which candidate's lyrics they match",
         "/captions": "pull THIS video's caption track (accurate text+timing); ?url=<exact video> beats a title search",
         "/nowplaying": "browser pushes the exact current video URL (?url=...) so auto-captions hit the right upload",
@@ -274,7 +275,11 @@ def make_handler(app, log_file, token):
                     self._send(200, {"ok": True, "action": "sync offset reset to 0"})
                 elif path == "/align":
                     self._run(app.align_by_listening)
-                    self._send(200, {"ok": True, "action": "syncing by listening (transcribe + match)"})
+                    self._send(200, {"ok": True, "action": "syncing by listening (transcribe + match, one-shot)"})
+                elif path == "/forcesync":
+                    # FORCE SYNC: reset to 0, then transcribe+match (two-point) until 3 reads agree
+                    self._run(app.force_sync)
+                    self._send(200, {"ok": True, "action": "force sync — hammering transcribe+match until it locks"})
                 elif path == "/decide":
                     # SMART song decision: transcribe the vocals + pick which candidate
                     # song's lyrics they match (corrects Shazam mis-IDs / mislabeled LRCs)
