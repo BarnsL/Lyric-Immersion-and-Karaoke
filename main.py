@@ -4810,11 +4810,17 @@ class Overlay:
                     and not self._aligning and not self._deciding
                     and (self.meta.get("source") or "") != "youtube-captions"):
                 st = self.media.get()
-                if st and st.get("status") == PLAYING and float(st.get("position") or 0.0) > 8:
+                # WAVEFORM GATE: only spend a transcription when the audio waveform
+                # shows VOCALS are actually active right now — transcribing an
+                # instrumental break / applause gap just yields an empty or garbage
+                # transcript that can't resync. The vocal-band energy analysis tells
+                # us when singing is happening, so the listen lands on real lyrics.
+                if (st and st.get("status") == PLAYING and float(st.get("position") or 0.0) > 8
+                        and self._vocals_active_now()):
                     try:
                         import align
                         if align.available():
-                            log.info("live resync (≈5×/min): listening to follow the live timing")
+                            log.info("live resync (≈5×/min): vocals active → listening to follow the live timing")
                             self.align_by_listening(silent=True)
                     except Exception:
                         pass
@@ -4965,6 +4971,11 @@ class Overlay:
                     self.offset = 0.0
                     self.idx = -1
                     self._hint("🎯 Corrected to the song being sung")
+                    # FUSE waveform + transcript: the transcript picked the SONG; now
+                    # let the vocal-energy WAVEFORM correlation pin the precise OFFSET
+                    # for the freshly-loaded lyrics (the transcript gives WHAT, the
+                    # waveform gives exactly WHEN). Runs shortly after the load settles.
+                    self.root.after(700, lambda: self._auto_align_by_energy("post-decide"))
                     return
             except Exception as e:
                 log.info("decide-by-ear: switch failed: %s", e)
@@ -5311,6 +5322,10 @@ class Overlay:
         if not (st and st.get("status") == PLAYING):
             return
         if float(st.get("position") or 0.0) < self._tune.get("auto_align_min_pos", 12.0):
+            return
+        # WAVEFORM GATE: only transcribe when the vocal-band energy says singing is
+        # happening now — an instrumental/quiet window yields a useless transcript.
+        if not self._vocals_active_now():
             return
         self._tier_listen = True
         self._aligning = True
