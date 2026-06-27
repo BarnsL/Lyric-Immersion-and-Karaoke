@@ -8,6 +8,37 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-085 — Fine-tune sync mode (±0.2s target via lyric pause) 🟢
+**User spec:** "My aim is to get most songs synced to the 0.2s of the sung lyric but not break any other syncing activity. Let's go in that mode after 20 seconds of satisfactory sync. Allow for the lyric procession to pause for 0.2 to 1 second at a time to assist with sync instead of moving place and causing stuttering user experience. Also allow it to move ahead 0.2 to 2 seconds if needed but prefer pause if that's what it needs."
+
+**Design:** post-major-sync precision pass that runs in addition to the existing sync-tier; does NOT replace anything.
+- **Enter** when `_sync_good_streak`'s wall-clock duration ≥ 20s (`fine_tune_enter_after_s`).
+- **Listen** every 8s (`fine_tune_listen_interval_s`) via the existing Whisper-anchor path.
+- **Per-tick classification** of measured drift:
+  - `|drift| ≤ 0.2s` (`fine_tune_target_s`) → in sync, no action, reset incon counter.
+  - `+0.2 < drift ≤ +1.0s` (lyrics AHEAD of vocals): **PAUSE** lyric procession for `drift` seconds. Both `pos` (eased) and `pos_raw` (raw clock) are held at the pause-start value so the line index, karaoke fill, AND the scroll belt all freeze in lockstep. At pause expiry, `self.offset -= pause_amount` so the displayed frame becomes the resumed frame with zero visible jump.
+  - `-2.0s ≤ drift < -0.2s` (lyrics BEHIND vocals): **MOVE-AHEAD** nudge of `min(|drift|, 2.0)` via `_smooth_offset("fine-tune-catchup")`. Higher cap than pause (`fine_tune_max_move_ahead_s = 2.0`) because a tiny forward skip is less perceptible than holding lyrics frozen. Asymmetric caps because pause >1s starts to feel like a bug, while a 2s forward skip is just a quick re-anchor.
+  - `|drift| > 2.5s` (`fine_tune_exit_drift_s`): exit fine-tune, hand off to the regular tier-commit to handle the bigger correction.
+- **Exit** triggers (call `_fine_exit(reason)` — drops all pause buffers, cancels listen, resets good-streak): big drift, 2 consecutive inconclusive listens, track change, force-sync activation, decide-by-ear switch, manual nudge/reset, manual /align by user.
+- **Cannot decide both directions per tick** (a single drift measurement is either positive or negative).
+- **"If still off-sync"**: fine-tune mode stays active across listen ticks; each ~8s tick decides anew based on a fresh drift measurement.
+
+**Implementation (v1.0.85):**
+- 7 fine_tune_* tune knobs (live-tunable via `/tune`)
+- 9 new instance state fields (`_fine_active`, `_fine_good_t0`, `_fine_incon`, `_fine_listen_after`, `_fine_listen_pending`, `_fine_pause_until`, `_fine_pause_pos_eased`, `_fine_pause_pos_raw`, `_fine_pause_amount`)
+- 5 new methods (`_maybe_enter_fine_tune`, `_fine_exit`, `_fine_listen_tick`, `_fine_pause`, `_apply_fine_listen`)
+- 11 edit sites in main.py (init, _tune, _tick pause-override + pause-end, _note_sync_verdict entry trigger, _apply_tier_listen handoff, all the major-sync exit paths)
+- `/diag` `sync` block exposes: `fine_active`, `fine_good_streak_s`, `fine_incon`, `fine_pause_remaining_s`, `fine_pause_amount`
+
+**Adversarial verify caught + fixed before ship:**
+- **HIGH same-tick race** between deferred-commit (TICKET-078) and pause-end: deferred-commit consumed `_pending_offset` first, then pause-end checked `if _pending_offset is None` and would have applied the subtraction against the freshly-committed offset. Fix: snapshot `had_pending_pre = self._pending_offset is not None` BEFORE the deferred-commit block; pause-end now guards on `not had_pending_pre and self._pending_offset is None`.
+- **MEDIUM `_maybe_auto_align` and silent `_apply_align`** were still firing in parallel with fine-tune's own listen cadence. Both now `return` early when `_fine_active and reason != "mv-intro-onset"` (energy-align) / `silent and _fine_active` (apply_align). Fine-tune owns the cadence while it's active.
+- **LOW**: added `/diag` fine_* surface, fixed a misleading "BEFORE the offset reset" comment in `_on_track_change` (the clears happen AFTER the offset = 0 line on purpose), added a missing log when `_fine_pause` is called with no media state.
+
+**Live verified post-deploy:** all 8 knobs present in /tune, all 5 fine_* fields surface in /diag, app at v1.0.85.
+
+---
+
 ## TICKET-084 — Rebrand "Desktop Karaoke" → "Lyric Immersion and Karaoke" (display strings) 🟢
 **Symptom:** taskbar tray icon tooltip still read "Desktop Karaoke" (and other user-facing surfaces did too), even though the exe + product were renamed in v1.0.77. Discord-shared previews, the /health endpoint, the About / window-title, and the MSIX DisplayName all still showed the old name.
 

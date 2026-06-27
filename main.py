@@ -1445,6 +1445,24 @@ class Overlay:
             # singing is worse than briefly running into a genuine long intro, so
             # the hold can never sit through more than this many seconds of vocals.
             "mv_intro_timeout":     20.0,   # s before the intro card releases regardless
+            # ── FINE-TUNE sync mode (sub-second polish layer atop the normal tier) ──
+            # After the regular tier has reported in-sync for `fine_tune_enter_after_s`
+            # of wall-time, engage a fast 8s-cadence polishing loop that drives drift
+            # toward `fine_tune_target_s` (0.2 s) using a VISUALLY GENTLE mechanism:
+            # for lyrics-ahead drift it PAUSES the lyric procession by `drift` seconds
+            # (line idx + karaoke fill freeze together) then re-bases self.offset by
+            # the same amount, so the resumed frame matches the held frame — no snap.
+            # For lyrics-behind drift it uses the existing _smooth_offset (boundary-
+            # deferred) path. Anything outside the [-1.5, +1.5] s envelope exits to
+            # the normal tier (which has the two-point verifier for big moves).
+            "fine_tune_enter_after_s":   20.0,  # wall-time in good streak before entering
+            "fine_tune_target_s":         0.2,  # |drift| at-or-below this = locked
+            "fine_tune_min_step_s":       0.2,  # smallest pause; below this is in-target
+            "fine_tune_max_pause_s":      1.0,  # biggest forward-drift pause (lyrics ahead); longer would itself stutter
+            "fine_tune_max_move_ahead_s": 2.0,  # biggest backward-drift catch-up nudge (lyrics behind); higher cap because skipping forward is less perceptible than pausing
+            "fine_tune_exit_drift_s":     2.5,  # |drift| above this hands back to the tier (above BOTH caps so leftover-after-step still handles on next tick)
+            "fine_tune_listen_interval_s": 8.0, # cadence between fine-tune Whisper listens
+            "fine_tune_inconclusive_exit":   2, # consecutive unreadable listens → exit
         }
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
@@ -1480,6 +1498,18 @@ class Overlay:
         self._tier_tpvr = None        # held 1st Whisper-read offset for two-point confirm
         self._tier_tpvr_until = 0.0   # deadline for the confirming 2nd tier read
         self._tier_listen = False     # a tier Whisper listen is in flight
+        # ── FINE-TUNE mode state (sub-second polish, bolted onto the tier) ──
+        # See the `fine_tune_*` block in self._tune for the knob semantics; these
+        # are the runtime fields the entry-gate / listen tick / pause override use.
+        self._fine_active = False         # fine-tune currently engaged
+        self._fine_good_t0 = None         # wall-clock first 'insync' verdict of current good streak
+        self._fine_incon = 0              # consecutive inconclusive fine-tune listens
+        self._fine_listen_after = None    # pending root.after id for the next fine-tune listen
+        self._fine_listen_pending = False # the in-flight tier-style listen is OURS — hand to _apply_fine_listen
+        self._fine_pause_until = 0.0      # wall-clock pause expiry (0 = no pause active)
+        self._fine_pause_pos_eased = None # held eased pos for the pause duration
+        self._fine_pause_pos_raw = None   # held raw pos for the pause duration
+        self._fine_pause_amount = 0.0     # how much to subtract from self.offset at pause-end
         self._last_drift = 0.0        # last audio-vs-display drift measured (sync telemetry)
         self._last_drift_t = 0.0      # when that drift was measured (time.time)
         self._pending_switch = None   # a contradicting heard song awaiting a 2nd confirming read
@@ -1561,6 +1591,26 @@ class Overlay:
         self._sound_song = None    # new video → re-identify by ear
         self._pending_corr = 1e9   # drop any pending large-offset confirmation
         self._pending_offset = None  # drop any deferred sync-offset commit from prev track
+        # FINE-TUNE: force-clear pause buffers AFTER the offset reset above so no
+        # queued pause subtraction can fire against the fresh-song offset (the
+        # subtraction-vs-reset order is intentional: clearing _fine_pause_amount=0
+        # below guarantees pause-end is a no-op even if the old timer hasn't fired
+        # yet). Cancel any pending fine-tune listen scheduled against the old
+        # song's clock.
+        if self._fine_listen_after is not None:
+            try:
+                self.root.after_cancel(self._fine_listen_after)
+            except Exception:
+                pass
+            self._fine_listen_after = None
+        self._fine_active = False
+        self._fine_good_t0 = None
+        self._fine_incon = 0
+        self._fine_listen_pending = False
+        self._fine_pause_until = 0.0
+        self._fine_pause_pos_eased = None
+        self._fine_pause_pos_raw = None
+        self._fine_pause_amount = 0.0
         if self._sync_confirm_after is not None:   # cancel a pending confirm listen
             try:
                 self.root.after_cancel(self._sync_confirm_after)
@@ -3096,6 +3146,12 @@ class Overlay:
         # boundary so the current (possibly mis-synced) line finishes naturally
         # before the next line is picked under the new offset. Capped at 8s in
         # case idx gets stuck so a pending correction can't strand forever.
+        # SAME-TICK RACE GUARD: snapshot whether a deferred commit was pending
+        # BEFORE we consume it, so the fine-tune pause-end below can tell the
+        # difference between "no commit was ever queued" (safe to apply pause
+        # subtraction) and "commit just fired this tick" (subtraction would
+        # corrupt the freshly-set offset).
+        had_pending_pre = self._pending_offset is not None
         if self._pending_offset is not None and self.lines:
             cur_pos = state["position"] + self.offset
             cur_end = self.lines[self.idx].end if self.idx >= 0 else 0.0
@@ -3108,6 +3164,33 @@ class Overlay:
                 self.offset = new_off
                 self.idx = -1
                 self._drift_integral = 0.0
+        # FINE-TUNE pause EXPIRY (placed ABOVE the pos computation so the offset
+        # adjustment is reflected in THIS frame's pos / pos_raw — zero visible
+        # discontinuity: the held frame becomes the resumed frame).
+        # RACE GUARD: if a tier commit queued a `_pending_offset` (consumed THIS
+        # tick OR still pending), that commit's offset is authoritative;
+        # subtracting our pause delta on top would corrupt it. Just drop the
+        # pause buffers and let the deferred commit drive the next frames.
+        if self._fine_pause_until and time.time() >= self._fine_pause_until:
+            amt = self._fine_pause_amount
+            if not had_pending_pre and self._pending_offset is None:
+                new_off = round(self.offset - amt, 2)
+                # also slide the eased display offset in lockstep so _eased_offset
+                # doesn't see a spurious target jump and re-ramp.
+                cur_disp = getattr(self, "_display_offset", None)
+                if cur_disp is not None:
+                    self._display_offset = cur_disp - amt
+                    self._display_offset_t = time.time()
+                log.info("fine-tune pause end: applied %+.2fs (offset %+.2fs → %+.2fs)",
+                         -amt, self.offset, new_off)
+                self.offset = new_off
+            else:
+                log.info("fine-tune pause end: tier commit pending → dropping pause delta %+.2fs",
+                         -amt)
+            self._fine_pause_until = 0.0
+            self._fine_pause_pos_eased = None
+            self._fine_pause_pos_raw = None
+            self._fine_pause_amount = 0.0
         # Render against an EASED display offset, not the raw sync offset, so a
         # sound-sync correction GLIDES the highlight/scroll into place instead of
         # snapping (the "jumpy karaoke fill"). See _eased_offset.
@@ -3120,17 +3203,32 @@ class Overlay:
         #              ahead then snaps back" stutter the user kept seeing.
         pos = state["position"] + self._eased_offset()
         pos_raw = state["position"] + self.offset
+        # FINE-TUNE pause OVERRIDE: if a pause is in flight, FREEZE both pos and
+        # pos_raw to the values captured at pause entry. Scroll belt, line idx,
+        # and karaoke fill all key off these — they freeze together with no work
+        # done to them individually. The held frame remains on screen for the
+        # pause duration; pause-end (above) then re-bases self.offset so the
+        # resumed frame equals the held frame.
+        branch_tag = "line"
+        if self._fine_pause_until and time.time() < self._fine_pause_until:
+            if self._fine_pause_pos_eased is not None:
+                pos = self._fine_pause_pos_eased
+            if self._fine_pause_pos_raw is not None:
+                pos_raw = self._fine_pause_pos_raw
+            branch_tag = "fine-pause"
 
         if self.scroll_dir in ("lr", "rl"):       # continuous horizontal scroll-through
             self._ticker_update(pos, pos_raw)
             self._render_frame = True
-            self._perf_record(state, pos, pos_raw, "scroll-h")
+            self._perf_record(state, pos, pos_raw,
+                              branch_tag if branch_tag == "fine-pause" else "scroll-h")
             self.root.after(self._fps, self._tick)
             return
         if self.scroll_dir in ("tb", "bt"):       # continuous vertical scroll-through
             self._ticker_update_v(pos, pos_raw)
             self._render_frame = True
-            self._perf_record(state, pos, pos_raw, "scroll-v")
+            self._perf_record(state, pos, pos_raw,
+                              branch_tag if branch_tag == "fine-pause" else "scroll-v")
             self.root.after(self._fps, self._tick)
             return
 
@@ -3150,7 +3248,7 @@ class Overlay:
             self._karaoke(pos_raw)
 
         self._render_frame = True
-        self._perf_record(state, pos, pos_raw, "line")
+        self._perf_record(state, pos, pos_raw, branch_tag)
         self.root.after(self._fps, self._tick)
 
     # ── drawing ──
@@ -4072,9 +4170,11 @@ class Overlay:
     # ── tray hooks ──
 
     def nudge(self, d):
+        self._fine_exit("manual-nudge")            # user input wins; drop pause buffers
         self.offset += d
 
     def reset_offset(self):
+        self._fine_exit("manual-reset")            # user input wins; drop pause buffers
         self.offset = 0.0
 
     def get_tune(self):
@@ -4136,6 +4236,14 @@ class Overlay:
                 "tier_incon_streak": self._sync_incon_streak,
                 "tier_energy_blind": self._energy_blind,
                 "tier_listening": self._tier_listen,
+                # fine-tune mode (TICKET-085): post-major-sync precision pass
+                "fine_active": bool(getattr(self, "_fine_active", False)),
+                "fine_good_streak_s": (round(time.time() - self._fine_good_t0, 1)
+                                       if getattr(self, "_fine_good_t0", None) else None),
+                "fine_incon": int(getattr(self, "_fine_incon", 0)),
+                "fine_pause_remaining_s": (round(self._fine_pause_until - time.time(), 2)
+                                           if getattr(self, "_fine_pause_until", 0) > time.time() else 0.0),
+                "fine_pause_amount": round(float(getattr(self, "_fine_pause_amount", 0.0)), 2),
             },
             "energy_align": self._last_energy,
             "decision": self._last_decision,        # last by-ear song decision (Whisper+rapidfuzz)
@@ -5245,6 +5353,7 @@ class Overlay:
         except Exception:
             self._hint("Force Sync needs the AI add-on (faster-whisper)")
             return
+        self._fine_exit("force-sync")              # force-sync owns the offset cleanly
         log.info("FORCE SYNC engaged: offset → 0, then try ranked matches until one holds %d× over %.0fs",
                  int(self._tune.get("force_sync_streak", 3)),
                  float(self._tune.get("force_sync_span_s", 16.0)))
@@ -5628,6 +5737,7 @@ class Overlay:
                 if p.exists() and self._file_valid(p, self._cur_duration):
                     log.info("decide-by-ear: SWITCHING to %s — its lyrics match the "
                              "singing far better (%.0f vs %.0f)", p.name, best_score, loaded_score)
+                    self._fine_exit("song-switch")   # fresh lyrics have no streak yet
                     self.load(p)
                     self._maybe_translate()
                     self._sound_title_alias = None
@@ -5661,6 +5771,12 @@ class Overlay:
         live mode (whole event), and Shazam hasn't locked the offset very
         recently. Cheap to call — no-ops when conditions aren't met."""
         if self._aligning or not self.lines or self._live_mode:
+            return
+        # Fine-tune mode owns the sync cadence and applies sub-second pauses
+        # instead of nudging the offset. Letting the energy correlator nudge
+        # `_smooth_offset` in parallel races with the pause-end subtraction.
+        # The MV-intro fast-sync still gets through (reason='mv-intro-onset').
+        if getattr(self, "_fine_active", False) and reason not in ("mv-intro-onset",):
             return
         # YouTube captions are already locked to the video's own timing — running
         # the energy correlator against them is wasted CPU (and risks nudging a
@@ -5912,28 +6028,43 @@ class Overlay:
         fast = self._tune.get("sync_tier_fast_s", 20.0)
         mid  = self._tune.get("sync_tier_mid_s", 40.0)
         slow = self._tune.get("sync_tier_slow_s", 60.0)
+        # FINE-TUNE: when active, OWN the cadence. The 8 s fine-tune listen IS the
+        # check; letting the tier also re-arm a 40-60 s Whisper read on top would
+        # race for the _tier_listen lock. We still track verdict-driven entry-gate
+        # accumulation below.
+        fine_owns = self._fine_active
         if verdict == "insync":
             self._sync_good_streak += 1
             self._sync_miss_streak = self._sync_incon_streak = 0
-            # one good check halves the rate; a second relaxes fully to 1×/min
-            self._sync_tier_interval = mid if self._sync_good_streak < 2 else slow
+            if not fine_owns:
+                # one good check halves the rate; a second relaxes fully to 1×/min
+                self._sync_tier_interval = mid if self._sync_good_streak < 2 else slow
+            # FINE-TUNE entry-gate accumulation: track wall-time spent in good streak.
+            if self._fine_good_t0 is None:
+                self._fine_good_t0 = time.time()
+            self._maybe_enter_fine_tune()
         elif verdict == "corrected":
             self._sync_miss_streak += 1
             self._sync_good_streak = self._sync_incon_streak = 0
-            self._sync_tier_interval = fast        # escalate; keep fast while missing
+            self._fine_good_t0 = None              # any miss resets the entry clock
+            if not fine_owns:
+                self._sync_tier_interval = fast    # escalate; keep fast while missing
         else:
             # inconclusive = couldn't get a reading (NOT a detected desync). A song we
             # can't verify must NOT be hammered at 3×/min — that only costs CPU (and
             # risks a stutter) for nothing. Back the cadence off one notch after two
             # blind checks so we settle toward 1×/min instead of churning Whisper.
+            self._fine_good_t0 = None              # blind = streak interrupted; restart clock on next insync
             self._sync_incon_streak += 1
             if self._sync_incon_streak < 2:
                 return                              # one-off blip: hold cadence
             self._sync_incon_streak = 0
-            self._sync_tier_interval = mid if self._sync_tier_interval <= fast else slow
-        log.info("sync-tier: %s → verify every %.0fs (good=%d miss=%d)",
+            if not fine_owns:
+                self._sync_tier_interval = mid if self._sync_tier_interval <= fast else slow
+        log.info("sync-tier: %s → verify every %.0fs (good=%d miss=%d)%s",
                  verdict, self._sync_tier_interval, self._sync_good_streak,
-                 self._sync_miss_streak)
+                 self._sync_miss_streak,
+                 " [fine-tune owns]" if fine_owns else "")
 
     def _note_energy_verdict(self, verdict):
         """Energy-correlator verdict: tracks the consecutive-blind streak (so the
@@ -5969,6 +6100,11 @@ class Overlay:
         Transcribes a few seconds and matches to the LRC; the result is judged (and,
         for a real miss, two-point verified) in _apply_tier_listen. Short capture,
         gated so it runs only when it's needed and safe."""
+        # FINE-TUNE owns the cadence while active — its 8 s listen IS the verification.
+        # Letting the relaxed tier ALSO fire here would race for _tier_listen and risk
+        # two Whisper reads in flight at once on the same song.
+        if self._fine_active:
+            return
         if (self._aligning or self._tier_listen or not self.lines
                 or self._live_mode or not self.media):
             return
@@ -6009,6 +6145,16 @@ class Overlay:
         """Judge a tier Whisper read and update the adaptive cadence. A small drift
         applies on a single read; only a LARGE proposed jump (chorus-mismatch
         territory) is held for a confirming second read before it can move sync."""
+        # FINE-TUNE: if this listen was kicked off by the fine-tune scheduler,
+        # hand the result to the fine-tune classifier instead of the tier logic.
+        # The capture path is shared (same align.capture_and_align via _tier_listen_now),
+        # but the verdict semantics diverge — fine-tune uses pause/nudge, not the
+        # two-point verifier.
+        if self._fine_active and self._fine_listen_pending:
+            self._fine_listen_pending = False
+            self._aligning = False
+            self._tier_listen = False
+            return self._apply_fine_listen(res)
         self._aligning = False
         self._tier_listen = False
         if not res:
@@ -6064,6 +6210,238 @@ class Overlay:
         self._hint(f"🎤 Re-synced ({target:+.1f}s)")
         self._note_sync_verdict("corrected")
 
+    # ── FINE-TUNE mode ────────────────────────────────────────────────────
+    # Engaged after the regular tier holds in-sync for fine_tune_enter_after_s
+    # of wall-time. Re-uses _tier_listen_now's threaded capture but routes the
+    # result here. For lyrics-ahead drift it PAUSES the lyric procession so the
+    # line/fill freeze, then re-bases self.offset by the same amount at pause
+    # expiry (see _tick) — the resumed frame matches the held frame, zero snap.
+    # For lyrics-behind drift it uses the existing _smooth_offset (boundary-
+    # deferred). Anything outside [-fine_tune_exit_drift_s, +exit] hands back to
+    # the normal tier via _tier_commit.
+
+    def _maybe_enter_fine_tune(self):
+        """Gate + activation. Called from _note_sync_verdict on every 'insync'."""
+        if self._fine_active:
+            return
+        if self._force_sync_active or self._live_mode or self._aligning or self._tier_listen:
+            return
+        if not self.lines:
+            return
+        if (self.meta.get("source") or "") == "youtube-captions":
+            return                                   # caption timing is already exact
+        try:
+            import align
+            if not align.available():
+                return                               # no Whisper → nothing to fine-tune with
+        except Exception:
+            return
+        need = float(self._tune.get("fine_tune_enter_after_s", 20.0))
+        if self._fine_good_t0 is None:
+            return
+        if (time.time() - self._fine_good_t0) < need:
+            return
+        self._fine_active = True
+        self._fine_incon = 0
+        self._fine_listen_pending = False
+        interval_ms = int(float(self._tune.get("fine_tune_listen_interval_s", 8.0)) * 1000)
+        self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
+        log.info("fine-tune: ENTER (good streak %.1fs, drift target ≤%.2fs, cadence %.1fs)",
+                 time.time() - self._fine_good_t0,
+                 float(self._tune.get("fine_tune_target_s", 0.2)),
+                 float(self._tune.get("fine_tune_listen_interval_s", 8.0)))
+        self._fine_good_t0 = None                    # consumed
+
+    def _fine_exit(self, reason):
+        """Idempotent teardown. Cancels the pending listen and clears pause buffers
+        WITHOUT re-applying the pause delta (the caller's reason — track change,
+        force-sync, manual override — has its own offset semantics)."""
+        was_active = self._fine_active
+        self._fine_active = False
+        if self._fine_listen_after is not None:
+            try:
+                self.root.after_cancel(self._fine_listen_after)
+            except Exception:
+                pass
+            self._fine_listen_after = None
+        self._fine_listen_pending = False
+        self._fine_incon = 0
+        self._fine_good_t0 = None
+        # Force-clear pause without subtracting amount — the caller owns the offset.
+        if self._fine_pause_until:
+            log.info("fine-tune: clearing in-flight pause (no delta applied) — %s", reason)
+        self._fine_pause_until = 0.0
+        self._fine_pause_pos_eased = None
+        self._fine_pause_pos_raw = None
+        self._fine_pause_amount = 0.0
+        if was_active:
+            log.info("fine-tune: EXIT (%s)", reason)
+
+    def _fine_listen_tick(self):
+        """Schedule + dispatch the next fine-tune Whisper listen. Mirrors
+        _tier_listen_now's gating so we don't fire when it's unsafe (paused,
+        no vocals, song too early), and sets _fine_listen_pending so the
+        shared _apply_tier_listen routes the result back here."""
+        self._fine_listen_after = None
+        if not self._fine_active:
+            return
+        # If a tier listen is mid-flight, defer one cadence and try again — don't
+        # fight it for the _tier_listen lock.
+        interval_ms = int(float(self._tune.get("fine_tune_listen_interval_s", 8.0)) * 1000)
+        if self._tier_listen or self._aligning:
+            self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
+            return
+        # SHARED gating: copied from _tier_listen_now so behavior matches.
+        if (not self.lines or self._live_mode or not self.media
+                or self._force_sync_active):
+            self._fine_exit("guard-fail")
+            return
+        if (self.meta.get("source") or "") == "youtube-captions":
+            self._fine_exit("captions-source")
+            return
+        try:
+            import align
+            if not align.available():
+                self._fine_exit("align-unavailable")
+                return
+        except Exception:
+            self._fine_exit("align-import-error")
+            return
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING):
+            # paused/stopped — reschedule, don't exit; resume should pick up.
+            self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
+            return
+        if float(st.get("position") or 0.0) < self._tune.get("auto_align_min_pos", 12.0):
+            self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
+            return
+        if not self._vocals_active_now():
+            # instrumental window — don't waste a Whisper read, try again next tick.
+            self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
+            return
+        # Mark the in-flight listen as ours and dispatch via the shared infrastructure.
+        self._fine_listen_pending = True
+        self._tier_listen = True
+        self._aligning = True
+        lines, lang = self.lines, self.meta.get("lang", "ja")
+        secs = float(self._tune.get("sync_tier_listen_s", 6.0))
+
+        def work():
+            res = None
+            try:
+                res = align.capture_and_align(lines, lang=lang,
+                                              get_pos=self._align_pos, seconds=secs)
+            except Exception as e:
+                log.info("fine-tune listen error: %s", e)
+            self.root.after(0, lambda: self._apply_tier_listen(res))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _fine_pause(self, drift):
+        """Pause the lyric procession by `drift` seconds (capped by max_pause and
+        80% of the current line's remaining time so a pause can't cross a line
+        boundary). Captures pos/pos_raw ONCE so the held frame is stable during
+        the pause. The pause-end block in _tick re-bases self.offset by the same
+        amount so the resumed frame equals the held frame."""
+        min_step = float(self._tune.get("fine_tune_min_step_s", 0.2))
+        max_pause = float(self._tune.get("fine_tune_max_pause_s", 1.0))
+        amount = max(min_step, min(drift, max_pause))
+        # BOUND by line-remaining (80%) so the pause can't strand the next line.
+        st = self.media.get()
+        if not st:
+            log.info("fine-tune: media state unavailable — skipping pause (drift %+.2fs)", drift)
+            return False
+        cur_pos = float(st.get("position") or 0.0)
+        pos_raw_now = cur_pos + self.offset
+        if 0 <= self.idx < len(self.lines):
+            remaining = self.lines[self.idx].end - pos_raw_now
+            if remaining > 0:
+                amount = min(amount, remaining * 0.8)
+        if amount < min_step:
+            # not enough time left on this line — skip; next listen will catch it.
+            log.info("fine-tune: drift %+.2fs but only %.2fs left on line — skip pause",
+                     drift, amount / 0.8 if amount > 0 else 0.0)
+            return False
+        self._fine_pause_pos_eased = cur_pos + self._eased_offset()
+        self._fine_pause_pos_raw = pos_raw_now
+        self._fine_pause_amount = amount
+        self._fine_pause_until = time.time() + amount
+        log.info("fine-tune pause %.2fs (lyrics ahead by %+.2fs)", amount, drift)
+        return True
+
+    def _apply_fine_listen(self, res):
+        """Classify the fine-tune Whisper read into one of:
+          (a) |drift| ≤ target  → in sync, reset incon, reschedule.
+          (b) +min_step < drift ≤ +max_pause → pause to let vocals catch up.
+          (c) -max_pause ≤ drift < -min_step → tiny forward nudge via _smooth_offset.
+          (d) |drift| > exit_drift          → exit + hand off to _tier_commit.
+          (e) res is None (inconclusive)    → bump incon, exit after N consecutive."""
+        interval_ms = int(float(self._tune.get("fine_tune_listen_interval_s", 8.0)) * 1000)
+        target = float(self._tune.get("fine_tune_target_s", 0.2))
+        min_step = float(self._tune.get("fine_tune_min_step_s", 0.2))
+        max_pause = float(self._tune.get("fine_tune_max_pause_s", 1.0))
+        exit_drift = float(self._tune.get("fine_tune_exit_drift_s", 1.5))
+        incon_limit = int(self._tune.get("fine_tune_inconclusive_exit", 2))
+
+        if res is None:
+            self._fine_incon += 1
+            log.info("fine-tune: inconclusive (%d/%d)", self._fine_incon, incon_limit)
+            if self._fine_incon >= incon_limit:
+                self._fine_exit("inconclusive-streak")
+                return
+            self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
+            return
+
+        offset, ratio, _start = res
+        drift = offset - self.offset
+
+        # (d) Big drift — escalate back to the normal tier's verifier.
+        if abs(drift) > exit_drift:
+            log.info("fine-tune: drift %+.2fs > exit %.2f → hand back to tier", drift, exit_drift)
+            self._fine_exit("big-drift")
+            self._tier_commit(offset, ratio, "fine→tier handoff %+.2f" % drift)
+            return
+
+        # (a) In target.
+        if abs(drift) <= target:
+            self._fine_incon = 0
+            log.info("fine-tune: locked (drift %+.2fs ≤ %.2fs)", drift, target)
+            self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
+            return
+
+        # (b) Lyrics ahead — pause to let vocals catch up.
+        if drift > min_step:
+            ok = self._fine_pause(drift)
+            self._fine_incon = 0
+            # Schedule next listen AFTER the pause expires + one cadence (so the
+            # subsequent measurement sees the rebased offset, not the in-flight pause).
+            if ok:
+                wait_ms = int((self._fine_pause_amount * 1000) + interval_ms)
+            else:
+                wait_ms = interval_ms
+            self._fine_listen_after = self.root.after(wait_ms, self._fine_listen_tick)
+            return
+
+        # (c) Lyrics behind — tiny forward nudge via the boundary-deferred path.
+        if drift < -min_step:
+            # Backward drift = lyrics behind sung vocals. A pause would make
+            # this worse — only option is a small forward nudge. Uses the
+            # SEPARATE max-move-ahead cap (default 2.0s) since a small forward
+            # skip is less perceptible than holding lyrics frozen.
+            max_move_ahead = float(self._tune.get("fine_tune_max_move_ahead_s", 2.0))
+            step = min(abs(drift), max_move_ahead)
+            new_off = round(self.offset + step, 2)
+            log.info("fine-tune catch-up nudge: %+.2fs (drift %+.2fs, cap %.2f)",
+                     step, drift, max_move_ahead)
+            self._smooth_offset(new_off, "fine-tune-catchup")
+            self._fine_incon = 0
+            self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
+            return
+
+        # |drift| ≤ min_step but > target — within step-noise floor; treat as locked.
+        self._fine_incon = 0
+        self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
+
     def _maybe_reject_for_sync_fail(self):
         """After `sync_reject_strikes` sync-by-ear reads in a row that heard vocals but
         couldn't ANCHOR them to the loaded lyrics, the cache is the WRONG song — a
@@ -6098,6 +6476,13 @@ class Overlay:
         self._aligning = False
         silent = getattr(self, "_auto_align_silent", False)
         self._auto_align_silent = False
+        # Silent (background) aligns must yield to fine-tune mode — the fine
+        # cadence is already listening at 8s. A manual /align (silent=False)
+        # is a user override and still runs (it'll exit fine-tune via _apply_align's
+        # existing _smooth_offset call → _fine_exit gets triggered separately
+        # by the offset write through _smooth_offset side effects).
+        if silent and getattr(self, "_fine_active", False):
+            return
         # If this listen was a live/concert resync, score it for the rolling cadence
         # (a confident match = good read → relax a step; nothing heard = miss → hammer).
         if getattr(self, "_live_resync_inflight", False):
@@ -6148,6 +6533,8 @@ class Overlay:
             return
         log.info("aligned by listening: offset=%.2fs (match %.2f)%s",
                  offset, ratio, " [auto]" if silent else "")
+        if not silent:
+            self._fine_exit("manual-align")        # user-driven align → restart the 20 s clock
         self._smooth_offset(offset, "align-by-ear")
         if not silent:
             self._hint(f"Synced by ear ({offset:+.1f}s)")
