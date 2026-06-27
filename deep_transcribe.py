@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import glob
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -42,6 +43,58 @@ _DEEP_SIZE = "medium"     # offline quality/speed balance: ~as accurate as large
 #                           the running app (large-v3 spilled to CPU → ~4min). Both
 #                           are pre-cached; bump to "large-v3" for max accuracy.
 _MAX_DUR = 900            # >15 min ⇒ almost certainly a concert/loop, not the song
+
+# ── yt-dlp anti-bot ──────────────────────────────────────────────────────────
+# YouTube periodically 403s / rate-limits the audio + caption download (heavy use
+# trips it). We add resilience that does NOT regress normal videos: a realistic
+# User-Agent, more retries, and a polite per-request delay — then a 2nd attempt
+# WITH browser cookies (authenticated requests are blocked less). We deliberately
+# DON'T force player_client: yt-dlp's own client selection is smart, and forcing
+# ios/tv mis-reported "DRM protected" on videos that download fine by default
+# (observed live on the KAF MV). Browser cookies are OPT-IN (env DK_COOKIES_BROWSER):
+# Chromium locks its cookie DB while running (yt-dlp #7271), so they only work when
+# that browser is closed — off by default to avoid pointless errors.
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+_COOKIE_BROWSERS = ("brave", "chrome", "edge", "vivaldi", "opera", "chromium", "firefox")
+
+
+def _cookie_browser():
+    """Browser for cookies-from-browser — OPT-IN via env ``DK_COOKIES_BROWSER`` (e.g.
+    'brave'). Off by default because Chromium locks its cookie DB while running
+    (yt-dlp #7271), so cookies only work when that browser is CLOSED (or a non-running
+    one). Returns the browser name, or None when unset/unknown."""
+    env = os.environ.get("DK_COOKIES_BROWSER", "").strip().lower()
+    return env if env in _COOKIE_BROWSERS else None
+
+
+def _resilient(opts: dict) -> dict:
+    """A copy of `opts` with anti-bot RESILIENCE that won't regress normal videos: a
+    realistic User-Agent, more retries, and a polite per-request delay (rides out
+    transient 403s / rate-limiting). Intentionally does NOT force player_client —
+    forcing ios/tv mis-reports "DRM protected" on videos that work by default."""
+    o = dict(opts)
+    hdr = dict(o.get("http_headers") or {})
+    hdr.setdefault("User-Agent", _UA)
+    o["http_headers"] = hdr
+    o["retries"] = max(int(o.get("retries", 3) or 3), 5)
+    o["fragment_retries"] = 5
+    o["extractor_retries"] = 3
+    o["sleep_interval_requests"] = 1
+    return o
+
+
+def _yt_variants(base: dict):
+    """yt-dlp opt sets to try IN ORDER until one works: resilient (yt-dlp's smart
+    default clients + UA + retries), then the same WITH browser cookies (authenticated
+    requests get blocked less). Both keep the default clients, so no DRM regression."""
+    variants = [_resilient(base)]
+    b = _cookie_browser()
+    if b:
+        v = _resilient(base)
+        v["cookiesfrombrowser"] = (b,)
+        variants.append(v)
+    return variants
 
 
 def available() -> bool:
@@ -84,18 +137,25 @@ def _download_audio(query: str, dest: Path) -> tuple[Path | None, str | None]:
     # machine with neither, the download may 403 and we degrade gracefully.
     if _sh.which("node"):
         opts["js_runtimes"] = {"node": {}}
-    info_title = None
-    try:
-        with yt_dlp.YoutubeDL(opts) as y:
-            info = y.extract_info(f"ytsearch1:{query}", download=True)
-            if isinstance(info, dict):
-                ents = info.get("entries") or [info]
-                if ents and isinstance(ents[0], dict):
-                    info_title = ents[0].get("title")
-    except Exception as e:
-        log.info("deep: download failed for %r: %s", query, str(e)[:140])
-        return None, None
+    info_title, last_err = None, None
+    for vopts in _yt_variants(opts):                 # cookies+anti-bot → anti-bot → plain
+        try:
+            with yt_dlp.YoutubeDL(vopts) as y:
+                info = y.extract_info(f"ytsearch1:{query}", download=True)
+                if isinstance(info, dict):
+                    ents = info.get("entries") or [info]
+                    if ents and isinstance(ents[0], dict):
+                        info_title = ents[0].get("title")
+            if glob.glob(str(dest / "src.*")):       # got the audio → stop trying variants
+                break
+        except Exception as e:
+            last_err = e
+            continue
     files = glob.glob(str(dest / "src.*"))
+    if not files:
+        if last_err is not None:
+            log.info("deep: download failed for %r: %s", query, str(last_err)[:140])
+        return None, None
     return (Path(files[0]) if files else None), info_title
 
 
@@ -299,9 +359,9 @@ def fetch_captions_only(query: str, lang: str | None = None):
         }
         if _sh.which("node"):
             opts["js_runtimes"] = {"node": {}}
-        # (Browser cookies were tried for region/age-gated videos but Chromium
-        # LOCKS its cookie DB while running — yt-dlp #7271 — so it just errored.
-        # The title search already finds an available upload for most songs.)
+        # Anti-bot variants (alternate player clients + best-effort browser cookies)
+        # are applied per-attempt via _yt_variants — the web client now 403s without
+        # a PO token, so the ios/tv/mweb clients are what actually fetch the captions.
         # Exact URL / 11-char video id → fetch THAT video; else search by title.
         q = query.strip()
         if re.match(r"https?://", q):
@@ -310,13 +370,19 @@ def fetch_captions_only(query: str, lang: str | None = None):
             target = f"https://www.youtube.com/watch?v={q}"
         else:
             target = f"ytsearch1:{q}"
-        try:
-            with yt_dlp.YoutubeDL(opts) as y:
-                y.extract_info(target, download=True)
-        except Exception as e:
-            log.info("captions: fetch failed for %r: %s", target, str(e)[:140])
-            return None
+        last_err = None
+        for vopts in _yt_variants(opts):
+            try:
+                with yt_dlp.YoutubeDL(vopts) as y:
+                    y.extract_info(target, download=True)
+                if _captions_from_dir(tmp, lang):    # got a caption track → done
+                    break
+            except Exception as e:
+                last_err = e
+                continue
         res = _captions_from_dir(tmp, lang)
+        if not res and last_err is not None:
+            log.info("captions: fetch failed for %r: %s", target, str(last_err)[:140])
         if res:
             log.info("captions: %d %s lines from YouTube caption track for %r",
                      len(res[0]), res[1], query)
