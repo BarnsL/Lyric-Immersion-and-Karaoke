@@ -540,6 +540,19 @@ def extract_cover_original(raw_title, cover_channel=""):
             # the tail IS the cover channel ("MAFIA / マフィア - Ouro Kronii") → keep
             # the SONG, no original artist (search title-first, ignore the channel).
             return None, parts[0].strip()
+    # EXPLICIT cover credit ("… covered by X" / "…歌ってみた") names the COVER artist
+    # OUTSIDE the slash, so what's left is "OriginalSong / OriginalArtist" — even
+    # though NEITHER side is the channel (the rules above missed it). Take the artist
+    # side so the search is QUALIFIED: "Rebellion / hololive English -Advent-" must
+    # search by "hololive English -Advent-" to find the right same-titled song
+    # instead of a generic "Rebellion" collision. 歌ってみた titles are "Song / Artist".
+    if re.search(r"covered?\s+by|歌ってみた|うたってみた|歌わせて", raw_title, re.I):
+        for sep in ("/", "／"):
+            if sep in t:
+                left, _, right = t.partition(sep)
+                left, right = left.strip(), right.strip()
+                if left and right and len(right) >= 2 and not _ch_match(right):
+                    return right, left            # (original artist, song)
     return None, None
 
 
@@ -4895,10 +4908,15 @@ class Overlay:
             # is better → the right song isn't cached. Fetch fresh by the title.
             log.info("decide-by-ear: loaded lyrics match the singing poorly (%.0f) and no "
                      "candidate fits → re-fetching by title %r", loaded_score, self._clean_title_cache)
-            if self._track and not self._is_cover:
+            if self._track:
+                # For a COVER, qualify the search with the ORIGINAL artist parsed from
+                # the title ("Rebellion / hololive English -Advent-") so a generic
+                # title finds the right same-titled song, not another collision.
+                art = (self._cover_original_artist if self._is_cover
+                       else self._clean_artist_cache) or ""
                 self._hint("🎯 Wrong lyrics — re-identifying…")
-                self._start_fetch(self._clean_artist_cache, self._clean_title_cache,
-                                  self._cur_duration)
+                self._start_fetch(art, self._clean_title_cache, self._cur_duration,
+                                  cover=self._is_cover)
 
     def _maybe_auto_align(self, reason="periodic"):
         """Background, automatic sync-by-listening. Runs only when conditions are
