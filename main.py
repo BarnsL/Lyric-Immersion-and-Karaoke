@@ -744,8 +744,11 @@ def is_mv_version(title):
 _LIVE_VER_RE = re.compile(
     r"\b(?:live(?:\s*(?:mv|ver(?:sion)?|performance|stage|clip))?|short\s*ver(?:sion)?|"
     r"acoustic|unplugged|orchestral?|piano\s*ver|ballad\s*ver|spinning\s*ver|"
-    r"one[\s-]?man(?:\s*live)?)\b"               # 'ONE-MAN LIVE' = a solo concert (JP term)
+    r"one[\s-]?man(?:\s*live)?|"                 # 'ONE-MAN LIVE' = a solo concert (JP term)
+    r"\d+(?:st|nd|rd|th)\s+(?:one|live|tour|anniv(?:ersary)?))\b"  # '3rd ONE' = SMTC-truncated ONE-MAN; '5th LIVE', '10th Anniversary', etc.
     r"|【\s*live\b|\[\s*live\b"                   # 【LIVE MV】 / [LIVE] bracket tags
+    r"|【冒頭無料】|【\s*無料\s*配信"             # 【冒頭無料】 = JP "first portion free" live banner
+    r"|#\w*one\s*man\b|#\w*\d+(?:st|nd|rd|th)\s*(?:one|live)\b"  # hashtag tells: #VESP3rdONEMAN, #3rdLIVE
     r"|from\s+[\"'“”『「]"                       # 'from "<concert/album>"'
     r"|ライブ|ﾗｲﾌﾞ|生歌|ワンマン|ショート(?:バージョン|ver)|アコースティック|弾き語り",
     re.I,
@@ -4117,6 +4120,14 @@ class Overlay:
         self._fast_calib = max(self._fast_calib, 2)
         self._start_identify(seconds=5, attempts=1)
         self._arm_recal(6)
+        # TICKET-079: inside a concert wrapper (ONE-MAN / LIVE / compilation), the
+        # SMTC track is the whole concert — Shazam usually can't fingerprint MMD/
+        # live performances, so back it up with a whole-library decide-by-ear ~12s
+        # after the boundary. Gives the new song a vocal sample to anchor against.
+        if self._live_arrangement or self._live_mode:
+            self.root.after(12000,
+                            lambda t=self._track_seq: self._decide_by_ear(
+                                t, reason="boundary"))
 
     def _fire_onset_event(self, pre_quiet=0.0):
         """Detector thread heard the song start after a quiet intro → Tk thread."""
@@ -5143,9 +5154,16 @@ class Overlay:
     def _decide_by_ear(self, track_seq, reason="track-start"):
         """Transcribe the live vocals and pick which candidate song's lyrics they
         match; switch if the loaded lyrics are the wrong song. Gated + one in
-        flight; skipped for baked (authoritative) songs and live mode."""
-        if (track_seq != self._track_seq or self._live_mode or not self.lines
-                or self._deciding or self._aligning):
+        flight; skipped for baked (authoritative) songs. For a concert wrapper
+        (live_arrangement / live_mode / boundary-triggered) we proceed even with
+        NO lyrics loaded — the SMTC track is the whole-concert container, so the
+        whole-library scan inside is the only way to ID the song currently playing
+        (TICKET-079)."""
+        if track_seq != self._track_seq or self._deciding or self._aligning:
+            return
+        in_concert = (self._live_arrangement or self._live_mode
+                      or reason == "boundary")
+        if not in_concert and (self._live_mode or not self.lines):
             return
         if (self.meta.get("source") or "").startswith("bundled"):
             return                                    # baked = ground truth already
