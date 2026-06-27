@@ -69,7 +69,7 @@ _ROUTES = {
         "/nudge": "shift sync by ?s=2.5 seconds (+ = lyrics later)",
         "/reset": "reset the sync offset to 0",
         "/align": "sync by listening — transcribe the audio + match to lyrics, one-shot (needs faster-whisper)",
-        "/forcesync": "FORCE SYNC — reset to 0, then transcribe+match (two-point) until 3 reads agree; nuclear",
+        "/forcesync": "FORCE SYNC — reset to 0, then try RANKED match candidates (skip chorus traps), forward-verifying each until one holds; nuclear",
         "/decide": "smart song decision — transcribe vocals + pick which candidate's lyrics they match",
         "/captions": "pull THIS video's caption track (accurate text+timing); ?url=<exact video> beats a title search",
         "/nowplaying": "browser pushes the exact current video URL (?url=...) so auto-captions hit the right upload",

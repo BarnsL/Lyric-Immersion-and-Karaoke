@@ -112,6 +112,30 @@ def _plain(jp: str) -> str:
     return _PUNCT.sub("", _FURI.sub("", jp or "")).strip()
 
 
+# Whisper's stock NON-SPEECH hallucinations — the YouTube outro phrases and bracket
+# tags it emits on quiet / instrumental / noisy clips. These poisoned decide-by-ear:
+# a verse-gap clip transcribed as "ご視聴ありがとうございました" once scored 100 against a
+# library song whose cache contained that very outro, switching away from a correct
+# title (Suisei 綺麗事 → Tip Taps Tip). Drop them before matching/generation.
+_HALLUCINATION_RE = re.compile(
+    r"ご(?:視聴|清聴)\s*ありがとうございま|ご覧いただきありがと|チャンネル登録|高評価|"
+    r"次回もお楽しみ|お(?:疲|つか)れ様でした|"
+    r"thank(?:s| you)\s*(?:you\s*)?(?:all\s*)?(?:so much\s*)?(?:for\s*)?(?:watch|listen|view)|"
+    r"please\s+(?:like|subscribe)|subscribe\s+(?:to|for|now)|like\s+and\s+subscribe|"
+    r"subtitles?\s+(?:by|provided)|transcription\s+by|amara\.org|"
+    r"\[\s*(?:music|applause|laughter|silence|sound|noise|cheering)\s*\]|"
+    r"^\s*[\(（]?\s*(?:music|applause|laughter)\s*[\)）]?\s*$",
+    re.I,
+)
+
+
+def _is_hallucination(text: str) -> bool:
+    """True if an ASR segment is one of Whisper's non-speech stock hallucinations
+    (so it must not drive a song decision or land in generated lyrics)."""
+    t = (text or "").strip()
+    return (not t) or bool(_HALLUCINATION_RE.search(t))
+
+
 def _data_models_dir():
     try:
         from appdata import data_dir
@@ -222,7 +246,9 @@ def transcribe_vocals(lang="ja", seconds=12, size=_GEN_MODEL):
     if float(np.sqrt(np.mean(np.square(audio)) + 1e-12)) < 4.0e-3:
         return None                                   # essentially silence
     segs = _transcribe(audio, lang, size=size)
-    heard = _plain(" ".join(t for _, t in segs))
+    # Drop Whisper's non-speech hallucinations so a quiet/instrumental clip can't
+    # turn "thanks for watching" into a confident (wrong) song match.
+    heard = _plain(" ".join(t for _, t in segs if not _is_hallucination(t)))
     return heard if len(heard) >= 6 else None
 
 
@@ -302,21 +328,28 @@ def transcribe_for_generation(pos_cap, lang=None, seconds=16, size=_GEN_MODEL):
     out = []
     for s in segs:
         t = (s.text or "").strip()
-        if len(t) < 2:
+        if len(t) < 2 or _is_hallucination(t):       # skip the "thanks for watching" outros
             continue
         out.append({"t": [round(pos_cap + float(s.start), 2),
                           round(pos_cap + float(s.end), 2)], "jp": t})
     return out
 
 
-def _best_anchor(segments, lines):
-    """Find the (segment_time_in_clip, cached_line) pair that matches best.
-    Returns (seg_t, line, ratio) or None."""
+def _rank_anchors(segments, lines, top_n=6):
+    """Rank EVERY (segment_time_in_clip, cached_line) pair by match ratio and
+    return the best ``top_n`` as ``[(seg_t, line, ratio), …]`` (best first).
+
+    Unlike a single best-anchor, this deliberately surfaces the runner-up
+    matches. When the heard window is a CHORUS hook that legitimately recurs at
+    several timestamps in the song, each occurrence is a separate ``line`` with
+    a near-equal ratio — so they all appear here, letting the caller derive a
+    candidate offset for each and try them in turn (instead of locking onto one
+    arbitrary occurrence: the "chorus trap")."""
     plains = [(_plain(ln.jp), ln) for ln in lines]
     plains = [(p, ln) for p, ln in plains if len(p) >= 3]
     if not plains:
-        return None
-    best = None
+        return []
+    scored = []
     for seg_t, text in segments:
         t = _PUNCT.sub("", text)
         if len(t) < 3:
@@ -326,9 +359,61 @@ def _best_anchor(segments, lines):
             # reward a strong partial hit (ASR clip often = part of a line)
             if len(t) < len(p):
                 r = max(r, difflib.SequenceMatcher(None, t, p[:len(t) + 4]).ratio())
-            if best is None or r > best[2]:
-                best = (seg_t, ln, r)
-    return best
+            scored.append((seg_t, ln, r))
+    scored.sort(key=lambda x: x[2], reverse=True)
+    return scored[:max(1, top_n)]
+
+
+def _best_anchor(segments, lines):
+    """Find the (segment_time_in_clip, cached_line) pair that matches best.
+    Returns (seg_t, line, ratio) or None."""
+    ranked = _rank_anchors(segments, lines, top_n=1)
+    return ranked[0] if ranked else None
+
+
+def rank_offsets(lines, lang="ja", get_pos=None, seconds=_CAP, top_n=6):
+    """Listen ONCE and return a ranked list of candidate sync offsets,
+    ``[(offset, ratio, line_start), …]`` best-first, deduped so near-identical
+    offsets collapse to one.
+
+    This is the multi-hypothesis cousin of :func:`capture_and_align` (which
+    commits to a single best anchor). Each top-ranked (segment, line) match
+    yields one candidate offset; a recurring chorus phrase therefore produces
+    SEVERAL offsets — one per occurrence in the song. Force Sync tries them in
+    rank order and forward-verifies each against later reads, so a wrong
+    occurrence (whose lyrics stop matching once the song moves on) is dropped in
+    favour of the one that keeps lining up."""
+    if not lines:
+        return []
+    _ensure_deps_path()
+    pos_cap = float(get_pos() or 0.0) if get_pos else 0.0
+    audio = _capture(seconds)
+    if audio is None:
+        return []
+    segs = _transcribe(audio, lang)
+    if not segs:
+        return []
+    cands = []
+    for seg_t, line, ratio in _rank_anchors(segs, lines, top_n=max(top_n * 3, 12)):
+        if ratio < _MIN_RATIO:
+            continue
+        offset = round(line.start - (pos_cap + seg_t), 2)
+        if abs(offset) > 600:                        # absolute sanity guard
+            continue
+        # Same jump-vs-confidence gate capture_and_align uses: a weak match that
+        # implies a big correction is almost always a mis-anchor, not a real
+        # long intro, so a larger offset must clear a higher ratio bar.
+        if ratio < _MIN_RATIO + min(0.30, abs(offset) / 200.0):
+            continue
+        cands.append((offset, round(ratio, 2), line.start))
+    # Collapse near-identical offsets (keep the strongest ratio of each cluster).
+    cands.sort(key=lambda x: (-x[1], abs(x[0])))
+    deduped = []
+    for off, r, ls in cands:
+        if any(abs(off - d[0]) <= 1.0 for d in deduped):
+            continue
+        deduped.append((off, r, ls))
+    return deduped[:max(1, top_n)]
 
 
 def capture_and_align(lines, lang="ja", get_pos=None, seconds=_CAP):
