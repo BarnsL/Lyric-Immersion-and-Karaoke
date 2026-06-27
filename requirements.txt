@@ -11,6 +11,9 @@ syncedlyrics>=1.0
 deep-translator>=1.11
 spotipy>=2.23
 pypinyin>=0.49
+# Chinese word segmentation for grouped pinyin (行业 as one word, not 行+业).
+# Optional: romanize() falls back to per-character lazy_pinyin if missing.
+jieba>=0.42
 hangul-romanize>=0.1.0
 soundcard>=0.4.3
 shazamio>=0.4

@@ -910,6 +910,57 @@ def is_live_arrangement(title):
     return bool(_LIVE_VER_RE.search(title or ""))
 
 
+# TICKET-091: number-word → digit map for SMTC handle normalization
+# (`CalibreCincuenta` → `Calibre 50`). Only the LAST PascalCase-split token
+# gets converted, so `One Direction` / `Trio Los Panchos` are preserved.
+_SMTC_NUM_WORDS = {
+    # English
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+    "eleven": "11", "twelve": "12", "twenty": "20", "thirty": "30",
+    "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70",
+    "eighty": "80", "ninety": "90", "hundred": "100",
+    # Spanish (Calibre 50 / Banda Cuarenta y Cinco / etc.)
+    "uno": "1", "dos": "2", "tres": "3", "cuatro": "4", "cinco": "5",
+    "seis": "6", "siete": "7", "ocho": "8", "nueve": "9", "diez": "10",
+    "once": "11", "doce": "12", "veinte": "20", "treinta": "30",
+    "cuarenta": "40", "cincuenta": "50", "sesenta": "60", "setenta": "70",
+    "ochenta": "80", "noventa": "90", "cien": "100", "ciento": "100",
+    # Japanese number-word handles (rare but cheap)
+    "ichi": "1", "ni": "2", "san": "3", "shi": "4", "go": "5",
+    "roku": "6", "shichi": "7", "hachi": "8", "kyuu": "9", "juu": "10",
+}
+_PASCAL_BREAK_RE = re.compile(r'(?<=[a-z])(?=[A-Z])')
+
+
+def _normalize_smtc_artist(s: str) -> str:
+    """TICKET-091: normalize SMTC artist strings that compact spaces and spell
+    numbers as words. `CalibreCincuenta` → `Calibre 50`, `BandaMS` → `Banda MS`,
+    `LosTigresDelNorte` → `Los Tigres Del Norte`, `MaroonFive` → `Maroon 5`.
+    Idempotent: `Calibre 50` stays `Calibre 50`, `One Direction` stays
+    `One Direction` (no PascalCase compaction → number-word not converted).
+    Only the LAST PascalCase-split token converts, to avoid breaking names like
+    `Trio Los Panchos`."""
+    raw = (s or "").strip()
+    if not raw:
+        return raw
+    if " " in raw:
+        # already spaced — only convert if the LAST token is a number-word and
+        # there are at least two tokens (avoid lone "Cinco" → "5")
+        toks = raw.split()
+        if len(toks) >= 2 and toks[-1].lower() in _SMTC_NUM_WORDS:
+            toks[-1] = _SMTC_NUM_WORDS[toks[-1].lower()]
+            return " ".join(toks)
+        return raw
+    # compacted PascalCase: split at lower→Upper boundaries
+    parts = _PASCAL_BREAK_RE.split(raw)
+    if len(parts) >= 2:
+        if parts[-1].lower() in _SMTC_NUM_WORDS:
+            parts[-1] = _SMTC_NUM_WORDS[parts[-1].lower()]
+        return " ".join(parts)
+    return raw
+
+
 def clean_artist(artist, source=""):
     """Strip YouTube channel cruft so the artist matches lyric providers:
     'Kaneko Lumi - Topic' → 'Kaneko Lumi', 'LMFAOVEVO' → 'LMFAO'. Auto-generated
@@ -919,9 +970,13 @@ def clean_artist(artist, source=""):
     TICKET-086: ``source`` (the SMTC source-app id) lets the cleaner BYPASS the
     aggressive channel rules for YouTube Music (``music.youtube.*``), which
     delivers a clean artist name already (``轟はじめ`` alone, not the channel
-    string). Default empty preserves all existing callers."""
+    string). Default empty preserves all existing callers.
+
+    TICKET-091: a final pass through ``_normalize_smtc_artist`` handles YT
+    channel handles that compact spaces and spell numbers in words
+    (`CalibreCincuenta` → `Calibre 50`)."""
     if source and "music.youtube" in (source or "").lower():
-        return (artist or "").strip()
+        return _normalize_smtc_artist((artist or "").strip())
     a = (artist or "").strip()
     D = r"[-–—‐]"          # include U+2010 ‐ used by hololive-style channel names
     a = re.sub(rf"\s*{D}\s*Topic$", "", a, flags=re.I)
@@ -949,7 +1004,8 @@ def clean_artist(artist, source=""):
     if m:
         a = (m.group(2) or "").strip() or m.group(1).strip()
     a = re.sub(r"\s+Channel$", "", a, flags=re.I)  # "Suisei Channel" → "Suisei"
-    return a.strip() or (artist or "")
+    a = _normalize_smtc_artist(a.strip())  # TICKET-091: CalibreCincuenta → Calibre 50
+    return a or (artist or "")
 
 
 # ── Lyrics data ──────────────────────────────────────────────────────
@@ -1517,10 +1573,31 @@ class Overlay:
             "perf_record_cap_mb":    20.0,  # rotate the perf log when it grows beyond this
             "ease_slew_cap_s":       3.0,   # max seconds-per-second the eased offset can slew
             "ease_pull_per_sec":     3.5,   # exponential pull rate (higher = catches up faster)
+            # TICKET-088: per-frame fraction cap so a single heavy frame (e.g. 300ms
+            # stall) cannot consume more than this fraction of the remaining delta.
+            # The exponential-pull formula step = delta * (1 - exp(-pull * dt)) with
+            # dt=0.3, pull=3.5 yields ~65% of delta in ONE frame = visible snap. Cap
+            # at 20% so even a quarter-second stall still glides over ~5 frames.
+            "ease_max_step_frac":   0.20,   # max fraction of remaining delta per frame
+            # TICKET-088: snap deadzone for sub-50ms drifts — below this, easing is
+            # a waste (the visual change is below human perception) and the residual
+            # ramp wastes work. Old hardcoded threshold was 10ms.
+            "ease_deadzone_s":      0.05,   # |target - cur| below this snaps to target
+            # TICKET-088: gate a debug assertion that warns when more than 2 offset
+            # writes happen in a single _tick (a sign the same-tick ordering is
+            # being violated). 0 = silent, 1 = log warnings.
+            "assert_same_tick":        0,   # 1 = log when >2 offset writes per tick
             "decide_margin":         12.0,  # …and beat the loaded song's match by this much to switch
             "decide_wrong_floor":    32.0,  # loaded match below this = the lyrics are the wrong song → search the library
             "decide_listen_s":       12.0,  # seconds of vocals to transcribe for the decision
             "decide_at_s":           20.0,  # run the by-ear decision this many s into a new track
+            # TICKET-090: a Shazam-VERIFIED song whose loaded title also matches the
+            # heard title is ground truth — the by-ear decide loop has nothing useful
+            # to add and a noisy/hallucinated transcription can only POISON it by
+            # ranking the wrong song. Default OFF: verified+title-locked stops decide.
+            # Set to 1 for paranoid mode (keep deciding even when locked) when
+            # diagnosing a mis-lock.
+            "decide_after_verified": 0,     # 0 = locked verified stops decide, 1 = keep deciding
             "continuous_recal_ms": 15000,   # legacy fixed cadence (superseded by the adaptive tier)
             # ── ADAPTIVE sync-verification tier (escalation / de-escalation) ──
             # Verify sync ~3×/min while syncing or after a miss; once a check CONFIRMS
@@ -1585,6 +1662,15 @@ class Overlay:
             # diagnosis. Only affects the WEAKER amp_collab signal; an explicit
             # cover tag (歌ってみた / [COVER] / "covered by") is never demoted.
             "cover_amp_album_demote":     1.0,  # YT Music album → demote amp_collab
+            # ── TICKET-089 Whisper language lock ──
+            # 1 = pin Whisper to the song's known language for deep transcription
+            # (the auto-detect default lets Whisper hallucinate Japanese on
+            # Spanish/English/Korean audio — live diag saw Calibre 50 ES return
+            # "てれこにでもなくすまさきまで…"). 0 = revert to auto-detect for A/B
+            # testing. Only languages on the whitelist below are pinned; "ja" is
+            # left on auto since the library is mostly Japanese already and the
+            # current per-chunk detection is working there.
+            "whisper_lang_lock":            1,  # 1=lock to self._gen_lang/meta lang, 0=auto-detect
         }
         self._identify_result = None
         self._sound_song = None       # last (title, artist) heard by Shazam
@@ -1647,6 +1733,7 @@ class Overlay:
         self._fs_tries = 0; self._fs_empties = 0
         self._force_sync_after = None
         self._last_decision = None    # last decide_song_by_lyrics result (telemetry)
+        self._decide_force_flag = False  # TICKET-090: caller forces decide past the verified+locked gate
         self._fast_calib = 0          # remaining quick re-locks after a song change
         self._recal_after = None      # pending recalibrate timer id
         self._live_mode = False       # concert/compilation → sound-only, no title-match
@@ -1745,6 +1832,13 @@ class Overlay:
         self._fs_misses = 0; self._fs_line_lo = self._fs_line_hi = None
         self._sound_fail_streak = 0  # fresh wrong-song strike count for the new track
         self._last_heard_contra = None
+        # TICKET-090: clear per-track decide cache so a PREVIOUS track's heard /
+        # ranked / scope can't bleed into the new track's diag (live diag saw
+        # stale Japanese hallucination ranking from a previous song still in
+        # decision.heard). The decide loop will repopulate from real audio on
+        # the new track. Also drop the in-flight force flag.
+        self._last_decision = None
+        self._decide_force_flag = False
         self._gen_token += 1       # cancel any in-flight lyric generation
         self._deep_token += 1      # cancel any in-flight deep (offline) transcription
         self._track_seq += 1
@@ -2544,6 +2638,46 @@ class Overlay:
                     self._pending_switch = None     # current song reconfirmed
                     self._sound_fail_streak = 0     # heard == loaded → sync works, clear strikes
                     self._last_heard_contra = None
+                    # TICKET-090: Verified-Shazam WINS. When the Shazam fingerprint
+                    # matched (we're in the loaded_ok branch ⇒ heard == loaded) AND
+                    # the song has been verified by duration/title (_mark_verified
+                    # turns _verified on at load time), the decide-by-ear loop must
+                    # not be allowed to override us with a hallucinated transcript.
+                    # Promote the title-lock immediately. The fuzzy-match check is
+                    # already loaded_ok (substring or _titles_match); harden it
+                    # with an explicit _norm_title equality OR substring on title
+                    # AND artist to avoid latching onto a same-title different-song.
+                    loaded_title = self.meta.get("title", "") or ""
+                    loaded_artist = self.meta.get("artist", "") or ""
+                    nt_loaded, nt_heard = _norm_title(loaded_title), _norm_title(f_title)
+                    na_loaded, na_heard = _norm_title(loaded_artist), _norm_title(f_artist or "")
+                    title_fuzzy = bool(nt_loaded and nt_heard and (
+                        nt_loaded == nt_heard or nt_loaded in nt_heard or nt_heard in nt_loaded))
+                    artist_fuzzy = (not na_loaded) or (not na_heard) or (
+                        na_loaded == na_heard or na_loaded in na_heard or na_heard in na_loaded)
+                    if (self._verified and title_fuzzy and artist_fuzzy
+                            and self.lines and not self._live_mode
+                            and not self._title_locked):
+                        # TRANSITION False → True: reset offset+drift state so the
+                        # newly-locked timing starts from a clean baseline (any
+                        # stale pending offset from before the lock could otherwise
+                        # commit a wrong correction the moment we lock).
+                        log.info("title-lock: verified Shazam + heard %r matches loaded %r "
+                                 "→ LOCKING (resetting offset/drift state)",
+                                 f_title, loaded_title)
+                        self._title_locked = True
+                        self.offset = 0.0                 # direct write, NOT _smooth_offset
+                        self._pending_offset = None
+                        self._pending_corr = 1e9
+                        self._drift_integral = 0.0
+                        self._drift_integral_t = 0.0
+                        try:
+                            self._offset_hist.append((round(time.time(), 1), 0.0))
+                            self._offset_hist_last = 0.0
+                            if len(self._offset_hist) > 40:
+                                del self._offset_hist[:len(self._offset_hist) - 40]
+                        except Exception:
+                            pass
                     if offset is not None and t_cap is not None:
                         st = self.media.get()
                         if st and st.get("status") == PLAYING:
@@ -2852,6 +2986,30 @@ class Overlay:
         # deep_transcribe.py / docs/GENERATION.md.
         self._begin_deep_generation(self._deep_token, self._gen_title, self._gen_artist)
 
+    def _whisper_lang_lock(self, lang):
+        """TICKET-089: decide which language to pin Whisper to for deep
+        transcription. Returns the language code to pass as ``language=`` (or
+        ``None`` to let Whisper auto-detect).
+
+        Whisper auto-detect hallucinates Japanese on Spanish/English/Korean
+        audio (live diag: Calibre 50 ES → "てれこにでもなくすまさきまで…").
+        When we already know the song's language — from per-chunk detection in
+        the Tier-1 loop (``self._gen_lang``) or the loaded metadata
+        (``self.meta["lang"]``) — pinning eliminates the wrong-script
+        hallucination. Only the languages we have confidence in are pinned;
+        "ja" stays on auto because the library is mostly Japanese already and
+        any other auto-detection error there is preferable to forcing JA on a
+        mis-tagged track. Gated by the ``whisper_lang_lock`` tune knob (set 0
+        to revert to auto-detect for A/B testing)."""
+        if int(self._tune.get("whisper_lang_lock", 1) or 0) != 1:
+            return None
+        # Whitelist of languages we trust the metadata/per-chunk detector for.
+        # "ja" is deliberately EXCLUDED — auto-detect is already accurate on a
+        # mostly-Japanese library, and forcing JA would mask mis-tagged tracks.
+        ALLOW = {"es", "en", "de", "fr", "ko", "zh", "pt", "it", "ru"}
+        lang = (lang or "").strip().lower()
+        return lang if lang in ALLOW else None
+
     def _begin_deep_generation(self, token, title, artist):
         """Spawn the offline high-quality transcription (Tier 2). No-op if deep
         transcription isn't available (no yt-dlp), generation is off, or we've
@@ -2874,11 +3032,20 @@ class Overlay:
         except Exception:
             pass
         self._deep_tried.add(slug)
-        lang = self._gen_lang
+        # TICKET-089: thread the known song language through to Whisper so it
+        # doesn't auto-detect into a hallucinated script. Prefer the per-chunk
+        # detector's result (Tier 1 already listened) over the metadata tag,
+        # which can be the stale "ja" default from _start_generation. `pin_lang`
+        # is what we hand to Whisper (None = auto-detect, only set for the
+        # whitelisted non-JA languages); `raw_lang` is preserved as the
+        # downstream annotation fallback so "ja" still drives furigana etc.
+        raw_lang = self._gen_lang or self.meta.get("lang")
+        pin_lang = self._whisper_lang_lock(raw_lang)
+        lang = raw_lang
 
         def work():
             try:
-                res = deep_transcribe.deep_transcribe(title, artist, lang=lang)
+                res = deep_transcribe.deep_transcribe(title, artist, lang=pin_lang)
             except Exception as e:
                 log.info("deep gen error: %s", e)
                 return
@@ -3132,6 +3299,21 @@ class Overlay:
                 pass
 
     def _tick_body(self):
+        # TICKET-088: CANONICAL same-tick offset-write ordering — every path that
+        # writes self.offset within ONE _tick MUST run in this order, and the
+        # combined writes for a single tick must stay ≤ 2 (one tier/deferred
+        # commit + one pause-end re-base at most). Anything else is a race that
+        # can produce a visible snap.
+        #   1. deferred-commit consumes self._pending_offset       (queued earlier)
+        #   2. fine-tune pause-end re-bases self.offset            (or re-queues)
+        #   3. eased display offset is read for THIS frame's render
+        # The race guard (`had_pending_pre`) below makes step 2 yield to step 1
+        # when both fire on the same tick; step 2 then re-queues its delta into
+        # _pending_offset (TICKET-088 item 4) rather than dropping it.
+        # The _tick_offset_writes counter is bumped by _commit_offset; if more
+        # than 2 writes land in one tick AND assert_same_tick is enabled, we
+        # log a WARN so a regression is loud, not silent.
+        self._tick_offset_writes = 0
         # Measure the interval between consecutive RENDER frames (only) for the
         # /status render_fps readout — paused/no-music frames use a slower cadence
         # and would skew it, so they're excluded.
@@ -3302,7 +3484,11 @@ class Overlay:
                 self._pending_offset = None
                 log.info("sync: deferred commit %+.2fs → %+.2fs (line ended)",
                          self.offset, new_off)
-                self.offset = new_off
+                # TICKET-088: route through atomic _commit_offset helper. Use
+                # reset_display=False so the eased display offset KEEPS gliding
+                # toward the new target (matches pre-088 behavior) — the snap
+                # fixes are in _eased_offset's per-frame fraction cap.
+                self._commit_offset(new_off, reset_display=False)
                 self.idx = -1
                 self._drift_integral = 0.0
         # FINE-TUNE pause EXPIRY (placed ABOVE the pos computation so the offset
@@ -3324,14 +3510,40 @@ class Overlay:
                     self._display_offset_t = time.time()
                 log.info("fine-tune pause end: applied %+.2fs (offset %+.2fs → %+.2fs)",
                          -amt, self.offset, new_off)
-                self.offset = new_off
+                # TICKET-088: route through atomic _commit_offset (reset_display
+                # =False because we just slid display_offset in lockstep above).
+                self._commit_offset(new_off, reset_display=False)
             else:
-                log.info("fine-tune pause end: tier commit pending → dropping pause delta %+.2fs",
-                         -amt)
+                # TICKET-088: instead of DROPPING the pause delta (the old code
+                # silently lost the fine-tune correction whenever a tier commit
+                # raced it), FOLD it into the pending offset so the deferred
+                # commit picks it up at the next line boundary. Combines both
+                # corrections in a single atomic write instead of either-or.
+                existing = self._pending_offset if self._pending_offset is not None else self.offset
+                merged = round(existing - amt, 2)
+                self._pending_offset = merged
+                self._pending_offset_t = time.time()
+                log.info("fine-tune pause end: tier commit pending → re-queued pause delta "
+                         "%+.2fs into pending offset (was %s, now %+.2fs)",
+                         -amt,
+                         "None" if not had_pending_pre else f"{existing:+.2f}",
+                         merged)
             self._fine_pause_until = 0.0
             self._fine_pause_pos_eased = None
             self._fine_pause_pos_raw = None
             self._fine_pause_amount = 0.0
+        # TICKET-088: same-tick offset-write assertion. _commit_offset bumps
+        # _tick_offset_writes; the canonical max within one tick is 2
+        # (deferred-commit + pause-end). More than that is a race regression.
+        # Gated by `assert_same_tick` so it stays silent in production.
+        try:
+            if (int(self._tune.get("assert_same_tick", 0))
+                    and self._tick_offset_writes > 2):
+                log.info("WARN: _tick saw %d offset writes (expected ≤2). "
+                         "Canonical order: deferred-commit then pause-end.",
+                         self._tick_offset_writes)
+        except Exception:
+            pass
         # Render against an EASED display offset, not the raw sync offset, so a
         # sound-sync correction GLIDES the highlight/scroll into place instead of
         # snapping (the "jumpy karaoke fill"). See _eased_offset.
@@ -4147,6 +4359,30 @@ class Overlay:
         self.cv.move("cur", -(e1 - e0) * ox, 0)
         self._anim_id = self.root.after(16, self._anim_step, ox, step + 1)
 
+    def _commit_offset(self, new_off, reset_display=True):
+        """TICKET-088: ATOMIC offset commit used by the deferred-commit and
+        pause-end paths. Both used to write self.offset (and sometimes
+        self._display_offset) inline and could fire on the SAME tick, producing
+        multiple offset writes per frame. Centralizing the write keeps the
+        ordering canonical (write offset → mirror to display if asked → log)
+        and lets _tick count the writes for the same-tick assertion.
+
+        reset_display=True is the right choice when we WANT _eased_offset to
+        treat the new value as already-displayed (no glide ramp from the old
+        value). pause-end uses False because it slides the display offset by
+        the same delta separately so the ramp continues smoothly.
+        """
+        self.offset = new_off
+        if reset_display:
+            self._display_offset = new_off
+            self._display_offset_t = time.time()
+        # Per-tick offset-write counter (consumed by _tick's same-tick warning
+        # gated on the assert_same_tick tune knob — see _tick_body docstring).
+        try:
+            self._tick_offset_writes = getattr(self, "_tick_offset_writes", 0) + 1
+        except Exception:
+            pass
+
     def _smooth_offset(self, new_off, reason=""):
         """Queue an auto-sync correction for the NEXT line boundary instead of
         snapping it in mid-line (TICKET-078). User-perceived effect: whatever
@@ -4199,7 +4435,12 @@ class Overlay:
             self._display_offset = target            # first use / major re-sync → snap
             self._display_offset_t = now
             return self._display_offset
-        if abs(target - cur) <= 0.01:
+        # TICKET-088: deadzone widened from a hardcoded 10 ms to a tunable
+        # ease_deadzone_s (default 50 ms). Sub-deadzone drifts snap rather than
+        # crawl through the easing ramp — the residual ramp is below human
+        # perception and just wastes per-frame work / log churn.
+        deadzone = float(self._tune.get("ease_deadzone_s", 0.05))
+        if abs(target - cur) <= deadzone:
             self._display_offset = target
             self._display_offset_t = now
             return self._display_offset
@@ -4217,6 +4458,17 @@ class Overlay:
         # absolute cap so even a 5s glide doesn't move faster than rate_per_sec
         cap = rate_per_sec * dt
         step = max(-cap, min(cap, step))
+        # TICKET-088: per-frame fraction cap — a single 300ms heavy frame
+        # (browser tab stall, GC pause, antivirus scan) with the default pull
+        # rate eats ~65% of the remaining delta in ONE step = a visible snap,
+        # not a glide. Cap the step at ease_max_step_frac (default 20%) of the
+        # remaining delta so even a quarter-second stall produces a ramp the
+        # eye reads as smooth motion across the next several frames.
+        max_frac = float(self._tune.get("ease_max_step_frac", 0.20))
+        if max_frac > 0.0 and delta != 0.0:
+            frac_cap = max_frac * abs(delta)
+            sign = 1.0 if step >= 0.0 else -1.0
+            step = sign * min(abs(step), frac_cap)
         self._display_offset = cur + step
         self._display_offset_t = now
         return self._display_offset
@@ -4312,11 +4564,19 @@ class Overlay:
 
     def nudge(self, d):
         self._fine_exit("manual-nudge")            # user input wins; drop pause buffers
-        self.offset += d
+        # TICKET-088: route manual nudges through _smooth_offset so the user
+        # sees the SAME glide the auto-sync uses (a direct self.offset += d
+        # would snap the highlight in mid-line — the very behavior we just
+        # capped in _eased_offset). _smooth_offset still snaps big jumps and
+        # no-line states.
+        self._smooth_offset(round(self.offset + d, 2), "manual-nudge")
 
     def reset_offset(self):
         self._fine_exit("manual-reset")            # user input wins; drop pause buffers
-        self.offset = 0.0
+        # TICKET-088: route through _smooth_offset for a glided reset (snaps
+        # automatically when there's no line on screen or when the current
+        # offset is >5s, which covers most "reset is huge" cases).
+        self._smooth_offset(0.0, "manual-reset")
 
     def get_tune(self):
         """Snapshot of the live-tunable sync parameters (for GET /tune)."""
@@ -5242,6 +5502,10 @@ class Overlay:
     def refetch(self):
         self._fetch_key = None
         self._lyrics_path = None
+        # TICKET-090: user-driven correction → drop the title-lock so the decide
+        # loop re-engages on demand (the lock would otherwise still gate decide
+        # for a fraction of a second before _on_track_change re-evaluates it).
+        self._title_locked = False
         if self._track:
             self._on_track_change(self._track, self._cur_duration)
 
@@ -5515,7 +5779,18 @@ class Overlay:
                  int(self._tune.get("force_sync_streak", 3)),
                  float(self._tune.get("force_sync_span_s", 16.0)))
         self.offset = 0.0                       # set sync timing to 0 as the first resort
+        # TICKET-088: snap the EASED display offset in parallel so _eased_offset
+        # doesn't try to glide from the previous offset to 0 — the user just
+        # asked for a nuclear resync, the glide here would look like a snap
+        # anyway (huge delta) and the per-frame fraction cap would draw the
+        # ramp out over many frames. Set both to the same value atomically.
+        self._display_offset = 0.0
+        self._display_offset_t = time.time()
         self.idx = -1
+        # TICKET-090: a manual Force Sync means the user is overruling our current
+        # belief — drop the title-lock so the decide loop can re-engage and the
+        # sound-driven correction paths aren't blocked by a stale ground-truth claim.
+        self._title_locked = False
         self._force_sync_active = True
         self._fs_current = None
         self._fs_confirms = 0
@@ -5729,6 +6004,17 @@ class Overlay:
         whole-library scan inside is the only way to ID the song currently playing
         (TICKET-079)."""
         if track_seq != self._track_seq or self._deciding or self._aligning:
+            return
+        # TICKET-090: a Shazam-VERIFIED + title-LOCKED song is ground truth — the
+        # decide loop can only hurt (a noisy/hallucinated transcript ranks the
+        # wrong song and overrides good lyrics). Skip it unless the tune knob
+        # asks for paranoia, or a caller forces it (e.g. the /decide API endpoint
+        # the user invoked deliberately, or a /wrong/forcesync that just unlocked).
+        forced = bool(getattr(self, "_decide_force_flag", False)
+                      or reason in ("api", "force", "wrong", "boundary"))
+        if (self._verified and self._title_locked and not forced
+                and not int(self._tune.get("decide_after_verified", 0))):
+            log.info("decide-by-ear (%s): SKIPPED — verified + title-locked (ground truth)", reason)
             return
         in_concert = (self._live_arrangement or self._live_mode
                       or reason == "boundary")
@@ -7037,45 +7323,64 @@ def main():
         try: icon.notify(f"Lyric Immersion and Karaoke v{info['version']} is available.", "Update available")
         except Exception: pass
 
+    # TICKET-097: menu organized in logical sections separated by SEPARATOR.
+    # 1. PER-SONG ACTIONS (act on the current track right now)
+    # 2. DETECTION / LYRIC SOURCES (toggles for how we find lyrics)
+    # 3. SYNC BEHAVIOR (timing controls)
+    # 4. VISUAL / DISPLAY (overlay appearance)
+    # 5. PERFORMANCE (renderer + GPU)
+    # 6. LIBRARY / CONTENT (presets, import, backup)
+    # 7. APP / SYSTEM (api, autostart)
+    # 8. UPDATES / ABOUT / QUIT
     menu = pystray.Menu(
-        pystray.MenuItem("Presets", preset_menu),
-        pystray.Menu.SEPARATOR,
+        # 1. PER-SONG ACTIONS ─────────────────────────────────────────────
         pystray.MenuItem("⚑  Wrong lyrics — fix this song", _wrong),
         pystray.MenuItem("🎧  Identify by sound", _ident),
         pystray.MenuItem("🚀  Force Sync  (try ranked matches, skip chorus traps, until it locks)", _align),
+        pystray.MenuItem("Re-fetch lyrics", _refetch),
+        pystray.MenuItem("⬇  Get captions for this video now", _get_caps),
+        pystray.Menu.SEPARATOR,
+        # 2. DETECTION / LYRIC SOURCES ────────────────────────────────────
         pystray.MenuItem("Fast song-change detect (compilations)", _toggle_bound,
                          checked=lambda i: ov.boundary_on),
         pystray.MenuItem("Use YouTube captions (accurate, for browser videos)", _toggle_caps,
                          checked=lambda i: ov.captions_on),
-        pystray.MenuItem("⬇  Get captions for this video now", _get_caps),
         pystray.MenuItem("Generate lyrics by ear when none found (AI, ***)", _toggle_gen,
                          checked=lambda i: ov.generate_on),
+        pystray.Menu.SEPARATOR,
+        # 3. SYNC BEHAVIOR ────────────────────────────────────────────────
+        pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),
+        pystray.MenuItem("Auto re-sync by sound", recal_menu),
+        pystray.Menu.SEPARATOR,
+        # 4. VISUAL / DISPLAY ─────────────────────────────────────────────
+        pystray.MenuItem("Show / Hide", _toggle),
+        pystray.MenuItem("Position", position_menu),
+        pystray.MenuItem("Display", display_menu),
+        pystray.MenuItem("Opacity", opacity_menu),
+        pystray.MenuItem("Font size", font_menu),
+        pystray.MenuItem("Scroll-in", scroll_menu),
+        pystray.MenuItem("Scroll-through speed", speed_menu),
+        pystray.MenuItem("Dancing character", _toggle_char,
+                         checked=lambda i: ov.character_on),
+        pystray.Menu.SEPARATOR,
+        # 5. PERFORMANCE ──────────────────────────────────────────────────
+        pystray.MenuItem("Performance", perf_menu),
         pystray.MenuItem(_gpu_label, _on_gpu,
                          enabled=lambda i: not _gpu["busy"] and not gpu_setup.gpu_ready(),
                          visible=lambda i: gpu_setup.nvidia_gpu_present()),
-        pystray.MenuItem("Auto re-sync by sound", recal_menu),
-        pystray.MenuItem("Library backup (Git)", git_menu),
-        pystray.MenuItem("📥  Import playlist (Spotify / YouTube)", _open_import),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),
-        pystray.MenuItem("Opacity", opacity_menu),
-        pystray.MenuItem("Font size", font_menu),
-        pystray.MenuItem("Position", position_menu),
-        pystray.MenuItem("Display", display_menu),
-        pystray.MenuItem("Scroll-in", scroll_menu),
-        pystray.MenuItem("Scroll-through speed", speed_menu),
-        pystray.MenuItem("Performance", perf_menu),
-        pystray.MenuItem("Dancing character", _toggle_char,
-                         checked=lambda i: ov.character_on),
+        # 6. LIBRARY / CONTENT ────────────────────────────────────────────
+        pystray.MenuItem("Presets", preset_menu),
+        pystray.MenuItem("📥  Import playlist (Spotify / YouTube)", _open_import),
+        pystray.MenuItem("Library backup (Git)", git_menu),
+        pystray.Menu.SEPARATOR,
+        # 7. APP / SYSTEM ─────────────────────────────────────────────────
         pystray.MenuItem("Local API (agent control)", _toggle_api,
                          checked=lambda i: ov.api_on),
-        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Start with Windows", _toggle_startup,
                          checked=lambda i: startup_enabled()),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Re-fetch lyrics", _refetch),
-        pystray.MenuItem("Show / Hide", _toggle),
-        pystray.Menu.SEPARATOR,
+        # 8. UPDATES / ABOUT / QUIT ───────────────────────────────────────
         pystray.MenuItem(_upd_label, _on_updates),
         pystray.MenuItem(f"ℹ️  About  ·  v{version.__version__}", _about),
         pystray.MenuItem("Quit", _quit),
