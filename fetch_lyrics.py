@@ -124,6 +124,8 @@ import confidence   # language_confidence — prefer the artist's usual language
 for _n in ("syncedlyrics", "syncedlyrics.providers"):
     logging.getLogger(_n).setLevel(logging.CRITICAL)
 
+log = logging.getLogger(__name__)
+
 # -- Musixmatch token-refresh resilience patch ------------------------------------
 # The upstream syncedlyrics Musixmatch provider retries infinitely on 401 and
 # doesn't auto-purge revoked tokens. This monkey-patch adds:
@@ -571,6 +573,41 @@ def _translit_ru(text: str) -> str:
     return "".join(out)
 
 
+# Cache for zh pinyin results, keyed by line text. Capped to avoid unbounded
+# growth on long sessions; jieba.lcut + pypinyin per line is cheap but not free.
+_ZH_PINYIN_CACHE: dict[str, str] = {}
+_ZH_PINYIN_CACHE_MAX = 256
+
+
+def _zh_pinyin(text: str) -> str:
+    """Chinese pinyin with jieba word segmentation. Characters within a word are
+    concatenated (no space), words are joined with single spaces. Falls back to
+    per-character lazy_pinyin if jieba isn't installed."""
+    cached = _ZH_PINYIN_CACHE.get(text)
+    if cached is not None:
+        return cached
+    from pypinyin import lazy_pinyin, Style
+    try:
+        import jieba
+        segments = jieba.lcut(text)
+        parts = []
+        for seg in segments:
+            if not seg:
+                continue
+            parts.append("".join(lazy_pinyin(seg, style=Style.TONE)))
+        result = " ".join(p for p in parts if p).strip()
+    except ImportError:
+        result = " ".join(lazy_pinyin(text, style=Style.TONE)).strip()
+    # naive cap: drop oldest insertion when full (dict preserves insertion order)
+    if len(_ZH_PINYIN_CACHE) >= _ZH_PINYIN_CACHE_MAX:
+        try:
+            _ZH_PINYIN_CACHE.pop(next(iter(_ZH_PINYIN_CACHE)))
+        except StopIteration:
+            pass
+    _ZH_PINYIN_CACHE[text] = result
+    return result
+
+
 def romanize(text: str, lang: str) -> str:
     """Romanize text for the given language: Japanese → Hepburn romaji (fugashi +
     cutlet, katakana English recovered as English), Chinese → pinyin, Korean →
@@ -591,8 +628,7 @@ def romanize(text: str, lang: str) -> str:
                     pass
             return " ".join(it["hepburn"] for it in _kakasi().convert(text)).strip()
         if lang == "zh":
-            from pypinyin import lazy_pinyin
-            return " ".join(lazy_pinyin(text)).strip()
+            return _zh_pinyin(text)
         if lang == "ko":
             return _korean().translit(text).replace("-", "").strip()
     except Exception:
@@ -799,6 +835,82 @@ def _synced_cjk(title, artist, duration):
     return None
 
 
+def _fetch_netease_lyrics(title: str, artist: str) -> str | None:
+    """NetEase Cloud Music (网易云音乐) direct provider — the canonical Chinese
+    lyrics source, with synced LRC for almost every Chinese pop/rap/indie release
+    that lrclib + syncedlyrics' aggregators miss. Used ONLY for lang=='zh' tracks
+    (see the gated call in fetch_lrc), AFTER lrclib/syncedlyrics, BEFORE AI gen.
+
+    Returns LRC text or None. Silently swallows network/parse errors so a
+    NetEase outage never breaks the pipeline."""
+    if not title:
+        return None
+    q = title if not artist else f"{title} {artist}"
+    headers = {
+        "User-Agent": "Mozilla/5.0",       # NetEase blocks empty UA
+        "Referer": "https://music.163.com",
+    }
+
+    def _get(url: str) -> dict | None:
+        last_exc = None
+        for _attempt in range(2):           # single retry
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return json.loads(r.read().decode("utf-8", errors="replace"))
+            except Exception as e:
+                last_exc = e
+        return None
+
+    # 1. SEARCH — type=1 is songs
+    search_url = ("https://music.163.com/api/search/get/web?"
+                  + urllib.parse.urlencode({"s": q, "type": 1,
+                                            "offset": 0, "limit": 10}))
+    try:
+        data = _get(search_url)
+        songs = (data or {}).get("result", {}).get("songs") or []
+        if not songs:
+            return None
+
+        # Fuzzy match: score each candidate on title + artist token overlap
+        # (reuses the local _norm helper — same scoring style as _pick_lrclib).
+        nt = _norm(title)
+        nas = [_norm(x) for x in split_artists(artist)] or [_norm(artist)]
+        best, best_score = None, 0
+        for s in songs:
+            ct = _norm(s.get("name") or "")
+            cas = [_norm((a or {}).get("name") or "") for a in (s.get("artists") or [])]
+            score = 0
+            if nt and ct and (nt in ct or ct in nt):
+                score += 3
+            if any(na and ca and (na in ca or ca in na)
+                   for na in nas if na for ca in cas):
+                score += 3
+            if score > best_score:
+                best, best_score = s, score
+        if not best or best_score < 3:
+            # No title overlap at all → don't risk a wrong-song match
+            return None
+        song_id = best.get("id")
+        if not song_id:
+            return None
+    except Exception:
+        return None
+
+    # 2. LYRICS — lv=1 wants the synced LRC; kv/tv carry karaoke/translation
+    lyric_url = ("https://music.163.com/api/song/lyric?"
+                 + urllib.parse.urlencode({"id": song_id, "lv": 1, "kv": 1, "tv": -1}))
+    try:
+        data = _get(lyric_url)
+        lrc = ((data or {}).get("lrc") or {}).get("lyric") or ""
+        lrc = lrc.strip()
+        if lrc and "[" in lrc:
+            return lrc
+    except Exception:
+        return None
+    return None
+
+
 def _title_variants(title: str) -> list:
     """Clean song-title candidates pulled out of a messy / bilingual video title,
     so a niche song still gets found. E.g.
@@ -997,6 +1109,25 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
             r = take(lrc, {"source": "syncedlyrics/title", "artist": a or None,
                            "duration": duration})
             if r:
+                return r
+
+    # 5. NetEase Cloud Music (网易云音乐) — direct provider, gated to Chinese-
+    # script tracks only (lang=="zh"). Chinese pop / rap / indie long-tail is
+    # often missing from lrclib + syncedlyrics' aggregators, and NetEase is the
+    # canonical Chinese lyrics source. Tried AFTER lrclib/syncedlyrics, BEFORE
+    # we return None (which upstream takes as the cue to AI-generate by ear).
+    # detect_lang(title) returns "zh" only when HAN is present with no kana and
+    # no hangul, so a kanji-heavy Japanese title (han_song above) won't reach
+    # this branch — _synced_cjk already covers that case via NetEase-thru-syncedlyrics.
+    if detect_lang(t) == "zh":
+        lrc = _fetch_netease_lyrics(t, a)
+        if lrc and verify_lrc(lrc, t, duration):
+            r = take(lrc, {"source": "netease", "artist": a or None,
+                           "duration": duration})
+            if r:
+                n_lines = sum(1 for ln in r[0].splitlines()
+                              if re.search(r"\[\d+:\d+", ln))
+                log.info("netease: lyrics found for %r — %d lines", t, n_lines)
                 return r
 
     # Nothing original-script found → use the stashed romaji if we have one.

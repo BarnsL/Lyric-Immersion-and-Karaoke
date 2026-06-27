@@ -8,6 +8,186 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-FUTURE-001 — Animated bouncing lyrics (per-syllable / per-character) 🔵
+**Future feature.** User intends to add animated lyrics that BOUNCE when sung. Per-character per-frame animation × multiple chars × multiple frames per syllable = drastically higher render budget than current static-color fill. Hard prerequisites BEFORE this can be attempted:
+- True 60 fps with no spikes (currently ~33 ms baseline + 100-500 ms freezes during track-change per perf.log)
+- Sub-millisecond per-character paint cost (Tk Canvas itemconfig probably can't hold this; need to evaluate Pygame/SDL2/Direct2D/OpenGL via moderngl as alternatives, OR cache pre-rendered per-character bitmaps and batch-blit)
+- Tk thread CANNOT do LRC parse / first-block PIL render synchronously during playback (TICKET-082b subprocess refactor mandatory)
+- Need an animation timeline format (offset per-char attack/release curve)
+**Status: blocked behind TICKET-082b + TICKET-088 (smooth-transitions still snapping) + general perf headroom.** Re-open when the prereqs are unblocked.
+
+---
+
+## TICKET-100 — Discord Rich Presence + Steam overlay music ingestion 🔵
+**Goal:** add supplementary "what's playing" sources beyond SMTC so we catch overlay/ambient music.
+**(A) Discord Rich Presence (local IPC):** Discord client exposes a local named pipe on Windows (`\\?\pipe\discord-ipc-0` through `discord-ipc-9`). The IPC supports `GET_ACTIVITY` to read the current user's Activity, which includes "Listening to Spotify" with track/artist/timestamps. Implementation: connect via win32pipe, send the Discord RPC handshake + GET_ACTIVITY, parse the response. Wire as a SOURCE that augments SMTC when SMTC is silent (or as a "what's my friend playing" presence-aware mode behind a tray toggle).
+**(B) Steam Rich Presence / SteamWorks:** Steam doesn't expose game audio directly, but some games broadcast track info via Steam Rich Presence (visible on profile). Read via `steam_api64.dll` `ISteamFriends::GetFriendRichPresence` for self, key `"steam_display"` or `"music_track"`. Effectiveness varies wildly per game; most games don't populate it.
+**(C) Existing fallback works:** Shazam-by-sound via WASAPI loopback (recognize.py) already identifies any audio playing through the system mixer including game BGM, Discord call music bots, etc. See TICKET-099 for prioritization.
+**Priority order (proposed):** SMTC.playing=true → SMTC. SMTC.playing=false + Shazam confident → Shazam (handle in TICKET-099). Discord Rich Presence as supplementary cross-check.
+**Status:** research / partial. Lowest priority of the new batch.
+
+---
+
+## TICKET-099 — SMTC vs Shazam disagreement: trust live audio over paused player 🔴
+**Symptom (live diag, 2026-06-27):**
+```
+player_title: "HAVE A NICE DAY"     ← SMTC (paused YouTube)
+player_artist: "WORLD ORDER"        ← SMTC
+playing: false                       ← SMTC says paused
+heard_by_sound: ["Counter-Strike 2: (Original Menu Music)", "Crosshair Kings"]   ← Shazam: actual live audio
+matched_title: "HAVE A NICE DAY"    ← we locked SMTC track
+verified: true                       ← but Shazam DISAGREES with SMTC
+```
+User was actually listening to CS2 menu music in-game. SMTC had a stale paused YouTube tab. The app locked the WRONG song (the paused tab) and ignored what was actually playing through the speakers.
+**Fix:**
+- Add disagreement detector: when `heard_by_sound` returns a song that does NOT fuzzy-match SMTC `player_title`/`player_artist`, log the conflict.
+- Resolution rule:
+  - SMTC `playing=true` → trust SMTC (browser kept playing).
+  - SMTC `playing=false` AND Shazam confident → **trust Shazam** (switch the loaded track to the Shazam match, re-fetch lyrics).
+  - Both confident + agree → `verified=true` (current behavior).
+  - Both confident + disagree → log + prefer per the rule above.
+- New state field: `source_priority` ∈ `{"smtc", "shazam-live", "agree"}` exposed in /diag.
+- Verification rule (clean up): `verified=true` should require AGREEMENT between SMTC and Shazam (or one of them strongly confident and the other silent). Mismatched + verified is the current bug.
+**Verify:** repro by pausing a YT tab and launching CS2 menu music; app should switch to CS2 menu music within ~10s once Shazam fires. Repro by playing Spotify (SMTC active) while game BGM plays underneath; app should keep Spotify (SMTC.playing=true wins).
+**Risk:** rapid SMTC/Shazam ping-pong if a game's BGM partially matches another song. Mitigate with a 15s switch debounce + minimum Shazam confidence threshold for the swap.
+
+---
+
+## TICKET-098 — Scroll-in: slide-in from top/bottom (centered) + right-orient on slide-in right 🔴
+**User request:** under Scroll-in menu, add "Slide in from top" and "Slide in from bottom" which auto-center text horizontally. "Slide in from right" should auto-set text orientation to right-aligned.
+**Current state (main.py:6989-7002):**
+- `none` (stationary), `left`/`right` (per-line slide from edge), `lr`/`rl` (continuous scroll-through), `tb`/`bt` (continuous vertical scroll-through).
+- `left`/`right` slide-in are PER LINE (text starts at edge, animates to its anchored position, stays).
+- `tb`/`bt` are MARQUEE-style continuous (not per-line).
+**Implementation:**
+- Add new scroll_dir values `top` and `bottom` for per-line vertical slide-in (each line drops in from above / rises from below, animates to anchored position, stays).
+- In `set_scroll(d)`:
+  - `d == "top"` or `d == "bottom"` → set `self.pos_x = "center"`
+  - `d == "right"` → set `self.pos_x = "right"`
+  - `d == "left"` → set `self.pos_x = "left"`
+  - Persist both via existing settings save.
+- In `scroll_menu` tray (main.py:6989), add the two new items between `"right"` and the SEPARATOR before `"lr"/"rl"`.
+- Renderer: extend the per-line slide-in code that already handles `left`/`right` (search for `self.scroll_dir == "left"` and similar) to also handle `top`/`bottom` with Y-axis animation.
+**Verify:** select each new mode in tray; text appears correctly anchored; per-line slide animation is smooth (no snap).
+**Risk:** existing `tb`/`bt` continuous-vertical-scroll keeps working unchanged (different code path).
+
+---
+
+## TICKET-097 — Tray menu logical reorganization 🔴
+**Symptom:** current tray menu order grew organically; alike controls are scattered. "Re-fetch lyrics" sits in the system section, "Local API" sits between visual settings and Start-with-Windows, "Show / Hide" lives below "Re-fetch lyrics" instead of at the top of the visual block.
+**Target structure** (separators between each group; alike controls grouped):
+1. **Per-song actions** — Wrong lyrics, Identify by sound, Force Sync, Re-fetch lyrics, Get captions for this video now
+2. **Detection / Lyric sources** — Fast song-change detect, Use YouTube captions, Generate lyrics by ear (AI)
+3. **Sync behavior** — Sync timing, Auto re-sync by sound (+ Calibrate when added)
+4. **Visual / Display** — Show / Hide, Position, Display, Opacity, Font size, Scroll-in, Scroll-through speed, Dancing character
+5. **Performance** — Performance, GPU acceleration
+6. **Library / Content** — Presets, Import playlist, Library backup (Git)
+7. **App / System** — Local API, Start with Windows
+8. **Updates** — Check for updates, About, Quit
+**Verify:** menu still works (all callbacks intact); checkbox/radio states still bind; emoji icons preserved on relevant items.
+
+---
+
+## TICKET-096 — Cantonese detection + Jyutping mode 🔵
+**Symptom:** `lang: "zh"` is ambiguous between Mandarin and Cantonese. Cantopop / HK artists need Jyutping (粵拼) not pinyin — different romanization system reflecting actual Cantonese pronunciation.
+**Detection signals:** artist region (HK label / 香港 / Cantonese-only artist list), traditional-character ratio >50%, presence of Cantonese-only function words (嘅 / 嘢 / 喺 / 咗 / 啲), explicit "粵語" / "粤语" / "Cantonese" tag.
+**Implementation:** new `lang_zh_variant(text, artist)` returning "yue" or "zh". When "yue", call `pycantonese` or `jyutping` library for romanization. Falls back to pinyin when lib missing. New tune knob `cantonese_detect = 1`.
+**Verify:** test against Beyond, 陳奕迅 (Eason Chan, Cantopop tracks), MIRROR, etc. → Jyutping; Faye Wong / Jay Chou / 周深 / mainland rap → pinyin.
+
+---
+
+## TICKET-095 — NetEase Cloud Music lyrics fallback (Chinese coverage) 🔴
+**Symptom:** Chinese long-tail (pop, rap, indie) often missing from lrclib + syncedlyrics. NetEase 网易云音乐 is the de-facto Chinese lyrics database with synced LRC for almost every Chinese release.
+**Implementation:** add `_fetch_netease_lyrics(title, artist, lang)` provider to `fetch_lyrics.py` chain. Search via public NetEase search API (`/cloudsearch?keywords=...`), grab top match by title+artist fuzzy, fetch lyrics via `/lyric?id=...`, parse `[mm:ss.xx]` LRC. Only attempted when `lang == "zh"` (skip cost for non-Chinese tracks). Falls in chain after lrclib/syncedlyrics, before AI generation.
+**Verify:** 揽佬SKAI, 法老, 陳奕迅, 五月天, 周杰倫 all hit NetEase before generation.
+**Risk:** NetEase API rate-limits / geofences — add 5s timeout, single retry, swallow failures silently.
+
+---
+
+## TICKET-094 — jieba word segmentation + per-word karaoke fill (zh) 🔴
+**Symptom:** Chinese lyrics chunked per-character. Karaoke fill highlights one hanzi at a time when it should highlight one WORD at a time (`梦想` should fill together, not 梦 then 想). Also: pinyin generated per-character misses polyphonic disambiguation (`行` could be `xíng` or `háng` depending on word context).
+**Implementation:** `jieba` segments full line. Karaoke fill iterates segments instead of chars. Pinyin generated per-segment via `pypinyin.lazy_pinyin(segment, style=Style.TONE)` (after TICKET-093), which uses dictionary-based disambiguation. Falls back to per-character when jieba unavailable.
+**Verify:** "要走上行业塔尖" → segments ["要", "走上", "行业", "塔尖"] → pinyin "yào zǒu shàng háng yè tǎ jiān". Per-word fill animation visible.
+**Risk:** jieba ~5MB dict load on first use; cache module-level. Worst case = static download cost on first Chinese song.
+
+---
+
+## TICKET-093 — Pinyin tone marks (pypinyin Style.TONE) 🔴
+**Symptom:** Chinese pinyin currently displays without tone marks (`yao zou shang hang ye ta jian`). For learners this is critically incomplete — tones distinguish words (`mā má mǎ mà` = mother/hemp/horse/scold). Without tones the romanization is half-useful.
+**Fix:** `fetch_lyrics.py:595` — change `lazy_pinyin(text)` to `lazy_pinyin(text, style=Style.TONE)`. Add `from pypinyin import Style` import.
+**Verify:** Chinese track displays "yāo zǒu shàng háng yè tǎ jiān" instead of "yao zou shang hang ye ta jian"; tone-mark glyphs (ā/á/ǎ/à/ē/é/ě/è/ī/í/ǐ/ì/ō/ó/ǒ/ò/ū/ú/ǔ/ù/ǖ/ǘ/ǚ/ǜ) render correctly in current font. If font lacks combining diacritics, fall back to numbered tones (`yao1 zou3 shang4`) via `Style.TONE3`.
+**Effort:** literally 1 line + 1 import. Highest user-value per byte changed in this entire ticket batch.
+
+---
+
+## TICKET-092 — Pygame + OpenGL renderer substrate swap (GPU acceleration) 🔵
+**Symptom:** at 18 fps target 62 on Chinese rap rendering 3 lines of pinyin + hanzi + English in scroll-mode. Stutter pattern is 1-in-3 frames degrading to 190ms worst-case. Tk Canvas + PIL software rasterization is the bottleneck. User has TWO modern GPUs (RTX 3080 eGPU + RTX 2080 Max-Q internal) sitting idle.
+**Path:** swap Tk Canvas → Pygame with SDL2's OpenGL backend.
+- Glyph atlas pre-rasterized via PIL ONCE, uploaded to GPU texture.
+- Karaoke fill = 1 shader uniform (no per-frame PIL composite).
+- Scroll translation = vertex matrix (free).
+- Bouncing animation (TICKET-FUTURE-001) becomes a 50-line shader, not "impossible".
+- Window flags: SDL2 supports WS_EX_LAYERED / TRANSPARENT / NOACTIVATE via `pygame.display.set_mode(flags=SRCALPHA, vsync=1)` + `ctypes.windll.user32.SetWindowLongW` for the same extended styles we apply now.
+**Effort:** ~1 week dedicated. Defer to a focused session.
+**Wins:**
+- 60+ fps sustained, no stutter (the entire 1-in-3 pattern collapses).
+- Bouncing-animation feature unblocked.
+- Frees the 2080 Max-Q from idle (currently paperweight while not gaming).
+**Risk:** transparent OpenGL overlays on Windows require specific window creation order (pre-create the HWND, set extended styles BEFORE first composite). Pattern is well-documented but needs careful porting of `_click_through` + topmost re-assert.
+**Status:** queued behind TICKET-088 + TICKET-082b (cheaper interim wins first).
+
+---
+
+## TICKET-091 — SMTC artist normalizer (number-word handles, PascalCase compaction) 🔴
+**Symptom (live diag, Calibre 50 - Corrido De Juanito):** SMTC reports `player_artist: "CalibreCincuenta"` (YouTube channel handle, "50" spelled out in Spanish, no space). Library lookup by SMTC text never finds the song; only Shazam succeeded. Generalizes to any artist whose YT/Spotify handle compacts spaces or spells digits.
+**Fix:**
+- Add `_normalize_smtc_artist(s)` invoked in `_on_track_change` before library lookup. Original SMTC string preserved on the side for display, normalized string used for matching.
+- De-PascalCase: split on lowercase->uppercase boundary (`CalibreCincuenta` -> `Calibre Cincuenta`, `BandaMS` -> `Banda MS`). Preserve all-caps runs of length >=2 as single tokens.
+- Number-word -> digit map. Spanish first (uno/dos/tres/cuatro/cinco/seis/siete/ocho/nueve/diez/veinte/treinta/cuarenta/cincuenta/sesenta/setenta/ochenta/noventa/cien). Add English (one/two/.../hundred) and Japanese (ichi/ni/san/.../hyaku) as cheap extensions.
+- Composite handling: `Cincuenta` -> `50`, `Setenta y Cinco` -> `75`. Limit composites to two tokens to avoid false positives.
+- Strip "Ch." / "VEVO" / "TV" / "Official" channel suffixes after normalization.
+**Verify:** unit list — `CalibreCincuenta` -> `Calibre 50`, `BandaMS` -> `Banda MS`, `LosTigresDelNorte` -> `Los Tigres Del Norte`, `MarcoAntonioSolis` -> `Marco Antonio Solis`, `Maluma` -> `Maluma` (no over-normalization), `Calibre 50` -> `Calibre 50` (idempotent). Library lookup against `_normalize_smtc_artist(artist)` for both stored and query strings.
+**Risk:** over-aggressive number conversion (`Trio Los Panchos` must not turn `Trio` into anything). Mitigate by only applying number-word map to tokens AFTER the PascalCase split has been done and only to recognized words.
+
+---
+
+## TICKET-090 — Verified-Shazam wins (gate decide loop, clear stale offset on lock) 🔴
+**Symptom (live diag, Calibre 50 - Corrido De Juanito):** Shazam correctly identified the song (`verified: true`, `heard_by_sound: ["Corrido De Juanito", "Calibre 50"]`, `matched_title`/`matched_artist` set, `line_count: 54` lyrics loaded). But `title_locked: false` and `identifying: true` — decide loop kept running, ranked four wrong Japanese candidates (`too_late_18if_episode_7_ending`, `the_world_is_mine_feat_hatsune_miku`, `sky_high`, `reincarnation`), and a stale offset of `-22.98s` from an earlier wrong-song decide blocked all lyric display (`effective_song_time: -16.99` while position was `+5.8`, `current_line: null`).
+**Fix:**
+- When Shazam returns `verified=True` AND `heard_by_sound` matches the loaded library file (title+artist fuzzy), immediately set `_title_locked = True`.
+- On title-lock transition, clear `self.offset = 0.0` (NOT through `_smooth_offset` — this is a coherent track-change reset, not a glide), clear `_pending_offset`, clear `_drift_integral`, reset `_offset_history` to baseline.
+- Gate `_decide_tick` early-return: `if self._verified and self._title_locked and not self._decide_force: return`. New tune knob `decide_after_verified = 0` (default off — verified+locked stops decide; user can enable for paranoia).
+- `/wrong` and `/forcesync` clear `_title_locked` so decide loop re-engages on demand.
+**Verify:** Spanish/English/Korean tracks reach `title_locked=True` within 5s of Shazam verification; `decision.ranked` does NOT populate with hallucinated candidates after lock; offset starts at 0.0 not at a leftover negative from prior track.
+**Risk:** Shazam false-positive matches a song that ISN'T in the library and we still lock — mitigated by requiring `heard_by_sound` to fuzzy-match the loaded `matched_title`/`matched_artist`, not just any name.
+
+---
+
+## TICKET-089 — Whisper language lock from SMTC / Shazam metadata (kill Japanese hallucination on non-CJK audio) 🔴
+**Symptom (live diag, Calibre 50 - Corrido De Juanito):** `lang: "es"` was known from artist/title heuristics, yet faster-whisper transcription returned `"てれこにでもなくすまさきまで読むとってよメタ取ればズラだった呼吸やるはやかててもる受け取れた"`. Whisper's language auto-detect defaulted to Japanese on Spanish vocals (likely because our library is ~95% Japanese, hyperparameters tuned for it, and Spanish input below the model's confidence floor). The Japanese hallucination then ranked four Japanese candidates in `decision.ranked` and triggered `wrong_song_strikes` against the actually-correct Shazam match.
+**Fix:**
+- In `deep_transcribe.transcribe_audio` (and wherever WhisperModel.transcribe is called for ID purposes), accept an optional `language` arg. Default `None` (current behavior).
+- In `main._consume_async` (where deep transcribe is invoked), pass `language=self._lang` when `self._lang in {"es", "en", "de", "fr", "ko", "zh", "pt", "it", "ru"}`. Japanese stays auto-detect (most of our library + some bilingual tracks).
+- Source of `self._lang`: existing language-from-title/artist heuristic, plus Shazam's metadata when present.
+- Add tune knob `whisper_lang_lock = 1` (default on); set to 0 to revert to auto-detect for A/B comparison.
+**Verify:** play any Spanish, English, or Korean track; `/diag` shows `decision.heard` in the correct script for that language (Latin chars for es/en/de/fr/pt/it, Hangul for ko, Hanzi for zh); no Japanese-character hallucinations on non-CJK audio.
+**Risk:** SMTC/Shazam language wrong (rare — e.g., Japanese cover of Spanish song with Spanish-language artist field) — mitigated by `lang_lock` knob and by Shazam's verification reset overriding if track-change.
+**Priority:** ABOVE TICKET-088, since it affects every non-Japanese song the user plays (entire roadmap toward Spanish/English/German/Korean was the stated goal of this app's recent direction).
+
+---
+
+## TICKET-088 — Smooth sync transitions still SNAPPING (user observation post-v1.0.85) 🔴
+**Symptom (user report):** "we have bad performance with merely sliding text right now and smooth transitions arent working yet they are snapping instead." Despite TICKET-078 (line-boundary deferral), TICKET-081 (in-tick Shazam routed through `_smooth_offset`), TICKET-082a (karaoke fill decoupling + scroll-mode deferral coverage + wall-clock ease), TICKET-082c (topmost re-assert) — transitions are still visually snapping for the user.
+**Hypotheses to verify:**
+- Some offset-write path I missed routing through `_smooth_offset` (e.g., `_on_song_onset` lines 4322/4324 still snap by design; maybe one of those is firing during normal playback now)
+- The wall-clock ease (TICKET-082a) might be too aggressive under load; check the `(target - cur) * (1 - exp(-pull*dt))` math when dt is large (heavy frame catches up too fast = visible snap)
+- Force-sync writes (main.py:5077/5092/5122) still snap intentionally; if user is hitting force-sync without realizing, they'd see snaps
+- Scroll-mode rendering may still snap the karaoke fill on offset commit even when line position is deferred (need to re-audit the fill commit path)
+- Tk thread freezes (TICKET-082b territory) DURING an eased glide would manifest as a "snap" once Tk resumes — the math says "smooth glide" but the user sees the catch-up jump after the freeze
+**Next step:** read-only diagnostic workflow with live perf.log capture during user's observed snap, then targeted fix per finding. Bundles naturally with TICKET-082b (subprocess refactor) since the freeze→snap-on-resume hypothesis links them.
+
+---
+
 ## TICKET-086 — YouTube Music URL normalization + ampersand-collab cover signal + YT Music metadata trust 🟢
 **User spec:** "Keep the same logic for the most part" — surgical changes for YouTube Music
 sources without regressing youtube.com / generic-browser flow.
