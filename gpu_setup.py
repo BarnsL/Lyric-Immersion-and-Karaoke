@@ -107,6 +107,107 @@ def status() -> str:
     return "available" if nvidia_gpu_present() else "none"
 
 
+# ── Game-aware Whisper device selection ──────────────────────────────────────
+# Whisper (faster-whisper / ctranslate2) is the only GPU work the app does, and a
+# transcription briefly pegs the card — which can hitch a game. So during a
+# FULLSCREEN game we keep off the game's GPU: an idle SECOND NVIDIA GPU if one
+# exists, else the CPU. (ctranslate2 is CUDA-or-CPU only — an Intel iGPU can't run
+# it, so the iGPU can't serve as the spare.)
+_game_cache = {"t": -1e9, "on": False}
+_cuda_count = None
+
+
+def game_active(ttl: float = 3.0) -> bool:
+    """True if an exclusive-fullscreen game is running, via the Windows shell's
+    user-notification state (the same signal Windows uses to silence toasts during
+    games). One cheap syscall, memoized for `ttl` s. Borderless-windowed games that
+    don't take exclusive fullscreen may not trip this."""
+    import time
+    now = time.monotonic()
+    if now - _game_cache["t"] < ttl:
+        return _game_cache["on"]
+    on = False
+    try:
+        import ctypes
+        st = ctypes.c_int(0)
+        # SHQueryUserNotificationState → 3 == QUNS_RUNNING_D3D_FULL_SCREEN
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(st)) == 0:
+            on = (st.value == 3)
+    except Exception:
+        on = False
+    _game_cache.update(t=now, on=on)
+    return on
+
+
+def cuda_device_count() -> int:
+    """Number of CUDA GPUs ctranslate2 can use (0 if none). Memoized for the session."""
+    global _cuda_count
+    if _cuda_count is None:
+        try:
+            import ctranslate2
+            _cuda_count = int(ctranslate2.get_cuda_device_count())
+        except Exception:
+            _cuda_count = 0
+    return _cuda_count
+
+
+def _gpu_utils() -> dict:
+    """{cuda_index: gpu_util_%} via NVML (nvml.dll ships with the NVIDIA driver — no
+    subprocess, no window). {} if NVML can't be loaded or queried."""
+    try:
+        import ctypes
+        nvml = ctypes.CDLL("nvml.dll")
+        if nvml.nvmlInit_v2() != 0:
+            return {}
+    except Exception:
+        return {}
+    out = {}
+    try:
+        import ctypes
+        cnt = ctypes.c_uint(0)
+        if nvml.nvmlDeviceGetCount_v2(ctypes.byref(cnt)) != 0:
+            return out
+
+        class _U(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+        for i in range(cnt.value):
+            h = ctypes.c_void_p()
+            if nvml.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(h)) != 0:
+                continue
+            u = _U()
+            if nvml.nvmlDeviceGetUtilizationRates(h, ctypes.byref(u)) == 0:
+                out[i] = int(u.gpu)
+    except Exception:
+        pass
+    finally:
+        try:
+            nvml.nvmlShutdown()
+        except Exception:
+            pass
+    return out
+
+
+def pick_inference_device(avoid_when_gaming: bool = True):
+    """Where Whisper should run RIGHT NOW → ``(device, index, reason)``.
+
+    No game → the fast path ``('cuda', 0)``. Fullscreen game (and ``avoid_when_gaming``)
+    → keep off the game's card: an IDLE second NVIDIA GPU if present, otherwise
+    ``('cpu', 0)`` so the transcription never competes with the game for the GPU."""
+    n = cuda_device_count()
+    if n <= 0:
+        return ("cpu", 0, "no CUDA GPU")
+    if not (avoid_when_gaming and game_active()):
+        return ("cuda", 0, "default")
+    if n <= 1:
+        return ("cpu", 0, "game: single GPU → CPU")
+    utils = _gpu_utils()
+    for i in range(1, n):                    # the game is almost always on GPU 0
+        if utils.get(i, 100) < 30:
+            return ("cuda", i, f"game: using idle GPU {i}")
+    return ("cpu", 0, "game: spare GPUs busy → CPU")
+
+
 def _is_pypi_https(url: str) -> bool:
     """True only for an https:// URL on PyPI's own hosts. Every fetch is gated
     through this so a manipulated metadata response can't point the download at an

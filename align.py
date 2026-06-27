@@ -148,10 +148,54 @@ def _data_models_dir():
 
 _device = {}          # which device each cached model actually loaded on
 _last_gen_lang = None  # language Whisper auto-detected on the most recent generation chunk
+_GPU_AVOID_WHEN_GAMING = True  # during a fullscreen game, fall off the GPU (idle 2nd GPU, else CPU)
+_CUBLAS_OK = None
+
+
+def set_gpu_gaming_guard(on: bool):
+    """Toggle the 'don't use the game's GPU' behaviour (default ON)."""
+    global _GPU_AVOID_WHEN_GAMING
+    _GPU_AVOID_WHEN_GAMING = bool(on)
+
+
+def _cuda_runtime_ok() -> bool:
+    """CUDA is usable only when its math libs actually load. ctranslate2 builds a CUDA
+    model even without cuBLAS, then fails on the first encode ("cublas64_12.dll not
+    found") — so probe the DLL (the GPU extras are an optional ~1.5 GB gpu_setup
+    download). Memoized; presence can't change mid-session."""
+    global _CUBLAS_OK
+    if _CUBLAS_OK is None:
+        try:
+            import ctypes
+            _ensure_deps_path()
+            ctypes.CDLL("cublas64_12.dll")
+            _CUBLAS_OK = True
+        except Exception:
+            _CUBLAS_OK = False
+    return _CUBLAS_OK
+
+
+def _select_device():
+    """(device, index, compute_type, reason) for a transcription RIGHT NOW: the GPU by
+    default, but an idle 2nd GPU or the CPU while a fullscreen game runs, so the AI
+    never fights the game for the card (see gpu_setup.pick_inference_device)."""
+    if not _cuda_runtime_ok():
+        return ("cpu", 0, "int8", "no CUDA runtime")
+    try:
+        import gpu_setup
+        dev, idx, reason = gpu_setup.pick_inference_device(_GPU_AVOID_WHEN_GAMING)
+    except Exception:
+        dev, idx, reason = ("cuda", 0, "default")
+    return (dev, idx, "float16" if dev == "cuda" else "int8", reason)
 
 
 def _get_model(size=_MODEL):
-    if size not in _models:
+    # Re-evaluated each call (cheap: game state is cached): the device can change when
+    # a game starts/ends. Models are cached per (size, device) so flipping back never
+    # reloads — both the CUDA and CPU copies stay warm.
+    dev, idx, ctype, reason = _select_device()
+    key = (size, dev, idx)
+    if key not in _models:
         import os
         _ensure_deps_path()
         md = _data_models_dir()
@@ -159,45 +203,28 @@ def _get_model(size=_MODEL):
             os.environ.setdefault("HF_HOME", md)
             os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         from faster_whisper import WhisperModel
-        m, used = None, None
-        # Prefer the GPU (CUDA) — transcription is ~5-10x faster — but ONLY when
-        # the CUDA math libs are actually loadable. ctranslate2 builds a CUDA
-        # model object even without cuBLAS, then fails on the first encode with
-        # "cublas64_12.dll not found" — so a construct-time try/except isn't
-        # enough. Probe the DLL first (the GPU extras are an optional ~1.5 GB
-        # download via gpu_setup; without them we use CPU, which is fine for the
-        # short align/generation clips — a 16 s clip in ~2 s).
-        devices = [("cpu", "int8")]
+        # Bound CPU inference to a FEW threads — CTranslate2 otherwise grabs every core
+        # and saturates the render cores (8-15) during a transcribe (audio/scroll
+        # stutter); ignored on CUDA. 4 keeps short int8 clips fast with render headroom.
+        kw = dict(compute_type=ctype, download_root=md, cpu_threads=4)
+        if dev == "cuda":
+            kw["device_index"] = idx
         try:
-            import ctypes
-            ctypes.CDLL("cublas64_12.dll")          # raises if not on the DLL path
-            devices = [("cuda", "float16"), ("cpu", "int8")]
-        except Exception:
-            pass
-        # Bound CPU inference to a FEW threads. CTranslate2 otherwise defaults to
-        # every physical core, and on CPU that saturated the render cores (8-15)
-        # during a transcribe — the audio/scroll stutter. 4 threads keep short
-        # int8 clips fast while leaving headroom for the render + audio. Ignored
-        # on CUDA. This protects the periodic sync-tier listen (and the applause
-        # resync / "sync by listening" button) from hitching the overlay.
-        for device, ctype in devices:
-            try:
-                m = WhisperModel(size, device=device, compute_type=ctype,
-                                 download_root=md, cpu_threads=4)
-                used = device
-                break
-            except Exception:
-                continue
-        _models[size] = m or WhisperModel(size, device="cpu", compute_type="int8",
-                                          download_root=md, cpu_threads=4)
-        _device[size] = used or "cpu"
-        try:        # surface GPU-vs-CPU once per model so it's visible in the log
+            m = WhisperModel(size, device=dev, **kw)
+        except Exception:                            # GPU load failed → CPU fallback
+            dev, idx, key = "cpu", 0, (size, "cpu", 0)
+            m = _models.get(key) or WhisperModel(size, device="cpu", compute_type="int8",
+                                                 download_root=md, cpu_threads=4)
+        _models[key] = m
+        _device[key] = dev
+        try:        # surface the device + reason once per (model, device) — visible in the log
             import logging
             logging.getLogger("karaoke").info(
-                "whisper model %r loaded on %s", size, _device[size])
+                "whisper model %r on %s (%s)", size,
+                "cpu" if dev == "cpu" else f"cuda:{idx}", reason)
         except Exception:
             pass
-    return _models[size]
+    return _models[key]
 
 
 def _capture(seconds=_CAP):
