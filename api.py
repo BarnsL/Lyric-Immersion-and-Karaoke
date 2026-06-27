@@ -93,6 +93,19 @@ def _current_line(app):
     return None
 
 
+def _gpu_snapshot():
+    """TICKET-103: snapshot of the GPU device pick gpu_setup would make
+    RIGHT NOW. Cheap (cuda_device_count + nvml utility queries are both
+    memoized in gpu_setup). Returns None if align isn't importable, so a
+    legacy /diag watcher just sees ``gpu: null`` instead of breaking."""
+    try:
+        import align
+        dev, idx, reason, n = align.current_device_choice()
+        return {"device": dev, "index": idx, "reason": reason, "gpu_count": n}
+    except Exception:
+        return None
+
+
 def _status(app):
     st = app.media.get() or {}
     return {
@@ -122,8 +135,18 @@ def _status(app):
         "verified": app._verified,
         "verified_meta": getattr(app, "_verified_meta", False),
         "source_priority": getattr(app, "_source_priority", "agree"),
+        # TICKET-103: expose the current GPU policy choice. Cheap; lets a
+        # diag watcher see Whisper falling to CPU during a fullscreen game
+        # or because of the single-GPU safety floor.
+        "gpu": _gpu_snapshot(),
         "heard_by_sound": app._sound_song,
         "boundary_detect": getattr(app, "boundary_on", None),
+        # TICKET-102: capability flags for the window-title scraper, mirrored
+        # in /status the same way boundary_detect is. Lets a watcher distinguish
+        # 'feature disabled' from 'feature on but slot empty'.
+        "window_titles_on": getattr(app, "window_titles_on", None),
+        "window_titles_generic_browsers_on":
+            getattr(app, "window_titles_generic_browsers_on", None),
         "live_mode": getattr(app, "_live_mode", None),
         "perf": getattr(app, "perf", None),
         "fps_target": (round(1000.0 / app._fps) if getattr(app, "_fps", 0) else None),

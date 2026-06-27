@@ -32,6 +32,10 @@ hiddenimports = [
     # TICKET-100: Discord IPC reader (lazy-imported in main.py only when the
     # tray toggle is ON, but pin it here so the frozen build includes it).
     "discord_rpc",
+    # TICKET-102: window-title scraper (Steam Overlay / Discord / Slack / Teams
+    # CEF hosts that DON'T publish to SMTC). Lazy-imported in main.py; pin here
+    # so the frozen build always includes it. Stdlib + ctypes only, no new deps.
+    "window_titles",
 ]
 
 # Packages that ship data files / dynamically-imported submodules.
