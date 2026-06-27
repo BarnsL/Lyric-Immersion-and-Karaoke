@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.79.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.80.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -52,7 +52,21 @@ Suisei). **Current build: v1.0.79.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.79, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.80, all deployed + on master)
+- **v1.0.80 — Romaji↔CJK title equivalence + lopsided decide-by-ear win + GPU picker
+  by utilization (TICKET-080):** kamone took 41 s before because `kamone` (romaji
+  player title) couldn't title-match `かもね.json` (JP-script cache), then Whisper
+  found the right song at 69 vs 20 but the library MIN=70 rejected it by 1 point.
+  Now every JP-titled cache entry also indexes a Hepburn romaji form (`_to_hepburn`
+  via pykakasi) in a separate `forms_alt` set, and `LyricsIndex.match` applies −3
+  when either side of the match used the cross-script bridge — so a same-script
+  cache wins when both exist (verified: `kamone`→`kamone.json`, `かもね`→`かもね.json`,
+  `Kireigoto`→`kireigoto.json`, `綺麗事`→`綺麗事.json`). `_apply_decision` accepts a
+  just-under-MIN library win when loaded is clearly wrong AND margin ≥ 3·MARGIN
+  (kamone's 49-pt margin would now win). `pick_inference_device` is utilization-based
+  always, not just when gaming — drops the "game on cuda:0" assumption (broken now
+  that the 2080 Max-Q Code 31 fix landed and the 3080 eGPU is cuda:1). Picks idlest
+  GPU with a cache-locality bias to cuda:0; under games, skips any GPU ≥30% util.
 - **v1.0.79 — Concert SMTC wrapper song-ID (TICKET-079 a+c):** `_LIVE_VER_RE` now matches
   SMTC-truncated concert titles (`3rd ONE` / `5th LIVE` / `10th Anniversary` / `3rd Tour`)
   plus `【冒頭無料】` / `【無料配信】` banners and `#…ONEMAN` / `#NthLIVE` hashtags, so
