@@ -182,12 +182,23 @@ def _open_releases(info=None):
         pass
 
 
+_EXE_NAMES = ("Lyric-Immersion-and-Karaoke.exe", "DesktopKaraoke.exe")  # new repo name, then legacy
+
+
+def _exe_in(folder: Path):
+    """The app exe inside `folder` — the repo-name exe, or the legacy name."""
+    for n in _EXE_NAMES:
+        if (folder / n).exists():
+            return folder / n
+    return None
+
+
 def _find_app_root(extracted: Path):
-    """The folder that actually holds DesktopKaraoke.exe (zip root, or one down)."""
-    if (extracted / "DesktopKaraoke.exe").exists():
+    """The folder that actually holds the app exe (zip root, or one down)."""
+    if _exe_in(extracted):
         return extracted
     for child in extracted.iterdir():
-        if child.is_dir() and (child / "DesktopKaraoke.exe").exists():
+        if child.is_dir() and _exe_in(child):
             return child
     return None
 
@@ -283,12 +294,13 @@ def stage_update(info, log=None) -> bool:
             _safe_extract(z, newroot)
         src = _find_app_root(newroot)
         if not src:
-            raise RuntimeError("update package has no DesktopKaraoke.exe")
+            raise RuntimeError("update package has no app .exe")
+        exe_name = _exe_in(src).name        # relaunch whatever the package actually ships
 
         helper = staging / "apply_update.cmd"
         helper.write_text(
             _HELPER.format(pid=os.getpid(), src=src, dst=install_dir,
-                           exe=install_dir / "DesktopKaraoke.exe"),
+                           exe=install_dir / exe_name),
             encoding="ascii",
         )
         _say(f"v{info.get('version')} verified + staged; relaunching to apply")

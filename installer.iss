@@ -3,19 +3,19 @@
 ; (build.bat does this automatically if iscc is on PATH.)
 
 #define AppName "Lyric Immersion and Karaoke"
-#define AppVer  "1.0.68"
-#define AppExe  "DesktopKaraoke.exe"
+#define AppVer  "1.0.77"
+#define AppExe  "Lyric-Immersion-and-Karaoke.exe"
 
 [Setup]
 AppName={#AppName}
 AppVersion={#AppVer}
-AppPublisher=Desktop Karaoke
+AppPublisher=Lyric Immersion and Karaoke
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#AppExe}
 OutputDir=dist
-OutputBaseFilename=DesktopKaraoke-Setup
+OutputBaseFilename=Lyric-Immersion-and-Karaoke-Setup
 SetupIconFile=icon.ico
 Compression=lzma2
 SolidCompression=yes
