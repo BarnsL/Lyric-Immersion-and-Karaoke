@@ -30,15 +30,16 @@ Suisei). **Current build: v1.0.86.** Read this, then `ARCHITECTURE.md` + `ISSUES
   `/health /diag /tune /scroll /position /forcesync /align /decide /wrong /purgecache …`.
 
 ## Build + deploy (the proven recipe — do it exactly)
-- **The app pins ITSELF to cores 8-15 (0xFF00) at BelowNormal** (audio-stutter fix). So a build
-  MUST run isolated on **cores 3-7** or it starves the overlay to <1 fps. Run PyInstaller via a
+- **The app pins ITSELF to cores 7-15 (0xFF80, 9 cores) at BelowNormal** (audio-stutter fix +
+  fill-paint headroom). So a build MUST run isolated on **cores 3-6** (one less than before) or
+  it overlaps the app on core 7 and causes audio stutter during builds. Run PyInstaller via a
   HIDDEN, core-pinned, foreground-waited process (never `run_in_background`, never a visible
   window — the user games fullscreen):
   ```powershell
   $p = Start-Process -FilePath <py312> -ArgumentList '-m','PyInstaller','--noconfirm','DesktopKaraoke.spec' `
        -WorkingDirectory '~/lyric-overlay' -WindowStyle Hidden -PassThru `
        -RedirectStandardOutput build.log -RedirectStandardError build.err
-  $p.ProcessorAffinity = [IntPtr]248   # 0xF8 = cores 3-7
+  $p.ProcessorAffinity = [IntPtr]120   # 0x78 = cores 3-6 (avoids the app's core 7)
   $p.PriorityClass = 'Normal'; $p.WaitForExit()
   ```
   `.deps\` present → full Whisper build (~774 MB `_internal`, exe ~21 MB). `LEAN_BUILD=1` env →
