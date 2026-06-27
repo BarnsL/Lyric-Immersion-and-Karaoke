@@ -149,6 +149,7 @@ def _data_models_dir():
 _device = {}          # which device each cached model actually loaded on
 _last_gen_lang = None  # language Whisper auto-detected on the most recent generation chunk
 _GPU_AVOID_WHEN_GAMING = True  # during a fullscreen game, fall off the GPU (idle 2nd GPU, else CPU)
+_GPU_SOLO_OVERRIDE = False     # TICKET-103: single-GPU stays on CPU unless this is True
 _CUBLAS_OK = None
 
 
@@ -156,6 +157,29 @@ def set_gpu_gaming_guard(on: bool):
     """Toggle the 'don't use the game's GPU' behaviour (default ON)."""
     global _GPU_AVOID_WHEN_GAMING
     _GPU_AVOID_WHEN_GAMING = bool(on)
+
+
+def set_gpu_solo_override(on: bool):
+    """TICKET-103: toggle whether single-GPU machines may use the GPU at all.
+    Default OFF (the policy stays on CPU on a single-GPU box). Flip to True
+    via the gpu_solo_override tune knob to opt back into the speed-up."""
+    global _GPU_SOLO_OVERRIDE
+    _GPU_SOLO_OVERRIDE = bool(on)
+
+
+def current_device_choice():
+    """Read-only snapshot of the device gpu_setup would pick RIGHT NOW.
+    Returns ``(device, index, reason, gpu_count)`` for /diag + tray label."""
+    try:
+        import gpu_setup
+        n = gpu_setup.cuda_device_count()
+        if not _cuda_runtime_ok():
+            return ("cpu", 0, "no CUDA runtime", n)
+        dev, idx, reason = gpu_setup.pick_inference_device(
+            _GPU_AVOID_WHEN_GAMING, _GPU_SOLO_OVERRIDE)
+        return (dev, idx, reason, n)
+    except Exception:
+        return ("cpu", 0, "gpu probe failed", 0)
 
 
 def _cuda_runtime_ok() -> bool:
@@ -183,7 +207,8 @@ def _select_device():
         return ("cpu", 0, "int8", "no CUDA runtime")
     try:
         import gpu_setup
-        dev, idx, reason = gpu_setup.pick_inference_device(_GPU_AVOID_WHEN_GAMING)
+        dev, idx, reason = gpu_setup.pick_inference_device(
+            _GPU_AVOID_WHEN_GAMING, _GPU_SOLO_OVERRIDE)
     except Exception:
         dev, idx, reason = ("cuda", 0, "default")
     return (dev, idx, "float16" if dev == "cuda" else "int8", reason)

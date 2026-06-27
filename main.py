@@ -211,6 +211,67 @@ def set_startup(enable):
     except Exception:
         pass
 
+
+# ── TICKET-105: Start Menu shortcut self-heal (rebrand migration) ────
+# After the v1.0.84 rebrand from Desktop Karaoke -> Lyric Immersion and
+# Karaoke (exe renamed too), users were left with a stale
+# 'Desktop Karaoke.lnk' in the Start Menu pointing at a deleted exe.
+# Clicking it did nothing, and searching the new name found nothing.
+# Self-heal at startup: nuke the broken old shortcut, drop a fresh one
+# under the new name pointing to sys.executable. Frozen builds only
+# (dev runs are noisy enough already).
+def _start_menu_dir() -> Path:
+    return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
+            / "Start Menu" / "Programs")
+
+
+def _migrate_start_menu_shortcut():
+    """One-shot per launch: clean up stale `Desktop Karaoke.lnk` and
+    ensure a `Lyric Immersion and Karaoke.lnk` exists pointing to the
+    current exe. Swallows all errors (best-effort, never blocks startup)."""
+    if not getattr(sys, "frozen", False):
+        return  # dev runs: leave the user's shortcuts alone
+    try:
+        smdir = _start_menu_dir()
+        old = smdir / "Desktop Karaoke.lnk"
+        new = smdir / "Lyric Immersion and Karaoke.lnk"
+        # 1) Old shortcut: delete if its target is missing or it points
+        # at the legacy DesktopKaraoke.exe (which no longer exists).
+        if old.exists():
+            try:
+                ps_old = (f"$W=New-Object -ComObject WScript.Shell;"
+                          f"$S=$W.CreateShortcut({_psq(old)});"
+                          f"Write-Output $S.TargetPath")
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_old],
+                    capture_output=True, timeout=5,
+                    creationflags=_NO_WINDOW, text=True)
+                tgt = (r.stdout or "").strip()
+                if (not tgt) or (not Path(tgt).exists()) or \
+                        tgt.lower().endswith("desktopkaraoke.exe"):
+                    old.unlink()
+            except Exception:
+                try: old.unlink()
+                except Exception: pass
+        # 2) New shortcut: create if missing, pointing at the current exe.
+        if not new.exists():
+            target = sys.executable
+            workdir = str(Path(target).parent)
+            ps_new = (f"$W=New-Object -ComObject WScript.Shell;"
+                      f"$S=$W.CreateShortcut({_psq(new)});"
+                      f"$S.TargetPath={_psq(target)};"
+                      f"$S.WorkingDirectory={_psq(workdir)};"
+                      f"$S.IconLocation={_psq(target + ',0')};"
+                      f"$S.Description='Transparent karaoke overlay with synced furigana, romaji, and English translation.';"
+                      f"$S.WindowStyle=7;"  # minimized, no-activate per CLAUDE.md app etiquette
+                      f"$S.Save()")
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_new],
+                           capture_output=True, timeout=10,
+                           creationflags=_NO_WINDOW)
+    except Exception:
+        pass
+
+
 # ── Palette (21st.dev-inspired: clean, vivid, no muddy purple) ────────
 TRANSPARENT = "#0d0b14"   # dark chroma key → anti-aliased edges fade to shadow
 INK         = "#000000"   # outline / drop-shadow
@@ -1384,6 +1445,17 @@ class Overlay:
         # under settings key 'discord_rpc'. Tray toggle and tune knob both write
         # the same runtime flag; whichever changes persists via _persist().
         self.discord_rpc_on = bool(s.get("discord_rpc", False))
+        # TICKET-102: opt-OUT scrape of allowlisted-process window titles for
+        # CEF/Electron hosts that don't publish SMTC (Steam Overlay, embedded
+        # Discord/Slack/Teams players). Default ON because the user-observed
+        # failure mode (steamwebhelper.exe playing ReGLOSS silent on SMTC) is
+        # exactly what this fixes; the allowlist is narrow + music-purposed.
+        # Generic standalone browsers are a separate, default-OFF tier — they
+        # already feed SMTC and scraping them risks double-counting unrelated
+        # tabs (Gmail, banking, chat).
+        self.window_titles_on = bool(s.get("window_titles", True))
+        self.window_titles_generic_browsers_on = bool(
+            s.get("window_titles_generic_browsers", False))
         # Throttle state for the Discord RP poll (own clock, decoupled from the
         # tick rate so the GET_ACTIVITY round-trip can't run more than every
         # discord_rpc_poll_s seconds even if the Tk loop is ticking at 60 Hz).
@@ -1702,9 +1774,9 @@ class Overlay:
             "fine_tune_enter_after_s":   20.0,  # wall-time in good streak before entering
             "fine_tune_target_s":         0.2,  # |drift| at-or-below this = locked
             "fine_tune_min_step_s":       0.2,  # smallest pause; below this is in-target
-            "fine_tune_max_pause_s":      1.0,  # biggest forward-drift pause (lyrics ahead); longer would itself stutter
+            "fine_tune_max_pause_s":      3.0,  # TICKET-104: bumped 1.0 -> 3.0 per user; holding a line still up to 3 s is quieter than the equivalent backward nudge that re-scrolls already-shown text
             "fine_tune_max_move_ahead_s": 2.0,  # biggest backward-drift catch-up nudge (lyrics behind); higher cap because skipping forward is less perceptible than pausing
-            "fine_tune_exit_drift_s":     2.5,  # |drift| above this hands back to the tier (above BOTH caps so leftover-after-step still handles on next tick)
+            "fine_tune_exit_drift_s":     3.5,  # TICKET-104: must be > fine_tune_max_pause_s + 0.5 buffer so a drift just under the cap doesn't immediately hand back to the tier
             "fine_tune_listen_interval_s": 8.0, # cadence between fine-tune Whisper listens
             "fine_tune_inconclusive_exit":   2, # consecutive unreadable listens → exit
             # ── TICKET-086 YouTube Music + ampersand-collab cover knobs ──
@@ -1712,6 +1784,12 @@ class Overlay:
             # diagnosis. Only affects the WEAKER amp_collab signal; an explicit
             # cover tag (歌ってみた / [COVER] / "covered by") is never demoted.
             "cover_amp_album_demote":     1.0,  # YT Music album → demote amp_collab
+            # ── TICKET-103 GPU policy ──
+            # 1 = override the single-GPU-stays-on-CPU safety floor (use the
+            # one GPU anyway). 0 = honor the policy. Multi-GPU machines are
+            # unaffected (they always get the idlest GPU when not gaming and
+            # the non-game-card when gaming).
+            "gpu_solo_override":            0,  # 1 = allow GPU on single-GPU machines, 0 = stay on CPU per policy
             # ── TICKET-089 Whisper language lock ──
             # 1 = pin Whisper to the song's known language for deep transcription
             # (the auto-detect default lets Whisper hallucinate Japanese on
@@ -1743,6 +1821,16 @@ class Overlay:
             "discord_rpc_silent_gap_s":   8.0,  # SMTC+Shazam must be silent this long before Discord can speak
             "discord_rpc_poll_s":         5.0,  # min seconds between GET_ACTIVITY probes (matches Discord's RP min interval)
             "discord_rpc_timeout_s":      0.5,  # hard cap on a single IPC call — must never block the Tk loop
+            # ── TICKET-102: window-title scraper (Steam Overlay / Discord) ──
+            # The HIGH tier (steamwebhelper, discord, slack, teams) is default
+            # ON: a narrow, music-purposed allowlist that fixes the SMTC-blind
+            # CEF/Electron case the user reported. The LOW tier (chrome, edge,
+            # firefox, opera, brave, vivaldi, arc) is default OFF because those
+            # browsers already feed SMTC and scraping ALL their tabs risks
+            # picking up unrelated content (Gmail, Twitter, podcasts).
+            "window_titles_on":             1,  # 1 = scrape allowlisted CEF/Electron windows
+            "window_titles_generic_browsers": 0,  # 1 = ALSO scrape chrome/edge/firefox/etc (opt-in)
+            "window_titles_poll_s":       2.0,  # background poll cadence (s); EnumWindows is sub-ms so 2s is safe
         }
         # TICKET-100: mirror the persisted toggle into the tune dict so a user
         # who flipped the tray menu ON in v1.0.89 boots back into the same
@@ -1761,6 +1849,27 @@ class Overlay:
                 import discord_rpc as _drpc
                 _drpc.start_watcher(
                     poll_s=float(self._tune.get("discord_rpc_poll_s", 5.0)))
+            except Exception:
+                pass
+        # TICKET-102: mirror the persisted window-title toggles into the tune
+        # dict so /tune queries reflect the live boot state.
+        try:
+            self._tune["window_titles_on"] = 1 if self.window_titles_on else 0
+            self._tune["window_titles_generic_browsers"] = (
+                1 if self.window_titles_generic_browsers_on else 0)
+        except Exception:
+            pass
+        # Throttle state for the per-tick window-title fallback (own clock so
+        # the slot read can't outpace the watcher's enum cadence).
+        self._window_titles_last_t = 0.0
+        self._window_titles_last_track = None
+        if self.window_titles_on:
+            try:
+                import window_titles as _wt
+                _wt.start_watcher(
+                    poll_s=float(self._tune.get("window_titles_poll_s", 2.0)),
+                    generic_browsers=self.window_titles_generic_browsers_on,
+                )
             except Exception:
                 pass
         self._identify_result = None
@@ -3723,6 +3832,84 @@ class Overlay:
             self._music_source_last_t = now_src
 
         if not state or not state["title"]:
+            # ── TICKET-102: window-title fallback (Steam Overlay etc.) ──────
+            # When SMTC is silent, peek at the WindowTitleWatcher's slot for
+            # a music-bearing tab in an allowlisted CEF/Electron host. This
+            # runs BEFORE the Discord RP probe because it's a LOCAL screen
+            # signal (the user is literally on that tab) while RP is a 3rd-
+            # party readout of someone else's Spotify session.
+            #
+            # Gating:
+            #   * feature OFF (toggle or tune knob = 0)               → skip
+            #   * candidate from LOW tier but generic-browser knob OFF → skip
+            #   * candidate exe is itself an SMTC publisher whose ID is
+            #     already in state['source'] (1-tick race during a tab
+            #     switch) → suppress (belt-and-braces; the outer SMTC-first
+            #     guard already covers this when SMTC has a title).
+            win_state = None
+            try:
+                if (bool(self.window_titles_on)
+                        or int(self._tune.get("window_titles_on", 0) or 0)):
+                    poll_s = float(self._tune.get("window_titles_poll_s", 2.0))
+                    generic_on = (
+                        bool(self.window_titles_generic_browsers_on)
+                        or int(self._tune.get(
+                            "window_titles_generic_browsers", 0) or 0))
+                    now_w = time.time()
+                    try:
+                        import window_titles as _wt
+                    except Exception:
+                        _wt = None
+                    if _wt is not None:
+                        # Ensure the watcher is up (covers the case where a
+                        # /tune POST flipped the knob without going through
+                        # set_window_titles).
+                        try:
+                            _wt.start_watcher(
+                                poll_s=poll_s, generic_browsers=bool(generic_on))
+                        except Exception:
+                            pass
+                        track = None
+                        if (now_w - self._window_titles_last_t) >= poll_s:
+                            self._window_titles_last_t = now_w
+                            try:
+                                track = _wt.get_current_track()
+                            except Exception:
+                                track = None
+                            self._window_titles_last_track = track
+                        else:
+                            track = self._window_titles_last_track
+                        if track and track.get("title"):
+                            priority = (track.get("priority") or "high").lower()
+                            # LOW tier (generic browsers) requires the user
+                            # to have opted in. We already gated start_watcher
+                            # on generic_on, but a stale slot from before the
+                            # flip would still expose a LOW hit — drop it.
+                            if priority == "low" and not generic_on:
+                                track = None
+                        if track and track.get("title"):
+                            exe = (track.get("process") or "").lower()
+                            win_state = {
+                                "title": track["title"],
+                                "artist": track.get("artist") or "",
+                                "album": "",
+                                "status": PLAYING,
+                                "position": 0.0,
+                                "duration": 0.0,
+                                "rate": 1.0,
+                                "source": track.get("source")
+                                          or ("window-title:" + exe),
+                                "ts": now_w,
+                            }
+            except Exception:
+                win_state = None
+            if win_state is not None:
+                state = win_state
+                # Mirror the Discord RP branch: bump source-last-spoken so
+                # the next tick doesn't re-enter the fallback chain even
+                # though SMTC is still silent. Side effect: the Discord RP
+                # branch below sees silent_for=0 and skips on this tick.
+                self._music_source_last_t = time.time()
             # ── TICKET-100: Discord Rich Presence fallback ──────────────────
             # When SMTC is silent (no session OR a session with no title), AND
             # Shazam-live has nothing, AND the toggle is on, AND the silent
@@ -3808,7 +3995,10 @@ class Overlay:
                 # on the next frame and re-probe Discord.
                 state = disc_state
                 self._music_source_last_t = time.time()
-            else:
+            # TICKET-102: a successful window-title synth already populated
+            # `state` above; treat it the same as the Discord-RP synth so we
+            # don't fall into the "waiting for music" no-source branch.
+            if not state or not state.get("title"):
                 if self._track is not None:
                     self._track = None
                     self._hint("Waiting for music…")
@@ -5138,7 +5328,37 @@ class Overlay:
             },
             "aligning": self._aligning,
             "identifying": self._identifying,
+            # TICKET-102: window-title scraper telemetry. Surfaces the latest
+            # raw title under the watcher's eye even when SMTC is the active
+            # source — invaluable for "why did it pick THIS as a song" field
+            # reports without forcing the user to reproduce the tab state.
+            "window_titles": self._diag_window_titles(),
         }
+
+    def _diag_window_titles(self):
+        """TICKET-102: snapshot of the window-title watcher for /diag.
+        Returns a small dict; never raises (best-effort)."""
+        out = {
+            "on": bool(getattr(self, "window_titles_on", False)),
+            "generic_browsers_on": bool(
+                getattr(self, "window_titles_generic_browsers_on", False)),
+            "source": None,        # exe basename if a track is currently held
+            "raw": None,           # unparsed window title text
+            "age_s": None,         # seconds since the watcher last refreshed
+            "priority": None,      # 'high' | 'low' for the cached track
+        }
+        try:
+            import window_titles as _wt
+            snap = _wt._current_snapshot()
+            out["age_s"] = snap.get("slot_age_s")
+            tr = snap.get("track") or None
+            if tr:
+                out["source"] = tr.get("process")
+                out["raw"] = tr.get("raw_title")
+                out["priority"] = tr.get("priority")
+        except Exception:
+            pass
+        return out
 
     def get_source(self):
         """Video/music SOURCE view (GET /source): the RAW media-session data the
@@ -5278,6 +5498,14 @@ class Overlay:
             return False, f"can't coerce {value!r} to {type(self._tune[key]).__name__}: {e}"
         self._tune[key] = new
         log.info("tune: %s %r → %r", key, old, new)
+        # TICKET-103: a /tune POST that flips gpu_solo_override must take
+        # effect immediately (not wait for the next app restart).
+        if key == "gpu_solo_override":
+            try:
+                import align
+                align.set_gpu_solo_override(bool(new))
+            except Exception:
+                pass
         return True, f"{key}: {old} → {new}"
 
     # ── appearance (persisted) ──
@@ -5589,6 +5817,9 @@ class Overlay:
                         "boundary": self.boundary_on, "generate": self.generate_on,
                         "captions": self.captions_on,
                         "discord_rpc": self.discord_rpc_on,
+                        "window_titles": self.window_titles_on,
+                        "window_titles_generic_browsers":
+                            self.window_titles_generic_browsers_on,
                         "concert_ocr": self.concert_ocr,
                         "display": self.display,
                         "display_fp": getattr(self, "_display_fp", None)})
@@ -5626,6 +5857,51 @@ class Overlay:
                 _drpc.start_watcher(poll_s=poll_s)
             else:
                 _drpc.stop_watcher()
+        except Exception:
+            pass
+        self._persist()
+
+    def set_window_titles(self, on):
+        """TICKET-102: toggle the window-title scraper (Steam Overlay etc.).
+        Mirrors set_discord_rpc: bool flag + tune mirror + start/stop the
+        long-lived daemon + _persist. Default ON, opt-out — see the tune
+        knob docs for the high vs low tier rationale."""
+        self.window_titles_on = bool(on)
+        try:
+            self._tune["window_titles_on"] = 1 if self.window_titles_on else 0
+        except Exception:
+            pass
+        try:
+            import window_titles as _wt
+            if self.window_titles_on:
+                poll_s = float(self._tune.get("window_titles_poll_s", 2.0))
+                _wt.start_watcher(
+                    poll_s=poll_s,
+                    generic_browsers=self.window_titles_generic_browsers_on,
+                )
+            else:
+                _wt.stop_watcher()
+        except Exception:
+            pass
+        self._persist()
+
+    def set_window_titles_generic_browsers(self, on):
+        """TICKET-102: flip the LOW tier (chrome/edge/firefox/etc.) on/off.
+        Sub-toggle of window_titles_on; if the parent is off this just
+        persists the preference for when the parent is flipped back on."""
+        self.window_titles_generic_browsers_on = bool(on)
+        try:
+            self._tune["window_titles_generic_browsers"] = (
+                1 if self.window_titles_generic_browsers_on else 0)
+        except Exception:
+            pass
+        try:
+            import window_titles as _wt
+            # Only push live if the parent is on; otherwise the daemon
+            # isn't running and there's nothing to update.
+            if self.window_titles_on:
+                _wt.set_generic_browsers(
+                    self.window_titles_generic_browsers_on)
         except Exception:
             pass
         self._persist()
@@ -7518,6 +7794,14 @@ class Overlay:
             _drpc.stop_watcher()
         except Exception:
             pass
+        # TICKET-102: tear down the window-title watcher too. Like the Discord
+        # watcher this is daemon=True so process exit would kill it anyway,
+        # but signalling stop here lets the worker's wait wake up cleanly.
+        try:
+            import window_titles as _wt
+            _wt.stop_watcher()
+        except Exception:
+            pass
         self.media.stop()
         self.root.quit()
 
@@ -7566,6 +7850,10 @@ def _is_only_instance():
 def main():
     if not _is_only_instance():
         return                 # another Desktop Karaoke is already running
+    # TICKET-105: heal up the rebrand-stale Start Menu shortcut before
+    # anything else (frozen builds only; no-op in dev). Best-effort and
+    # never blocks startup.
+    _migrate_start_menu_shortcut()
     # Windows' default system timer granularity is ~15.6 ms, so Tk's after(16)
     # for a 60 fps loop actually fires at either ~15.6 ms or ~31.2 ms — that
     # uneven cadence is exactly the scroll "stutter" (diagnosed via /diag:
@@ -7760,6 +8048,12 @@ def main():
     # TICKET-100: Discord Rich Presence reader toggle (default OFF, opt-in).
     def _toggle_discord_rpc(*_):
         ov.root.after(0, lambda: ov.set_discord_rpc(not ov.discord_rpc_on))
+    # TICKET-102: window-title scraper toggles (HIGH default ON, LOW default OFF).
+    def _toggle_window_titles(*_):
+        ov.root.after(0, lambda: ov.set_window_titles(not ov.window_titles_on))
+    def _toggle_window_titles_generic(*_):
+        ov.root.after(0, lambda: ov.set_window_titles_generic_browsers(
+            not ov.window_titles_generic_browsers_on))
     def _get_caps(*_):     ov.root.after(0, ov.load_youtube_captions)
 
     # ── Optional GPU acceleration ────────────────────────────────────────
@@ -7770,10 +8064,21 @@ def main():
     _gpu = {"busy": False}
 
     def _gpu_label(i=None):
+        # TICKET-103: when the GPU libs are installed, show WHERE Whisper
+        # will actually run right now (live policy: which CUDA device or
+        # 'CPU' with the reason, e.g. 'game running', 'single-GPU policy').
         if _gpu["busy"]:
             return "⏳  Installing GPU acceleration…"
-        return ("⚡  GPU acceleration: on" if gpu_setup.gpu_ready()
-                else f"⚡  Enable GPU acceleration (~{gpu_setup.APPROX_MB} MB)")
+        if not gpu_setup.gpu_ready():
+            return f"⚡  Enable GPU acceleration (~{gpu_setup.APPROX_MB} MB)"
+        try:
+            import align
+            dev, idx, reason, _n = align.current_device_choice()
+            if dev == "cuda":
+                return f"⚡  GPU acceleration: cuda:{idx}  ·  {reason}"
+            return f"⚡  GPU acceleration: CPU  ·  {reason}"
+        except Exception:
+            return "⚡  GPU acceleration: on"
 
     def _on_gpu(icon_, *_):
         if _gpu["busy"] or gpu_setup.gpu_ready() or not gpu_setup.nvidia_gpu_present():
@@ -7884,6 +8189,18 @@ def main():
         pystray.MenuItem("Read Discord Rich Presence (Spotify, when no other source)",
                          _toggle_discord_rpc,
                          checked=lambda i: ov.discord_rpc_on),
+        # TICKET-102: window-title scraper — picks up Steam Overlay's embedded
+        # CEF browser, Discord/Slack/Teams embedded players (the SMTC-blind
+        # cases). Default ON because the allowlist is narrow + music-purposed.
+        pystray.MenuItem("Read window titles (Steam Overlay, Discord, Slack, Teams)",
+                         _toggle_window_titles,
+                         checked=lambda i: ov.window_titles_on),
+        # Sub-toggle: ALSO scrape standalone browsers (slower, may misfire on
+        # podcast / vlog titles). Hidden when the parent is off.
+        pystray.MenuItem("Read window titles from web browsers (slower, may misfire)",
+                         _toggle_window_titles_generic,
+                         checked=lambda i: ov.window_titles_generic_browsers_on,
+                         visible=lambda i: ov.window_titles_on),
         pystray.Menu.SEPARATOR,
         # 3. SYNC BEHAVIOR ────────────────────────────────────────────────
         pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),

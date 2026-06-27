@@ -188,8 +188,17 @@ def _gpu_utils() -> dict:
     return out
 
 
-def pick_inference_device(avoid_when_gaming: bool = True):
+def pick_inference_device(avoid_when_gaming: bool = True,
+                          solo_override: bool = False):
     """Where Whisper should run RIGHT NOW → ``(device, index, reason)``.
+
+    POLICY (TICKET-103, user request): GPU acceleration is opt-in for
+    multi-GPU machines only. On a single-GPU machine we always stay on CPU
+    so the lone card can never fight whatever else the user is doing on it
+    (game, video decode, browser hardware-accel, etc.); Whisper does fine
+    on CPU and the user explicitly asked for this safety floor. The user
+    can flip ``solo_override`` (tune knob ``gpu_solo_override``) to force
+    GPU use on a single-GPU machine when they want the speed.
 
     Picks the LEAST-utilized CUDA GPU instead of assuming the game is always on
     GPU 0 (TICKET-080 — on this rig the eGPU 3080 is cuda:1 and gets the game,
@@ -202,9 +211,14 @@ def pick_inference_device(avoid_when_gaming: bool = True):
     if n <= 0:
         return ("cpu", 0, "no CUDA GPU")
     if n == 1:
+        # TICKET-103: single-GPU → CPU unless the user explicitly opted in
+        # via gpu_solo_override. Even with the override, the gaming guard
+        # still kicks in (no point fighting the game for the only card).
+        if not solo_override:
+            return ("cpu", 0, "single GPU → CPU (policy: solo GPU stays free)")
         if avoid_when_gaming and game_active():
-            return ("cpu", 0, "game: single GPU → CPU")
-        return ("cuda", 0, "default (single GPU)")
+            return ("cpu", 0, "game: single GPU → CPU (override on, but gaming)")
+        return ("cuda", 0, "single GPU (override on)")
     utils = _gpu_utils()                              # {idx: util%} — missing = idle
     gaming = avoid_when_gaming and game_active()
     BUSY = 30

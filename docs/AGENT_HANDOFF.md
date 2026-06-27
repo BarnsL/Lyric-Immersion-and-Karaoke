@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.89.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.90.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -53,7 +53,52 @@ Suisei). **Current build: v1.0.89.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.89, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.90, all deployed + on master)
+- **v1.0.90 — Window-title scraper for Steam Overlay / Discord / Slack / Teams CEF hosts
+  (TICKET-102):** the Steam Overlay's embedded CEF browser (steamwebhelper.exe), Discord's
+  embedded YouTube/Spotify iframes, and Slack/Teams media tiles do NOT publish to SMTC,
+  so a song playing inside any of those was invisible to the overlay (SMTC would stay
+  locked on a stale paused tab from earlier; Shazam might fingerprint a different release
+  or miss the track entirely). New module `window_titles.py` — stdlib + ctypes only,
+  matches `discord_rpc.py`'s daemon-watcher + lock-guarded-slot style. `EnumWindows` walks
+  visible top-level HWNDs every 2s on a background daemon thread; per HWND we
+  `GetWindowThreadProcessId` → `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` →
+  `QueryFullProcessImageNameW` to resolve the exe basename, reject anything not on the
+  process allowlist BEFORE reading the title (privacy invariant: non-allowlisted window
+  text is never read), then `SendMessageTimeoutW(WM_GETTEXT, SMTO_ABORTIFHUNG, 100ms)`
+  for the text — avoids stalling on a hung Chrome tab the way `GetWindowTextW` would.
+  Title parser strips a music-marker suffix (` - YouTube` / ` - Spotify` / ` - SoundCloud`
+  / ` - Bandcamp` / ` - Apple Music` / ` - Tidal` / ` - Deezer` / ` - Niconico` / ` - Bilibili`
+  / ` - Mixcloud` and the YT Music variant), rejects a non-music suffix
+  (Gmail / Docs / Sheets / Notion / Linear / GitHub / Jira / Confluence / Figma /
+  Twitter / Reddit / Discord channel-name etc.) before accepting, drops bare-hostname
+  titles ("youtube.com", "new tab"), strips a `Channel: ` Steam Overlay prefix, splits
+  on first ` — ` / ` – ` / ` - ` / ` | ` separator into (title, artist) and hands the
+  raw pair downstream where `clean_title`/`clean_artist` already swap by heuristic.
+  TWO process tiers: HIGH (default ON) covers steamwebhelper.exe + discord(.exe|canary|ptb)
+  + slack.exe + teams.exe + ms-teams.exe — these don't hit SMTC, so the scrape is
+  unambiguously load-bearing. LOW (default OFF, opt-in via `window_titles_generic_browsers`)
+  covers chrome/edge/brave/firefox/opera/vivaldi/arc — these DO hit SMTC for the major
+  music sites, so the toggle is the kind of thing a user with a non-SMTC PWA setup
+  flips on. PID→exe cache so OpenProcess+Query doesn't fire on every cycle for the same
+  PID; cleared on stop() so a recycled PID can't carry a stale name. Hard 50ms per-cycle
+  budget; foreground-window preferred when multiple allowlisted windows have a music
+  marker (the tab the user is actually on wins the tie). Wired into `_tick` as a NEW
+  source slotting between SMTC (`playing=true` still wins) and Shazam-live for the
+  HIGH tier, BELOW Shazam for the LOW tier (most generic-browser tabs ARE in SMTC, so
+  generic browser scraping only matters when SMTC is silent). Public surface is two
+  functions — `start_watcher(poll_s, generic_browsers)` and `get_current_track()` →
+  `{title, artist, source: "window-title:<exe>", process, window_handle, window_class,
+  raw_title, priority: "high"|"low", last_update_t} | None`. Two tray menu items under
+  the detection group: "Read window titles (Steam Overlay, Discord, Slack, Teams)"
+  (default ON) and "Read window titles from web browsers (slower, may misfire)"
+  (default OFF). Three new tune knobs (`window_titles_on`, `window_titles_generic_browsers`,
+  `window_titles_poll_s`); `/diag.window_titles` exposes `on`, `generic_browsers_on`,
+  `running`, `slot_age_s`, `track`; `/source.capabilities` mirrors the persisted toggles.
+  Pinned in `DesktopKaraoke.spec` hiddenimports so the frozen build includes the module.
+  No new requirements (`requirements.txt` unchanged — ctypes is stdlib). Teardown path
+  in shutdown mirrors `discord_rpc.stop_watcher()`. Per-game RP / SteamWorks /
+  registered-application-id are still queued as TICKET-101.
 - **v1.0.89 — Slide-in top/bottom + SMTC-paused Shazam takeover + Discord RP fallback
   (TICKET-098 / TICKET-099 / TICKET-100):** three independent features in one build, each
   surgical. **(098)** Per-line slide-in gains `top` and `bottom` modes (drop from above /
