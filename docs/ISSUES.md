@@ -8,6 +8,13 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-082c — Overlay below game/app layer (z-order topmost re-assert) 🟢
+**Symptom:** the click-through lyric overlay was getting buried under a borderless-windowed game (or any other app that asserts topmost) after a focus change. Tk's `-topmost True` attribute is one-shot at window creation — nothing kept the overlay at top z-order over time. v1.0.82's `_click_guard` re-asserted click-through every 500 ms but not topmost.
+**Fix (v1.0.83):** `_click_through` now also calls `SetWindowPos(hwnd, HWND_TOPMOST, …, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)` on every guard tick — the exact pattern Discord/Steam/Nvidia overlays use, and a no-op when the window is already topmost so it's free to call at 500 ms cadence. Also added `WS_EX_TOPMOST` (0x00000008) to the EXSTYLE mask so the bit stays set. Mirror windows get the same treatment per-HWND inside the same loop.
+**Caveat (documented):** exclusive-fullscreen DirectX games cannot be overlaid by any Win32 windowed app without DXGI hooks. Use borderless-fullscreen-windowed mode in the game settings. (Most modern games default to this anyway.)
+
+---
+
 ## TICKET-082 — Karaoke fill decoupling + scroll-mode deferral + MV-intro fast-sync + in-app perf recorder 🟡 (082a landed; 082b open)
 **Symptoms:**
 - The currently-sung lyrics highlighting (karaoke fill) doesn't ramp smoothly across syllables — visible "stutter" or "race-then-snap" feel even on songs where sync is technically correct.

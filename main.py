@@ -4621,7 +4621,7 @@ class Overlay:
                                 lambda t=self._track_seq: self._maybe_fetch_captions(t))
 
     def _click_through(self):
-        """(Re)assert the overlay's click-through window style.
+        """(Re)assert the overlay's click-through window style AND its z-order.
 
         CRITICAL: this MUST be re-applied after every ``-alpha`` /
         ``-transparentcolor`` change. On Windows, tkinter resets the window's
@@ -4633,15 +4633,38 @@ class Overlay:
 
         WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW keep it from stealing focus or adding a
         taskbar button; WS_EX_LAYERED + WS_EX_TRANSPARENT make every pixel pass
-        mouse input straight through to whatever is below."""
+        mouse input straight through to whatever is below.
+
+        TICKET-082c: also re-assert HWND_TOPMOST every guard tick. Tk's
+        ``-topmost`` attribute is a one-shot at create time; games / fullscreen
+        apps / focus changes can knock the window out of top z-order over time.
+        ``SetWindowPos(HWND_TOPMOST, …, NOMOVE|NOSIZE|NOACTIVATE)`` is what
+        Discord/Steam/Nvidia overlays use and is a no-op when already topmost,
+        so this is safe to call from the 500 ms ``_click_guard`` loop. (Caveat:
+        exclusive-fullscreen DirectX games cannot be overlaid by any Win32
+        window without DXGI hooks — use borderless-fullscreen-windowed mode.)
+        """
         try:
             u = ctypes.windll.user32
             hwnd = u.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
             GWL_EXSTYLE = -20
-            WS_EX = 0x08000000 | 0x00000080 | 0x00080000 | 0x00000020  # NOACTIVATE|TOOLWINDOW|LAYERED|TRANSPARENT
+            WS_EX = (0x08000000 | 0x00000080 | 0x00080000 | 0x00000020
+                     | 0x00000008)              # …| TOPMOST so EXSTYLE bit stays set
             ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
             if (ex & WS_EX) != WS_EX:                  # only re-apply if a bit was lost
                 u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX)
+            HWND_TOPMOST = -1
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE = 0x0002, 0x0001, 0x0010
+            u.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                           SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            # Mirror windows too — each is its own HWND.
+            for win in getattr(self, "_mirrors", []) or []:
+                try:
+                    mh = u.GetAncestor(win.winfo_id(), 2) or win.winfo_id()
+                    u.SetWindowPos(mh, HWND_TOPMOST, 0, 0, 0, 0,
+                                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                except Exception:
+                    pass
         except Exception:
             pass
 
