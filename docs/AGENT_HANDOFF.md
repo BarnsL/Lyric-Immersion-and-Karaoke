@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.83.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.84.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -52,7 +52,15 @@ Suisei). **Current build: v1.0.83.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.83, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.84, all deployed + on master)
+- **v1.0.84 — Display-string rebrand "Desktop Karaoke" → "Lyric Immersion and Karaoke" (TICKET-084):**
+  workflow-driven sweep (audit → replace → adversarial verify). 15 edits across api.py /health field,
+  character.py artist-fallback, main.py tray tooltip + 7 toast titles + Tk window title + Startup .lnk,
+  playlist_import_gui.py title, AppxManifest DisplayName + Executable, build_msix.ps1 SkipBuild
+  Test-Path, version.py. Internal slugs preserved: D:\\DesktopKaraoke deploy folder, data-dir,
+  DesktopKaraoke.spec, MSIX AppId, mutex/UA, pystray icon-name. Live /health confirms
+  `app":"Lyric Immersion and Karaoke","version":"1.0.84"` post-deploy. Adversarial verify caught
+  two MSIX/build-script issues the initial audit missed (Executable= attribute + SkipBuild path).
 - **v1.0.83 — Overlay topmost re-assert (TICKET-082c):** the overlay was falling behind borderless
   game windows after a focus change because Tk's `-topmost` is one-shot at creation. Extended
   `_click_through` (already running every 500 ms via `_click_guard`) to also call
