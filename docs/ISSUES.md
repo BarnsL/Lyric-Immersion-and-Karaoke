@@ -8,6 +8,57 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-079 — Concert SMTC wrapper defeats song-ID 🟡 (a+c landed; b+d open)
+**Symptom (VESPERBELL 3rd ONE-MAN LIVE BEYOND):** the app was alive for the entire
+6-minute window inside the concert (00:50:37 → 00:56:34) without showing a single lyric.
+The logs say it all:
+```
+00:50:37 track change: 'VESPERBELL 3rd ONE' / 'VESPERBELL' (dur None)
+00:50:37 no confident title-match for 'VESPERBELL 3rd ONE' (best 0); will use sound
+00:50:57 decide-by-ear (track-start): listening among 5 title candidates   ← stale candidates from prior song; result NEVER logged
+00:51:03 audio boundary detected → re-identifying by sound
+00:51:32 audio boundary detected → re-identifying by sound
+00:54:14 audio boundary detected → re-identifying by sound
+00:54:54 audio boundary detected → re-identifying by sound
+00:54:58 same song re-reported ('VESPERBELL 3rd ONE') — keeping sync, no reset
+```
+ZERO `heard '...'` lines for the whole window. Four piled-up failures:
+- **(1) SMTC truncated** `【冒頭無料】VESPERBELL 3rd ONE-MAN LIVE BEYOND #VESP3rdONEMAN`
+  to `VESPERBELL 3rd ONE` — `is_live_arrangement` (`_LIVE_VER_RE` requires `one[\s-]?man`)
+  missed it → `live_arrangement=false` → no live-mode aggressive resync, no follow-the-offset.
+- **(2) Shazam never returned a hit** — expected for MMD/live performances (TICKET-072
+  already documents this).
+- **(3) `_decide_by_ear` bailed on `not self.lines`** — no LRC was loaded because the
+  wrapper title matched nothing (best 0). The "5 title candidates" line is misleading
+  — those were stale candidates and the function didn't reach the whole-library scan
+  for a freshly-empty `self.lines`.
+- **(4) Boundary detections were no-ops** — `_on_boundary` fires Shazam (which fails on
+  live cuts) and that's all. Inside a concert wrapper that means every real song change
+  inside the container goes un-identified, while the "same song re-reported" SMTC gate
+  suppresses any wrapper-level reset.
+
+**Fix (v1.0.79) — (a) + (c) landed:**
+- **(a) Truncation-tolerant `_LIVE_VER_RE`:** adds `\d+(?:st|nd|rd|th)\s+(?:one|live|tour|anniv(?:ersary)?)`
+  so "3rd ONE" / "5th LIVE" / "10th Anniversary" / "3rd Tour" all classify as live
+  arrangements regardless of where SMTC chops the title. Also adds `【冒頭無料】` / `【無料配信】`
+  live-broadcast banners and hashtag tells `#…ONEMAN` / `#3rdLIVE`. Smoke-tested: VESPERBELL
+  truncated form → LIVE, normal song titles (feelingradation / white balance / `KAF #128`) → std.
+- **(c) Boundary in a concert wrapper fires whole-library decide-by-ear:** `_on_boundary`
+  now schedules `_decide_by_ear(reason="boundary")` ~12 s after Shazam when
+  `_live_arrangement or _live_mode`. The gate in `_decide_by_ear` is opened for concert
+  contexts: it no longer bails on `not self.lines` when we're inside a concert wrapper or
+  boundary-triggered — the whole-library scan path (loaded_score < wrong_floor) takes over
+  and adopts the best library match for the song actually playing inside the container.
+
+**Still open (deferred):**
+- **(b) Decide-by-ear MIN tuning for concerts** — the current 70 library threshold may be
+  too high for a 12 s vocal sample at concert audio quality. Watch real runs.
+- **(d) Concert setlist mode** — pull setlist.fm (or accept paste-in `MM:SS — Title` CSV)
+  and pre-seed candidates by time window inside the concert wrapper. Highest value, biggest
+  surface area; do as its own pass.
+
+---
+
 ## TICKET-078 — Defer auto-sync corrections to the next line boundary (no mid-line snap) 🟢
 **Symptom:** every auto-sync correction (energy-align, tier-listen, align-by-ear) wrote
 `self.offset = X` immediately + `self.idx = -1`, so any line on screen jump-cut to a

@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.78.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.79.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -52,7 +52,15 @@ Suisei). **Current build: v1.0.78.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.78, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.79, all deployed + on master)
+- **v1.0.79 — Concert SMTC wrapper song-ID (TICKET-079 a+c):** `_LIVE_VER_RE` now matches
+  SMTC-truncated concert titles (`3rd ONE` / `5th LIVE` / `10th Anniversary` / `3rd Tour`)
+  plus `【冒頭無料】` / `【無料配信】` banners and `#…ONEMAN` / `#NthLIVE` hashtags, so
+  `is_live_arrangement` fires for live wrappers even when the title is chopped. `_on_boundary`
+  inside a `_live_arrangement` / `_live_mode` wrapper schedules a whole-library
+  `_decide_by_ear(reason="boundary")` ~12 s later, and `_decide_by_ear`'s `not self.lines`
+  gate is opened for concert contexts (the whole-library scan via `loaded_score < wrong_floor`
+  picks the song actually playing inside the container). b+d still open — see TICKET-079.
 - **v1.0.78 — Defer auto-sync corrections to line boundaries (TICKET-078):** the named
   auto-apply paths (`_apply_align`, `_tier_commit`, `_apply_energy_align`) now route
   through `_smooth_offset`, which queues `_pending_offset` when a line is on screen
