@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.82.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.83.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -52,7 +52,16 @@ Suisei). **Current build: v1.0.82.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.82, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.83, all deployed + on master)
+- **v1.0.83 — Overlay topmost re-assert (TICKET-082c):** the overlay was falling behind borderless
+  game windows after a focus change because Tk's `-topmost` is one-shot at creation. Extended
+  `_click_through` (already running every 500 ms via `_click_guard`) to also call
+  `SetWindowPos(HWND_TOPMOST, …, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)` — Discord/Steam/Nvidia
+  overlay pattern, no-op when already topmost. WS_EX_TOPMOST added to the EXSTYLE mask too.
+  Mirror windows get the same per-HWND treatment. Caveat: exclusive-fullscreen DirectX games still
+  cannot be overlaid by any Win32 window without DXGI hooks — borderless-fullscreen-windowed only.
+  MV regex verified (already catches `Original Song MV`, `Official MV`, `(MV)`, `（MV）`,
+  `【Original Song MV】`) so v1.0.82's MV-intro fast-sync applies to KOSEKI BIJOU / Deep Dive too.
 - **v1.0.82 — Karaoke fill decoupling + scroll-mode deferral + wall-clock ease + MV-intro fast-sync
   + in-app perf recorder (TICKET-082a):** the karaoke highlight (currently-sung characters) now
   ramps against the RAW song clock (`pos_raw = position + self.offset`) while the LINE POSITION
