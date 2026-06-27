@@ -863,6 +863,27 @@ class LyricsIndex:
         self.entries = [e for e in self.entries if e["path"] != path]
         self.refresh()
 
+    def candidates(self, title, limit=6):
+        """Cache PATHS whose title plausibly relates to `title` — the candidate
+        pool for the by-ear song decision (`align.decide_song_by_lyrics`). Loose on
+        purpose: the by-ear lyric match is the real filter, this only narrows the
+        field so we transcribe-compare against a handful, not the whole library."""
+        q = _norm_title(title)
+        if not q:
+            return []
+        out = []
+        for e in self.entries:
+            ct = _norm_title(e["core"]) or _norm_title(e["title"])
+            if not ct:
+                continue
+            short, lng = sorted((q, ct), key=len)
+            if short and (short in lng or (len(short) >= 4 and any(
+                    short[i:i + 4] in lng for i in range(len(short) - 3)))):
+                out.append(e["path"])
+                if len(out) >= limit:
+                    break
+        return out
+
     def match(self, artist, title, duration=None):
         """Find the cached song whose TITLE matches `title` confidently.
 
@@ -1242,6 +1263,12 @@ class Overlay:
             "unconfirmed_backoff_s": 30.0,  # settled-but-unconfirmable song → slow the Shazam poll (anti-stutter)
             "confirmed_recal_s":     45.0,  # confirmed+watched song → slow Shazam re-lock (tier handles drift)
             "wrong_song_strikes":     5,    # heard the SAME other song this many × → loaded song is wrong, switch
+            # ── SMART song decision by ear (Whisper 'small' + rapidfuzz, ~250 MB) ──
+            "decide_min_score":      55.0,  # a candidate must match the heard singing ≥ this to win
+            "decide_margin":         12.0,  # …and beat the loaded song's match by this much to switch
+            "decide_wrong_floor":    32.0,  # loaded match below this = the lyrics are the wrong song
+            "decide_listen_s":       12.0,  # seconds of vocals to transcribe for the decision
+            "decide_at_s":           20.0,  # run the by-ear decision this many s into a new track
             "continuous_recal_ms": 15000,   # legacy fixed cadence (superseded by the adaptive tier)
             # ── ADAPTIVE sync-verification tier (escalation / de-escalation) ──
             # Verify sync ~3×/min while syncing or after a miss; once a check CONFIRMS
@@ -1305,6 +1332,8 @@ class Overlay:
         self._pending_switch = None   # a contradicting heard song awaiting a 2nd confirming read
         self._sound_fail_streak = 0   # consecutive times the SAME other song was heard (wrong-song strikes)
         self._last_heard_contra = None  # the last contradicting heard song (for the strike streak)
+        self._deciding = False        # a by-ear song decision (Whisper) is in flight
+        self._last_decision = None    # last decide_song_by_lyrics result (telemetry)
         self._fast_calib = 0          # remaining quick re-locks after a song change
         self._recal_after = None      # pending recalibrate timer id
         self._live_mode = False       # concert/compilation → sound-only, no title-match
@@ -1507,6 +1536,11 @@ class Overlay:
         if not self._live_mode:
             self.root.after(25000,
                             lambda t=self._track_seq: self._track_start_auto_align(t))
+            # SMART song decision: a few seconds in (vocals present), transcribe and
+            # confirm the lyrics on screen are the song actually being sung — switch
+            # if Shazam mis-ID'd or the LRC is mislabeled. Skipped for baked songs.
+            self.root.after(int(self._tune.get("decide_at_s", 20.0) * 1000),
+                            lambda t=self._track_seq: self._decide_by_ear(t))
         # YOUTUBE CAPTIONS: for a browser video, the video's OWN caption track is
         # the most accurate lyric source — correct words AND timing locked to this
         # exact video (no wrong-transcription LRC, no cross-version drift). Fetch
@@ -3724,6 +3758,8 @@ class Overlay:
                 "tier_listening": self._tier_listen,
             },
             "energy_align": self._last_energy,
+            "decision": self._last_decision,        # last by-ear song decision (Whisper+rapidfuzz)
+            "deciding": self._deciding,
             "fps": {
                 "target": target_fps,
                 "render": render_fps,
@@ -4743,6 +4779,126 @@ class Overlay:
         if track_seq != self._track_seq:
             return
         self._maybe_auto_align(reason="track-start")
+
+    # ── SMART song decision by ear (Whisper 'small' + rapidfuzz) ──────────────
+    #
+    # The robust answer to "what song should we show lyrics to?" when the usual
+    # signals fail — an MMD / cover / "Performance Video" Shazam can't fingerprint,
+    # or a MISLABELED provider LRC (feelingradation got a different song's LRC). It
+    # transcribes a few seconds of the actual vocals and picks the candidate whose
+    # LYRICS best match what's being sung, switching if the loaded song is wrong.
+
+    @staticmethod
+    def _lyric_text(lines):
+        """Flatten a song's lines to one plain string for lyric-match scoring."""
+        out = []
+        for ln in lines or []:
+            t = getattr(ln, "jp", None) if not isinstance(ln, dict) else ln.get("jp")
+            if t:
+                out.append(t)
+        return " ".join(out)
+
+    def _decide_by_ear(self, track_seq, reason="track-start"):
+        """Transcribe the live vocals and pick which candidate song's lyrics they
+        match; switch if the loaded lyrics are the wrong song. Gated + one in
+        flight; skipped for baked (authoritative) songs and live mode."""
+        if (track_seq != self._track_seq or self._live_mode or not self.lines
+                or self._deciding or self._aligning):
+            return
+        if (self.meta.get("source") or "").startswith("bundled"):
+            return                                    # baked = ground truth already
+        if (self.meta.get("source") or "") == "youtube-captions":
+            return                                    # caption lyrics are the video's own
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING):
+            return
+        if float(st.get("position") or 0.0) < self._tune.get("decide_at_s", 20.0) - 2:
+            return
+        try:
+            import align
+            if not align.available():
+                return
+        except Exception:
+            return
+        # candidate pool: the loaded song + title-similar library caches + the
+        # Shazam-heard song (each as (path-or-key, plain lyric text)).
+        pool, seen = [], set()
+        loaded_key = str(self._lyrics_path) if self._lyrics_path else "loaded"
+        pool.append((loaded_key, self._lyric_text(self.lines)))
+        seen.add(loaded_key)
+        try:
+            for p in self.index.candidates(self._clean_title_cache, limit=5):
+                k = str(p)
+                if k in seen:
+                    continue
+                try:
+                    d = json.loads(Path(p).read_text("utf-8"))
+                except Exception:
+                    continue
+                pool.append((k, self._lyric_text(d.get("lines"))))
+                seen.add(k)
+        except Exception:
+            pass
+        if len(pool) < 2:
+            return                                    # nothing to compare against
+        self._deciding = True
+        lang = self.meta.get("lang", "ja")
+        secs = float(self._tune.get("decide_listen_s", 12.0))
+        log.info("decide-by-ear (%s): listening to pick among %d candidates", reason, len(pool))
+
+        def work():
+            res = None
+            try:
+                res = align.decide_song_by_lyrics(pool, lang=lang, seconds=secs)
+            except Exception as e:
+                log.info("decide-by-ear error: %s", e)
+            self.root.after(0, lambda: self._apply_decision(res, track_seq, loaded_key))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_decision(self, res, track_seq, loaded_key):
+        self._deciding = False
+        if not res or not res.get("ranked"):
+            return
+        self._last_decision = {"heard": res["heard"][:60],
+                               "ranked": [(s, Path(k).name if k != "loaded" else k)
+                                          for s, k in res["ranked"][:4]],
+                               "t": time.time()}
+        if track_seq != self._track_seq:
+            return                                    # track changed mid-transcribe
+        ranked = res["ranked"]
+        best_score, best_key = ranked[0]
+        loaded_score = next((s for s, k in ranked if k == loaded_key), 0.0)
+        log.info("decide-by-ear: heard %r → best %s (%.0f) vs loaded (%.0f)",
+                 res["heard"][:40],
+                 Path(best_key).name if best_key not in ("loaded",) else best_key,
+                 best_score, loaded_score)
+        MIN = self._tune.get("decide_min_score", 55.0)
+        MARGIN = self._tune.get("decide_margin", 12.0)
+        if (best_key not in ("loaded", loaded_key) and best_score >= MIN
+                and best_score - loaded_score >= MARGIN):
+            try:
+                p = Path(best_key)
+                if p.exists() and self._file_valid(p, self._cur_duration):
+                    log.info("decide-by-ear: SWITCHING to %s — its lyrics match the "
+                             "singing far better (%.0f vs %.0f)", p.name, best_score, loaded_score)
+                    self.load(p)
+                    self._maybe_translate()
+                    self._sound_title_alias = None
+                    self.offset = 0.0
+                    self.idx = -1
+                    self._hint("🎯 Corrected to the song being sung")
+            except Exception as e:
+                log.info("decide-by-ear: switch failed: %s", e)
+        elif loaded_score < self._tune.get("decide_wrong_floor", 32.0):
+            # the loaded lyrics match the singing POORLY and nothing in the library
+            # is better → the right song isn't cached. Fetch fresh by the title.
+            log.info("decide-by-ear: loaded lyrics match the singing poorly (%.0f) and no "
+                     "candidate fits → re-fetching by title %r", loaded_score, self._clean_title_cache)
+            if self._track and not self._is_cover:
+                self._hint("🎯 Wrong lyrics — re-identifying…")
+                self._start_fetch(self._clean_artist_cache, self._clean_title_cache,
+                                  self._cur_duration)
 
     def _maybe_auto_align(self, reason="periodic"):
         """Background, automatic sync-by-listening. Runs only when conditions are
