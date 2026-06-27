@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.80.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.81.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -52,7 +52,23 @@ Suisei). **Current build: v1.0.80.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.80, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.81, all deployed + on master)
+- **v1.0.81 — Title/artist weight rebalancing + cover-as-live + in-tick Shazam smooth-sync
+  + library MIN 60 + privacy cleanup (TICKET-081):** one big bundle of targeted fixes for
+  the live-session failures. Adds a substring-superset penalty (`ghost` ⊂ `ghosting` no
+  longer beats exact `ghost`), bumps artist corroboration from +5 to +12 exact / +6 partial,
+  treats covers as live_arrangements so the FOLLOW path absorbs the inevitable cover-vs-original
+  timing drift, fixes `_on_vocal_onset` to calibrate the negative offset for covers with
+  extended intros (the 名前のない怪物 cover was 78 s out of sync), routes the four in-tick
+  Shazam writes through `_smooth_offset` (the high-frequency steady-state corrections that
+  were the user's "mid-line jump"), adds title-lock parenthetical equivalence
+  (`GHOST` ≡ `Ghost (Stellar ver.)`), doubles the strike threshold when SMTC artist clearly
+  disagrees with heard artist, adds a 20-char minimum on decide-by-ear so a tiny transcript
+  can't claim "in sync", penalizes a cross-artist library switch by -8, and lowers
+  `decide_library_min` to 60. Also deleted the poisoned `hand_sign.json` cache. Privacy: the
+  stale public branch `claude/caption-sync-perf-fixes` and the public tag `v1.0.68` (both
+  carrying AWS email / purpleindustries alias / Claude trailers) were deleted from origin;
+  10 local orphan tags pruned; `git log --all --format='%ae'` returns only `barnsl@pm.me`.
 - **v1.0.80 — Romaji↔CJK title equivalence + lopsided decide-by-ear win + GPU picker
   by utilization (TICKET-080):** kamone took 41 s before because `kamone` (romaji
   player title) couldn't title-match `かもね.json` (JP-script cache), then Whisper
