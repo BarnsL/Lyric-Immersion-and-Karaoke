@@ -93,6 +93,32 @@ def _current_line(app):
     return None
 
 
+def _decision_engine_snapshot(app):
+    """TICKET-109: surface the live decision-engine state. Returns None when
+    the engine state hasn't been initialized (graceful legacy degrade)."""
+    try:
+        state = getattr(app, "_decision_state", None)
+        if state is None:
+            return None
+        last_act = getattr(app, "_decision_last_action_t", 0) or 0
+        return {
+            "state":             state,
+            "strikes":           getattr(app, "_decision_strikes", 0),
+            "dim_scores":        dict(getattr(app, "_decision_dim_scores", {})),
+            "dim_history":       {k: list(v)[-6:]
+                                  for k, v in getattr(app, "_decision_dim_history", {}).items()},
+            "audit":             list(getattr(app, "_decision_audit", []))[-5:],
+            "last_action_age_s": (round(time.time() - last_act, 1) if last_act else None),
+            "thresholds": {
+                "caution": int(app._tune.get("decision_caution_strikes", 3)),
+                "switch":  int(app._tune.get("decision_switch_strikes",  5)),
+                "regen":   int(app._tune.get("decision_regen_strikes",   8)),
+            },
+        }
+    except Exception:
+        return None
+
+
 def _gpu_snapshot():
     """TICKET-103: snapshot of the GPU device pick gpu_setup would make
     RIGHT NOW. Cheap (cuda_device_count + nvml utility queries are both
@@ -139,6 +165,10 @@ def _status(app):
         # diag watcher see Whisper falling to CPU during a fullscreen game
         # or because of the single-GPU safety floor.
         "gpu": _gpu_snapshot(),
+        # TICKET-109: decision engine state + per-dim scores + recent audit
+        # so a watcher (or the tray hint) can see TRUST -> CAUTION -> SWITCH
+        # -> REGEN promotions live, including which dimension drove them.
+        "decision_engine": _decision_engine_snapshot(app),
         "heard_by_sound": app._sound_song,
         "boundary_detect": getattr(app, "boundary_on", None),
         # TICKET-102: capability flags for the window-title scraper, mirrored
