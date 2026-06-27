@@ -54,7 +54,43 @@ karaoke tool. Read this first, then `ARCHITECTURE.md`.
    network-only alternative to Whisper), TPVR-gated. ASR text is NEVER shown. New path in
    `deep_transcribe.py` (fetch auto subs to a hint buffer) + a matcher feeding `_consume_async`.
 
+## ⭐ THE SONG-DECISION SYSTEM ("what lyrics do we show?") — current as of v1.0.66
+The hardest problem in this app is picking the RIGHT song for MMD / cover / "Performance
+Video" cuts (Shazam can't fingerprint them) and around MISLABELED provider LRCs (a
+provider returned a *different* song's LRC for feelingradation). The decision is now
+LAYERED, each layer a fallback for the last:
+1. **Title match** (`LyricsIndex.match`) — exact/≥60 % title overlap; provisional instant load.
+2. **Cover original artist** (`extract_cover_original`) — for 歌ってみた/covered-by titles,
+   pull the ORIGINAL artist ("Rebellion / hololive English -Advent-" → search qualified, not
+   the generic title) so a same-title collision isn't grabbed. Covers with no parseable
+   original DROP the channel and search title-first.
+3. **Language confidence** (`confidence.language_confidence`) — the artist's usual language
+   (`_ALWAYS_JA` Suisei = full JA, `_KNOWN_JA` romanized acts = full JA) rejects an
+   English-collision for a JP act. Western artists score 0 (unaffected).
+4. **Shazam** (`recognize.py`) — sound ID; **5-strike override** (`wrong_song_strikes`):
+   hearing the SAME other song 5× breaks a wrong title-lock and switches (Deep Dive→Dunk).
+5. **Decide-by-ear** (`align.decide_song_by_lyrics` / `_decide_by_ear`, the "model") — ~20 s
+   in (or `POST /decide`), transcribe ~12 s of vocals with **faster-whisper 'small' (~250 MB
+   int8)** and **rapidfuzz**-match the transcript against candidate LYRICS. Two stages:
+   title-similar pool first; if the loaded song matches the singing below `decide_wrong_floor`,
+   it IDENTIFIES against the **WHOLE cached library** (the model "trained on everything we
+   have" — 833 songs, the right one self-matches ~100 vs ~30 for wrong) and switches, or
+   re-fetches if nothing cached fits. Skips baked + caption + live songs. `/diag.decision`.
+6. **Bundled (baked) lyrics** (`bundled_lyrics/`, `_seed_bundled_lyrics`) — for songs that
+   ALWAYS fail to fetch, ship a verified LRC; it's AUTHORITATIVE (sound mis-IDs can't override
+   a `source: bundled` song). **LESSON: providers mislabel LRCs — verify a bake against the
+   canonical Genius lyrics before trusting it** (feelingradation's first bake was a wrong song).
+   Currently baked: feelingradation, サクラミラージュ.
+
 ## What this session shipped (all deployed + pushed)
+- **Decide-by-ear / library-wide song ID** (TICKET-071) — see the decision system above.
+- **Baked-lyrics mechanism + authoritative guard** (TICKET-070) — feelingradation + サクラミラージュ.
+- **Cover original-artist for "Song / Artist covered by X"** — Rebellion case.
+- **5-strike wrong-song recovery** (TICKET-068) — break a wrong title-lock by ear/sound.
+- **Cinematic-intro false-positive** (TICKET-069) — looser vocal detect + 20 s backstop.
+- **Translation context** (TICKET-067) — numbered-protocol window keeps ±2 lines of context.
+- **Anti-stutter Shazam back-off** (TICKET-066) — settled/confirmed song slows the recal poll
+  (the GIL-stall stutter on unconfirmable songs); `unconfirmed_backoff_s` / `confirmed_recal_s`.
 - **Adaptive sync-verification tier** (TICKET-065) — `_periodic_auto_align` verifies
   ~3×/min while syncing, relaxes to 1×/min once confirmed, snaps back on any miss
   (`_note_sync_verdict` / `_sync_tier_interval`). Energy correlation gives the verdict;
@@ -64,7 +100,7 @@ karaoke tool. Read this first, then `ARCHITECTURE.md`.
   `（Cover MV）` lenticular tags; covers with no parseable original artist DROP the cover
   channel and search title-first (the MAFIA / マフィア — Ouro Kronii case).
 - **Language-confidence + known-acts** (TICKET-062) — `confidence.language_confidence`
-  + `_KNOWN_JA`; GHOST/星街すいせい → JA, feelingradation/ReGLOSS → JA.
+  + `_KNOWN_JA` / `_ALWAYS_JA`; GHOST/星街すいせい → JA, feelingradation/ReGLOSS → JA.
 - **Long-concert** (TICKET-063) — applause gap = song boundary → re-identify; 2-6 min
   duration heuristic. (Open: transcription-based song-ID against the library.)
 - **Glyph atlas** render — each (glyph,font,colour,stroke) rasterised once + pasted;
@@ -92,11 +128,20 @@ karaoke tool. Read this first, then `ARCHITECTURE.md`.
   hololive-wide out of scope (point at a playlist to add).
 
 ## Key references
-- `ARCHITECTURE.md` (subsystems + confidence), `ISSUES.md` (TICKET-001..061),
+- `ARCHITECTURE.md` (subsystems + confidence), `ISSUES.md` (TICKET-001..071),
   `PERFORMANCE.md` / `LYRIC_PERFORMANCE.md` (PERF/LP; LP-100/101 = PyGame-SDL2 / single-strip
   GPU paths if 60 fps isn't enough).
-- Sync lives in `main.py`: `_consume_async`, `_schedule_sync_confirm`, `_eased_offset`,
-  `_check_applause_gap`, `_apply_align`, `_auto_align_by_energy`, `align.py`, `songchange.py`.
-- `/diag` is the eyes (fps + full sync state machine); `/tune` changes sync/render knobs live.
+- **Song decision** (`main.py`): `_on_track_change`, `_consume_async` (Shazam + 5-strike +
+  bundled-authoritative guard), `_decide_by_ear` / `_apply_decision`, `LyricsIndex.candidates`,
+  `align.transcribe_vocals` / `score_candidates` / `decide_song_by_lyrics`, `confidence.py`,
+  `extract_cover_original`, `_seed_bundled_lyrics`.
+- **Sync** (`main.py`): `_periodic_auto_align` (adaptive tier), `_note_sync_verdict`,
+  `_tier_listen_now`, `_check_applause_gap`, `_apply_align`, `_auto_align_by_energy`,
+  `_eased_offset`, `align.py`, `songchange.py`.
+- `/diag` is the eyes (fps + full sync + `.decision` + `.sync.tier_*`); `/tune` changes knobs
+  live (incl. all `decide_*`, `sync_tier_*`, `wrong_song_strikes`).
+- **PII / repo hygiene:** keep build scratch (`build_*.err/.log/.exit`, `*.bak`, `_batch_fetch*`)
+  OUT of git — they embed `C:\Users\<name>\…` paths. `.gitignore` covers them; if a tracked one
+  slips in, `git rm --cached` it. No PII in source/docs as of v1.0.66.
 - User prefs (memory): keep work on D:\ ; always merge clean / never force-push (multi-machine);
   native minimised app, no terminal windows; minimise em/en dashes in prose.
