@@ -112,7 +112,16 @@ def _status(app):
         "matched_title": app.meta.get("title"),
         "matched_artist": app.meta.get("artist"),
         "lang": app.meta.get("lang"),
+        # TICKET-099: `verified` now means "duration/title meta passes AND
+        # Shazam has corroborated the loaded title at least once" — i.e.
+        # SOUND has agreed. A duration-match alone is no longer enough; that
+        # was the v1.0.88 bug where a paused SMTC tab with a stale title was
+        # being reported as verified before any audio confirmation.
+        # `verified_meta` exposes the old (duration/title) check for any
+        # backward-compatible watcher that wants it.
         "verified": app._verified,
+        "verified_meta": getattr(app, "_verified_meta", False),
+        "source_priority": getattr(app, "_source_priority", "agree"),
         "heard_by_sound": app._sound_song,
         "boundary_detect": getattr(app, "boundary_on", None),
         "live_mode": getattr(app, "_live_mode", None),

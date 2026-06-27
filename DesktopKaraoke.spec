@@ -29,6 +29,9 @@ hiddenimports = [
     # frozen build always includes them.
     "appdata", "version", "updater", "songchange", "align", "api", "character", "recognize", "fetch_lyrics", "gpu_setup",
     "playlist_import", "playlist_import_gui", "concert_ocr", "deep_transcribe", "confidence",
+    # TICKET-100: Discord IPC reader (lazy-imported in main.py only when the
+    # tray toggle is ON, but pin it here so the frozen build includes it).
+    "discord_rpc",
 ]
 
 # Packages that ship data files / dynamically-imported submodules.
