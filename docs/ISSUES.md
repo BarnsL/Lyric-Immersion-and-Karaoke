@@ -18,6 +18,67 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## v1.0.93 — Shipped (boundary-deferred whole-lyrics swap, TICKET-111)
+Closes TICKET-111. All five immediate-clear paths (decision-engine SWITCH at Site H, decision-engine REGEN at Site I, wrong-song-strike at Site D, user `/wrong` at Site G, and AI-gen `_begin_generation` at Site C) now queue the replacement on `self._pending_swap` instead of blanking `self.lines` on fire. The fetch (or AI-gen) is kicked off in parallel so latency overlaps with the remaining playback of the old lyrics. `_consume_async` routes the completed payload into `pending_swap["lines"]` when the fetch's captured swap_token still matches; `_apply_generated` does the same for REGEN via a `gen_token` check. The new `_tick_body` consumer (placed RIGHT AFTER the `_pending_offset` consumer to preserve TICKET-088 same-tick ordering) tracks an `_idx_minus_one_since` wall-clock timer and calls `_try_apply_swap`, which checks the per-mode boundary via `_swap_ready` (LINE-mode: current line ends or `≥swap_defer_instrumental_gap_s` on `idx==-1`; SCROLL-mode: belt drained or instrumental gap). `_apply_pending_swap` commits atomically: cancels in-flight LINE-mode slide-in, clears scroll belt, wipes canvas, swaps `self.meta`/`self.lines`/`self._lyrics_path` in one tick, drops the verified gate ONLY if this swap set it, invalidates PERF-102 block cache, and increments `_swap_commit_seq`. Safety cap (`swap_defer_max_s` default 8.0s) force-commits if the boundary never lands; `/wrong` uses a tighter cap (`swap_defer_user_max_s` default 3.0s). Track change calls `_cancel_pending_swap("track-change")`. Stale fetch tokens are dropped with a log line. Kill-switch via `swap_defer_enabled` (default 1), flipping to 0 via `/tune` restores v1.0.92 immediate-clear without a re-release.
+
+**Four new tune knobs:** `swap_defer_enabled` (1), `swap_defer_max_s` (8.0), `swap_defer_instrumental_gap_s` (2.0), `swap_defer_user_max_s` (3.0). All live-tunable via `/tune`.
+
+**Observability:** `/diag.pending_swap` returns `{queued, kind, source_site, artist, title, queued_age_s, fetch_ready, ready_for_swap, blocked_by, force_ai_gen, fetch_token, will_force_commit_in_s, set_gate, last_commit_seq}` so the operator can watch a swap traverse the state machine in real time. `api.py` `/diag` help blurb updated to mention pending-swap; the dict itself passes through automatically since `api.py:277-279` already forwards everything `app.get_diag()` returns.
+
+**Smoke test:** baseline `/diag.pending_swap.queued == false`; play a known-wrong-LRC song until decision engine flips SWITCH (`/diag.decision_engine.state == "SWITCH"`); confirm `pending_swap.queued == true` and old lyrics keep rendering; when current line ends, `pending_swap.queued == false` and `last_commit_seq` increments. Kill-switch test: `POST /tune swap_defer_enabled=0`; queued swaps commit immediately with `reason == "disabled"`.
+
+---
+
+## v1.0.92 — Shipped (continuous decision engine, TICKET-109)
+Closes TICKET-109. New background watcher `_decision_tick` (self-throttled to `decision_tick_interval_s`, default 2.0s) aggregates four signal dimensions (SMTC<->Shazam agreement, drift trend, lyric-quality flags, decide-by-ear corroboration) into a strike score over a rolling window of `decision_score_window` samples (default 12). State machine promotes TRUST -> CAUTION -> SWITCH -> REGEN at strike thresholds 3 / 5 / 8 (knobs `decision_caution_strikes`, `decision_switch_strikes`, `decision_regen_strikes`). `_fire_decision_action` executes SWITCH (re-fetch alternative source, cooldown `decision_action_cooldown_s` default 30.0s) or REGEN (force AI generation). Engine forgets prior song's strikes on track change via `_reset_decision_engine`. Tray hint surfaces state; `/diag.decision_engine` exposes state, strikes, last_action_age_s, dim scores for live observability.
+
+**Knobs:** `decision_engine_on` (1), `decision_caution_strikes` (3), `decision_switch_strikes` (5), `decision_regen_strikes` (8), `decision_score_window` (12), `decision_tick_interval_s` (2.0), `decision_action_cooldown_s` (30.0).
+
+**Known issue closed in v1.0.93:** the SWITCH/REGEN branches in `_fire_decision_action` cleared `self.lines = []` immediately on fire, producing a 1-5s on-screen blackout while the new lyrics arrived (TICKET-111 fixed by deferring the swap to a boundary).
+
+---
+
+## TICKET-111 — Boundary-deferred whole-lyrics swap (no more 1-5s blackout on SWITCH/REGEN/wrong-song) 🟢 (v1.0.93)
+**Symptom (post-v1.0.92):** the v1.0.92 decision engine's `_fire_decision_action` SWITCH and REGEN branches, the wrong-song-strike teardown (Site D), and the user-driven `/wrong` (Site G) all blanked `self.lines = []` immediately on fire and re-fetched. Result: 1-5 seconds of empty overlay while the new lyrics loaded, exactly the kind of visible "snap" the user has been hunting for (lineage: TICKET-088 smooth-transitions still snapping).
+
+**Fix (v1.0.93):** queue the swap on `self._pending_swap` instead. Fetch / AI-gen runs in parallel so latency overlaps. Old lyrics keep rendering until the boundary fires. Atomic commit at the boundary via `_apply_pending_swap`. Same shape as TICKET-078 `_pending_offset` (precedent for offset corrections; this is the same state machine generalized to whole-lyrics replacement). TICKET-088 same-tick ordering preserved: the new consumer is placed RIGHT AFTER the `_pending_offset` consumer in `_tick_body`, so offset commits first and the swap commits against the fresh offset.
+
+**Five sites converted:**
+- Site C: `_begin_generation` (guards its immediate clear when a REGEN swap is pending, `_apply_generated` writes into `pending["lines"]` and `_apply_pending_swap` commits atomically)
+- Site D: wrong-song-strike teardown in `_tick`
+- Site G: `report_wrong` (user `/wrong`, tighter `swap_defer_user_max_s` cap)
+- Site H: `_fire_decision_action` SWITCH branch
+- Site I: `_fire_decision_action` REGEN branch
+
+**Boundary detection per render mode:**
+- LINE modes (`none`/`left`/`right`/`top`/`bottom`): current line ends (post-last-line is a fast-path) OR `idx==-1` instrumental gap exceeds `swap_defer_instrumental_gap_s` (default 2.0s).
+- SCROLL modes (`lr`/`rl`/`tb`/`bt`): scroll belt drained (`len(self._stream) == 0`) OR same instrumental-gap rule.
+- Animation in progress in LINE mode blocks the commit (`anim-in-progress`) so a slide-in can't snap the new line.
+
+**Safety:** `swap_defer_max_s` (default 8.0s) is a hard cap, force-commit with `reason="timeout(...)"` if the boundary never lands. `swap_defer_user_max_s` (default 3.0s) is a tighter cap for `/wrong` since the user explicitly asked for the fix. Kill-switch `swap_defer_enabled` (default 1), `/tune swap_defer_enabled=0` restores v1.0.92 immediate-clear without a re-release; any in-flight swap flushes (`reason="disabled"`) or cancels.
+
+**Race-safety:** stale fetch tokens (`_swap_fetch_token` monotonic) are dropped when `_consume_async` sees a token that doesn't match `pending_swap["fetch_token"]`, rapid double `/wrong` no longer races. Real track change in `_on_track_change` calls `_cancel_pending_swap("track-change")` so an old-song target can't land against new-song state. A sibling `_pending_offset` write is dropped in `_apply_pending_swap` since the line timings under it just changed.
+
+**Files:** `main.py` (13 edits: tune knobs, init state, on_track_change cancel, _start_fetch swap_token threading, _consume_async route, Sites C/D/G/H/I, _tick_body consumer, helper methods `_queue_swap`/`_try_apply_swap`/`_apply_pending_swap`/`_cancel_pending_swap`/`_swap_ready`/`_diag_pending_swap`, get_diag entry); `api.py` (1 edit, /diag help blurb only).
+
+**Verify:** see v1.0.93 smoke test above. /diag.pending_swap fields cover every state-machine transition.
+
+---
+
+## TICKET-110 — No-repo-lyrics path (handle songs the user has no LRC for, AI-gen disabled) 🔴
+**Symptom:** when a track has no cached LRC, no provider lyrics, and the user has AI generation disabled (or it fails), the overlay just sits empty with no user feedback. The current paths assume one of fetch/cache/generation succeeds.
+
+**Proposal:** explicit "no lyrics available" hint + tray badge state. Detection runs after the full fetch chain returns empty AND `force_ai_gen`/`generate_by_ear_on` is false (or AI-gen yielded nothing in N seconds). Surface a tray-icon overlay glyph + `/status.no_lyrics_reason ∈ {"chain-empty", "ai-disabled", "ai-failed"}` so the user knows WHY. Allow inline `/wrong` to bypass and try again; allow `/identify` to re-run sound-ID in case the track field was wrong.
+
+**Status:** queued for v1.0.94. Pairs naturally with TICKET-111's deferred-swap state machine (a no-lyrics signal could route through `_cancel_pending_swap` cleanly).
+
+---
+
+## TICKET-109 — Continuous decision engine (SMTC/Shazam/drift/quality aggregation -> SWITCH/REGEN) 🟢 (v1.0.92)
+**Shipped in v1.0.92.** Background watcher `_decision_tick` aggregates four dimensions into strike scores over a rolling window; state machine promotes TRUST -> CAUTION -> SWITCH -> REGEN; `_fire_decision_action` executes the chosen action with a per-state cooldown. See v1.0.92 changelog above for full detail. Closed by v1.0.93 follow-up (TICKET-111) which removed the immediate-clear blackout on SWITCH/REGEN.
+
+---
+
 ## v1.0.91 — Shipped (LINE-mode render perf + perf instrumentation + title-alias album fallback + verified-render grace + scroll_ rename + concert-detect regex + fine-tune pause + GPU policy followups + Start Menu self-heal)
 **Seven workflow-driven fixes in one build, all targeting failure classes captured by the v1.0.90 perf workflow (w821l9jnw) on V.W.P "歌姫" + cluster A/B stall traces.** Closes TICKET-103 followups, TICKET-104, TICKET-105, TICKET-106 and lands the batch4 A1/A2/A3 plus the scroll_ rename batch1.
 
