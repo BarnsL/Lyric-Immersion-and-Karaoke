@@ -8,6 +8,58 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## TICKET-086 — YouTube Music URL normalization + ampersand-collab cover signal + YT Music metadata trust 🟢
+**User spec:** "Keep the same logic for the most part" — surgical changes for YouTube Music
+sources without regressing youtube.com / generic-browser flow.
+
+**Three areas:**
+- **(A) URL normalization** at every yt-dlp / video-id entry point.
+  - New `deep_transcribe._normalize_youtube_url(q)`: lossless `urlsplit`/`urlunsplit` roundtrip
+    that rewrites `music.youtube.com` and `m.music.youtube.com` netloc to `www.youtube.com`.
+    NO-OP for non-http (titles / 11-char ids).
+  - Wired into `fetch_captions_only` (replaces `q = query.strip()`) and `_download_audio`
+    (passes the URL straight through instead of `ytsearch1:` prefixing it).
+  - Inline guard in `main.set_now_url` so `_now_url` (and `/source`/`/status`) always carry
+    the canonical host.
+- **(B) Cover detector gains an ampersand-collab signal** (lower-confidence than the explicit tag).
+  - New `_is_amp_collab_title(title, cover_channel)`: HTML-unescapes, refuses
+    `_AMP_ARTIST_ALLOWLIST` (Hall & Oates, Simon & Garfunkel, Crosby/Stills/Nash, Earth Wind &
+    Fire, Florence + the Machine, Kool & the Gang, …), requires a real title separator
+    (`-–—/|:【「(\[`) before the right side, and the right side must be ≥2 word/CJK tokens of
+    length ≥2 joined by `&` / `＆`. Cover-channel-only matches are rejected.
+  - New `cover_signal(title, cover_channel)` returns `'explicit'` / `'amp_collab'` / `None`.
+  - `is_cover_title` now ORs the amp_collab signal in (same routing — title-first fetch).
+  - `extract_cover_original` short-circuits for amp_collab: returns `(None, song_before_sep)`,
+    so the existing `_on_track_change` fall-through sets `fetch_artist = ''` (title-only).
+  - **Demotion:** in the tick loop, if `cover_signal == 'amp_collab'` AND YT Music source AND
+    SMTC `album` field is non-empty, demote (`_cover_signal = None; _is_cover = False`).
+    YT Music only populates album for OFFICIAL tracks, so this is strong original-evidence.
+    Tunable via `cover_amp_album_demote` (default 1.0 = ON).
+- **(C) YT Music metadata trust.**
+  - `clean_artist(artist, source="")` — source-aware bypass: if `'music.youtube' in source`,
+    return the SMTC artist verbatim (already clean: `'轟はじめ'`, not `'Hajime Ch. 轟はじめ ‐ ReGLOSS'`).
+    Default empty preserves all existing callers; updated the single call site to pass `src`.
+  - `clean_title` strips a BOL-anchored `^\s*Mix\s*[-–—]\s*` autoplay-mix prefix. Anchored to
+    BOL so `'DJ Mix - Track'` and `'Track - Mix'` are not touched.
+
+**State + diagnostics:**
+- `_cover_signal` init in `__init__`, set every tick alongside `_is_cover`.
+- `/source` `derived` exposes `cover_signal`, `yt_music_source`, `album` (mirrored from raw).
+- 1 new tune knob: `cover_amp_album_demote` (live-tunable via `/tune`).
+
+**Sanity-tested (scratchpad/test_086.py):**
+- URL normalize: 7/7 (music.youtube + m.music.youtube → www; www.youtube preserved with
+  `?v=`/`&list=`/`&t=` params; 11-char id, plain title, empty, None all pass through).
+- amp_collab detection: positives ("Despacito - Luis Fonsi & Daddy Yankee", "Song / Alka &
+  Lumi") + allowlist negatives (Hall & Oates, Simon & Garfunkel) + plain-title negatives.
+- Mix - prefix: BOL match strips, "DJ Mix - Track" and "Track - Mix" preserved, lowercase
+  case-insensitive.
+
+**Live verify post-deploy:** `/health` reports 1.0.86; `/source` derived shows
+`cover_signal` + `yt_music_source` + `album` when a YT Music tab is playing.
+
+---
+
 ## TICKET-085 — Fine-tune sync mode (±0.2s target via lyric pause) 🟢
 **User spec:** "My aim is to get most songs synced to the 0.2s of the sung lyric but not break any other syncing activity. Let's go in that mode after 20 seconds of satisfactory sync. Allow for the lyric procession to pause for 0.2 to 1 second at a time to assist with sync instead of moving place and causing stuttering user experience. Also allow it to move ahead 0.2 to 2 seconds if needed but prefer pause if that's what it needs."
 
