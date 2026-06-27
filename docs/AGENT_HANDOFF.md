@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.84.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.85.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -52,7 +52,20 @@ Suisei). **Current build: v1.0.84.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.84, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.85, all deployed + on master)
+- **v1.0.85 — Fine-tune sync mode (TICKET-085):** post-major-sync precision pass that drives
+  sync to ±0.2s of the sung lyric WITHOUT touching anything else. Enters after 20s of
+  satisfactory sync, listens every 8s via Whisper-anchor. Per tick: forward drift 0.2–1.0s →
+  PAUSE lyric procession (line index + karaoke fill + scroll belt all freeze in lockstep on
+  the held pos/pos_raw); at pause-end self.offset is re-based so the resumed frame equals
+  the held frame with zero visible jump. Backward drift 0.2–2.0s → tiny forward nudge
+  via _smooth_offset (asymmetric cap — pause >1s feels like a bug, but a 2s forward skip is
+  imperceptible). Drift >2.5s exits to normal tier. Exits also on track change / force-sync /
+  decide-by-ear switch / manual nudge / 2 inconclusive in a row. Adversarial verify caught
+  a same-tick race with the v1.0.78 deferred-commit machinery (snapshot had_pending_pre
+  before the deferred-commit consumes _pending_offset) + gated energy-align and silent
+  apply_align so they don't race with fine-tune's own listen cadence. 7 tune knobs
+  (fine_tune_*) live-tunable; 5 fine_* fields surface in /diag for observability.
 - **v1.0.84 — Display-string rebrand "Desktop Karaoke" → "Lyric Immersion and Karaoke" (TICKET-084):**
   workflow-driven sweep (audit → replace → adversarial verify). 15 edits across api.py /health field,
   character.py artist-fallback, main.py tray tooltip + 7 toast titles + Tk window title + Startup .lnk,
