@@ -18,6 +18,25 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## v1.0.95 — Shipped (six-language translation actually delivered + /retranslate, TICKET-115)
+Closes TICKET-115. The README's "English translation for Japanese / Chinese / Korean / Spanish / German / Russian" claim was previously aspirational on the German + Russian side: live capture on Rammstein "Deutschland" (lang=de, 51 lines from lrclib/search) showed every `en` field empty. Root cause was a two-place language whitelist that had drifted between `fetch_lyrics._translate_lines` and `main._maybe_translate`, plus a per-line gate that only ran translation when CJK lines were present — so a fully German body never reached the translate worker.
+
+**Fix in `fetch_lyrics.py`:** hoisted the language set into a module constant `_LANGS = ("ja", "ko", "zh", "es", "de", "ru", "fr", "pt", "it")` used at BOTH the per-line `detect_lang(raw) in _LANGS` gate AND the whole-song `song_lang in (*_LANGS, "ja-romaji")` gate inside `_translate_lines`, so the two can never drift apart again. `annotate()` comment updated: any Latin-script source (es / de / fr / it / pt / en) renders as-is with empty `rm` — no romaji needed.
+
+**Fix in `main.py`:** mirrored the same set into `Overlay._maybe_translate`'s "whole" tuple — `("es", "de", "fr", "it", "pt", "ru", "ja-romaji")` — with an explicit "keep in sync with `_translate_lines._LANGS`" comment so a future edit doesn't re-introduce the drift. CJK songs still get only their CJK lines translated; non-English Latin/Cyrillic songs get every line.
+
+**Bonus delivered alongside the six promised:** French / Italian / Portuguese now work too (the whitelist already classifies them via `detect_lang`; the bug was the missing wire-up).
+
+**New endpoint `POST /retranslate`:** force a translation backfill of the currently loaded track without re-fetching lyrics. `api.py` marshals the request onto the Tk thread via a `threading.Event` + `_run` pattern so the HTTP response carries the worker's snapshot (`{ok, action, path, lang, n_lines, n_missing}`). Bounded 5 s wait so a frozen UI thread can never hang the API (returns 503 with `"UI thread did not respond within 5s"`). Backed by `Overlay.retranslate_loaded()` which clears any stuck `_translating` guard and routes through `_start_translate` → `backfill_file` (atomic LRC rewrite, main tick re-loads in place, playback position preserved).
+
+**In-flight guard hardening:** the `_start_translate` worker's `_translating = None` release moved into a `try/finally` so an exception in `backfill_file` no longer poisons the guard and silently blocks every future `_maybe_translate` call for the same path. `/retranslate` also clears `_translating` before kicking off to guarantee a prior poisoned run can't block a manual retry.
+
+**Files:** `fetch_lyrics.py` (`_translate_lines` _LANGS hoist + dual-gate; `annotate()` comment), `main.py` (`_maybe_translate` whole-set; `_start_translate` finally; new `retranslate_loaded` method), `api.py` (`/retranslate` route + `_ROUTES` help blurb).
+
+**Verify:** load Rammstein "Deutschland" (or any German / French / Italian / Portuguese track); `/status.lines` should show `en` populated within seconds. Or on an already-loaded track with empty translations: `POST /retranslate` returns `{ok: true, n_lines: N, n_missing: N}` and the overlay shows English translations after `backfill_file` completes. Pre-existing CJK + Spanish + Russian behavior is unchanged (same gates, just live-tunable via the constant now).
+
+---
+
 ## v1.0.93 — Shipped (boundary-deferred whole-lyrics swap, TICKET-111)
 Closes TICKET-111. All five immediate-clear paths (decision-engine SWITCH at Site H, decision-engine REGEN at Site I, wrong-song-strike at Site D, user `/wrong` at Site G, and AI-gen `_begin_generation` at Site C) now queue the replacement on `self._pending_swap` instead of blanking `self.lines` on fire. The fetch (or AI-gen) is kicked off in parallel so latency overlaps with the remaining playback of the old lyrics. `_consume_async` routes the completed payload into `pending_swap["lines"]` when the fetch's captured swap_token still matches; `_apply_generated` does the same for REGEN via a `gen_token` check. The new `_tick_body` consumer (placed RIGHT AFTER the `_pending_offset` consumer to preserve TICKET-088 same-tick ordering) tracks an `_idx_minus_one_since` wall-clock timer and calls `_try_apply_swap`, which checks the per-mode boundary via `_swap_ready` (LINE-mode: current line ends or `≥swap_defer_instrumental_gap_s` on `idx==-1`; SCROLL-mode: belt drained or instrumental gap). `_apply_pending_swap` commits atomically: cancels in-flight LINE-mode slide-in, clears scroll belt, wipes canvas, swaps `self.meta`/`self.lines`/`self._lyrics_path` in one tick, drops the verified gate ONLY if this swap set it, invalidates PERF-102 block cache, and increments `_swap_commit_seq`. Safety cap (`swap_defer_max_s` default 8.0s) force-commits if the boundary never lands; `/wrong` uses a tighter cap (`swap_defer_user_max_s` default 3.0s). Track change calls `_cancel_pending_swap("track-change")`. Stale fetch tokens are dropped with a log line. Kill-switch via `swap_defer_enabled` (default 1), flipping to 0 via `/tune` restores v1.0.92 immediate-clear without a re-release.
 
@@ -35,6 +54,31 @@ Closes TICKET-109. New background watcher `_decision_tick` (self-throttled to `d
 **Knobs:** `decision_engine_on` (1), `decision_caution_strikes` (3), `decision_switch_strikes` (5), `decision_regen_strikes` (8), `decision_score_window` (12), `decision_tick_interval_s` (2.0), `decision_action_cooldown_s` (30.0).
 
 **Known issue closed in v1.0.93:** the SWITCH/REGEN branches in `_fire_decision_action` cleared `self.lines = []` immediately on fire, producing a 1-5s on-screen blackout while the new lyrics arrived (TICKET-111 fixed by deferring the swap to a boundary).
+
+---
+
+## TICKET-115 — Six-language translation actually delivered + `/retranslate` endpoint 🟢 (v1.0.95)
+**Symptom (live capture, 2026-06-27):** README has long claimed "English translation for Japanese / Chinese / Korean / Spanish / German / Russian songs" but on Rammstein "Deutschland" (lang=de, 51 lines loaded from lrclib/search) every `en` field came back empty. Romaji `rm` was also empty (correct — German doesn't need it), but no translation ever ran. The whole German + Russian "delivered" claim was effectively a lie for the songs the user actually queues up.
+
+**Root cause:** two-place language whitelist drift plus a per-line gate that only fired when CJK lines were present.
+- `fetch_lyrics._translate_lines` had `("ja", "ko", "zh", "es", "de", "ru")` at the per-line gate and `("ja", "ko", "zh", "es", "de", "ru", "ja-romaji")` at the whole-song gate — already two slightly different sets.
+- `main.Overlay._maybe_translate` "whole" tuple was `("es", "de", "ru", "ja-romaji")` — tighter still, and missing the CJK + es overlap that `_translate_lines` got right.
+- The per-line gate only marked a line for translation when `detect_lang(raw)` hit the whitelist; a fully German body that the song-language pipeline correctly classified as `de` never had any individual lines forced into the want-set because the CJK-presence shortcut didn't fire on a Latin-script song.
+
+**Fix (v1.0.95):**
+- `fetch_lyrics._translate_lines`: hoisted into `_LANGS = ("ja", "ko", "zh", "es", "de", "ru", "fr", "pt", "it")` used at BOTH gates (per-line `detect_lang(raw) in _LANGS`, whole-song `song_lang in (*_LANGS, "ja-romaji")`). One source of truth, can't drift.
+- `main._maybe_translate`: "whole" tuple expanded to `("es", "de", "fr", "it", "pt", "ru", "ja-romaji")` with an explicit "keep in sync with `_translate_lines._LANGS`" comment.
+- `annotate()` comment clarified: any Latin-script source (es / de / fr / it / pt / en) renders as-is with empty `rm` — the `backfill_file` re-process guard already skips lines with `rm` set, so leaving Latin lines empty is intentional and correct.
+
+**Bonus:** French / Italian / Portuguese also work now (already classified by `detect_lang`, only the wire-up was missing).
+
+**New endpoint:** `POST /retranslate` forces a translation backfill of the currently loaded track without re-fetching lyrics. `api.py` marshals onto the Tk thread via `threading.Event` + `_run` so the HTTP response carries the worker snapshot (`{ok, action, path, lang, n_lines, n_missing}`); bounded 5 s wait returns 503 if the UI thread is hung. Backed by `Overlay.retranslate_loaded()` which clears any stuck `_translating` guard and routes through the existing `_start_translate` → `backfill_file` pipeline (atomic rewrite, main tick re-loads in place, playback position preserved). Help blurb in `_ROUTES`.
+
+**In-flight guard hardening:** `_start_translate`'s `self._translating = None` release moved into a `try/finally` so an exception in `backfill_file` no longer poisons the guard and silently blocks every future `_maybe_translate` call for the same path.
+
+**Files:** `fetch_lyrics.py` (`_translate_lines` _LANGS hoist + dual-gate; `annotate()` comment), `main.py` (`_maybe_translate` whole-set; `_start_translate` finally; new `retranslate_loaded` method), `api.py` (`/retranslate` route + `_ROUTES` help blurb).
+
+**Verify:** see v1.0.95 smoke test above. README's "Japanese / Chinese / Korean / Spanish / German / Russian" claim is now actually delivered end-to-end; French / Italian / Portuguese delivered as a bonus.
 
 ---
 
