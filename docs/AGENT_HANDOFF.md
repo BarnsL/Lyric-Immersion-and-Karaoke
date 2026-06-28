@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.95.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.96.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -53,7 +53,106 @@ Suisei). **Current build: v1.0.95.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.95, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.96, all deployed + on master)
+- **v1.0.96 — Two-tab "Tab A muted / Tab B audible" source lock (TICKET-117 + TICKET-118).**
+  Closes the exact user scenario *"i want to be able to watch a muted video while having the
+  actual music video in a different tab providing lyrics and music without interference"* —
+  Brave with two YouTube tabs (TAB A = muted Cyberpunk 2077 POV motorbike video, TAB B = audible
+  "I Really Want to Stay at Your House" by Rosa Walton). Before v1.0.96, both tabs published to
+  SMTC and `MediaWatcher._pick` picked the most-recently-active session, so any browser focus
+  ping-pong yanked the overlay between the two tracks. v1.0.96 adds two complementary fixes:
+  - **TICKET-117 — explicit SMTC session pin (tray menu).** New tray submenu "Source →" lists
+    every visible SMTC session (`{app_name} — {title} ({artist})`) with the AUTO entry on top
+    and a checkmark on the currently-selected pin. Pinning installs a 16-hex composite id on
+    `MediaWatcher` (`set_pinned_session(id, source_app)`); `_pick` then returns the pinned
+    session unconditionally if it's still alive. Pinned id is persisted via `_persist()` (key
+    `pinned_session_id` + `pinned_source_app`) and re-applied on launch. If the pinned session
+    disappears (tab closed) the watcher enters a brief grace window (`pin_grace_s`, default
+    20.0s) where any single new session from the same `source_app` is silently adopted as the
+    re-pin target (so a Brave tab refresh doesn't lose the lock); after the grace window the
+    pin is cleared and AUTO behavior resumes. `/diag.sessions` lists every visible session +
+    the pin state for the operator; `/diag.pin` shows `{id, source_app, alive, age_s}`.
+  - **TICKET-118 — audible-session preference (Core Audio peak meter tiebreaker).** New
+    `audible_sessions.py` wraps pycaw's `AudioUtilities.GetAllSessions()` →
+    `IAudioMeterInformation.GetPeakValue()`, aggregated per-PID then per-executable basename,
+    cached 1s, hard-timeouted 500ms on a worker thread (so a hung HDMI audio endpoint can't
+    stall the 0.15s SMTC poll loop). When MULTIPLE SMTC sessions are equally eligible and no
+    explicit pin (TICKET-117) is set, `_pick` consults the audible-pref map: the session whose
+    `source_app` substring-matches the loudest process (peak ≥ `prefer_audible_threshold`,
+    default 0.02) wins. Net effect for the user scenario: even WITHOUT pinning Tab B
+    explicitly, the muted Tab A's Brave PID reports peak ≈ 0.0 while Tab B's Brave PID reports
+    a real audible peak, so the watcher locks onto Tab B automatically. Kill-switch via
+    `prefer_audible_session` tune knob (default 1 = on, 0 = pre-118 sticky-only). On
+    non-Windows / missing pycaw, `_AVAILABLE` flips False on the first ImportError and the
+    feature degrades to exact pre-118 behavior — silent and free.
+  - **Order of precedence in `_pick`:** TICKET-117 pin (absolute) → TICKET-118 audible (with
+    threshold) → pre-118 sticky (last-active wins). `/diag.audible_pref` exposes
+    `{enabled, threshold, levels, module: audible_sessions.diag()}` for live verification.
+  - **New tune knobs:** `prefer_audible_session` (1), `prefer_audible_threshold` (0.02),
+    `pin_grace_s` (20.0). A `/tune` POST that flips `prefer_audible_session` or
+    `prefer_audible_threshold` mirrors the new value into `MediaWatcher` immediately
+    (`Overlay.set_audible_pref`) — no restart needed.
+  - **New dep:** `pycaw>=20240210; sys_platform == "win32"` in `requirements.txt`. ~50 KB
+    plus comtypes (already transitive via pystray). Frozen-build pins: `audible_sessions` +
+    `pycaw` + `pycaw.pycaw` + `comtypes` + `comtypes.gen` in `DesktopKaraoke.spec`
+    hiddenimports, plus `pycaw` + `comtypes` in the `collect_all` loop (the COM proxy stubs
+    comtypes generates lazily would otherwise be missed).
+  - **Files:** `audible_sessions.py` (new, ~230 lines), `main.py` (`MediaWatcher` pin state +
+    `set_pinned_session` / `set_audible_pref` / `list_sessions` / `get_pin` / `audible_diag`
+    around lines 410-770, `_pick` two-stage tiebreaker, Overlay tray "Source →" submenu around
+    line 10115, `_persist` keys `pinned_session_id` / `pinned_source_app`, pin liveness
+    grace-window check in tick around line 3528, `/tune` mirror for the audible knobs around
+    line 6810), `api.py` (`/diag.sessions` + `/diag.pin` + `/diag.audible_pref` pass-through —
+    these already forward whatever `app.get_diag()` returns), `DesktopKaraoke.spec` + `requirements.txt`.
+  - **Verify (the user's scenario):** open Brave with TAB A (Cyberpunk motorbike, MUTED) and
+    TAB B (Rosa Walton "I Really Want to Stay at Your House", AUDIBLE, playing); `/diag.sessions`
+    lists both; `/diag.audible_pref.levels` shows `brave` with a non-zero peak (Tab B);
+    `/source.session_id` should lock to Tab B even when Tab A is brought to the foreground.
+    For a guaranteed lock regardless of audio: tray → Source → pick Tab B; `/diag.pin.id`
+    should match Tab B's id and `/source.session_id` should not budge even if Tab B is
+    momentarily muted. Toggle `prefer_audible_session=0` via `/tune` to fall back to pre-118
+    sticky behavior for A/B testing.
+- **v1.0.95 — Four tickets shipped together (TICKET-112 + TICKET-113 + TICKET-114 + TICKET-115).**
+  Two concurrent agent workflows (`wyo3skdey` + `wawvm5uvx`) landed in one bump.
+- **TICKET-112 — YouTube video-description metadata extractor (`yt_description.py`):** SMTC titles
+  like "Shooting Star" are massively ambiguous (dozens of songs share that name) and previously
+  the fetch query was `title + smtc_artist` only, so once a wrong LRC was cached the re-fetch on
+  `/wrong` returned the same wrong file. The new lazy-loaded `yt_description` module calls
+  `yt_dlp` metadata-only (no audio download, bundled already) with a hard
+  `yt_description_timeout_s` (default 8.0s) and an in-process LRU keyed by video_id, then parses
+  templated tags in JP / EN / KR: `作詞・作曲` / `作詞` / `作曲` / `編曲` / `歌唱` / `ボーカル` /
+  `Original` / `カバー元` / `Music:` / `Vocals:` / `Lyrics:` / `Composer:` / `Original by:` /
+  `작사` / `작곡` / `노래`. Fires from `_on_track_change` (main.py:2479) and the `/wrong`
+  re-identify path (main.py:6836) for sources matching `youtube*.com` / `steamwebhelper`.
+  Extracted `vocals` overrides the SMTC artist when the SMTC title is short/ambiguous;
+  `composer` + `original_artist` ride along as fetch disambiguators (`_fetch_lyrics` query)
+  so the ReGLOSS × BEMANI "Shooting Star" case now resolves to `kors k / ReGLOSS` instead of
+  matching some other "Shooting Star". `_video_id` and `extract_video_metadata` are the public
+  entry points; failure is logged at debug, never raises. `/diag` exposes the parsed
+  `yt_metadata` dict; new `GET /yt-meta` returns it. **New tune knobs:**
+  `yt_description_lookup` (1), `yt_description_cache_days` (30), `yt_description_timeout_s` (8.0).
+  **Frozen-build pin:** `yt_description` added to `DesktopKaraoke.spec` `hiddenimports` because
+  it's lazy-imported (`from yt_description import ...`) and PyInstaller's static analyser misses it.
+- **TICKET-113 — Per-track lyric blacklist + provider rotation on `/wrong` / REGEN:** the user-reported
+  failure was *"wrong song, even when I told it, it didnt try to find a new one"* — `/wrong`
+  cleared the cache and re-fetched, but the same provider chain with the same query returned the
+  same wrong LRC. Fix is a track-scoped `self._lyrics_blacklist` set of `(sha1(first 500 chars of
+  LRC), source_provider)` tuples that is reset on track change. `/wrong` adds the currently loaded
+  lyrics' signature to the blacklist BEFORE kicking the re-fetch; the decision-engine REGEN branch
+  does the same. `fetch_lyrics.fetch_and_save` accepts a `reject_signatures` kwarg and skips any
+  provider hit whose signature matches. Two-or-more `/wrong` within 60s escalates straight to
+  AI-gen, bypassing the provider chain that just kept returning the same wrong file. Provider chain
+  order rotates per track on each `/wrong` so a stubborn primary doesn't dominate.
+- **TICKET-114 — Instrumental-gap timer reset on every track change (and on every `idx>=0` transition):**
+  the live diag captured `pending_swap.blocked_by='instrumental-gap(204.2s)'` on a **161-second song** —
+  proof that `_idx_minus_one_since` was being set ONCE at app `__init__` (boot wall-clock) and never
+  reset, so every short song after the first inherited a multi-minute "instrumental gap" measurement
+  that blocked TICKET-111's swap from committing on the LINE-mode boundary path. Now reset in
+  `_on_track_change` (the natural reset point) AND on every idx transition `>=0` in `_tick_body`
+  (so within a single track, the gap timer always starts from when `idx` actually went `-1`, not from
+  app boot). Diag display is clamped to `<= position` so reports stay sane even if the timer
+  somehow leads playback. Net effect: TICKET-111's `will_force_commit_in_s` countdown is honest,
+  and the `swap_defer_instrumental_gap_s` (default 2.0s) boundary actually fires.
 - **v1.0.95 — Six-language translation delivered + `/retranslate` endpoint (TICKET-115):**
   the README has long advertised English translation for Japanese, Chinese, Korean, Spanish,
   German, and Russian, but the actual `_translate_lines` whitelist in `fetch_lyrics.py` only

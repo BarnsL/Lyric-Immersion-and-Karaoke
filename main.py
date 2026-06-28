@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import ctypes
 from ctypes import wintypes
+import hashlib
 import json
 import os
 import re
@@ -405,15 +406,58 @@ def _title_forms_split(title):
 
 # ── Real playback position via Windows Media Transport Controls ───────
 
+def _session_key(source_app, title):
+    """TICKET-117: stable 16-hex composite id for an SMTC session, hashed off
+    (lowercased source_app, lowercased title). Two Brave tabs collide under
+    source_app alone — adding the title disambiguates. Artist is excluded
+    because YouTube/SMTC occasionally updates artist a beat after title, which
+    would flip the id mid-track."""
+    base = f"{(source_app or '').lower()}||{(title or '').lower()}"
+    return hashlib.sha1(base.encode("utf-8", "replace")).hexdigest()[:16]
+
+
 class MediaWatcher:
     """Polls the OS media session in a background thread."""
 
     def __init__(self):
         self._state = None
+        # TICKET-117: cached full session list — each entry is the same st-dict
+        # shape as _state plus an "id" key. Updated every poll under _lock.
+        self._all_sessions = []
+        # TICKET-117: set-of-keys digest from the prior poll, so the menu
+        # refresher only fires when the visible set actually changes.
+        self._sessions_sig = ""
+        # TICKET-117: pinned session id (16-hex). Empty string = Auto. Set
+        # from the Overlay (set_pinned_session) after settings load; the
+        # async loop reads it under _lock each poll so a pin from any thread
+        # takes effect on the next _pick().
+        self._pinned_id = ""
+        # TICKET-117: source_app captured AT pin time, kept so the optional
+        # auto-migrate (same-app sole survivor) can re-pin a single-tab title
+        # change without dropping to Auto.
+        self._pinned_app = ""
+        # TICKET-117: optional callback the Overlay registers to refresh the
+        # tray menu when the visible session set changes (debounced).
+        self._on_sessions_changed = None
+        self._last_change_notify = 0.0
         self._lock = threading.Lock()
         self._stop = False
         self.error = None
         self._pick_src = None       # source_app of the session we're following (sticky)
+        # TICKET-118: audible-session preference. When ON, _pick uses Core
+        # Audio peak meters to break ties between equally-eligible PLAYING
+        # sessions (pick the LOUDEST process whose executable substring-
+        # matches the session's source_app). Off / unavailable → fall through
+        # to the existing sticky/first-playing behavior. Three pieces of
+        # state, all read under _lock so the Tk-thread setter is safe:
+        #   _audible_pref_on    -- runtime flag (1=on)
+        #   _audible_threshold  -- peak below this is "silent" (~0.005 = -46 dBFS)
+        #   _last_pick_reason   -- 'pinned' | 'audible-pref' | 'sticky' | 'first-playing' | 'fallback'
+        #   _last_audible_scores -- last per-session score dict; surfaced via diag
+        self._audible_pref_on = 1
+        self._audible_threshold = 0.005
+        self._last_pick_reason = "init"
+        self._last_audible_scores: dict = {}
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
@@ -431,83 +475,165 @@ class MediaWatcher:
             try:
                 if mgr is None:                 # reuse the manager across polls —
                     mgr = await MM.request_async()  # re-requesting it each 0.1s was wasteful
-                sess = self._pick(mgr)
+                # TICKET-117: enumerate ALL sessions once per poll so list_sessions()
+                # and the tray menu builder don't have to hit WinRT from the Tk thread.
+                # _pick() now consumes this same list (also gets pin awareness).
+                try:
+                    raw_sessions = list(mgr.get_sessions())
+                except Exception:
+                    raw_sessions = []
+                all_states = []
+                for rs in raw_sessions:
+                    try:
+                        rs_info = await rs.try_get_media_properties_async()
+                        rs_tl = rs.get_timeline_properties()
+                        rs_pb = rs.get_playback_info()
+                        try:
+                            rs_rate = float(rs_pb.playback_rate) if rs_pb.playback_rate else 1.0
+                        except Exception:
+                            rs_rate = 1.0
+                        if rs_rate <= 0:
+                            rs_rate = 1.0
+                        rs_pos = rs_tl.position.total_seconds()
+                        try:
+                            rs_lu = rs_tl.last_updated_time
+                            if rs_pb.playback_status == PLAYING and rs_lu.year > 1:
+                                rs_pos += (datetime.now(timezone.utc) - rs_lu).total_seconds() * rs_rate
+                        except Exception:
+                            pass
+                        rs_src = (rs.source_app_user_model_id or "").lower()
+                        rs_title = rs_info.title or ""
+                        all_states.append({
+                            "id": _session_key(rs_src, rs_title),
+                            "title": rs_title,
+                            "artist": rs_info.artist or "",
+                            "album": (getattr(rs_info, "album_title", "") or ""),
+                            "status": rs_pb.playback_status,
+                            "position": max(0.0, rs_pos),
+                            "duration": rs_tl.end_time.total_seconds(),
+                            "rate": rs_rate,
+                            "source": rs_src,
+                            "ts": time.time(),
+                            "_sess": rs,            # for _pick(); stripped from snapshots
+                        })
+                    except Exception:
+                        continue
+                # Publish the cache (without the live winsdk handle) and detect
+                # set-of-keys changes so the tray menu only rebuilds on real diff.
+                snapshot = [{k: v for k, v in s.items() if k != "_sess"}
+                            for s in all_states]
+                sig = "|".join(sorted(f"{s['id']}:{int(s['status'])}" for s in snapshot))
+                pinned_id, _pinned_app, on_changed = (
+                    self._pinned_id, self._pinned_app, self._on_sessions_changed)
+                with self._lock:
+                    self._all_sessions = snapshot
+                    sig_changed = (sig != self._sessions_sig)
+                    self._sessions_sig = sig
+                sess = self._pick(all_states, pinned_id)
                 if sess:
-                    info = await sess.try_get_media_properties_async()
-                    tl = sess.get_timeline_properties()
-                    pb = sess.get_playback_info()
-                    status = pb.playback_status
-                    # Playback rate (≠1.0 when the user speeds up / slows down,
-                    # very common on YouTube) — the clock must advance by it.
-                    try:
-                        rate = float(pb.playback_rate) if pb.playback_rate else 1.0
-                    except Exception:
-                        rate = 1.0
-                    if rate <= 0:
-                        rate = 1.0
-                    pos = tl.position.total_seconds()
-                    try:
-                        lu = tl.last_updated_time
-                        if status == PLAYING and lu.year > 1:
-                            pos += (datetime.now(timezone.utc) - lu).total_seconds() * rate
-                    except Exception:
-                        pass
                     st = {
-                        "title": info.title or "",
-                        "artist": info.artist or "",
-                        "album": (getattr(info, "album_title", "") or ""),
-                        "status": status,
-                        "position": max(0.0, pos),
-                        "duration": tl.end_time.total_seconds(),
-                        "rate": rate,
-                        "source": (sess.source_app_user_model_id or "").lower(),
-                        "ts": time.time(),
+                        "title": sess["title"], "artist": sess["artist"],
+                        "album": sess["album"], "status": sess["status"],
+                        "position": sess["position"], "duration": sess["duration"],
+                        "rate": sess["rate"], "source": sess["source"],
+                        "ts": sess["ts"],
                     }
                     with self._lock:
                         self._state = st
                 else:
                     with self._lock:
                         self._state = None
+                # Debounced menu refresh: at most once per 2s, only on real diff.
+                if sig_changed and on_changed:
+                    now = time.time()
+                    if now - self._last_change_notify >= 2.0:
+                        self._last_change_notify = now
+                        try:
+                            on_changed()
+                        except Exception:
+                            pass
             except Exception:
                 mgr = None                      # drop a stale manager; re-request next poll
             await asyncio.sleep(0.15)   # position is extrapolated, so 0.15s polling
             #                              keeps accuracy while cutting CPU ~33%
 
-    def _pick(self, mgr):
-        """Pick the media session to follow — STICKY, so a paused background tab
-        can't hijack playback. The bug: with a paused tab (Coffee) AND a playing
-        Mix, during the brief gap between Mix songs NO session is 'playing', and
-        the old code fell back to `get_current_session()` (often the paused tab) —
-        so the overlay flip-flopped Coffee↔Mix every track, loading the wrong
-        song's lyrics. Now: prefer a PLAYING session, preferring the one we were
-        already following; and when nothing is playing (a transition gap) KEEP
-        following the last session instead of jumping to a different paused tab."""
-        try:
-            sessions = list(mgr.get_sessions())
-        except Exception:
-            sessions = []
+    def _pick(self, sessions, pinned_id):
+        """Pick the media session to follow.
+
+        TICKET-117: if a pin is active, the pinned session wins absolutely —
+        even when paused (the user's literal scenario is a MUTED video on a
+        sibling tab that SMTC still reports as 'playing'; pin must beat the
+        playing-priority, not be subordinate to it). When the pinned id is set
+        but its session is gone, we deliberately return None so MediaWatcher.get()
+        holds last state via the existing extrapolation path — falling back to
+        any other session during a pin is the ping-pong bug the pin exists to fix.
+
+        Without a pin: STICKY — prefer a PLAYING session, preferring the one we
+        were already following; when nothing is playing (a transition gap) KEEP
+        following the last session instead of jumping to a different paused tab.
+        Same logic as before TICKET-117, just sourced from the pre-enumerated list.
+        """
+        if pinned_id:
+            for s in sessions:
+                if s["id"] == pinned_id:
+                    return s
+            self._last_pick_reason = "pinned-missing"
+            return None
 
         def sid(s):
-            try:
-                return s.source_app_user_model_id or ""
-            except Exception:
-                return ""
+            return s["source"]
 
         def playing(s):
             try:
-                return s.get_playback_info().playback_status == PLAYING
+                return s["status"] == PLAYING
             except Exception:
                 return False
 
         playing_now = [s for s in sessions if playing(s)]
+        # TICKET-118: audible-session tiebreaker. When MULTIPLE sessions are
+        # PLAYING (the user's literal scenario — Brave Tab A muted + Brave
+        # Tab B audible BOTH report 'playing' to SMTC), score each by the
+        # peak amplitude of any process whose executable basename appears as
+        # a substring of the session's source_app. The loudest wins.
+        # AUMIDs like 'app.brave.brave' → match against 'brave'; opaque UWP
+        # ids score 0.0 and we fall through to sticky behavior.
+        #
+        # Pin (above) > audible-pref (here) > sticky (below). Done as a
+        # PRE-FILTER before sticky so a muted-but-still-playing Tab A can't
+        # hijack the lock just because we saw it first.
+        if len(playing_now) >= 2 and self._audible_pref_on:
+            try:
+                levels = self._score_sessions_by_audio(playing_now)
+            except Exception:
+                levels = {}
+            self._last_audible_scores = levels
+            if levels:
+                # Pick highest-scoring session whose score clears the floor.
+                best_id, best_score = None, 0.0
+                for s in playing_now:
+                    score = levels.get(s["id"], 0.0)
+                    if score > best_score:
+                        best_id, best_score = s["id"], score
+                if best_id is not None and best_score >= self._audible_threshold:
+                    for s in playing_now:
+                        if s["id"] == best_id:
+                            self._pick_src = sid(s)
+                            self._last_pick_reason = "audible-pref"
+                            return s
+            # else: no usable signal (pycaw unavailable / no matching process
+            #       / all silent) — fall through to sticky behavior.
+        else:
+            self._last_audible_scores = {}
         # 1) keep following our session if it's still playing (stability)
         if self._pick_src:
             for s in playing_now:
                 if sid(s) == self._pick_src:
+                    self._last_pick_reason = "sticky"
                     return s
         # 2) otherwise the first playing session — and remember it
         if playing_now:
             self._pick_src = sid(playing_now[0])
+            self._last_pick_reason = "first-playing"
             return playing_now[0]
         # 3) NOTHING is playing (likely a gap between Mix tracks). Do NOT jump to
         #    a paused tab — keep the session we were following if it still exists,
@@ -515,11 +641,52 @@ class MediaWatcher:
         if self._pick_src:
             for s in sessions:
                 if sid(s) == self._pick_src:
+                    self._last_pick_reason = "sticky-paused"
                     return s
+        # 4) Final fallback: ANY session (the original get_current_session()
+        #    behavior, but sourced from our cache).
+        if sessions:
+            self._last_pick_reason = "fallback"
+            return sessions[0]
+        self._last_pick_reason = "none"
+        return None
+
+    def _score_sessions_by_audio(self, sessions):
+        """TICKET-118: map {session_id: peak_amplitude} by substring-matching
+        each session's source_app (e.g. 'app.brave.brave') against the list
+        of audible process basenames (e.g. 'brave' → 0.42).
+
+        Why substring: SMTC SourceAppUserModelId is NOT a stable mapping to a
+        process — Brave reports 'app.brave.brave' for every window/tab while
+        the executable is 'brave.exe'. Substring on the executable basename
+        (no path, no '.exe') is the cheapest match that handles both
+        traditional Win32 apps (Spotify → 'spotify') and the AUMID-as-id
+        case. Caller already filtered to multi-session-playing case.
+
+        Returns {} on any failure or when audible_sessions is unavailable.
+        Caches nothing — audible_sessions.get_process_audio_levels has its
+        own ~1s cache.
+        """
         try:
-            return mgr.get_current_session()
+            import audible_sessions
+            levels = audible_sessions.get_process_audio_levels()
         except Exception:
-            return None
+            return {}
+        if not levels:
+            return {}
+        out = {}
+        for s in sessions:
+            src = (s.get("source") or "").lower()
+            if not src:
+                continue
+            # Highest peak across every process whose basename appears in src.
+            best = 0.0
+            for name, peak in levels.items():
+                if name and name in src:
+                    if peak > best:
+                        best = peak
+            out[s["id"]] = best
+        return out
 
     def get(self):
         with self._lock:
@@ -529,6 +696,74 @@ class MediaWatcher:
         if s["status"] == PLAYING:
             s["position"] += (time.time() - s["ts"]) * s.get("rate", 1.0)
         return s
+
+    def list_sessions(self):
+        """TICKET-117: snapshot of every SMTC session the watcher last saw.
+        Each entry: {id, source, title, artist, album, status, position,
+        duration, rate, ts}. Served from the cache, no WinRT call — safe to
+        invoke from the Tk thread (tray menu builder)."""
+        with self._lock:
+            return [dict(s) for s in self._all_sessions]
+
+    def get_for_id(self, session_id):
+        """TICKET-117: live state for ONE specific session by id. Returns the
+        same shape as get() (position extrapolated forward to wall-clock now),
+        or None when the session is not present in the current cache."""
+        if not session_id:
+            return None
+        with self._lock:
+            for s in self._all_sessions:
+                if s["id"] == session_id:
+                    out = dict(s)
+                    break
+            else:
+                return None
+        if out["status"] == PLAYING:
+            out["position"] += (time.time() - out["ts"]) * out.get("rate", 1.0)
+        return out
+
+    def set_pinned(self, session_id, source_app=""):
+        """TICKET-117: install / clear the pinned-session filter. Pass '' to
+        clear. source_app is captured at pin time for the auto-migrate guard."""
+        with self._lock:
+            self._pinned_id = (session_id or "").strip()
+            self._pinned_app = (source_app or "").strip().lower()
+
+    def get_pinned(self):
+        """TICKET-117: (pinned_id, pinned_app) tuple under lock."""
+        with self._lock:
+            return self._pinned_id, self._pinned_app
+
+    def set_audible_pref(self, on, threshold=None):
+        """TICKET-118: enable/disable the audible-session tiebreaker. Called
+        from the Overlay whenever the prefer_audible_session tune knob flips
+        and once at startup to mirror the persisted value. Thread-safe."""
+        with self._lock:
+            self._audible_pref_on = 1 if on else 0
+            if threshold is not None:
+                try:
+                    self._audible_threshold = max(0.0, float(threshold))
+                except Exception:
+                    pass
+
+    def get_audible_pref_diag(self):
+        """TICKET-118: snapshot for /diag.audible_pref. Returns
+        {'enabled', 'threshold', 'last_reason', 'scores'} — `scores` is the
+        per-session-id peak from the last _pick that had multiple playing
+        sessions. Never raises."""
+        with self._lock:
+            return {
+                "enabled": bool(self._audible_pref_on),
+                "threshold": float(self._audible_threshold),
+                "last_reason": self._last_pick_reason,
+                "scores": dict(self._last_audible_scores or {}),
+            }
+
+    def set_sessions_changed_cb(self, cb):
+        """TICKET-117: register a 0-arg callable invoked (debounced, max 1/2s)
+        whenever the set of visible session ids changes. Used by the Overlay
+        to icon.update_menu() so the Source submenu reflects the new tabs."""
+        self._on_sessions_changed = cb
 
     def stop(self):
         self._stop = True
@@ -1505,6 +1740,29 @@ class Overlay:
         self.window_titles_on = bool(s.get("window_titles", True))
         self.window_titles_generic_browsers_on = bool(
             s.get("window_titles_generic_browsers", False))
+        # TICKET-117: pinned SMTC session (the "watch a muted video, follow a
+        # different tab for lyrics" lock). Empty string = Auto (highest-priority
+        # session wins as before). Composite id is `_session_key(source, title)`.
+        # `pinned_session_app` is the source_app at pin time, kept for the
+        # auto-migrate guard (a single same-app session changing title is
+        # likely the same tab autoplaying the next song).
+        self.pinned_session_id = (s.get("pinned_session_id") or "").strip()
+        self.pinned_session_app = (s.get("pinned_session_app") or "").strip().lower()
+        # Wall-time when the pinned session was last seen in the watcher's
+        # snapshot. While the session is missing, _tick polls this against
+        # pinned_grace_s before auto-unpinning so a tab navigation / quick
+        # title flicker doesn't drop the pin.
+        self._pinned_last_seen_t = time.time()
+        # Set true once the watcher has produced any non-empty session list —
+        # gates the cold-start auto-clear (a pin restored from settings whose
+        # session never shows up in the FIRST enumeration silently reverts).
+        self._pinned_cold_start = True
+        self._pinned_cold_start_t = time.time()
+        # Tray-icon handle (set in main() after pystray.Icon() is built) — the
+        # set_pinned_session() helper calls icon.update_menu() to refresh the
+        # Source submenu's radio dots. Stored as an attribute so api.py / tray
+        # toggles can both reach it.
+        self._icon = None
         # Throttle state for the Discord RP poll (own clock, decoupled from the
         # tick rate so the GET_ACTIVITY round-trip can't run more than every
         # discord_rpc_poll_s seconds even if the Tk loop is ticking at 60 Hz).
@@ -1988,6 +2246,25 @@ class Overlay:
             "window_titles_on":             1,  # 1 = scrape allowlisted CEF/Electron windows
             "window_titles_generic_browsers": 0,  # 1 = ALSO scrape chrome/edge/firefox/etc (opt-in)
             "window_titles_poll_s":       2.0,  # background poll cadence (s); EnumWindows is sub-ms so 2s is safe
+            # ── TICKET-117: pinned-session lock (Tab-A-muted / Tab-B-lyrics) ──
+            # Empty pinned_session_id = Auto (highest-priority session wins,
+            # historical behavior). When set, only that session feeds lyrics —
+            # even if other sessions are PLAYING. See set_pinned_session().
+            "pinned_grace_s":             30.0,  # how long to hold a pin after its session goes missing before reverting to Auto
+            "pinned_menu_refresh_s":       2.0,  # min wait between Source-submenu refreshes when the visible session set changes
+            "pinned_auto_migrate_same_app": 1,  # 1 = if pin disappears + exactly one other session shares the pin's source_app, migrate to it (YouTube autoplay)
+            # ── TICKET-118: audible-session preference ──
+            # When MULTIPLE SMTC sessions are PLAYING (e.g. Brave Tab A muted +
+            # Brave Tab B audible BOTH report 'playing'), prefer the session
+            # whose process is actually making sound (Core Audio peak meter).
+            # Pinned session (TICKET-117) wins absolutely if set; this knob is
+            # only consulted to break ties between equally-eligible PLAYING
+            # sessions. Default ON — degrades cleanly to pre-118 sticky
+            # behavior when pycaw / Core Audio is unavailable (non-Windows
+            # dev box, missing dep) or when no audible process matches any
+            # session's source_app.
+            "prefer_audible_session":       1,    # 1 = use Core Audio peak as a tiebreaker, 0 = pre-118 sticky-only
+            "prefer_audible_threshold":     0.005,  # peak below this is 'silent' (~-46 dBFS)
         }
         # TICKET-104 A1: apply measure_text cache size ONCE at startup. The
         # cache is module-level (shared across Overlay/Mirror), so we set the
@@ -2159,6 +2436,23 @@ class Overlay:
         _seed_bundled_lyrics()        # bake-in songs providers always miss (feelingradation)
         self.index = LyricsIndex()
         self.media = MediaWatcher()
+        # TICKET-117: push the persisted pin into the watcher so the very first
+        # _pick() respects it (no Auto blip on startup). The icon.update_menu
+        # callback is registered later, AFTER pystray.Icon is built (in main()).
+        if self.pinned_session_id:
+            self.media.set_pinned(self.pinned_session_id, self.pinned_session_app)
+        # TICKET-118: mirror the audible-pref tune knob into the watcher so
+        # the very first _pick already respects the setting (instead of going
+        # through one cycle of pre-118 sticky behavior). Safe even when pycaw
+        # is unavailable — the watcher's score helper returns {} and _pick
+        # falls through.
+        try:
+            self.media.set_audible_pref(
+                int(self._tune.get("prefer_audible_session", 1) or 0),
+                float(self._tune.get("prefer_audible_threshold", 0.005)),
+            )
+        except Exception:
+            pass
         self.character = Character(self.root, _DATA)
         if self.character_on:
             self.character.set_enabled(True)
@@ -3231,6 +3525,15 @@ class Overlay:
                     self._health_attempts += 1
                     # Identify by sound — the authoritative correction.
                     self._start_identify(seconds=6, attempts=2)
+            # TICKET-117: pin liveness — if the pinned SMTC session has been
+            # gone longer than pinned_grace_s, auto-migrate (same-app sole
+            # survivor) or revert to Auto and notify. Cheaper than wiring
+            # into the per-frame _tick (9s cadence is well under the 30s
+            # default grace).
+            try:
+                self._pinned_tick()
+            except Exception:
+                pass
         finally:
             self.root.after(9000, self._health_check)
 
@@ -6157,6 +6460,15 @@ class Overlay:
             # source — invaluable for "why did it pick THIS as a song" field
             # reports without forcing the user to reproduce the tab state.
             "window_titles": self._diag_window_titles(),
+            # TICKET-117: SMTC session pin (Tab-A-muted / Tab-B-lyrics).
+            # `available` is every session the watcher last saw; `pinned_id`
+            # is the composite hash currently locked, or null for Auto.
+            "sessions": self._diag_sessions(),
+            # TICKET-118: audible-session preference (Core Audio peak meter
+            # tiebreaker when multiple SMTC sessions are PLAYING). Mirrors
+            # the watcher's last decision so field reports can show WHY a
+            # given tab was chosen without needing process-level access.
+            "audible_pref": self._diag_audible_pref(),
         }
 
     def _diag_yt_metadata(self):
@@ -6212,6 +6524,98 @@ class Overlay:
         out = dict(m)
         out["present"] = True
         out["fetching"] = bool(getattr(self, "_yt_metadata_fetching", False))
+        return out
+
+    def _diag_sessions(self):
+        """TICKET-117: snapshot of every visible SMTC session + the pin state
+        for /diag. Status integers are decoded to human strings to match the
+        existing /source convention. Never raises."""
+        STATUS = {0: "closed", 1: "opened", 2: "changing", 3: "stopped",
+                  4: "playing", 5: "paused"}
+        out = {
+            "pinned_id": self.pinned_session_id or None,
+            "pinned_app": self.pinned_session_app or None,
+            "pinned_grace_s": self._pinned_grace_s(),
+            "pinned_grace_remaining_s": 0.0,
+            "available": [],
+        }
+        try:
+            sessions = self.media.list_sessions()
+        except Exception:
+            sessions = []
+        ids_now = set()
+        for s in sessions:
+            sid = s.get("id") or ""
+            ids_now.add(sid)
+            out["available"].append({
+                "id": sid,
+                "source_app": s.get("source") or "",
+                "title": s.get("title") or "",
+                "artist": s.get("artist") or "",
+                "status": STATUS.get(s.get("status"), s.get("status")),
+                "is_pinned": bool(sid and sid == self.pinned_session_id),
+            })
+        if self.pinned_session_id and self.pinned_session_id not in ids_now:
+            remaining = max(0.0, self._pinned_grace_s()
+                                  - (time.time() - self._pinned_last_seen_t))
+            out["pinned_grace_remaining_s"] = round(remaining, 2)
+        return out
+
+    def _diag_audible_pref(self):
+        """TICKET-118: snapshot of the audible-session preference state for
+        /diag. Combines the watcher's last-pick reason + per-session scores
+        with the audible_sessions module's own diag (cache age, last error,
+        the raw per-process levels that fed the score). Never raises.
+
+        Scores are per-session-id, but for human-readable debugging we also
+        attach the source_app so the reader doesn't have to cross-reference
+        with /diag.sessions.available.
+        """
+        out = {
+            "enabled": False,
+            "threshold": 0.005,
+            "last_reason": None,
+            "scores": [],
+            "module": None,
+        }
+        try:
+            pref = self.media.get_audible_pref_diag()
+        except Exception:
+            pref = None
+        try:
+            sess_map = {s.get("id"): (s.get("source") or "")
+                        for s in self.media.list_sessions()}
+        except Exception:
+            sess_map = {}
+        if pref:
+            out["enabled"] = bool(pref.get("enabled"))
+            out["threshold"] = float(pref.get("threshold", 0.005))
+            out["last_reason"] = pref.get("last_reason")
+            scores = pref.get("scores") or {}
+            for sid, peak in scores.items():
+                out["scores"].append({
+                    "session_id": sid,
+                    "source_app": sess_map.get(sid, ""),
+                    "peak": round(float(peak), 4),
+                    "above_threshold": float(peak) >= out["threshold"],
+                })
+            out["scores"].sort(key=lambda r: r["peak"], reverse=True)
+        try:
+            import audible_sessions
+            mod = audible_sessions.diag() or {}
+            # Surface ONLY processes whose basename appears in some session's
+            # source_app — keeps /diag bounded and avoids leaking unrelated
+            # audible-app names to anyone reading diag output.
+            full_levels = mod.get("levels") or {}
+            srcs = " ".join(sess_map.values()).lower()
+            mod["levels"] = {
+                n: round(float(p), 4)
+                for n, p in full_levels.items()
+                if n and n in srcs
+            }
+            out["module"] = mod
+        except Exception:
+            out["module"] = {"available": False}
         return out
 
     def _diag_window_titles(self):
@@ -6401,6 +6805,17 @@ class Overlay:
             try:
                 import align
                 align.set_gpu_solo_override(bool(new))
+            except Exception:
+                pass
+        # TICKET-118: a /tune POST that flips prefer_audible_session (or the
+        # threshold) must propagate to MediaWatcher so the next _pick honors
+        # it without an app restart.
+        if key in ("prefer_audible_session", "prefer_audible_threshold"):
+            try:
+                self.media.set_audible_pref(
+                    int(self._tune.get("prefer_audible_session", 1) or 0),
+                    float(self._tune.get("prefer_audible_threshold", 0.005)),
+                )
             except Exception:
                 pass
         return True, f"{key}: {old} → {new}"
@@ -6717,6 +7132,11 @@ class Overlay:
                         "window_titles": self.window_titles_on,
                         "window_titles_generic_browsers":
                             self.window_titles_generic_browsers_on,
+                        # TICKET-117: SMTC session pin (Tab-A-muted / Tab-B-lyrics).
+                        # Two strings: the composite id (or '' for Auto) and the
+                        # source_app captured at pin time (auto-migrate guard).
+                        "pinned_session_id": self.pinned_session_id,
+                        "pinned_session_app": self.pinned_session_app,
                         "concert_ocr": self.concert_ocr,
                         "display": self.display,
                         "display_fp": getattr(self, "_display_fp", None)})
@@ -6781,6 +7201,146 @@ class Overlay:
         except Exception:
             pass
         self._persist()
+
+    def set_pinned_session(self, session_id, source_app=""):
+        """TICKET-117: pin the lyric source to ONE specific SMTC session, or
+        clear the pin (pass '' / None) to return to Auto. Persisted across
+        restarts via _persist().
+
+        User scenario: two browser tabs, one MUTED visual + one with the actual
+        music — Auto ping-pongs because SMTC reports both as 'playing'. Pinning
+        the music tab makes the overlay ignore the visual tab entirely.
+
+        Also dropped into the MediaWatcher under its own lock so the SMTC poll
+        thread sees the new pin on the NEXT tick (no race with the Tk thread).
+        """
+        new_id = (session_id or "").strip()
+        new_app = (source_app or "").strip().lower()
+        # Capture source_app from current session list if caller didn't pass one
+        # — the menu builder always does, but /tune POSTs may not.
+        if new_id and not new_app:
+            try:
+                for s in self.media.list_sessions():
+                    if s.get("id") == new_id:
+                        new_app = (s.get("source") or "").lower()
+                        break
+            except Exception:
+                pass
+        self.pinned_session_id = new_id
+        self.pinned_session_app = new_app
+        try:
+            self.media.set_pinned(new_id, new_app)
+        except Exception:
+            pass
+        # Reset grace-window state so a fresh pin gets a full grace period and
+        # the cold-start auto-clear can't fire against a just-installed pin.
+        self._pinned_last_seen_t = time.time()
+        self._pinned_cold_start = False
+        try:
+            log.info("pinned session: id=%s app=%s", new_id or "(auto)", new_app or "-")
+        except Exception:
+            pass
+        self._persist()
+        # Refresh the tray menu so the radio dot moves to the new selection.
+        try:
+            if self._icon is not None:
+                self._icon.update_menu()
+        except Exception:
+            pass
+
+    def _pinned_grace_s(self):
+        return float(self._tune.get("pinned_grace_s", 30.0))
+
+    def _pinned_auto_migrate_check(self):
+        """TICKET-117: while the pinned id is missing, look for a SINGLE same-
+        source_app session — if exactly one is present AND no other session
+        shares the pinned app, migrate the pin to that new id (the common case
+        is a YouTube autoplay advancing to the next song; the title hash
+        changes but it's the same tab). Returns True if a migration happened.
+
+        The 'only one same-app session present' guard is the safety net for the
+        user's two-Brave-tabs scenario: if both Tab A and Tab B are still
+        Brave and Tab B's title changes, we can't disambiguate from app alone,
+        so we DON'T migrate — we hold and let the grace timer eventually
+        revert to Auto, prompting the user to re-pin."""
+        if not (self.pinned_session_id and self.pinned_session_app):
+            return False
+        if not int(self._tune.get("pinned_auto_migrate_same_app", 1) or 0):
+            return False
+        try:
+            sessions = self.media.list_sessions()
+        except Exception:
+            return False
+        same_app = [s for s in sessions
+                    if (s.get("source") or "").lower() == self.pinned_session_app
+                    and s.get("id") != self.pinned_session_id]
+        if len(same_app) != 1:
+            return False
+        new_id = same_app[0].get("id") or ""
+        if not new_id:
+            return False
+        log.info("pin auto-migrate (%s sole survivor): %s → %s",
+                 self.pinned_session_app, self.pinned_session_id, new_id)
+        self.set_pinned_session(new_id, self.pinned_session_app)
+        try:
+            if self._icon is not None:
+                self._icon.notify(
+                    f"Pin followed: {same_app[0].get('title') or '(no title)'}",
+                    "Lyric Immersion and Karaoke")
+        except Exception:
+            pass
+        return True
+
+    def _pinned_tick(self):
+        """TICKET-117: per-tick pin-health check. Tracks _pinned_last_seen_t;
+        when the pinned session is missing for longer than pinned_grace_s, try
+        the same-app auto-migrate first, otherwise clear the pin and notify.
+
+        Cold-start branch: on restart, if the pin's session is not in the FIRST
+        non-empty enumeration (the tab was closed before restart), silently
+        clear the pin without burning the full grace window — the user never
+        meant 'wait 30s before resuming Auto' on a process restart."""
+        if not self.pinned_session_id:
+            return
+        try:
+            sessions = self.media.list_sessions()
+        except Exception:
+            return
+        ids = {s.get("id") for s in sessions}
+        now = time.time()
+        if self.pinned_session_id in ids:
+            self._pinned_last_seen_t = now
+            self._pinned_cold_start = False
+            return
+        # Cold-start grace: 5s from boot to let the watcher's first poll land.
+        if self._pinned_cold_start:
+            if not sessions and (now - self._pinned_cold_start_t) < 5.0:
+                return
+            if sessions:
+                log.info("pin cold-start: %s not present at boot → reverting to Auto",
+                         self.pinned_session_id)
+                self.set_pinned_session("", "")
+                try:
+                    if self._icon is not None:
+                        self._icon.update_menu()
+                except Exception:
+                    pass
+                return
+        # Live grace: attempt auto-migrate, then time out to Auto.
+        if (now - self._pinned_last_seen_t) < self._pinned_grace_s():
+            return
+        if self._pinned_auto_migrate_check():
+            return
+        old_id = self.pinned_session_id
+        self.set_pinned_session("", "")
+        log.info("pin grace expired (%s vanished) → Auto", old_id)
+        try:
+            if self._icon is not None:
+                self._icon.notify("Pinned source ended — back to Auto",
+                                  "Lyric Immersion and Karaoke")
+                self._icon.update_menu()
+        except Exception:
+            pass
 
     def set_window_titles_generic_browsers(self, on):
         """TICKET-102: flip the LOW tier (chrome/edge/firefox/etc.) on/off.
@@ -9552,6 +10112,99 @@ def main():
             not ov.window_titles_generic_browsers_on))
     def _get_caps(*_):     ov.root.after(0, ov.load_youtube_captions)
 
+    # ── TICKET-117: Source pin (which SMTC session feeds lyrics) ─────────
+    # Two browser tabs both playing media (e.g. a muted visual + the actual
+    # music) collide under Auto because both register as 'playing'; pinning
+    # locks the overlay onto exactly one session. The submenu is rebuilt on
+    # every open (callable Menu) so it reflects the live session list.
+    _SOURCE_PRETTY = {
+        "brave":   "Brave",
+        "chrome":  "Chrome",
+        "msedge":  "Edge",
+        "edge":    "Edge",
+        "firefox": "Firefox",
+        "opera":   "Opera",
+        "vivaldi": "Vivaldi",
+        "arc":     "Arc",
+        "spotify": "Spotify",
+        "discord": "Discord",
+        "slack":   "Slack",
+        "teams":   "Teams",
+        "music.youtube": "YouTube Music",
+    }
+
+    def _pretty_source(src):
+        s = (src or "").lower()
+        for needle, name in _SOURCE_PRETTY.items():
+            if needle in s:
+                return name
+        # Strip the trailing .exe / AUMID suffix for readability.
+        return (src or "(unknown)").split("!")[0].split(".")[0] or "(unknown)"
+
+    def _set_pin(sid, app=""):
+        def _do():
+            ov.root.after(0, lambda: ov.set_pinned_session(sid, app))
+        return _do
+
+    def _source_menu_items():
+        items = [
+            pystray.MenuItem(
+                "🔓  Auto  (highest-priority session wins)",
+                _set_pin("", ""),
+                radio=True,
+                checked=lambda i: not ov.pinned_session_id),
+            pystray.Menu.SEPARATOR,
+        ]
+        try:
+            sessions = ov.media.list_sessions()
+        except Exception:
+            sessions = []
+        seen_pinned = False
+        # Sort: playing first, then by title for stability across rebuilds.
+        sessions.sort(key=lambda s: (s.get("status") != PLAYING,
+                                     (s.get("title") or "").lower()))
+        for s in sessions:
+            sid = s.get("id") or ""
+            if not sid:
+                continue
+            if sid == ov.pinned_session_id:
+                seen_pinned = True
+            playing_glyph = "▶" if s.get("status") == PLAYING else "⏸"
+            title = (s.get("title") or "(no title)").strip()
+            if len(title) > 60:
+                title = title[:57] + "…"
+            label = f"{playing_glyph}  {title}  —  {_pretty_source(s.get('source'))}"
+            items.append(pystray.MenuItem(
+                label,
+                _set_pin(sid, (s.get("source") or "").lower()),
+                radio=True,
+                checked=lambda i, sid=sid: ov.pinned_session_id == sid))
+        # If the pinned session is missing from the live list (grace window),
+        # show a disabled placeholder so the user can SEE the pin is still
+        # active and not silently dropped.
+        if ov.pinned_session_id and not seen_pinned:
+            items.append(pystray.Menu.SEPARATOR)
+            items.append(pystray.MenuItem(
+                "⌛  (pinned session missing — holding lyrics)",
+                None, enabled=lambda i: False))
+        if len(items) <= 2:
+            items.append(pystray.MenuItem(
+                "(no sessions detected)", None, enabled=lambda i: False))
+        return pystray.Menu(*items)
+
+    def _refresh_source_menu():
+        # Called from the MediaWatcher poll thread on session-set change.
+        # The whole top-level menu is a single pystray.Menu object so we just
+        # ask the icon to redraw — the callable-Menu in the Source item picks
+        # up the fresh session list on the next open.
+        try:
+            if ov._icon is not None:
+                ov._icon.update_menu()
+        except Exception:
+            pass
+
+    ov.media.set_sessions_changed_cb(_refresh_source_menu)
+
     # ── Optional GPU acceleration ────────────────────────────────────────
     # Transcription runs on the CPU by default (fine — 16s clip in ~2s). On an
     # NVIDIA GPU the user can opt in to CUDA, which is a bit faster; the ~1.5 GB of
@@ -9697,6 +10350,13 @@ def main():
                          _toggle_window_titles_generic,
                          checked=lambda i: ov.window_titles_generic_browsers_on,
                          visible=lambda i: ov.window_titles_on),
+        # TICKET-117: pin lyrics to ONE SMTC session. Solves the two-browser-
+        # tabs case (one MUTED visual + one with the music) where Auto
+        # ping-pongs because both register as 'playing'. Label updates live.
+        pystray.MenuItem(
+            lambda i: ("🎯  Source: pinned"
+                       if ov.pinned_session_id else "🎯  Source  (Auto)"),
+            _source_menu_items),
         pystray.Menu.SEPARATOR,
         # 3. SYNC BEHAVIOR ────────────────────────────────────────────────
         pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),
@@ -9736,6 +10396,9 @@ def main():
         pystray.MenuItem("Quit", _quit),
     )
     icon = pystray.Icon("desktop-karaoke", make_icon(), "Lyric Immersion and Karaoke", menu)
+    # TICKET-117: stash the icon handle on the Overlay so set_pinned_session()
+    # and the auto-unpin tick can call icon.update_menu() / icon.notify().
+    ov._icon = icon
     updater.background_check(_on_update_found)   # notify if a newer release exists (portable build)
     # SELF-HEALING TRAY ICON: the icon is the ONLY way to reach the menu (Quit,
     # toggles), so it must be present whenever the app runs. pystray's run() can
@@ -9759,6 +10422,10 @@ def main():
             try:
                 cur = pystray.Icon("desktop-karaoke", make_icon(),
                                    "Lyric Immersion and Karaoke", menu)
+                # TICKET-117: keep ov._icon in sync with the replacement icon
+                # so set_pinned_session()/the auto-unpin tick stop poking the
+                # dead handle and start refreshing the new one.
+                ov._icon = cur
             except Exception:
                 pass
     threading.Thread(target=_tray_runner, daemon=True).start()
