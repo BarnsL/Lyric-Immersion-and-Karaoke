@@ -36,6 +36,18 @@ hiddenimports = [
     # CEF hosts that DON'T publish to SMTC). Lazy-imported in main.py; pin here
     # so the frozen build always includes it. Stdlib + ctypes only, no new deps.
     "window_titles",
+    # TICKET-112: YouTube description metadata extractor (composer / vocals /
+    # original-artist tags on browser sources). Lazy-imported in main.py inside
+    # _maybe_fetch_yt_description; pin here so PyInstaller bundles it.
+    "yt_description",
+    # TICKET-118: audible-session preference (Core Audio peak meter → pick the
+    # AUDIBLE SMTC session when multiple tabs publish to SMTC and one is muted).
+    # Lazy-imported inside audible_sessions.get_process_audio_levels(); pin
+    # pycaw + comtypes.gen so the frozen build can resolve the runtime COM
+    # proxy stubs comtypes generates lazily.
+    "audible_sessions",
+    "pycaw", "pycaw.pycaw",
+    "comtypes", "comtypes.gen",
 ]
 
 # Packages that ship data files / dynamically-imported submodules.
@@ -45,6 +57,10 @@ for pkg in ("winsdk", "soundcard", "shazamio", "pykakasi", "jaconv",
             "fugashi", "unidic_lite", "cutlet", "mojimoji",
             "pypinyin", "hangul_romanize", "deep_translator", "syncedlyrics",
             "pystray", "spotipy", "aiohttp", "aiosignal", "pydub", "numpy",
+            # TICKET-118: pycaw uses comtypes-generated proxy stubs at runtime
+            # — collect_all pulls the data files / lazy submodules PyInstaller
+            # would otherwise miss in the frozen build.
+            "pycaw", "comtypes",
             # yt-dlp: pulls a YouTube video's own caption track (accurate lyrics
             # + perfect timing, locked to the video) — strictly better than a
             # provider LRC for browser videos. ~10 MB, pure Python.

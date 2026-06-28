@@ -18,6 +18,16 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## v1.0.96 — Shipped (2 tickets bundled: TICKET-117 + TICKET-118)
+Closes the user's two-tab "Tab A muted / Tab B audible" scenario (Brave with TAB A = Cyberpunk 2077 POV motorbike video MUTED, TAB B = Rosa Walton "I Really Want to Stay at Your House" PLAYING). Before v1.0.96 both tabs published to SMTC and `MediaWatcher._pick` returned the most-recently-active session, so any browser focus swap ping-ponged the overlay between the two tracks. v1.0.96 fixes it with TWO complementary mechanisms: TICKET-117 = explicit tray "Source →" pin (persistent, absolute), TICKET-118 = Core Audio audible-session preference (automatic tiebreaker — the loudest process wins when no pin is set). See per-ticket sections below.
+
+---
+
+## v1.0.95 — Shipped (4 tickets bundled: TICKET-112 + TICKET-113 + TICKET-114 + TICKET-115)
+Two concurrent agent workflows (`wyo3skdey` for song-ID hardening + `wawvm5uvx` for translation) landed in the same version bump. TICKET-112/113/114 close a long-standing wrong-song failure mode (ambiguous SMTC titles like "Shooting Star" matching the wrong "Shooting Star" forever, with `/wrong` unable to escape the same bad LRC); TICKET-115 closes the translation-whitelist drift. See per-ticket sections below.
+
+---
+
 ## v1.0.95 — Shipped (six-language translation actually delivered + /retranslate, TICKET-115)
 Closes TICKET-115. The README's "English translation for Japanese / Chinese / Korean / Spanish / German / Russian" claim was previously aspirational on the German + Russian side: live capture on Rammstein "Deutschland" (lang=de, 51 lines from lrclib/search) showed every `en` field empty. Root cause was a two-place language whitelist that had drifted between `fetch_lyrics._translate_lines` and `main._maybe_translate`, plus a per-line gate that only ran translation when CJK lines were present — so a fully German body never reached the translate worker.
 
@@ -54,6 +64,126 @@ Closes TICKET-109. New background watcher `_decision_tick` (self-throttled to `d
 **Knobs:** `decision_engine_on` (1), `decision_caution_strikes` (3), `decision_switch_strikes` (5), `decision_regen_strikes` (8), `decision_score_window` (12), `decision_tick_interval_s` (2.0), `decision_action_cooldown_s` (30.0).
 
 **Known issue closed in v1.0.93:** the SWITCH/REGEN branches in `_fire_decision_action` cleared `self.lines = []` immediately on fire, producing a 1-5s on-screen blackout while the new lyrics arrived (TICKET-111 fixed by deferring the swap to a boundary).
+
+---
+
+## TICKET-118 — Audible-session preference (Core Audio peak meter → pick the audible SMTC session) 🟢 (v1.0.96)
+**Symptom (user report, 2026-06-27):** *"i want to be able to watch a muted video while having the actual music video in a different tab providing lyrics and music without interference"*. Brave with TWO YouTube tabs both publishing to SMTC: TAB A = Cyberpunk 2077 POV hyper-realistic motorbike ride (MUTED, visual only), TAB B = cyberpunk edgerunners "I Really Want to Stay at Your House" by Rosa Walton (Hyper) (AUDIBLE, the actual music). `MediaWatcher._pick` returned the most-recently-active SMTC session, so as soon as the user clicked back into Tab A to watch the video, the overlay swapped onto Tab A's track and lost lyric sync with the music actually playing.
+
+**Root cause:** SMTC has no concept of "which session is making sound right now". `playback_status` reports PLAYING for both tabs (they both technically play — Tab A is just muted at the browser level, not paused), and the OS-level "current session" cycles based on which tab was last interacted with. Without an external audibility signal, the picker is blind.
+
+**Fix (v1.0.96):** new `audible_sessions.py` module + `MediaWatcher._pick` tiebreaker.
+- `audible_sessions.get_process_audio_levels()` returns `{executable_basename_lower: max_peak_amplitude}` by:
+  1. Lazy-importing `pycaw.pycaw.AudioUtilities` (sentinel `_AVAILABLE` flips False on first ImportError so non-Windows / missing-dep boxes never retry).
+  2. `AudioUtilities.GetAllSessions()` → per-PID max of `IAudioMeterInformation.GetPeakValue()` (a Chromium PID hosts multiple audio streams; the loudest is what "this process is audible" means).
+  3. Aggregating per-executable basename (lowercased, no `.exe`) so the caller can substring-match SMTC `source_app` AUMIDs like `app.brave.brave` against `brave`.
+  4. **Hard 500 ms timeout** on a daemon worker thread — a hung audio endpoint (sleeping HDMI is a known cause) cannot stall the 0.15s SMTC poll loop.
+  5. **1 s cache** — `GetAllSessions` has COM overhead; rate-limit to once per second.
+- `MediaWatcher._pick` (when MULTIPLE sessions are eligible AND no explicit pin from TICKET-117 is set AND `prefer_audible_session=1`): call `_audible_peaks_for_sessions()` which maps `{session_id: peak}` by substring-matching the session's `source_app` against the audible-levels dict. Sessions with peak `>= prefer_audible_threshold` (default 0.02) sort first; ties fall through to the pre-118 sticky behavior. Result: Tab A (muted, peak ≈ 0.0) loses to Tab B (audible, peak > 0.02) deterministically.
+- Sentinel-disabled path (`_AVAILABLE=False`) → empty dict → caller falls through to pre-118 sticky → zero regression on non-Windows / missing-pycaw boxes.
+
+**New tune knobs:** `prefer_audible_session` (1 = on, 0 = pre-118 sticky-only), `prefer_audible_threshold` (0.02 — peaks below this are treated as "silent enough to ignore"). Both live-tunable via `/tune`; a `/tune` POST that flips either mirrors the new value into `MediaWatcher` immediately (`Overlay.set_audible_pref(enabled, threshold)`) so no restart is needed.
+
+**New dep:** `pycaw>=20240210; sys_platform == "win32"` in `requirements.txt`. ~50 KB plus comtypes (already a transitive dep via pystray's COM stack). Frozen build pins in `DesktopKaraoke.spec`: hiddenimports `audible_sessions`, `pycaw`, `pycaw.pycaw`, `comtypes`, `comtypes.gen`; `collect_all` for `pycaw` + `comtypes` so the COM proxy stubs comtypes generates lazily are pulled into the bundle.
+
+**Observability:** `/diag.audible_pref` returns `{enabled, threshold, levels, module: audible_sessions.diag()}` where `module.diag()` exposes `{available, last_error, cache_age_s, cache_ttl_s, timeout_s, levels}`. `/diag.sessions` (added by TICKET-117) lists every visible SMTC session so the operator can correlate `source_app` → audible-peak.
+
+**Files:** `audible_sessions.py` (new, ~230 lines), `main.py` (`MediaWatcher.__init__` audible-pref state, `_audible_peaks_for_sessions`, `_pick` tiebreaker around line 593, `set_audible_pref` setter, `audible_diag`, `Overlay._tune` defaults `prefer_audible_session` / `prefer_audible_threshold`, `Overlay.__init__` mirror into watcher around line 2444, `_tune` POST mirror around line 6810, `/diag.audible_pref` entry around line 6565), `requirements.txt`, `DesktopKaraoke.spec`.
+
+**Verify (the user's scenario):** open Brave with TAB A (any muted YouTube video — the Cyberpunk motorbike POV) and TAB B (Rosa Walton "I Really Want to Stay at Your House", PLAYING audibly); `/diag.sessions` lists BOTH; `/diag.audible_pref.levels` shows `brave` with a non-zero peak (Tab B is the source); `/source.session_id` should lock to Tab B and stay there even when Tab A is clicked into the foreground. Toggle `prefer_audible_session=0` via `/tune` → behavior reverts to pre-118 sticky (ping-pongs on browser focus) — proves the tiebreaker is doing the work. With `prefer_audible_threshold=0.5` (artificially high) → no session clears the bar → falls through to sticky → also proves the threshold is honored.
+
+---
+
+## TICKET-117 — Explicit SMTC session pin (tray "Source →" submenu, persistent) 🟢 (v1.0.96)
+**Symptom (user report, 2026-06-27, same scenario as TICKET-118):** *"i want to be able to watch a muted video while having the actual music video in a different tab providing lyrics and music without interference"*. The TICKET-118 audible-session tiebreaker handles the common case automatically (loudest process wins), but the user wanted a GUARANTEED lock — a way to say "the lyric source IS this exact tab, ignore everything else, even if it briefly goes silent during an instrumental break or while paused mid-song." Audible-pref alone can't deliver that because peak=0 during a paused / instrumental moment would still tip the picker to whichever other session is currently loudest.
+
+**Fix (v1.0.96):** explicit per-session pin in `MediaWatcher`, surfaced as a tray "Source →" submenu.
+- New `MediaWatcher` state: `_pinned_id: str` (16-hex composite id from `_composite_session_id(session)` = hash of `(source_app, title, artist)` — stable across the session's lifetime, unique per SMTC session), `_pinned_source_app: str` (captured at pin time so the grace-window re-adopt knows which app to look for), `_pinned_last_seen_t: float` (last time the pinned id was visible in the enumerated session list).
+- `set_pinned_session(id_hex: str, source_app: str)` installs the pin (or clears it with `id_hex=''`). `_pick` returns the pinned session unconditionally if it's in the current session list. If the pinned id is MISSING from the list, the watcher enters a grace window: for `pin_grace_s` (default 20.0s) any single new session whose `source_app` substring-matches `_pinned_source_app` is silently adopted as the new pin target (so a Brave tab refresh — which assigns a new SMTC session id — doesn't break the lock). After the grace window expires, `_pinned_id` is cleared and AUTO behavior resumes.
+- Tray "Source →" submenu: lists every visible SMTC session as `{app_name} — {title} ({artist})` with a checkmark on the currently-pinned one (or AUTO if no pin). Click a session → `set_pinned_session(...)` + persist; click AUTO → `set_pinned_session('', '')` + persist. The menu is rebuilt on a debounced callback the watcher fires whenever the visible session set changes (max 1 rebuild per 2s to keep the tray cheap).
+- Persistence via `_persist()`: new keys `pinned_session_id` (the 16-hex) + `pinned_source_app`. Loaded in `Overlay.__init__` and pushed into the watcher AFTER the watcher's first enumeration so the very first pick already honors the pin. If the pinned session isn't present at boot, the grace-window machinery picks it up as soon as the browser tab is reopened.
+
+**New tune knob:** `pin_grace_s` (20.0) — how long the watcher will hold a missing pin open waiting for a re-appearance of a same-`source_app` session. Live-tunable; 0 = no grace (clear immediately on first missing-pin pick).
+
+**Observability:** `/diag.sessions` returns a list of `{id, app_name, source_app, title, artist, status, age_s, pinned: bool}` — one entry per visible SMTC session, with `pinned: true` on the currently-locked one. `/diag.pin` returns `{id, source_app, alive, age_s, grace_remaining_s}` (or `null` when no pin is set).
+
+**Interaction with TICKET-118:** the pin is ABSOLUTE — if a pin is set, `_pick` never consults the audible-pref tiebreaker. The two tickets together give the user: (a) automatic loudest-wins (TICKET-118) for the common case, (b) explicit override (TICKET-117) for full control.
+
+**Files:** `audible_sessions.py` is TICKET-118 only; TICKET-117 changes live in `main.py`:
+- `MediaWatcher` (~line 410-770): `_composite_session_id`, `_sessions_cache`, `_sessions_keys_digest`, `_pinned_id` / `_pinned_source_app` / `_pinned_last_seen_t` state, `_pick` pinned-session branch (line 563), `set_pinned_session`, `get_pin`, `list_sessions`, `_sessions_changed_cb` register/fire.
+- `Overlay.__init__` (line 2249-2266 + 2439-2444): `_pinned_session_id` loaded from `_tune`, pushed into watcher via `set_pinned_session(...)` post-construction.
+- `Overlay._on_track_change` (line 3528): pin-liveness check — if the pinned id has been missing for `> pin_grace_s`, clear the pin and the persisted keys.
+- Tray submenu (line 10115 + 10353): "Source →" build, checkmark on pinned, click handler `set_pinned_session(...)` + `_persist()`.
+- `_persist()` (existing pattern): two new keys `pinned_session_id` + `pinned_source_app`.
+
+**Verify (the user's scenario):** open Brave with TAB A (Cyberpunk POV, muted) and TAB B (Rosa Walton, audible, playing); right-click tray → Source → pick the Rosa Walton entry; `/diag.pin.id` should equal that session's id and `/source.session_id` should match; click into Tab A to bring it to the foreground → `/source.session_id` should NOT change (pre-117 it would); pause Tab B mid-song → `/source.session_id` should STILL not change (the audible-pref tiebreaker would have lost interest, but the pin is absolute); close Tab B, then reopen the same URL in a new tab within 20s → the new tab's session is auto-adopted (`/diag.pin.id` changes, `source_app` stays `brave`). Close Tab B and wait >20s with no Brave session reappearing → pin clears, AUTO resumes. Persist test: pin Tab B, restart app, Tab B's URL still open → `/diag.pin.id` is restored from `settings.json` on first poll cycle.
+
+---
+
+## TICKET-114 — Instrumental-gap timer reset on every track change (and every `idx>=0` transition) 🟢 (v1.0.95)
+**Symptom (live capture, 2026-06-27):** `/diag.pending_swap` reported `blocked_by='instrumental-gap(204.2s)'` on a **161.7-second song** ("Play On！" by NTE 公式, position 11.73s). 204.2s of "instrumental gap" on a 161s song is nonsense — that's the wall-clock age since the app booted, not the time the current track has been on `idx==-1`. TICKET-111's LINE-mode boundary check therefore could never satisfy `gap_s >= swap_defer_instrumental_gap_s` cleanly, and `will_force_commit_in_s` was being driven by the `swap_defer_max_s` hard cap (e.g. 0.96s in the captured frame) instead of the real boundary. Effectively, the gap-gated boundary commit was dead code on every song after the first.
+
+**Root cause:** `self._idx_minus_one_since = time.monotonic()` was set once in `Overlay.__init__` (boot wall-clock) and never reassigned. Within a single track, idx transitions from `>=0` to `-1` never updated it; track changes never reset it. So `now - self._idx_minus_one_since` measured "seconds since the app started" forever.
+
+**Fix (v1.0.95):**
+- `_on_track_change`: reset `self._idx_minus_one_since = None` (the natural reset point — a new track has no prior gap).
+- `_tick_body` idx-transition arm: on every transition where `prev_idx == -1 and idx >= 0` (singing resumed), clear `self._idx_minus_one_since = None`; on every transition where `prev_idx >= 0 and idx == -1` (just entered instrumental), set `self._idx_minus_one_since = time.monotonic()`. Within a single track, the timer now always measures the current `idx==-1` stretch — exactly what `swap_defer_instrumental_gap_s` was designed to threshold.
+- Diag display clamped: `gap_s = min(gap_s, position)` so the operator-facing number can't exceed playback position (defensive against any clock skew).
+
+**Net effect:** TICKET-111's `_swap_ready` LINE-mode `idx==-1 and gap_s >= swap_defer_instrumental_gap_s` branch actually fires now. `will_force_commit_in_s` is driven by the real boundary on most songs, not the 8s safety cap, so SWITCH/REGEN/wrong-song swaps land much sooner on songs with any instrumental section >= 2.0s. The `swap_defer_max_s` cap returns to being a fallback, not the primary commit trigger.
+
+**Files:** `main.py` (`_on_track_change` reset; `_tick_body` idx-transition arms; `_diag_pending_swap` clamp).
+
+**Verify:** play a song with a clear instrumental intro; `/diag.pending_swap.gap_s` should read `0` at first beat, climb up to ~2.0s during silence, reset on the first sung line. Trigger `/wrong` during an instrumental gap — swap should commit within 2s, not 3s (`swap_defer_user_max_s`) or 8s (`swap_defer_max_s`).
+
+---
+
+## TICKET-113 — Per-track lyric blacklist + provider rotation on `/wrong` / REGEN 🟢 (v1.0.95)
+**Symptom (user report, 2026-06-27, ReGLOSS × BEMANI "Shooting Star"):** *"wrong song, even when I told it, it didnt try to find a new one"*. SMTC.title = "Shooting Star" (one of dozens of songs with that name); the app loaded the wrong cached "Shooting Star" LRC. User pressed `/wrong`, the cache was cleared and `report_wrong` triggered a re-fetch — but the query going into the provider chain was IDENTICAL (`title + smtc_artist`), so lrclib / syncedlyrics / NetEase returned the SAME wrong LRC, the app re-cached it, and the user was stuck in a loop where `/wrong` accomplished nothing.
+
+**Root cause:** the fetch path had no memory of what it had just rejected. `fetch_and_save` was idempotent on `(title, artist)`, and the provider chain order was fixed.
+
+**Fix (v1.0.95):**
+- New `self._lyrics_blacklist: set[tuple[str, str]]` on Overlay — entries are `(sha1(first 500 chars of LRC normalized), source_provider)` tuples. Reset on every `_on_track_change` (per-track scope — a wrong "Shooting Star" for THIS track doesn't poison the same LRC if it happens to be correct for a different track later).
+- `report_wrong` (and decision-engine REGEN): compute the signature of the CURRENTLY LOADED lyrics, add to `self._lyrics_blacklist` BEFORE kicking the re-fetch. So the re-fetch knows what NOT to return.
+- `fetch_lyrics.fetch_and_save` accepts `reject_signatures: set[tuple[str, str]] | None`. Every provider hit is sha1'd at the same normalization the blacklist uses; matches are skipped, the chain tries the next candidate (next provider, or next NetEase result, etc.).
+- **2-strike escalation:** two `/wrong` calls within `wrong_escalate_window_s` (default 60s) for the same track set `force_ai_gen=True` on the re-fetch, bypassing the provider chain entirely and going straight to AI-gen (the providers have proven they only have the wrong file for this query).
+- **Provider chain rotation:** per-track chain order rotates one slot on each `/wrong` (e.g. `[lrclib, synced, netease, ai]` → `[synced, netease, lrclib, ai]`) so a stubborn primary doesn't dominate. Reset on track change.
+
+**Files:** `main.py` (`_lyrics_blacklist` init, `_on_track_change` reset, `report_wrong` signature compute + add, `_fire_decision_action` REGEN add, escalation counter); `fetch_lyrics.py` (`fetch_and_save` `reject_signatures` kwarg + per-provider signature check; provider chain rotation helper). New tune knobs: `wrong_escalate_window_s` (60.0), `wrong_escalate_strikes` (2).
+
+**Verify:** load a song with multiple candidate LRCs in cache; press `/wrong` repeatedly; each press should land a DIFFERENT LRC (or escalate to AI-gen after the 2nd strike within 60s). `/diag.lyrics_blacklist` exposes the current set so the operator can see what's been rejected this track.
+
+---
+
+## TICKET-112 — YouTube video-description metadata extractor (composer / vocals / original-artist tags) 🟢 (v1.0.95)
+**Symptom:** SMTC for browser-played YouTube videos exposes only `title` and `artist` (the channel name, often a label / VTuber agency, NOT the actual vocalist). For ambiguous titles like "Shooting Star" — shared by dozens of songs from completely different artists — `title + smtc_artist` is not enough to disambiguate, and the fetch returns the wrong LRC consistently (this is the upstream root cause of the TICKET-113 user complaint).
+
+**Available ground truth:** the YouTube description on the ReGLOSS × BEMANI "Shooting Star" video reads `作詞・作曲：kors k / 歌唱：ReGLOSS(音乃瀬奏/一条莉々華/儒烏風亭らでん/轟はじめ)` — exactly the disambiguators we need (composer = kors k, vocals = ReGLOSS members). `yt-dlp` is already bundled (`DesktopKaraoke.spec` hiddenimports for `deep_transcribe.py` audio download), so a metadata-only call (`--skip-download`) is free.
+
+**Fix (v1.0.95):** new `yt_description.py` module.
+- `_video_id(url)`: extracts the `v=` param from `youtube.com/watch?v=...` / `youtu.be/...` / `music.youtube.com/...` URLs, returns `None` for non-YouTube.
+- `extract_video_metadata(url, timeout_s=8.0) -> dict | None`: lazy `import yt_dlp` (so the module loads fast even if yt-dlp is heavy); calls `YoutubeDL({'skip_download': True, 'socket_timeout': timeout_s, 'quiet': True})`.extract_info, parses the description against templated tags:
+  - **JP:** `作詞・作曲` / `作詞` / `作曲` / `編曲` / `歌唱` / `ボーカル` / `Original` / `カバー元`
+  - **EN:** `Music:` / `Vocals:` / `Lyrics:` / `Composer:` / `Original by:`
+  - **KR:** `작사` / `작곡` / `노래`
+  - Returns `{composer, lyricist, arranger, vocals, original_artist, source: 'yt_description', video_id, fetched_at}` or `None` on parse failure / timeout / non-YouTube.
+- In-process LRU keyed by `video_id` (default cap 256; controlled by `yt_description_cache_days` for soft TTL). Hard `yt_description_timeout_s` (8.0s) so a slow network call can't block the calling thread.
+
+**Wire-up in `main.py`:**
+- `_on_track_change` (main.py:2479): if the source is `youtube*.com` / `steamwebhelper` and `yt_description_lookup` is on, schedule `_maybe_fetch_yt_description(track_seq)` on a worker thread; the result lands in `self._yt_metadata` keyed by track_seq (so a late return for a stale track is ignored).
+- `report_wrong` (main.py:6830): when `/wrong` fires on a YouTube source whose `yt_metadata` is still missing, force a fresh fetch — the metadata might be what unblocks the next provider try.
+- `_fetch_lyrics` query construction (main.py:7321): if `yt_metadata.vocals` exists and the SMTC artist is short / one of the channel-name patterns (`* Music`, `* Records`, etc.), substitute `vocals` as the artist; pass `composer` + `original_artist` as fetch disambiguators (joined into the lrclib `q=` query) so the provider chain narrows from "any 'Shooting Star'" to "the kors k / ReGLOSS one".
+
+**Observability:** `/diag.yt_metadata` returns the parsed dict for the current track (or `null` if not YT / not yet fetched / disabled). New `GET /yt-meta` route in `api.py` returns the same.
+
+**New tune knobs:** `yt_description_lookup` (1 = on, 0 = off for diagnosis), `yt_description_cache_days` (30), `yt_description_timeout_s` (8.0). All live-tunable.
+
+**Frozen-build pin:** `yt_description` is lazy-imported (`from yt_description import _video_id, extract_video_metadata` inside functions), so PyInstaller's static analyser misses it. Added to `DesktopKaraoke.spec` hiddenimports next to the other lazy-loaded local modules. Without this pin a frozen build would `ImportError` on first browser-source track change.
+
+**Files:** `yt_description.py` (new, ~440 lines), `main.py` (`_yt_metadata` state, `_maybe_fetch_yt_description`, `_on_track_change` schedule, `report_wrong` force-fetch, `_fetch_lyrics` query merge, `get_diag` entry, tune knob defaults), `api.py` (`/yt-meta` route + `_ROUTES` help blurb), `DesktopKaraoke.spec` (hiddenimports pin).
+
+**Verify:** load the ReGLOSS × BEMANI "Shooting Star" video in a browser (SMTC title alone = ambiguous); `/diag.yt_metadata` should populate with `{composer: 'kors k', vocals: 'ReGLOSS(...)', ...}` within ~8s of track change; `/diag.last_query` should show `kors k` / `ReGLOSS` substituted into the fetch query; the loaded LRC should match the BEMANI version, not a different "Shooting Star".
 
 ---
 
