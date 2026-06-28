@@ -1548,6 +1548,14 @@ class Overlay:
         self._caption_song = None    # (artist,title) we last attempted captions for
         self._captions_fetching = False  # single-flight: one yt-dlp caption fetch at a time
         self._now_url = None         # exact current video URL (browser-pushed, for captions)
+        # TICKET-112: parsed YouTube description metadata for the current track
+        # — composer/lyricist/vocals/original_artist as DISAMBIGUATORS for the
+        # provider chain. _yt_metadata_video_id natural-dedupes so a re-invoke
+        # (set_now_url firing again on the same id) no-ops. Both are cleared
+        # on _on_track_change so a stale prior-track value can never bleed in.
+        self._yt_metadata = None
+        self._yt_metadata_video_id = None
+        self._yt_metadata_fetching = False  # single-flight per track
         self._frame_ms = 0.0         # EWMA of render-frame interval (ms) → /status render_fps
         self._last_tick_t = None
         self._render_frame = False
@@ -1741,6 +1749,21 @@ class Overlay:
             "smtc_paused_shazam_takeover": 1,    # 1 = enable takeover; 0 = disable
             "smtc_paused_min_s":           8.0,  # continuous non-PLAYING floor before takeover may fire
             "smtc_takeover_debounce_s":   20.0,  # min seconds between consecutive takeovers
+            # ── TICKET-112: YouTube description metadata extractor ──
+            # The SMTC title "Shooting Star" is hugely ambiguous (dozens of
+            # songs share the name). When the user reports /wrong we used to
+            # re-run the SAME (title, artist) query and get the SAME wrong
+            # match back — no new signal had entered the system. yt-dlp can
+            # fetch the video's DESCRIPTION cheaply (no audio, no captions)
+            # and the description usually carries ground-truth credits like
+            # "作詞・作曲：kors k" / "歌唱：ReGLOSS(...)". Those become
+            # additional artist candidates layered onto the existing
+            # fetch_lrc loop so a re-fetch can actually try a different
+            # artist. Set yt_description_lookup=0 to disable for diagnosis
+            # (the feature degrades silently when off).
+            "yt_description_lookup":        1,   # 1 = run description extraction on browser sources; 0 = off
+            "yt_description_cache_days":   30,   # on-disk-ish TTL for the LRU (in-process for now); also caps memory
+            "yt_description_timeout_s":   8.0,   # yt_dlp socket_timeout for the metadata-only call
             # ── TICKET batch4 A3: title-alias album fallback ──
             # When Shazam returns the ALBUM name instead of the track name (very
             # common with V.W.P style releases where Shazam responds with e.g.
@@ -2081,6 +2104,23 @@ class Overlay:
         }
         self._decision_audit            = deque(maxlen=20)
         self._force_ai_gen              = False     # consumed by the AI-gen branch
+        # ── TICKET-113: per-track lyric blacklist + /wrong escalation ──
+        # _lyrics_blacklist: {(source, sha1_signature)} of lyric bodies the user
+        # (or REGEN) has rejected for THIS playback of THIS song. Memory-only,
+        # cleared on _on_track_change — see the design doc: a blacklist entry's
+        # meaning evaporates on track change / app restart.
+        # _wrong_streak: consecutive /wrong presses inside the 60s window.
+        # When the streak hits wrong_streak_force_ai_gen_threshold (default 2)
+        # the next re-fetch jumps straight to AI-gen — every network provider
+        # has been wrong, so burning more time on them wastes the listen.
+        # _provider_order: rotation state. report_wrong rotates index 0 to the
+        # end; reset to default on _on_track_change. 'ai-gen' is a SENTINEL — when
+        # it rotates to position 0, _start_fetch skips fetch_and_save and sets
+        # _force_ai_gen instead (generation lives in main.py, not fetch_lyrics).
+        self._lyrics_blacklist: set        = set()
+        self._wrong_streak: int            = 0
+        self._wrong_streak_t: float        = 0.0
+        self._provider_order: list         = ["lrclib", "syncedlyrics", "netease", "ai-gen"]
         # ── FINE-TUNE mode state (sub-second polish, bolted onto the tier) ──
         # See the `fine_tune_*` block in self._tune for the knob semantics; these
         # are the runtime fields the entry-gate / listen tick / pause override use.
@@ -2151,6 +2191,18 @@ class Overlay:
         if not artist and " - " in title:
             a, t = title.split(" - ", 1)
             artist, title = a.strip(), t.strip()
+        # TICKET-114: re-anchor the instrumental-gap timer on EVERY SMTC track
+        # event (including the same-song re-report below). Without this, the
+        # boot-time stamp from __init__ (line 2042) is never cleared when the
+        # initially-loaded lyrics never let idx reach >=0, so on subsequent
+        # tracks the timer keeps accumulating as wall-time-since-boot — exactly
+        # the "instrumental-gap(204.2s)" on an 11.7s-position 161s song seen in
+        # the live diag. Placed ABOVE the same-song early-return so SMTC
+        # re-reports of the current track also benefit (title-stability is not
+        # the same as gap-state stability). The per-tick logic at ~line 4572
+        # re-stamps on the very next tick where idx is still -1, so this
+        # zero-then-restamp is safe for both branches.
+        self._idx_minus_one_since = 0.0
         # SMTC re-reports the SAME song mid-playback (YouTube nudges its metadata —
         # a channel suffix appears/disappears, the title reflows), which flips the
         # cleaned (artist,title) tuple and used to re-enter here and WIPE a confirmed
@@ -2243,6 +2295,21 @@ class Overlay:
         self._generating = False
         self._gen_defers = 0       # fresh defer budget for this track's fetch
         self._fetch_key = None     # let this track re-attempt a real fetch (upgrade path)
+        # TICKET-113: per-track blacklist + /wrong escalation + provider rotation
+        # all reset on a real song change — a blacklist entry from the previous
+        # song must not silently suppress the new song's valid hits, and the
+        # streak window must not bleed forward.
+        self._lyrics_blacklist.clear()
+        self._wrong_streak = 0
+        self._wrong_streak_t = 0.0
+        # TICKET-112: a real new track invalidates the previous track's YT
+        # description (different video → different credits). Both fields
+        # cleared together so set_now_url's "if vid != _yt_metadata_video_id"
+        # triggers a fresh fetch even when the new URL hadn't pushed yet.
+        self._yt_metadata = None
+        self._yt_metadata_video_id = None
+        self._yt_metadata_fetching = False
+        self._provider_order = ["lrclib", "syncedlyrics", "netease", "ai-gen"]
         self._recent_corr = []     # reset ambiguity history for the new song
         self._last_align_t = 0.0        # let auto-align run early on the new song
         self._last_sound_lock_t = 0.0   # no Shazam lock yet on the new song
@@ -2400,6 +2467,18 @@ class Overlay:
                 and any(h in (self._last_src or "") for h in BROWSER_HINTS)):
             self.root.after(4000,
                             lambda t=self._track_seq: self._maybe_fetch_captions(t))
+        # TICKET-112: YT-description metadata extractor. Runs in PARALLEL to
+        # captions (cheap metadata-only yt_dlp call, no audio/no subs) so a
+        # browser source gets disambiguators ('作詞・作曲：kors k',
+        # '歌唱：ReGLOSS(...)') layered onto the next provider query. Gated on
+        # self._now_url being known — captions/description both need an exact
+        # URL, and set_now_url also re-kicks this when the URL settles late
+        # for a new track.
+        if (not self._live_mode
+                and any(h in (self._last_src or "") for h in BROWSER_HINTS)
+                and int(self._tune.get("yt_description_lookup", 1) or 0)):
+            self.root.after(300,
+                            lambda t=self._track_seq: self._maybe_fetch_yt_description(t))
 
     def _maybe_fetch_captions(self, track_seq):
         """Background: pull this YouTube video's caption track and prefer it over
@@ -2421,6 +2500,90 @@ class Overlay:
         self._last_caption_t = now
         self._caption_song = self._track
         self.load_youtube_captions(silent=True)
+
+    # ── TICKET-112: YouTube description metadata extractor ─────────────
+    def _maybe_fetch_yt_description(self, track_seq):
+        """Background: pull this YouTube video's DESCRIPTION (metadata only,
+        no audio + no captions) and parse out structured credit fields
+        (作詞/作曲/歌唱 / Music/Lyrics/Vocals / 작사/작곡/노래) into
+        ``self._yt_metadata``. Downstream readers:
+          * ``_start_fetch`` — pass the extracted vocals as additional
+            artist candidates to ``fetch_lrc`` (disambiguator only; the
+            existing scoring + language guards stay in charge).
+          * ``report_wrong`` — when /wrong fires AND we have description
+            credits, prefer the new vocalist on the re-fetch.
+          * ``get_diag`` — surfaces the parsed dict for /diag and /yt-meta.
+
+        Single-flight per track via self._yt_metadata_fetching. Re-kicked
+        from set_now_url when the browser pushes the URL late for the new
+        track (without that, the gate `self._now_url is set` would miss
+        the first invocation here)."""
+        if track_seq != self._track_seq or self._live_mode:
+            return
+        if not int(self._tune.get("yt_description_lookup", 1) or 0):
+            return
+        url = self._now_url
+        if not url:
+            # URL hasn't been pushed by the browser yet — set_now_url will
+            # re-kick this when it arrives. Don't busy-poll here.
+            return
+        if self._yt_metadata_fetching:
+            return
+        # Dedupe: if we already have parsed metadata for this exact video,
+        # nothing to do (the LRU also catches this, but skipping here
+        # avoids the lock + thread creation).
+        try:
+            from yt_description import _video_id, extract_video_metadata
+        except Exception:
+            return
+        vid = _video_id(url)
+        if vid and vid == self._yt_metadata_video_id and self._yt_metadata:
+            return
+        try:
+            timeout = float(self._tune.get("yt_description_timeout_s", 8.0))
+        except Exception:
+            timeout = 8.0
+        self._yt_metadata_fetching = True
+        captured_seq = track_seq
+        captured_url = url
+
+        def work():
+            meta = None
+            try:
+                meta = extract_video_metadata(captured_url, timeout=timeout)
+            except Exception:
+                meta = None
+            try:
+                # Stale-token guard: drop the result if the track changed
+                # while we were fetching. Otherwise we'd stamp the prior
+                # track's video credits onto the new song.
+                if captured_seq != self._track_seq:
+                    return
+                if meta is None:
+                    log.info("yt_description: no metadata for %s", captured_url[:80])
+                    return
+                self._yt_metadata = meta
+                self._yt_metadata_video_id = meta.get("video_id")
+                # Tray hint: prefer real credits; fall back gracefully when
+                # only one side parsed. Mirrors the captions/identify hint
+                # style and is muted (no symbol) when nothing parsed.
+                vocals = meta.get("vocals") or []
+                comp = meta.get("composer") or meta.get("lyricist") or []
+                orig = meta.get("original_artist") or []
+                primary_vocal = (vocals[0] if vocals
+                                 else (orig[0] if orig
+                                       else (meta.get("channel") or "")))
+                primary_credit = comp[0] if comp else ""
+                if primary_credit and primary_vocal:
+                    self._hint(f"🎬 YT credits: {primary_credit} / {primary_vocal}")
+                elif primary_vocal:
+                    self._hint(f"🎬 YT credits: {primary_vocal}")
+                elif primary_credit:
+                    self._hint(f"🎬 YT credits: {primary_credit}")
+            finally:
+                self._yt_metadata_fetching = False
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _maybe_generate(self, track_seq):
         """Deadline fallback: still no lyrics for this track → generate by ear.
@@ -2871,10 +3034,13 @@ class Overlay:
             return
         cjk = [ln for ln in self.lines if ln.jp.strip() and _has_cjk(ln.jp)]
         need_rm = any(not ln.rm.strip() for ln in cjk)
-        # non-English Latin/Cyrillic songs (Spanish, German, Russian, and
-        # romanized-Japanese) should have every line translated; CJK songs only
-        # their CJK lines.
-        whole = self.meta.get("lang") in ("es", "de", "ru", "ja-romaji")
+        # TICKET-115: non-English Latin/Cyrillic songs (Spanish, German,
+        # French, Italian, Portuguese, Russian, and romanized-Japanese) should
+        # have every line translated; CJK songs only their CJK lines. Keep this
+        # set in sync with fetch_lyrics._translate_lines' _LANGS.
+        whole = self.meta.get("lang") in (
+            "es", "de", "fr", "it", "pt", "ru", "ja-romaji"
+        )
         want_en = (self.lines if whole else cjk)
         want_en = [ln for ln in want_en if ln.jp.strip()]
         have_en = sum(1 for ln in want_en if ln.en.strip())
@@ -2884,8 +3050,43 @@ class Overlay:
     def _start_fetch(self, artist, title, duration=None, cover=False, strict=False,
                      swap_token=None):
         key = (artist, title)
-        if self._fetch_key == key:
+        # TICKET-113: snapshot the blacklist at queue time so the worker thread
+        # never reads the live set (a second /wrong mid-fetch would otherwise
+        # mutate the set under iteration in fetch_lrc's take() chokepoint).
+        # frozenset(...) is the safe handoff — immutable, hashable, cheap.
+        reject_sigs = frozenset(sig for (_src, sig) in self._lyrics_blacklist)
+        # TICKET-112: snapshot the YT-description metadata at queue time so
+        # the worker thread sees a stable view (description fetch can still
+        # be in flight; if it lands AFTER us the NEXT _start_fetch — e.g.
+        # report_wrong's re-fetch — picks it up). Build an ordered list of
+        # extra artist candidates from vocals -> original_artist -> composer
+        # -> lyricist so the most "artist-shaped" credits get tried first.
+        ytm = self._yt_metadata or {}
+        extra_artists = []
+        for k in ("vocals", "original_artist", "composer", "lyricist"):
+            for name in (ytm.get(k) or []):
+                if name and name not in extra_artists:
+                    extra_artists.append(name)
+        yt_composer = list(ytm.get("composer") or [])
+        yt_original = list(ytm.get("original_artist") or [])
+        yt_lyrics_block = ytm.get("lyrics_block")
+        # TICKET-113: when reject_signatures is non-empty, bypass the
+        # _fetch_key == key short-circuit — without this, /wrong's re-fetch
+        # for the SAME (artist, title) silently no-ops and the blacklist filter
+        # never runs. report_wrong / _fire_decision_action already clear
+        # _fetch_key, but a future caller might forget.
+        if self._fetch_key == key and not reject_sigs:
             return
+        # TICKET-113: 'ai-gen' sentinel — when it has rotated (or escalated
+        # via wrong-streak) to position 0, do not call fetch_and_save at all.
+        # Generation needs the audio stream + Whisper; that lives in main.py
+        # (_begin_generation), not fetch_lyrics. Set the flag the gen consumer
+        # already checks and return — the existing tick / decide loop picks
+        # it up and routes through _begin_generation.
+        if (self._provider_order and self._provider_order[0] == "ai-gen"
+                and not self._force_ai_gen):
+            log.info("provider rotation: head is 'ai-gen' → forcing AI-gen, skipping fetch")
+            self._force_ai_gen = True
         self._fetch_key = key
         self._fetching = True       # in flight → generation defers until this resolves
         # TICKET-111: capture swap_token at queue time so the completion can
@@ -2896,8 +3097,28 @@ class Overlay:
         def work():
             try:
                 from fetch_lyrics import fetch_and_save
+                # TICKET-112: feed YT-description disambiguators into the
+                # provider chain as kwargs. fetch_and_save accepts unknown
+                # kwargs gracefully (it forwards/ignores via **kw); when
+                # they're empty the call is byte-identical to v1.0.93.
                 p = fetch_and_save(title, artist, translate=False, duration=duration,
-                                   cover=cover, strict=strict)
+                                   cover=cover, strict=strict,
+                                   reject_signatures=reject_sigs or None,
+                                   extra_artists=extra_artists or None,
+                                   yt_composer=yt_composer or None,
+                                   yt_original_artist=yt_original or None,
+                                   yt_lyrics_block=yt_lyrics_block)
+            except TypeError:
+                # Older fetch_and_save signature (no description kwargs) —
+                # fall back to the legacy call so this stays robust if the
+                # two files drift between deployments.
+                try:
+                    from fetch_lyrics import fetch_and_save as _fas
+                    p = _fas(title, artist, translate=False, duration=duration,
+                             cover=cover, strict=strict,
+                             reject_signatures=reject_sigs or None)
+                except Exception:
+                    p = None
             except Exception:
                 p = None
             # 3-tuple (key, path, swap_token); _consume_async tolerates legacy 2-tuples.
@@ -2914,13 +3135,44 @@ class Overlay:
         def work():
             ok = False
             try:
-                from fetch_lyrics import backfill_file   # romaji + translation
-                ok = backfill_file(path)
-            except Exception:
-                ok = False
-            self._translate_result = (path, ok)
+                try:
+                    from fetch_lyrics import backfill_file   # romaji + translation
+                    ok = backfill_file(path)
+                except Exception:
+                    ok = False
+                self._translate_result = (path, ok)
+            finally:
+                # TICKET-115: ALWAYS release the in-flight guard, even on
+                # exception — otherwise a poisoned _translating flag silently
+                # blocks every future _maybe_translate call for this same path
+                # (e.g. the user hits /retranslate to retry a failed run).
+                self._translating = None
 
         threading.Thread(target=work, daemon=True).start()
+
+    def retranslate_loaded(self) -> dict:
+        """TICKET-115: force a translation backfill of the currently loaded
+        track. Used by POST /retranslate (and any future "translate now" UI).
+        Routes through the existing backfill_file pipeline so the file is
+        rewritten atomically and the main tick re-loads it in place (keeping
+        playback position). Returns a small status dict for the API.
+        """
+        path = self._lyrics_path
+        if not path or not self.lines:
+            return {"ok": False, "reason": "no loaded track"}
+        want_en = [ln for ln in self.lines if ln.jp.strip()]
+        missing_before = sum(1 for ln in want_en if not ln.en.strip())
+        # Clear any stuck in-flight guard so a prior poisoned run can't block us.
+        self._translating = None
+        self._start_translate(path)
+        return {
+            "ok": True,
+            "action": "backfilling translations",
+            "path": str(path),
+            "lang": self.meta.get("lang"),
+            "n_lines": len(want_en),
+            "n_missing": missing_before,
+        }
 
     # ── audio identification (detect by SOUND, not title) ──
 
@@ -5860,6 +6112,27 @@ class Overlay:
             "deciding": self._deciding,
             # TICKET-111: deferred whole-lyrics swap state
             "pending_swap": self._diag_pending_swap(),
+            # TICKET-113: per-track blacklist + /wrong escalation + provider rotation
+            "lyrics": {
+                "lyrics_blacklist_count": len(self._lyrics_blacklist),
+                # Source names (not hex hashes) so the snapshot is human-readable
+                "lyrics_blacklist_sources": sorted({src for (src, _sig)
+                                                    in self._lyrics_blacklist}),
+                "wrong_streak": self._wrong_streak,
+                "wrong_streak_age_s": (round(time.time() - self._wrong_streak_t, 1)
+                                       if self._wrong_streak_t else None),
+                "provider_order": list(self._provider_order),
+                "force_ai_gen": bool(self._force_ai_gen),
+                # bool, not the dict — keeps /diag output bounded if a YT
+                # description is several KB
+                "yt_metadata_present": bool(getattr(self, "_yt_metadata", None)),
+            },
+            # TICKET-112: full parsed YT-description metadata for the
+            # current track. The raw description and lyrics_block are
+            # capped at the extractor; here we surface a SUMMARY (drop the
+            # bulkiest fields) so /diag stays bounded. Full text is
+            # available via the dedicated /yt-meta endpoint.
+            "yt_metadata": self._diag_yt_metadata(),
             "fps": {
                 "target": target_fps,
                 "render": render_fps,
@@ -5885,6 +6158,61 @@ class Overlay:
             # reports without forcing the user to reproduce the tab state.
             "window_titles": self._diag_window_titles(),
         }
+
+    def _diag_yt_metadata(self):
+        """TICKET-112: SUMMARY snapshot of the YT-description metadata for
+        /diag. Drops the bulkiest fields (`description`, `lyrics_block`) so
+        /diag output stays bounded; the full dict is reachable via the
+        dedicated /yt-meta endpoint. Returns None when no metadata yet.
+        Never raises."""
+        try:
+            m = getattr(self, "_yt_metadata", None)
+            if not m:
+                return {
+                    "present": False,
+                    "fetching": bool(getattr(self, "_yt_metadata_fetching", False)),
+                    "video_id": getattr(self, "_yt_metadata_video_id", None),
+                }
+            out = {
+                "present": True,
+                "fetching": bool(getattr(self, "_yt_metadata_fetching", False)),
+                "video_id": m.get("video_id"),
+                "title_raw": m.get("title_raw"),
+                "channel": m.get("channel"),
+                "uploader": m.get("uploader"),
+                "composer": list(m.get("composer") or []),
+                "lyricist": list(m.get("lyricist") or []),
+                "arranger": list(m.get("arranger") or []),
+                "vocals": list(m.get("vocals") or []),
+                "original_artist": list(m.get("original_artist") or []),
+                "language": m.get("language"),
+                "tags": list(m.get("tags") or [])[:8],
+                "upload_date": m.get("upload_date"),
+                "fetched_at": m.get("fetched_at"),
+                "from_cache": bool(m.get("from_cache")),
+                "has_lyrics_block": bool(m.get("lyrics_block")),
+                "description_chars": len(m.get("description") or ""),
+            }
+            return out
+        except Exception:
+            return None
+
+    def get_yt_metadata(self):
+        """TICKET-112: full parsed YT-description metadata for /yt-meta.
+        Unlike _diag_yt_metadata this INCLUDES the raw description body and
+        lyrics_block — invaluable when a description has unusual labels we
+        don't yet parse. Returns None when no metadata is loaded yet."""
+        m = getattr(self, "_yt_metadata", None)
+        if not m:
+            return {
+                "present": False,
+                "fetching": bool(getattr(self, "_yt_metadata_fetching", False)),
+                "video_id": getattr(self, "_yt_metadata_video_id", None),
+            }
+        out = dict(m)
+        out["present"] = True
+        out["fetching"] = bool(getattr(self, "_yt_metadata_fetching", False))
+        return out
 
     def _diag_window_titles(self):
         """TICKET-102: snapshot of the window-title watcher for /diag.
@@ -6494,6 +6822,20 @@ class Overlay:
                     and (self.meta.get("source") or "") != "youtube-captions"):
                 self.root.after(300,
                                 lambda t=self._track_seq: self._maybe_fetch_captions(t))
+            # TICKET-112: a new URL may also mean a new video id — re-kick
+            # the YT-description extractor so the disambiguator credits land
+            # for THIS video. Cheap fast-path: skip when the video id hasn't
+            # actually changed (same URL, different fragment / timestamp).
+            try:
+                from yt_description import _video_id as _ytd_vid
+                new_vid = _ytd_vid(url)
+            except Exception:
+                new_vid = None
+            if (new_vid and new_vid != self._yt_metadata_video_id
+                    and self._track and not self._live_mode
+                    and int(self._tune.get("yt_description_lookup", 1) or 0)):
+                self.root.after(300,
+                                lambda t=self._track_seq: self._maybe_fetch_yt_description(t))
 
     def _click_through(self):
         """(Re)assert the overlay's click-through window style AND its z-order.
@@ -6872,9 +7214,129 @@ class Overlay:
         if self._track:
             self._on_track_change(self._track, self._cur_duration)
 
+    # ─────────────────────── TICKET-113 helpers ───────────────────
+    def _blacklist_current_lyrics(self, reason: str) -> None:
+        """Add the currently-loaded lyric body to self._lyrics_blacklist BEFORE
+        any caller unlinks the file / clears self.lines. Called from
+        report_wrong, _fire_decision_action SWITCH, and _fire_decision_action
+        REGEN — three sites, one helper, so the "capture before destroy"
+        ordering is enforced in one place rather than three.
+
+        Reads the on-disk LRC body via self._lyrics_path when available, else
+        falls back to reconstructing a plain-text body from self.lines (used
+        when the file was already unlinked or never written to disk). Both
+        paths route through fetch_lyrics._lrc_signature so they hash identically
+        to the rejection site."""
+        try:
+            from fetch_lyrics import _lrc_signature
+        except Exception:
+            return
+        body = ""
+        src = (self.meta or {}).get("source", "unknown")
+        try:
+            if self._lyrics_path and Path(self._lyrics_path).exists():
+                # The cached JSON has parsed `lines` (jp/rm/en) not the raw LRC;
+                # rebuild a plain-text body from `lines[*].jp` so the signature
+                # matches what fetch_lrc's take() would have hashed for the same
+                # content (timestamps stripped, whitespace collapsed).
+                data = json.loads(Path(self._lyrics_path).read_text("utf-8"))
+                body = "\n".join((ln.get("jp") or "") for ln in data.get("lines", []))
+                src = (data.get("meta") or {}).get("source", src)
+        except Exception:
+            body = ""
+        if not body and self.lines:
+            body = "\n".join((getattr(ln, "jp", "") or "") for ln in self.lines)
+        if not body:
+            log.info("blacklist: skipped (no body to hash) reason=%s", reason)
+            return
+        sig = _lrc_signature(body)
+        if not sig:
+            return
+        entry = (src, sig)
+        if entry in self._lyrics_blacklist:
+            log.info("blacklist: already present source=%s sig=%s reason=%s",
+                     src, sig[:10], reason)
+            return
+        # FIFO cap (per design risks): keep the set bounded so a REGEN-storm
+        # with the instrumental-gap-timer bug can't blow up memory or starve
+        # every provider in a few cycles.
+        cap = int(self._tune.get("lyrics_blacklist_max", 8))
+        if len(self._lyrics_blacklist) >= cap:
+            # set is unordered — drop an arbitrary entry to make room
+            self._lyrics_blacklist.pop()
+        self._lyrics_blacklist.add(entry)
+        log.info("blacklist: added source=%s sig=%s reason=%s (now %d entries)",
+                 src, sig[:10], reason, len(self._lyrics_blacklist))
+
+    def _rotate_provider_order(self) -> None:
+        """Move provider index 0 to the end. Called on /wrong so the next
+        re-fetch reaches for a DIFFERENT provider first — demote-only doesn't
+        help because the wrong provider's hit was 'valid' from its POV; we
+        need a different one entirely."""
+        if len(self._provider_order) >= 2:
+            self._provider_order = self._provider_order[1:] + [self._provider_order[0]]
+            log.info("provider rotation: %s", self._provider_order)
+
+    def _bump_wrong_streak(self) -> bool:
+        """Increment the /wrong streak (with a 60s soft expiry window) and
+        return True iff the streak crossed the AI-gen-force threshold."""
+        now = time.time()
+        window = float(self._tune.get("wrong_streak_window_s", 60.0))
+        if now - self._wrong_streak_t < window:
+            self._wrong_streak += 1
+        else:
+            self._wrong_streak = 1
+        self._wrong_streak_t = now
+        thr = int(self._tune.get("wrong_streak_force_ai_gen_threshold", 2))
+        return self._wrong_streak >= thr
+
     def report_wrong(self):
         """User-driven correction: bin the wrong lyrics and identify by SOUND.
         For covers, also re-fetch using the original artist from the title."""
+        # TICKET-112: if a YT-description fetch is in flight, wait briefly
+        # for it to land — the user's exact failure ("re-fetch returned the
+        # same wrong 'Shooting Star' because the query was unchanged") only
+        # gets fixed when the new disambiguator signal is in
+        # self._yt_metadata BEFORE _start_fetch reads it. Bounded short
+        # wait so a hung yt-dlp can never block the user's correction.
+        if (getattr(self, "_yt_metadata_fetching", False)
+                and not getattr(self, "_yt_metadata", None)):
+            try:
+                wait_until = time.time() + 2.0  # at most 2s — design risk note
+                while (self._yt_metadata_fetching
+                       and not self._yt_metadata
+                       and time.time() < wait_until):
+                    time.sleep(0.1)
+            except Exception:
+                pass
+        # TICKET-112: ground-truth override — when the video description names
+        # an explicit Original / カバー元 artist, that beats whatever the title
+        # regex inferred earlier. Logged on disagreement (silent overrides
+        # historically masked real bugs in title parsing).
+        ytm = getattr(self, "_yt_metadata", None) or {}
+        yt_orig = (ytm.get("original_artist") or [None])[0]
+        if yt_orig:
+            if (self._cover_original_artist
+                    and self._cover_original_artist != yt_orig):
+                log.info("yt_description: original_artist %r overrides title-parsed %r",
+                         yt_orig, self._cover_original_artist)
+            self._cover_original_artist = yt_orig
+            # Description-confirmed original → treat as a cover even when
+            # title parsing didn't flag it (cover-without-marker case).
+            self._is_cover = True
+        # TICKET-113: capture the current lyric signature BEFORE the unlink
+        # below destroys the file. Also rotate providers + bump the /wrong
+        # streak — if the user hits /wrong twice within 60s, every network
+        # provider has been wrong and we short-circuit to AI-gen (which uses
+        # the audio stream, not titles, so it doesn't share the collision
+        # failure mode).
+        self._blacklist_current_lyrics(reason="report_wrong")
+        self._rotate_provider_order()
+        force_ai = self._bump_wrong_streak()
+        if force_ai:
+            log.info("wrong-streak hit AI-gen threshold (%d in %.0fs window) → forcing AI-gen",
+                     self._wrong_streak, float(self._tune.get("wrong_streak_window_s", 60.0)))
+            self._force_ai_gen = True
         if self._lyrics_path:
             try:
                 Path(self._lyrics_path).unlink(missing_ok=True)
@@ -7529,6 +7991,9 @@ class Overlay:
         if state == "SWITCH" and track:
             artist, title = track
             hint = f"🔁 Switched to alternative lyric source for {title}…"
+            # TICKET-113: capture before destroy — the unlink below would leave
+            # nothing for the helper to hash.
+            self._blacklist_current_lyrics(reason="decision-switch")
             if getattr(self, "_lyrics_path", None):
                 try: Path(self._lyrics_path).unlink(missing_ok=True)
                 except Exception: pass
@@ -7557,6 +8022,10 @@ class Overlay:
             self._decision_strikes = max(0, self._decision_strikes - 3)
         elif state == "REGEN" and track:
             hint = "✨ Regenerating lyrics via AI…"
+            # TICKET-113: capture before destroy — REGEN clears self.lines
+            # below in the legacy path, so the helper must run first or the
+            # signature comes back from an empty body.
+            self._blacklist_current_lyrics(reason="decision-regen")
             self._fetch_key = None
             deferred = (int(self._tune.get("swap_defer_enabled", 1) or 0) == 1
                         and bool(self.lines))
@@ -7640,13 +8109,21 @@ class Overlay:
         mode = self.scroll_dir
         now = time.time()
         gap_thr = float(self._tune.get("swap_defer_instrumental_gap_s", 2.0))
+        # TICKET-114: cosmetic clamp for the diag string only. The readiness
+        # math (`>= gap_thr`) keeps raw wall-time, so a real 2s instrumental
+        # gap still trips the boundary correctly. Without this clamp, a stale
+        # anchor (e.g. from boot-time before TICKET-114 reset landed, or from
+        # any future regression) can print absurd values like
+        # "instrumental-gap(204.2s)" on a song only 11.7s into 161s of runtime.
+        last_pos = getattr(self, "_last_pos", 0.0) or 0.0
         if mode in ("lr", "rl", "tb", "bt"):
             stream_n = len(getattr(self, "_stream", []) or [])
             if stream_n == 0:
                 return True, "belt-drained"
             if (self.idx == -1 and self._idx_minus_one_since
                     and (now - self._idx_minus_one_since) >= gap_thr):
-                return True, f"instrumental-gap({now - self._idx_minus_one_since:.1f}s)"
+                gap_s = min(now - self._idx_minus_one_since, last_pos)
+                return True, f"instrumental-gap({gap_s:.1f}s)"
             return False, f"belt={stream_n} idx={self.idx}"
         # LINE modes
         if getattr(self, "_anim_id", None) is not None:
@@ -7654,16 +8131,18 @@ class Overlay:
         if self.idx == -1:
             if (self._idx_minus_one_since
                     and (now - self._idx_minus_one_since) >= gap_thr):
-                return True, f"instrumental-gap({now - self._idx_minus_one_since:.1f}s)"
+                gap_s = min(now - self._idx_minus_one_since, last_pos)
+                return True, f"instrumental-gap({gap_s:.1f}s)"
             wait = (gap_thr - (now - self._idx_minus_one_since)
                     if self._idx_minus_one_since else gap_thr)
+            wait = max(0.0, min(wait, last_pos)) if last_pos else max(0.0, wait)
             return False, f"gap-too-short(wait {wait:.1f}s)"
         # In-line must wait for line end. Fast path: post-last-line.
         try:
             ln = self.lines[self.idx]
         except Exception:
             return True, "idx-out-of-range"
-        last_pos = getattr(self, "_last_pos", 0.0) or 0.0
+        # last_pos hoisted to top of fn (TICKET-114 clamp); reuse here.
         ends_in = ln.end - last_pos
         if self.idx >= len(self.lines) - 1 and ends_in <= 0.0:
             return True, "post-last-line"
