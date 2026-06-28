@@ -34,9 +34,11 @@ PREFER ORIGINAL SCRIPT OVER ROMAJI
   • pypinyin      — Chinese → pinyin.
   • hangul-romanize — Korean → romaja.
   • deep-translator — line translation to English ('auto' source so it covers
-                  ja / zh / ko / es alike). Uses the free Google endpoint by
-                  default; if a DEEPL_API_KEY env var is set it uses DeepL
-                  instead (noticeably better JP/CJK→EN). No key required to run.
+                  ja / zh / ko / es / de / ru / fr / pt / it alike, plus
+                  romanized-Japanese ('ja-romaji')). Uses the free Google
+                  endpoint by default; if a DEEPL_API_KEY env var is set it
+                  uses DeepL instead (noticeably better JP/CJK→EN). No key
+                  required to run.
                   Lines are translated in CONTEXT WINDOWS (each block carries a
                   couple of neighbouring lines before/after) so a line is read in
                   the flow of the song, not in isolation. See _translate_lines.
@@ -109,6 +111,7 @@ CLI:
     python fetch_lyrics.py --lrc file.lrc "Title" "Artist"
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -119,6 +122,25 @@ import urllib.request
 from pathlib import Path
 
 import confidence   # language_confidence — prefer the artist's usual language
+
+
+# ── TICKET-113: lyric-body signature for the per-track blacklist ─────
+# Defined ONCE at module top so the capture site (main.py) and the
+# rejection site (the take() chokepoint in fetch_lrc) use byte-identical
+# normalization — if they drift apart the blacklist silently stops working.
+# Strips [..] timestamp tags and collapses whitespace so the same lyrics file
+# from two providers (or the same provider with a tweaked sync offset)
+# hashes identically and gets rejected consistently.
+def _lrc_signature(lrc: str) -> str:
+    """SHA-1 of the normalized lyric body. lrc may be a full LRC string OR
+    plain-text lines (so callers without the original LRC — e.g. the App
+    reading self.lines — can still produce the same signature)."""
+    if not lrc:
+        return ""
+    body = re.sub(r"\[[^\]]*\]", "", lrc)          # drop [mm:ss.xx] timestamps
+    body = re.sub(r"<\d+:\d+(?:\.\d+)?>", "", body)  # drop word-level <tags>
+    body = re.sub(r"\s+", " ", body).strip()
+    return hashlib.sha1(body.encode("utf-8")).hexdigest()
 
 # syncedlyrics logs noisy provider warnings (e.g. Musixmatch 401) — quiet them
 for _n in ("syncedlyrics", "syncedlyrics.providers"):
@@ -938,7 +960,12 @@ def _title_variants(title: str) -> list:
 
 
 def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
-              cover: bool = False, strict: bool = False):
+              cover: bool = False, strict: bool = False,
+              reject_signatures: set | None = None,
+              extra_artists: list | None = None,
+              yt_composer: list | None = None,
+              yt_original_artist: list | None = None,
+              yt_lyrics_block: str | None = None):
     """Return (lrc_string, meta) of a VERIFIED match, or (None, None).
     Widens the search across artist variants while guarding false positives.
     Prefers ORIGINAL-script lyrics: a romaji-only result is stashed and used only
@@ -955,9 +982,33 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     artist-unconfirmed title-only last resort is SKIPPED: for a generic title like
     "Lucky Star" that catalog has many different songs under, an artist-unconfirmed
     title hit is almost always the WRONG one ("Twinkle Twinkle"), so returning
-    nothing (→ generate by ear from the real audio) beats showing a different song."""
+    nothing (→ generate by ear from the real audio) beats showing a different song.
+
+    TICKET-112: ``extra_artists`` / ``yt_composer`` / ``yt_original_artist`` /
+    ``yt_lyrics_block`` are DISAMBIGUATORS pulled from the YouTube video's
+    description (e.g. ``作詞・作曲：kors k`` / ``歌唱：ReGLOSS(...)``). They are
+    NOT the primary query — instead, every extra artist name is layered onto
+    the existing ``arts`` candidate list so the standard scoring + language
+    + duration guards stay in charge of picking the winner. With them empty
+    or None the behavior is identical to v1.0.93."""
     t, a = title.strip(), artist.strip()
     arts = split_artists(a)
+    # TICKET-112: prepend YT-description vocalists / original-artist /
+    # composer / lyricist as additional artist candidates. Vocals come first
+    # (most likely to BE the recording artist), then original_artist (for
+    # cover videos), then composer/lyricist (less likely to be the singer
+    # but still narrows aggregator search). De-duped against existing arts
+    # so we don't re-query the same name twice.
+    _extras_seen = {x.strip().lower() for x in arts if x}
+    if a:
+        _extras_seen.add(a.strip().lower())
+    for _src in (extra_artists or []):
+        if not _src:
+            continue
+        _key = _src.strip().lower()
+        if _key and _key not in _extras_seen:
+            arts.append(_src.strip())
+            _extras_seen.add(_key)
     romaji_fallback = [None]   # (lrc, meta) — used only if nothing original-script
     # A CJK-script artist's song is in a CJK language (or, for a cover, English) —
     # never German/Spanish/Russian. So a European-language hit on a Latin title is a
@@ -982,6 +1033,14 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     def take(lrc, meta):
         """Accept this match now — unless it's romanized Japanese (stash + keep
         looking for the original) or a same-title hit in the wrong language."""
+        # TICKET-113: per-track blacklist gate. Every provider's hit routes
+        # through this closure, so rejecting a known-wrong body HERE covers
+        # lrclib/get, lrclib/search, syncedlyrics, syncedlyrics/cover,
+        # syncedlyrics/title, and netease in one place.
+        if reject_signatures and _lrc_signature(lrc) in reject_signatures:
+            log.info("blacklist: rejected hit from %s (signature in reject_signatures)",
+                     (meta or {}).get("source", "?"))
+            return None
         body = re.sub(r"\[[^\]]*\]", "", lrc)
         if exp_cjk and detect_lang(body) in ("de", "es", "ru", "fr", "it", "pt"):
             return None   # CJK artist + European-language lyrics → collision, skip
@@ -1131,7 +1190,15 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
                 return r
 
     # Nothing original-script found → use the stashed romaji if we have one.
-    return romaji_fallback[0] or (None, None)
+    # TICKET-113: re-check the stashed romaji against the blacklist at the
+    # return site — a romaji whose signature is reject_signatures slips past
+    # take() into the stash before rejection, so without this check a stashed
+    # bad romaji can still be returned after all CJK upgrades are blacklisted.
+    rf = romaji_fallback[0]
+    if rf and reject_signatures and _lrc_signature(rf[0]) in reject_signatures:
+        log.info("blacklist: rejected stashed romaji fallback")
+        return (None, None)
+    return rf or (None, None)
 
 
 # ── Annotation ───────────────────────────────────────────────────────
@@ -1201,7 +1268,13 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
         tr = _make_translator()
     except ImportError:
         return 0
-    whole = song_lang in ("ja", "ko", "zh", "es", "de", "ru", "ja-romaji")
+    # TICKET-115: full non-English whitelist. Whole-song fallback covers any
+    # Latin/Cyrillic source we identify at song level (German, French, Italian,
+    # Portuguese as well as Spanish + Russian); CJK + Japanese-romaji round out
+    # the per-line set. Keep both gates in lockstep with main.py's
+    # _maybe_translate "whole" set and with detect_lang()'s outputs.
+    _LANGS = ("ja", "ko", "zh", "es", "de", "ru", "fr", "pt", "it")
+    whole = song_lang in (*_LANGS, "ja-romaji")
 
     def want(ln):
         if only_missing and ln.get("en", "").strip():
@@ -1210,9 +1283,9 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
         if not raw.strip():
             return False
         ll = detect_lang(raw)
-        if ll in ("ja", "ko", "zh", "es", "de", "ru"):
+        if ll in _LANGS:
             return True
-        return whole and ll == "other"     # Spanish/German line w/o markers, etc.
+        return whole and ll == "other"     # Romance/Germanic line w/o markers, etc.
 
     want_set = {i for i, ln in enumerate(lines) if want(ln)}
     if not want_set:
@@ -1284,7 +1357,12 @@ def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict
         elif ll == "ru":
             ln["rm"] = romanize(raw, "ru")          # Cyrillic → Latin reading
         else:
-            ln["rm"] = ""  # Spanish / German / English — shown as-is, no romaji
+            # Latin-script source languages (Spanish, German, French, Italian,
+            # Portuguese, English) — shown as-is; no romaji needed. Leaving 'rm'
+            # empty here is intentional and keeps the downstream pipeline (incl.
+            # backfill_file's `if ln.get('rm', '').strip(): continue` guard)
+            # from re-processing these lines.
+            ln["rm"] = ""
     if translate:
         _translate_lines(lines, lang)
     return lines
@@ -1364,13 +1442,27 @@ def validate_file(path, duration: float | None = None) -> tuple[bool, str]:
 
 def fetch_and_save(title: str, artist: str = "", translate: bool = False,
                    duration: float | None = None, interactive: bool = False,
-                   cover: bool = False, strict: bool = False) -> Path | None:
+                   cover: bool = False, strict: bool = False,
+                   reject_signatures: set | None = None,
+                   extra_artists: list | None = None,
+                   yt_composer: list | None = None,
+                   yt_original_artist: list | None = None,
+                   yt_lyrics_block: str | None = None) -> Path | None:
     # Don't cache a song under a "title" that's just the artist/channel name
     # (e.g. a mangled YouTube title) — it indexes garbage that then false-matches
     # every other video by that artist. Sound ID will find the real song instead.
     if artist and _norm(title) and _norm(title) == _norm(artist):
         return None
-    lrc, meta = fetch_lrc(title, artist, duration, cover=cover, strict=strict)
+    # TICKET-113: pass the per-track blacklist (a snapshot — see _start_fetch)
+    # through to fetch_lrc, which routes the rejection into the take() closure
+    # that gates every provider.
+    # TICKET-112: thread YT-description disambiguators through to fetch_lrc.
+    lrc, meta = fetch_lrc(title, artist, duration, cover=cover, strict=strict,
+                          reject_signatures=reject_signatures,
+                          extra_artists=extra_artists,
+                          yt_composer=yt_composer,
+                          yt_original_artist=yt_original_artist,
+                          yt_lyrics_block=yt_lyrics_block)
     if not lrc:
         return None
     lines = parse_lrc_text(lrc)

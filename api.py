@@ -62,6 +62,7 @@ _ROUTES = {
         "/audio": "audio listener: live loudness + vocal-band ratio + recent on/off pattern",
         "/lyricstate": "lyric current-state analyzer: current/prev/next lines, fill, structural checks",
         "/import/status": "current playlist import state: state, done, total, ok, skipped, failed_count",
+        "/yt-meta": "TICKET-112: full parsed YouTube description metadata for the current track (credits, raw description, lyrics_block) — useful when debugging which disambiguators the fetch_lrc call did or didn't get",
     },
     "POST": {
         "/identify": "re-identify by sound now",
@@ -76,6 +77,7 @@ _ROUTES = {
         "/tune": "set sync param: ?key=drift_fastpath&value=3.0 (one per call); or POST JSON {k:v,...}",
         "/reindex": "rescan the local library",
         "/import/csv": "start a playlist CSV import: ?path=C:\\path\\to\\file.csv [&translate=1] [&force=1]",
+        "/retranslate": "TICKET-115: force a translation backfill of the currently loaded track (de/fr/it/pt/ru/es/ja-romaji + CJK)",
     },
 }
 
@@ -296,6 +298,12 @@ def make_handler(app, log_file, token):
                         self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/import/status":
                     self._send(200, {"ok": True, **_import_status()})
+                elif path == "/yt-meta":
+                    # TICKET-112: full parsed YT-description metadata
+                    try:
+                        self._send(200, {"ok": True, "yt_metadata": app.get_yt_metadata()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/":
                     self._send(200, {"ok": True, "app": "Lyric Immersion and Karaoke",
                                      "version": API_VERSION, "routes": _ROUTES})
@@ -416,6 +424,29 @@ def make_handler(app, log_file, token):
                     if x:
                         self._run(lambda: app.set_pos("x", x))
                     self._send(200, {"ok": True, "action": f"position y={y or '-'} x={x or '-'}"})
+                elif path == "/retranslate":
+                    # TICKET-115: force translation backfill of the currently
+                    # loaded track. Bounce onto the Tk thread for a result, so
+                    # the response carries the path/lang/line counts the worker
+                    # snapshotted. _run-then-wait pattern: small Event marshals
+                    # the dict back to the request thread.
+                    result_box: dict = {}
+                    done_ev = threading.Event()
+
+                    def _do():
+                        try:
+                            result_box.update(app.retranslate_loaded() or {})
+                        except Exception as e:
+                            result_box.update({"ok": False,
+                                               "reason": f"{type(e).__name__}: {e}"})
+                        finally:
+                            done_ev.set()
+
+                    self._run(_do)
+                    # Bounded wait so a frozen UI thread can never hang the API.
+                    if not done_ev.wait(timeout=5.0):
+                        return self._err(503, "UI thread did not respond within 5s")
+                    self._send(200 if result_box.get("ok") else 409, result_box)
                 elif path == "/purgecache":
                     # clear bad cached lyrics at runtime: ?current=1, ?lang=ko, ?source=youtube-captions
                     cur = q.get("current", ["0"])[0] in ("1", "true", "yes")

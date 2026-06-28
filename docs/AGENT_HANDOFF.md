@@ -4,7 +4,7 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.93.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.0.95.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
 
 ---
 
@@ -53,7 +53,37 @@ Suisei). **Current build: v1.0.93.** Read this, then `ARCHITECTURE.md` + `ISSUES
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
 - **Bump `version.py`** each deploy; `/health` reports it so you can confirm the new build is live.
 
-## What this session shipped (v1.0.69 → v1.0.93, all deployed + on master)
+## What this session shipped (v1.0.69 → v1.0.95, all deployed + on master)
+- **v1.0.95 — Six-language translation delivered + `/retranslate` endpoint (TICKET-115):**
+  the README has long advertised English translation for Japanese, Chinese, Korean, Spanish,
+  German, and Russian, but the actual `_translate_lines` whitelist in `fetch_lyrics.py` only
+  fired for `("ja", "ko", "zh", "es", "de", "ru")` at the per-line gate and
+  `("ja", "ko", "zh", "es", "de", "ru", "ja-romaji")` at the whole-song gate — and the
+  `_maybe_translate` mirror in `main.py` was tighter still (`("es", "de", "ru", "ja-romaji")`
+  for "whole"). Live capture on Rammstein "Deutschland" (lang=de) showed every `en` field
+  empty across all 51 lines: the German body loaded into `jp` but no translation ever ran
+  because the path that detected the German source language never reached the translate
+  worker on a non-Spanish Latin-script song that lacked CJK lines to trigger the per-line
+  gate. **Fix:** hoisted the language set into a module constant
+  `_LANGS = ("ja", "ko", "zh", "es", "de", "ru", "fr", "pt", "it")` in
+  `fetch_lyrics._translate_lines`, used at BOTH the per-line `detect_lang(raw) in _LANGS`
+  gate AND the whole-song `song_lang in (*_LANGS, "ja-romaji")` gate so they can never
+  drift apart again. Mirrored the same set into `Overlay._maybe_translate`'s "whole" tuple
+  in `main.py` with an explicit "keep in sync with `_translate_lines._LANGS`" comment.
+  Net effect: German, French, Italian, and Portuguese songs now get whole-song translation;
+  the README's claims are now actually delivered (the original six plus French/Italian/Portuguese
+  as a bonus). `annotate()` no longer hard-codes the romaji-skip language list — the comment
+  was updated to call out that any Latin-script source language renders as-is with empty `rm`.
+  **New endpoint `POST /retranslate`** (api.py) — force a translation backfill of the currently
+  loaded track without re-fetching lyrics. Bounces onto the Tk thread via an `Event`-marshalled
+  `_run` call so the HTTP response carries the worker's snapshot (`{ok, action, path, lang,
+  n_lines, n_missing}`); 5 s bounded wait so a frozen UI thread can't hang the API. Backed by
+  `Overlay.retranslate_loaded()` which clears any stuck `_translating` guard and routes through
+  the existing `_start_translate` → `backfill_file` pipeline (atomic rewrite, main tick re-loads
+  in place, playback position preserved). The `_start_translate` worker's `_translating = None`
+  release moved into a `try/finally` so an exception in `backfill_file` no longer poisons the
+  in-flight guard and blocks every future `_maybe_translate` call for the same path. Help blurb
+  for `/retranslate` added to `api.py`'s `_ROUTES` table.
 - **v1.0.93 — Boundary-deferred lyrics swap (TICKET-111):** the v1.0.92 decision-engine
   SWITCH/REGEN actions, the long-standing wrong-song-strike teardown (Site D), and the
   user-driven `/wrong` path (Site G) all USED to blank `self.lines` IMMEDIATELY and re-fetch,
