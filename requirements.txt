@@ -17,6 +17,11 @@ jieba>=0.42
 hangul-romanize>=0.1.0
 soundcard>=0.4.3
 shazamio>=0.4
+# TICKET-118: per-process Core Audio peak meters → audible-session preference
+# (picks the AUDIBLE SMTC session when multiple tabs publish to SMTC and one
+# is muted). Windows-only; lazy-imported so non-Windows dev boxes are fine.
+# comtypes is already a transitive dep via pystray's COM stack.
+pycaw>=20240210; sys_platform == "win32"
 # Python 3.13 removed the stdlib `audioop` module (PEP 594) that pydub (via
 # shazamio) imports; this backport restores it. No-op on <=3.12.
 audioop-lts>=0.2; python_version >= "3.13"
