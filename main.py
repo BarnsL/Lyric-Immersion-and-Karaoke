@@ -5866,6 +5866,7 @@ class Overlay:
                 if ln.start <= pos_hi < ln.end:
                     new = i
                     break
+            self._diag_idx_skip(new, pos_hi, state)
             self.idx = new
             try:
                 self._gpu_send_state(pos_hi)
@@ -5906,6 +5907,7 @@ class Overlay:
             if ln.start <= pos_hi < ln.end:
                 new = i
                 break
+        self._diag_idx_skip(new, pos_hi, state)
         if new != self.idx:
             self.idx = new
             if new >= 0:
@@ -6780,6 +6782,25 @@ class Overlay:
         log.info("sync: deferring %+.2fs → %+.2fs until current line ends (%s)",
                  self.offset, new_off, reason or "auto")
 
+    def _diag_idx_skip(self, new, pos_hi, state):
+        """DIAG: log when the active line index SKIPS intermediate lines (jumps by
+        >1), with the clock internals, so we can see WHY the highlight skips a
+        couple lines instead of advancing one at a time."""
+        try:
+            if not int(self._tune.get("hi_diag", 1)):
+                return
+            prev = self.idx
+            if new >= 0 and prev >= 0 and abs(new - prev) > 1:
+                raw = state.get("position", 0.0) if isinstance(state, dict) else 0.0
+                live = getattr(self, "_live_mode", False) or getattr(self, "_live_arrangement", False)
+                log.info("hi-skip: idx %d→%d (Δ%d)  pos_hi=%.2f hi_clock=%.2f hi_off=%+.2f "
+                         "raw=%.2f off=%+.2f corr=%+.3f live=%s gpu=%s",
+                         prev, new, new - prev, pos_hi, getattr(self, "_hi_clock", 0.0),
+                         getattr(self, "_hi_offset", 0.0), raw, self.offset,
+                         getattr(self, "_hi_corr", 0.0), live, self._gpu_active())
+        except Exception:
+            pass
+
     def _hi_pos(self, state, lead):
         """The FREE-RUNNING highlight clock — the single timebase for the active
         line index + karaoke fill (CPU and GPU). It is
@@ -6824,7 +6845,7 @@ class Overlay:
             self._hi_last_raw = raw_pos        # last SMTC reading seen (change-detect)
             self._hi_corr = 0.0                # pending position correction, bled smoothly
             return self._hi_clock + self._hi_offset + lead
-        dt = max(0.0, min(0.5, now - getattr(self, "_hi_t", now)))
+        raw_dt = now - getattr(self, "_hi_t", now)
         self._hi_t = now
 
         # ── 1) smooth song clock ──
@@ -6834,19 +6855,43 @@ class Overlay:
         # and zig-zags). Only re-anchor when the reported value actually CHANGES
         # (a fresh reading = the true position): snap on a seek, else schedule a
         # small correction that bleeds in smoothly over the next few frames.
-        if playing:
-            self._hi_clock += dt
+        #
+        # STALL HANDLING (the "skips a couple lines" bug): a long frame gap means
+        # the Tk thread was BLOCKED (a ~4s sync-read capture, a decide-by-ear
+        # transcribe, a lyric fetch) and the overlay was frozen anyway. Clamping
+        # dt would credit only a fraction of the real elapsed time, so the clock
+        # LOSES time, lags, and SNAPS forward 10-15s later (observed: Δ+15.03s) —
+        # skipping lines mid-song. Instead, on a stall RE-ANCHOR straight to the
+        # player's true position: one accurate catch-up (the render was frozen
+        # regardless), no accumulated lag, no delayed multi-line snap.
+        stall = float(self._tune.get("hi_stall_s", 0.40))
+        if raw_dt > stall:
+            self._hi_clock = raw_pos
+            self._hi_corr = 0.0
+            self._hi_last_raw = raw_pos
+            dt = 0.0
+        else:
+            dt = max(0.0, raw_dt)
+            if playing:
+                self._hi_clock += dt
         corr = getattr(self, "_hi_corr", 0.0)              # bleed any pending correction
         if abs(corr) > 1e-4:
             cap = 2.0 * dt                                 # up to 2 s/s — fast but continuous
             step = max(-cap, min(cap, corr))
             self._hi_clock += step
             self._hi_corr = corr - step
-        seek_snap = float(self._tune.get("hi_seek_snap_s", 1.75))
+        # Only a genuine SEEK (big jump) snaps; sub-threshold gaps bleed in
+        # smoothly via _hi_corr. Raised 1.75→4.0: stalls are already re-anchored
+        # above, so the only gaps left here are small drift + the occasional ~2s
+        # residual — gliding those (instead of snapping) keeps the fill smooth.
+        seek_snap = float(self._tune.get("hi_seek_snap_s", 4.0))
         if abs(raw_pos - getattr(self, "_hi_last_raw", raw_pos)) > 1e-6:   # fresh reading
             self._hi_last_raw = raw_pos
             gap_p = raw_pos - self._hi_clock
             if abs(gap_p) > seek_snap:
+                if int(self._tune.get("hi_diag", 1)):
+                    log.info("hi-snap: clock %.2f→%.2f (Δ%+.2f) playing=%s",
+                             self._hi_clock, raw_pos, gap_p, playing)
                 self._hi_clock = raw_pos                   # seek / big drift → snap
                 self._hi_corr = 0.0
             elif abs(gap_p) > 0.05:
