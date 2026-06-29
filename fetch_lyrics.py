@@ -477,11 +477,13 @@ def split_artists(artist: str) -> list[str]:
 # a DASH ('‐ ReGLOSS'); the space-separated PREFIX form is what leaks through.
 # Ordered LONGEST-first so 'hololive DEV_IS' is matched before bare 'hololive'.
 _AGENCY_PREFIXES = (
-    "hololive dev_is", "hololive dev is", "hololive english", "hololive indonesia",
+    "hololive dev_is", "hololive dev is", "hololive english -justice-",
+    "hololive english", "hololive indonesia", "hololive justice",
     "hololive en", "hololive id", "hololive jp", "hololive",
     "holostars english", "holostars uprising", "holostars en", "holostars",
     "kamitsubaki studio", "kamitsubaki", "phase connect", "phase-connect",
-    "phaseconnect", "nijisanji en", "nijisanji", "vshojo", "vspo",
+    "phaseconnect", "nijisanji en", "nijisanji", "vshojo", "vspo en", "vspo",
+    "ぶいすぽっ！", "ぶいすぽ",
 )
 
 

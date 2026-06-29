@@ -97,15 +97,51 @@ _KNOWN_JA = (
     "ouro kronii", "kaf", "kanaeru", "kobo", "michiru shisui", "kaneko lumi",
     "harusaruhi", "isekaijoucho", "rim", "laplus", "la+", "laplus darkness",
     "kizuna ai", "kizunaai", "理芽", "幸祜",
+    # ── 2026 refresh: current JP / V-act roster ───────────────────────────────
+    # DISTINCTIVE romanized tokens only (≥4 chars, JP-specific) — this list is
+    # matched as a PLAIN SUBSTRING here, so short/ambiguous tokens (eve, ado,
+    # mio) are deliberately excluded to avoid mis-tagging non-JP acts.
+    # hololive DEV_IS FLOW GLOW (2nd gen, debuted 2024)
+    "flowglow", "isaki riona", "koganei niko", "mizumiya su", "rindo chihaya",
+    "kikirara vivi",
+    # hololive JP singers who always perform in Japanese
+    "azki", "watame", "tsunomaki", "koyori", "hakui koyori", "kazama iroha",
+    "nekomata", "ookami mio",
+    # VSPO! (Virtual eSports Project)
+    "vspo", "ぶいすぽ",
+    # mainstream JP artists (unambiguously Japanese; distinctive names)
+    "yoasobi", "ikura", "ayase", "yorushika", "n-buna", "zutomayo", "vaundy",
+    "aimer", "yonezu", "kenshi yonezu", "mafumafu",
 )
 
 # A subset of _KNOWN_JA that is UNAMBIGUOUS and consistent enough that the
 # romanized name alone is a FULL Japanese signal (certainty 1.0) — the user's
-# "Suisei is always Japanese, make her channel/name full JA" rule. Matched as a
-# lowercase substring of the artist/channel.
+# "Suisei is always Japanese, make her channel/name full JA" rule. Matched by the
+# word-boundaried regex below (against the artist/channel).
 _ALWAYS_JA = (
     "suisei", "hoshimachi", "hoshimatic", "星街すいせい", "すいせい",
+    # Mainstream acts that are unambiguously Japanese even when romanized — the
+    # romanized name alone is a full-JA signal (certainty 1.0), like Suisei.
+    "yoasobi", "yorushika", "zutomayo", "vaundy", "yonezu", "kenshi yonezu",
+    "mafumafu",
 )
+
+
+def _compile_known(tokens):
+    """Build the act-name matcher: WORD-BOUNDARY the Latin tokens so short ones
+    ('rim'/'kaf'/'kobo') don't substring-match inside unrelated names (Grimes,
+    Kafka, Kobold), and bare-match the CJK tokens (Python \\b is Latin-only).
+    Mirrors fetch_lyrics._JP_VAGENCY_RE exactly so the language scorer and the
+    ko/zh body-rejection finally agree (they used to drift out of sync)."""
+    parts = []
+    for k in tokens:
+        esc = re.escape(k)
+        parts.append(rf"\b{esc}\b" if all(ord(c) < 128 for c in k) else esc)
+    return re.compile("|".join(parts), re.I) if parts else None
+
+
+_KNOWN_JA_RE  = _compile_known(_KNOWN_JA)
+_ALWAYS_JA_RE = _compile_known(_ALWAYS_JA)
 
 
 def language_confidence(title: str, artist: str = "") -> dict:
@@ -126,8 +162,8 @@ def language_confidence(title: str, artist: str = "") -> dict:
     al = a.lower()
     v = {"ja": 0.0, "en": 0.0, "zh": 0.0, "ko": 0.0}
     strong = 0.0
-    always_ja = any(k in al for k in _ALWAYS_JA)        # unambiguous JP act (Suisei…)
-    known_ja = any(k in al for k in _KNOWN_JA)          # known romanized JP act/label
+    always_ja = bool(_ALWAYS_JA_RE and _ALWAYS_JA_RE.search(a))   # unambiguous JP act (Suisei…)
+    known_ja = bool(_KNOWN_JA_RE and _KNOWN_JA_RE.search(a))      # known romanized JP act/label
     # Artist name script = the act's usual language (the strongest cue).
     if always_ja:
         v["ja"] += 3.0; strong += 3.0          # Suisei etc.: romanized name = FULL JA
