@@ -58,6 +58,8 @@ _ROUTES = {
         "/lyrics": "the full loaded lyric lines",
         "/tune": "live sync-tuning parameters (drift_fastpath, agree, spread_reset, …)",
         "/diag": "deep diagnostics: full sync state machine, last energy-correlation, FPS/frame-timing, pending-swap (TICKET-111)",
+        "/metrics": "per-release success/wobbler/fail telemetry counter (TICKET-121)",
+        "/sync": "current offset lock state: offset, last energy-align, last OCR-assisted align, verify cadence (TICKET-123)",
         "/source": "video/music source view: raw SMTC data + what the app derived from it",
         "/audio": "audio listener: live loudness + vocal-band ratio + recent on/off pattern",
         "/lyricstate": "lyric current-state analyzer: current/prev/next lines, fill, structural checks",
@@ -71,6 +73,8 @@ _ROUTES = {
         "/reset": "reset the sync offset to 0",
         "/align": "sync by listening — transcribe the audio + match to lyrics, one-shot (needs faster-whisper)",
         "/forcesync": "FORCE SYNC — reset to 0, then try RANKED match candidates (skip chorus traps), forward-verifying each until one holds; nuclear",
+        "/resync": "force resync NOW: energy re-align + OCR-assisted alignment off the burned-in lyrics (TICKET-123)",
+        "/ocrsync": "OCR-assisted sync: read the on-screen burned-in line, match to the LRC, set the offset precisely (TICKET-123)",
         "/decide": "smart song decision — transcribe vocals + pick which candidate's lyrics they match",
         "/captions": "pull THIS video's caption track (accurate text+timing); ?url=<exact video> beats a title search",
         "/nowplaying": "browser pushes the exact current video URL (?url=...) so auto-captions hit the right upload",
@@ -281,6 +285,16 @@ def make_handler(app, log_file, token):
                         self._send(200, {"ok": True, **app.get_diag()})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/metrics":
+                    try:
+                        self._send(200, {"ok": True, **app.get_metrics()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/sync":
+                    try:
+                        self._send(200, {"ok": True, **app.get_sync()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/source":
                     try:
                         self._send(200, {"ok": True, **app.get_source()})
@@ -346,6 +360,14 @@ def make_handler(app, log_file, token):
                 elif path == "/align":
                     self._run(app.align_by_listening)
                     self._send(200, {"ok": True, "action": "syncing by listening (transcribe + match, one-shot)"})
+                elif path == "/resync":
+                    self._run(app.force_resync)
+                    self._send(200, {"ok": True, "action": "force resync — energy re-align + OCR-assisted alignment"})
+                elif path == "/ocrsync":
+                    import threading as _th
+                    app._last_ocr_sync_t = 0.0      # bypass throttle for a manual call
+                    _th.Thread(target=lambda: app._ocr_assisted_sync("api"), daemon=True).start()
+                    self._send(200, {"ok": True, "action": "OCR-assisted sync — reading the burned-in line + aligning the LRC"})
                 elif path == "/forcesync":
                     # FORCE SYNC: reset to 0, then transcribe+match (two-point) until 3 reads agree
                     self._run(app.force_sync)

@@ -13,10 +13,9 @@ from PyInstaller.utils.hooks import collect_all
 WHISPER = os.path.isdir(".deps") and os.environ.get("LEAN_BUILD") != "1"
 
 datas = [("icon.ico", ".")]
-# Lyrics baked into the app for songs the providers always miss (feelingradation):
-# seeded into the runtime cache at startup by _seed_bundled_lyrics().
-if os.path.isdir("bundled_lyrics"):
-    datas.append(("bundled_lyrics", "bundled_lyrics"))
+# TICKET-124: NO bundled lyrics are shipped. This is a sellable product — every lyric
+# must be FOUND BY CODE at runtime (providers / YouTube captions / OCR / by-ear), never
+# copyrighted text baked into the build. (bundled_lyrics/ was removed from the repo.)
 binaries = []
 hiddenimports = [
     "pystray._win32", "PIL._tkinter_finder", "PIL.ImageTk", "PIL.ImageGrab",
@@ -27,8 +26,8 @@ hiddenimports = [
     "winsdk.windows.graphics.imaging",
     # local modules imported lazily inside functions — pin them so the
     # frozen build always includes them.
-    "appdata", "version", "updater", "songchange", "align", "api", "character", "recognize", "fetch_lyrics", "gpu_setup",
-    "playlist_import", "playlist_import_gui", "concert_ocr", "deep_transcribe", "confidence",
+    "appdata", "version", "updater", "songchange", "align", "api", "character", "recognize", "fetch_lyrics", "gpu_setup", "metrics",
+    "playlist_import", "playlist_import_gui", "concert_ocr", "ocr_lyrics", "deep_transcribe", "confidence",
     # TICKET-100: Discord IPC reader (lazy-imported in main.py only when the
     # tray toggle is ON, but pin it here so the frozen build includes it).
     "discord_rpc",

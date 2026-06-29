@@ -959,6 +959,66 @@ def _title_variants(title: str) -> list:
     return out[:6]
 
 
+# Hepburn romaji → hiragana, longest-match, with sokuon (doubled consonant → っ)
+# and moraic n (ん). Used to ALSO search a romanized Japanese title under its native
+# kana: providers (NetEase / syncedlyrics aggregators) index 'かもね' under かもね, and
+# the bare romaji query 'kamone' pulls a DIFFERENT same-romaji song. Returns the kana
+# string, or None when the input is not cleanly romanized Japanese (English titles like
+# 'white balance'/'deadpool' leave a consonant cluster and are rejected → no-op).
+_HEPBURN_KANA = {
+    "kya": "きゃ", "kyu": "きゅ", "kyo": "きょ", "sha": "しゃ", "shu": "しゅ", "sho": "しょ",
+    "cha": "ちゃ", "chu": "ちゅ", "cho": "ちょ", "nya": "にゃ", "nyu": "にゅ", "nyo": "にょ",
+    "hya": "ひゃ", "hyu": "ひゅ", "hyo": "ひょ", "mya": "みゃ", "myu": "みゅ", "myo": "みょ",
+    "rya": "りゃ", "ryu": "りゅ", "ryo": "りょ", "gya": "ぎゃ", "gyu": "ぎゅ", "gyo": "ぎょ",
+    "ja": "じゃ", "ju": "じゅ", "jo": "じょ", "bya": "びゃ", "byu": "びゅ", "byo": "びょ",
+    "pya": "ぴゃ", "pyu": "ぴゅ", "pyo": "ぴょ", "shi": "し", "chi": "ち", "tsu": "つ",
+    "fu": "ふ", "ji": "じ",
+    "ka": "か", "ki": "き", "ku": "く", "ke": "け", "ko": "こ", "ga": "が", "gi": "ぎ",
+    "gu": "ぐ", "ge": "げ", "go": "ご", "sa": "さ", "su": "す", "se": "せ", "so": "そ",
+    "za": "ざ", "zu": "ず", "ze": "ぜ", "zo": "ぞ", "ta": "た", "te": "て", "to": "と",
+    "da": "だ", "de": "で", "do": "ど", "na": "な", "ni": "に", "nu": "ぬ", "ne": "ね",
+    "no": "の", "ha": "は", "hi": "ひ", "he": "へ", "ho": "ほ", "ba": "ば", "bi": "び",
+    "bu": "ぶ", "be": "べ", "bo": "ぼ", "pa": "ぱ", "pi": "ぴ", "pu": "ぷ", "pe": "ぺ",
+    "po": "ぽ", "ma": "ま", "mi": "み", "mu": "む", "me": "め", "mo": "も", "ya": "や",
+    "yu": "ゆ", "yo": "よ", "ra": "ら", "ri": "り", "ru": "る", "re": "れ", "ro": "ろ",
+    "wa": "わ", "wo": "を", "a": "あ", "i": "い", "u": "う", "e": "え", "o": "お",
+}
+
+
+def romaji_to_kana(s: str) -> str | None:
+    """Romanized-Japanese title → hiragana, or None if it isn't cleanly romaji
+    (so English titles are rejected, not mangled). Conservative on purpose: a
+    leftover consonant cluster ⇒ not Japanese ⇒ None."""
+    if not s or not re.fullmatch(r"[A-Za-z \-’'ー]+", s):
+        return None
+    out = []
+    for word in re.split(r"[\s\-]+", s.strip().lower()):
+        if not word:
+            continue
+        i = 0
+        while i < len(word):
+            c = word[i]
+            # sokuon: a doubled consonant (not n) → small つ
+            if c not in "aeioun" and i + 1 < len(word) and word[i + 1] == c:
+                out.append("っ"); i += 1; continue
+            # moraic n: 'n' not starting a な-row / -ya mora
+            if c == "n" and (i + 1 >= len(word) or word[i + 1] not in "aeiouy"):
+                out.append("ん"); i += 1; continue
+            m = None
+            for L in (3, 2, 1):
+                if word[i:i + L] in _HEPBURN_KANA:
+                    m = word[i:i + L]; break
+            if not m:
+                return None
+            out.append(_HEPBURN_KANA[m]); i += len(m)
+    return "".join(out) or None
+
+
+def _hira_to_kata(h: str) -> str:
+    """Hiragana → katakana (so a loanword title indexed in katakana also matches)."""
+    return "".join(chr(ord(c) + 0x60) if "ぁ" <= c <= "ゖ" else c for c in (h or ""))
+
+
 def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
               cover: bool = False, strict: bool = False,
               reject_signatures: set | None = None,
@@ -1029,6 +1089,16 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     # Suppressed when the title/artist ITSELF carries hangul (a real Korean entry).
     han_song = (bool(_HAN.search(t)) or bool(_HAN.search(a))) \
         and not (title_ko or bool(_HANGUL.search(a)))
+    # A known JAPANESE VTuber act/agency (ReGLOSS / hololive / 神椿·V.W.P …) marks a
+    # JAPANESE song even when BOTH the title and artist are romanized/English — e.g.
+    # 'ReGLOSS - Flashpoint': no kana/kanji anywhere, so the script guards above can't
+    # fire, and a Korean fan-LRC would otherwise be accepted. These acts don't release
+    # Korean/Chinese-language songs, so reject a ko/zh body for them. (Suppressed when
+    # the title/artist itself carries hangul — a genuine Korean entry.)
+    jp_vagency = bool(re.search(
+        r"regloss|hololive|holostars|holo\s*x|kamitsubaki|神椿|"
+        r"v\.?\s?w\.?\s?p\b|花譜|理芽|ヰ世界情緒|あんは|harusaruhi|laplus",
+        f"{t} {a}", re.I)) and not (title_ko or bool(_HANGUL.search(a)))
 
     def take(lrc, meta):
         """Accept this match now — unless it's romanized Japanese (stash + keep
@@ -1051,12 +1121,23 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
             return None   # hangul title = Korean song; zh/ja hit is a collision
         if han_song and body_lang == "ko":
             return None   # kanji (JA/ZH) song; a Korean body is a wrong-language collision
+        if jp_vagency and body_lang in ("ko", "zh"):
+            return None   # JP VTuber act (ReGLOSS/hololive/神椿…); ko/zh body = wrong-language collision
         # LANGUAGE-CONFIDENCE guard (TICKET-062): a kana/hangul-named artist almost
         # never IS an English same-title song — Suisei's 星街すいせい "GHOST" pulled an
         # English "Ghost". When confidence clearly favours a CJK language over English
         # AND rests on a strong NON-Latin signal (so a romanized name like "Suisei
         # Hoshimachi" can't misfire), reject the English body as a collision.
         if body_lang == "en":
+            # A PURE CJK-script title (kana/hangul, NO Latin) whose body detects as
+            # English is an English TRANSLATION mislabeled as the original — the
+            # アイドル → idol.json bug, where 'Complete and perfect' / 'Dear miss genius
+            # idol' was shown instead of 完璧で嘘つきな君は. Reject outright so the real
+            # CJK body / a re-fetch wins. (A title carrying Latin — 'Idol English Ver.'
+            # — falls through to the gentler confidence test so a genuine English
+            # version isn't dropped.)
+            if (title_ja or title_ko) and not re.search(r"[A-Za-z]", t):
+                return None
             lc = confidence.language_confidence(t, a)
             cjk = lc["ja"] + lc["zh"] + lc["ko"]
             if lc.get("certainty", 0.0) >= 0.6 and cjk >= 0.6 and cjk > lc["en"] + 0.2:
@@ -1115,6 +1196,32 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     # "地球儀" title query grabs an unrelated same-title song. The cover title-only
     # fast-path is the FALLBACK below — only for true 歌ってみた uploads where the
     # channel-as-artist genuinely derails the search (TICKET-001 vs TICKET-002).
+    # NATIVE-KANA FIRST (guarded): a romanized-Japanese title ('kamone' → かもね) is
+    # indexed by providers under its KANA; the bare romaji query pulls a DIFFERENT
+    # same-romaji Japanese song that still passes the (script-only) language guard, so
+    # it would WIN before any later kana variant is ever tried. Try the kana form FIRST,
+    # ARTIST-QUALIFIED, with the [ar:]-conflict guard — a Latin title gets NO language
+    # check in verify_lrc, so the artist-conflict guard is what stops a same-kana WRONG
+    # song from being accepted. English / loanword titles → romaji_to_kana None → no-op.
+    # Bounded to 4 queries (hiragana+katakana × 2 orders), all on the primary artist.
+    kana = romaji_to_kana(t)
+    if kana and a:
+        kana_qs, kseen = [], set()
+        for kf in (kana, _hira_to_kata(kana)):
+            for q in (f"{kf} {a}", f"{a} {kf}"):
+                kk = q.lower().strip()
+                if kk not in kseen:
+                    kseen.add(kk)
+                    kana_qs.append(q)
+        for q in kana_qs:
+            lrc = _try(q)
+            if (lrc and verify_lrc(lrc, t, duration)
+                    and not _lrc_artist_conflict(lrc, a)):
+                r = take(lrc, {"source": "syncedlyrics/kana", "artist": a or None,
+                               "duration": duration})
+                if r:
+                    return r
+
     hi_q, seen = [], set()
     for tt in (_title_variants(t) or [t]):
         if arts:
