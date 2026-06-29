@@ -2686,6 +2686,13 @@ class Overlay:
             "fetch_timeout": 0,                     # swap fetches that blew the hard cap
         }
         self._fetch_durations = []                  # seconds per applied swap fetch (P50/P95)
+        # ── sync diagnostics ring buffer (surfaced via /syncdiag) ──
+        # Bounded list of real sync EVENTS (snap/skip/commit/drift/caption/
+        # decision/force-sync) — never appended per-frame, so it's cheap. Lets a
+        # "highlights fucked" report be diagnosed by one curl. See _sync_event().
+        self._sync_events = []
+        self._drift_sign_hist = []                  # recent sign(drift) reads (monotonic-drift detect)
+        self._drift_monotonic_since = 0.0           # wall-time a one-directional drift streak began (0=none)
         self._idx_minus_one_since = 0.0  # wall-time of the first tick idx hit -1 (for instrumental-gap boundary)
         self._live_arrangement = False  # LIVE/short/alt version → FOLLOW the offset, don't reset
         # Concert applause/cheering-pause detection (TICKET-061): a live cut pauses
@@ -3005,6 +3012,11 @@ class Overlay:
         # Treat covers like live-arrangements: FOLLOW the measured offset.
         self._live_arrangement = (is_live_arrangement(title)
                                   or bool(getattr(self, "_is_cover", False)))
+        self._sync_event("mode_change", title=title, cover=getattr(self, "_is_cover", False),
+                         live_arrangement=self._live_arrangement,
+                         live_mode=getattr(self, "_live_mode", False))
+        self._drift_sign_hist = []          # new song → fresh monotonic-drift detection
+        self._drift_monotonic_since = 0.0
         self._live_sync_streak = 0          # new song → resync aggressively again (~8×/min)
         self._live_resync_gap = None
         self._live_resync_inflight = False
@@ -3170,7 +3182,14 @@ class Overlay:
         # `src` isn't a param here — use the cached source from the tick loop.
         if (self.captions_on and not self._live_mode
                 and any(h in (self._last_src or "") for h in BROWSER_HINTS)):
-            self.root.after(4000,
+            # COVER / LIVE-ARRANGEMENT: a re-sung cover (or a live take) NEVER
+            # matches the original studio LRC's timing, so fetch the video's OWN
+            # caption track EAGERLY (it IS this performance's lyrics + timing)
+            # before the mismatched LRC dominates the sync. Studio originals keep
+            # the 4s delay (their LRC is fine; CC is just a nicety there).
+            _cap_delay = (250 if (getattr(self, "_is_cover", False)
+                                  or getattr(self, "_live_arrangement", False)) else 4000)
+            self.root.after(_cap_delay,
                             lambda t=self._track_seq: self._maybe_fetch_captions(t))
         # TICKET-112: YT-description metadata extractor. Runs in PARALLEL to
         # captions (cheap metadata-only yt_dlp call, no audio/no subs) so a
@@ -4478,6 +4497,35 @@ class Overlay:
                             cur_t = (self.lines[self.idx].start
                                      if 0 <= self.idx < len(self.lines) else -1.0)
                             self._last_drift = round(diff, 2)
+                            self._sync_event("drift_read", drift=round(diff, 2), corr=round(corr, 2),
+                                             offset=round(self.offset, 2), spread=round(spread, 1),
+                                             cover=getattr(self, "_is_cover", False),
+                                             live=getattr(self, "_live_arrangement", False))
+                            # MONOTONIC-DRIFT detect (STUDIO only): N consecutive same-sign
+                            # reads outside the deadband = the lyrics are steadily creeping
+                            # ONE way (共鳴 "starts in sync then gets late"). Flag it so
+                            # _maybe_auto_align re-locks on a SHORTER cooldown. Covers/live
+                            # FOLLOW the offset by design and must not trip this.
+                            _studio = not (getattr(self, "_is_cover", False)
+                                           or getattr(self, "_live_arrangement", False)
+                                           or getattr(self, "_force_sync_active", False))
+                            _db = float(self._tune.get("deadband", 0.8))
+                            _sgn = (1 if diff > _db else (-1 if diff < -_db else 0))
+                            self._drift_sign_hist.append(_sgn)
+                            if len(self._drift_sign_hist) > 6:
+                                del self._drift_sign_hist[:len(self._drift_sign_hist) - 6]
+                            _need = int(self._tune.get("drift_monotonic_reads_n", 3))
+                            _recent = self._drift_sign_hist[-_need:]
+                            if (_studio and _sgn != 0 and len(_recent) >= _need
+                                    and all(s == _sgn for s in _recent)):
+                                if not self._drift_monotonic_since:
+                                    self._drift_monotonic_since = time.time()
+                                    log.info("drift-recovery: monotonic %s drift (%d reads) → faster re-lock",
+                                             "LATE" if _sgn > 0 else "EARLY", _need)
+                                    self._sync_event("drift_monotonic",
+                                                     dir=("late" if _sgn > 0 else "early"), n=_need)
+                            elif _sgn == 0:
+                                self._drift_monotonic_since = 0.0   # back inside the deadband
                             self._last_drift_t = time.time()
                             # Track the absolute Shazam-implied offset so the
                             # energy correlator can sanity-check its result
@@ -6972,6 +7020,8 @@ class Overlay:
         # mid-line, defeating the deferral.
         self._pending_offset = new_off
         self._pending_offset_t = time.time()
+        self._sync_event("offset_defer", reason=reason or "auto", to=round(new_off, 2),
+                         frm=round(self.offset, 2), idx=self.idx)
         log.info("sync: deferring %+.2fs → %+.2fs until current line ends (%s)",
                  self.offset, new_off, reason or "auto")
 
@@ -6991,8 +7041,70 @@ class Overlay:
                          prev, new, new - prev, pos_hi, getattr(self, "_hi_clock", 0.0),
                          getattr(self, "_hi_offset", 0.0), raw, self.offset,
                          getattr(self, "_hi_corr", 0.0), live, self._gpu_active())
+                self._sync_event("idx_skip", frm=prev, to=new, delta=new - prev,
+                                 pos_hi=round(pos_hi, 2), offset=round(self.offset, 2),
+                                 drift=getattr(self, "_last_drift", None), live=live)
         except Exception:
             pass
+
+    def _sync_event(self, kind, **fields):
+        """Append a sync diagnostic event to the bounded ring buffer (for
+        /syncdiag). Called only at real EVENTS (hi-snap, idx-skip, offset
+        commit/defer, drift read, caption load, decision switch, energy-align,
+        force-sync) — never per frame — so it's a few appends/sec at most. Never
+        raises (diagnostics must not break playback)."""
+        try:
+            if not int(self._tune.get("sync_event_enabled", 1)):
+                return
+            fields["t"] = round(time.time(), 2)
+            fields["kind"] = kind
+            ev = self._sync_events
+            ev.append(fields)
+            cap = int(self._tune.get("sync_event_buffer_size", 200))
+            if len(ev) > cap:
+                del ev[:len(ev) - cap]
+        except Exception:
+            pass
+
+    def get_sync_diag(self):
+        """Ring buffer of recent sync events + a live snapshot of the highlight
+        clock, offset, mode, and current line — so a 'fucked highlights' report
+        is one `curl 127.0.0.1:8765/syncdiag` away from a full diagnosis."""
+        def g(a):
+            try:
+                return round(float(getattr(self, a, 0.0) or 0.0), 3)
+            except Exception:
+                return None
+        idx = self.idx if 0 <= self.idx < len(self.lines) else -1
+        ln = self.lines[idx] if idx >= 0 else None
+        st = self.media.get() or {}
+        m = self.meta if isinstance(self.meta, dict) else {}
+        po = getattr(self, "_pending_offset", None)
+        return {
+            "events": list(self._sync_events)[-120:],
+            "n_events": len(self._sync_events),
+            "clock": {
+                "hi_clock": g("_hi_clock"), "hi_offset": g("_hi_offset"),
+                "hi_out": g("_hi_out"), "hi_corr": g("_hi_corr"), "offset": g("offset"),
+                "pending_offset": (round(po, 3) if po is not None else None),
+                "last_drift": getattr(self, "_last_drift", None),
+                "drift_integral": g("_drift_integral"),
+                "drift_monotonic_since": round(getattr(self, "_drift_monotonic_since", 0.0), 1),
+            },
+            "line": ({"idx": idx, "start": round(ln.start, 2), "end": round(ln.end, 2),
+                      "jp": ln.jp} if ln else {"idx": idx}),
+            "mode": {"is_cover": getattr(self, "_is_cover", False),
+                     "live_mode": getattr(self, "_live_mode", False),
+                     "live_arrangement": getattr(self, "_live_arrangement", False),
+                     "verified": getattr(self, "_verified", False),
+                     "title_locked": getattr(self, "_title_locked", False),
+                     "force_sync_active": getattr(self, "_force_sync_active", False)},
+            "source": m.get("source"), "title": m.get("title"), "artist": m.get("artist"),
+            "playing": (st.get("status", PLAYING) == PLAYING),
+            "position": round(float(st.get("position", 0.0) or 0.0), 2),
+            "frame_worst_ms": getattr(self, "_frame_worst", None),
+            "offset_hist": list(getattr(self, "_offset_hist", []))[-12:],
+        }
 
     def _hi_pos(self, state, lead):
         """The FREE-RUNNING highlight clock — the single timebase for the active
@@ -7094,6 +7206,8 @@ class Overlay:
                 if int(self._tune.get("hi_diag", 1)):
                     log.info("hi-snap: clock %.2f→%.2f (Δ%+.2f) playing=%s",
                              self._hi_clock, raw_pos, gap_p, playing)
+                self._sync_event("hi_snap", frm=round(self._hi_clock, 2), to=round(raw_pos, 2),
+                                 delta=round(gap_p, 2), playing=playing)
                 self._hi_clock = raw_pos                   # real seek / track scrub → cut
                 self._hi_corr = 0.0
                 snapped = True
@@ -10667,6 +10781,19 @@ class Overlay:
         # perfect sync). Skip it for caption-sourced lyrics.
         if (self.meta.get("source") or "") == "youtube-captions":
             return
+        # COVER on a mismatched LRC: the loaded lyrics are the ORIGINAL's timing,
+        # which a re-sung cover never matches — correlating the cover's vocal
+        # energy against that grid locks a confidently-WRONG offset (the "started
+        # in sync then drifted way off" cover failure, reasons #4/#10). Don't
+        # energy-align a cover; pull the video's own captions instead (THIS
+        # performance's real timing). Once captions load, the guard above returns.
+        if getattr(self, "_is_cover", False):
+            try:
+                self.root.after(0, lambda t=self._track_seq: self._maybe_fetch_captions(t))
+            except Exception:
+                pass
+            self._sync_event("energy_align_skip", reason="cover-mismatched-lrc")
+            return
         st = self.media.get()
         if not (st and st.get("status") == PLAYING):
             return
@@ -10678,7 +10805,13 @@ class Overlay:
             self._note_sync_verdict("insync")
             return
         # Don't run within the cooldown of the previous auto-align (CPU budget).
-        if now - self._last_align_t < self._tune["auto_align_cooldown"]:
+        # MONOTONIC drift active → re-lock on a SHORTER cooldown so the energy
+        # correlator catches a steady one-directional creep (共鳴 "starts in sync
+        # then gets late") instead of waiting the full ~14s. Studio-only flag.
+        _cooldown = float(self._tune["auto_align_cooldown"])
+        if getattr(self, "_drift_monotonic_since", 0.0):
+            _cooldown = float(self._tune.get("drift_recovery_cooldown", 5.0))
+        if now - self._last_align_t < _cooldown:
             return
         # Need to be reasonably into the track so there are vocals to match.
         vpos = float(st.get("position") or 0.0)
