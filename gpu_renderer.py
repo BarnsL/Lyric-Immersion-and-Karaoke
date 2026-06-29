@@ -49,11 +49,17 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-# Force UTF-8 stdout so the diagnostic prints (which may include CJK or arrows)
-# don't crash under Windows' default cp1252 console encoding.
+# Force UTF-8 on ALL three std streams. stdout/stderr so the diagnostic prints
+# (which may include CJK or arrows) don't crash under Windows' default cp1252
+# console encoding; stdin so the NDJSON the parent pipes in (UTF-8 lyric text)
+# is decoded as UTF-8 and not the locale codepage — decoding the parent's
+# UTF-8 bytes as cp1252 turns every CJK lyric into mojibake (JP garbled while
+# ASCII romaji/English stay clean). _stdin_reader also reads binary + decodes
+# UTF-8 explicitly as a second line of defense.
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
+    sys.stdin.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
@@ -624,8 +630,17 @@ def _grab(hwnd, out_path: str):
 def _stdin_reader(q):
     import threading
     def _read():
-        for raw in sys.stdin:
-            raw = raw.strip()
+        # Read stdin as BINARY and decode each line as UTF-8 explicitly. The
+        # parent writes UTF-8 NDJSON; relying on text-mode sys.stdin would
+        # decode with Windows' cp1252 locale and turn every CJK lyric into
+        # mojibake (the JP-garbled / romaji-fine bug). Binary + explicit UTF-8
+        # is immune to the active console codepage.
+        stream = getattr(sys.stdin, "buffer", None) or sys.stdin
+        for rawb in stream:
+            if isinstance(rawb, bytes):
+                raw = rawb.decode("utf-8", "replace").strip()
+            else:
+                raw = rawb.strip()
             if not raw:
                 continue
             try:
@@ -667,6 +682,7 @@ def run_ipc_child(width: int | None = None, height: int | None = None,
     playing = False
     last_log_t = time.perf_counter()
     frames = 0
+    cap_path = None                     # DEBUG: {"type":"capture","path":...}
     try:
         while not r.quit:
             # Drain ALL pending messages each frame so a burst of state updates
@@ -687,6 +703,11 @@ def run_ipc_child(width: int | None = None, height: int | None = None,
                 elif t == "window":
                     # M2 keeps a fixed window; resize is M3 work.
                     pass
+                elif t == "capture":
+                    # DEBUG: grab a composited screenshot of the overlay window
+                    # AFTER the next draw, so we can verify visibility through
+                    # the exact spawned-child path (CREATE_NO_WINDOW etc.).
+                    cap_path = msg.get("path")
                 elif t == "quit":
                     r.quit = True
                     break
@@ -694,6 +715,10 @@ def run_ipc_child(width: int | None = None, height: int | None = None,
             r.pump_events()
             r.set_state(pos_raw, idx=idx, fill_frac=fill_frac)
             r.draw()
+            if cap_path:
+                _grab(r.hwnd, cap_path)
+                print(f"gpu_renderer: captured -> {cap_path}", file=sys.stderr, flush=True)
+                cap_path = None
             frames += 1
             now = time.perf_counter()
             if now - last_log_t >= 5.0:
