@@ -1296,7 +1296,7 @@ def is_live_or_compilation(title, duration=None):
     the title names the EVENT, not the song. Such videos must be driven by SOUND:
     title-matching them is what makes a whole concert show one (wrong) song's
     lyrics, with no way for Shazam to override a title that's a real song name."""
-    if duration and duration > 12 * 60:      # >12 min ⇒ multi-song in practice
+    if duration and duration > 10 * 60:      # >10 min ⇒ concert/compilation (multi-song) in practice
         return True
     m = _LIVE_RE.search(title or "")
     if not m:
@@ -2947,7 +2947,23 @@ class Overlay:
                 log.info("cover: no original artist in title → title-only search "
                          "(ignoring cover channel %r)", artist)
 
-        self._live_mode = is_live_or_compilation(title, duration)
+        # Live/concert DETECTION uses the RAW video length — a reliable concert
+        # signal even on browser sources, where duration is NOT trusted for SYNC
+        # (so the passed `duration` is usually None for a YouTube tab). A >10-min
+        # video is a concert/compilation of many songs and must be driven by
+        # SOUND, not its event title (理芽 - Singularity Live = 18.96 min, but the
+        # title 'Singularity Live' isn't enough for _LIVE_RE alone). Per the user:
+        # "over 10 minutes is generally a concert video with multiple songs."
+        _live_dur = duration
+        if not _live_dur:
+            try:
+                _live_dur = float((self.media.get() or {}).get("duration") or 0.0) or None
+            except Exception:
+                _live_dur = None
+        self._live_mode = is_live_or_compilation(title, _live_dur)
+        if self._live_mode and not (duration and duration > 600):
+            log.info("live/concert mode via VIDEO LENGTH %.0fs (%.1f min) — %r",
+                     _live_dur or 0.0, (_live_dur or 0.0) / 60.0, title)
         # TICKET-109: new track => decision engine forgets the prior song's strikes
         self._reset_decision_engine()
         if self._live_mode:
