@@ -955,6 +955,23 @@ def feat_artists_from_title(title):
     return out
 
 
+# Curated cover→original-artist hints for frequently-covered songs whose ORIGINAL
+# artist appears nowhere in the cover's title (so the title-only fallback can't
+# find them, and a bare-title search risks a same-title WRONG-LANGUAGE hit). This
+# is METADATA only — no lyrics — so it's compatible with the no-bundled-lyrics
+# policy; the body still comes from providers/captions/OCR/by-ear. Keyed by the
+# cleaned, lowercased song title. The '!!!' in 'bang!!!' is load-bearing: it is
+# EGOIST's Japanese song, NOT the K-pop 'BANG' / IVE 'BANG BANG'. Extend as needed.
+_KNOWN_COVER_ORIGINALS = {
+    "bang!!!": "EGOIST",
+}
+
+
+def _known_cover_original(title: str):
+    """Original artist for a known frequently-covered song title, or None."""
+    return _KNOWN_COVER_ORIGINALS.get((title or "").strip().lower())
+
+
 def extract_cover_original(raw_title, cover_channel=""):
     """Parse a cover video title to find the ORIGINAL artist.
 
@@ -1910,13 +1927,14 @@ class Overlay:
         self.generate_on = bool(s.get("generate", True))  # generate lyrics by ear
         self.captions_on = bool(s.get("captions", True))   # prefer YouTube caption track for browser videos
         self.concert_ocr = bool(s.get("concert_ocr", True)) # banner-text fallback song-ID during concerts
-        # v1.1.15: GPU-driven lyric renderer DEFAULT ON. The GL child process
-        # draws on the idle GPU at 100+ fps while the main process stops doing
-        # ANY Pillow/canvas work — that removes the GIL contention that caused
-        # audio stutter + the disappear/reappear flicker + highlight lag. If the
-        # child can't spawn or dies, the app silently falls back to the Tk
-        # renderer (_gpu_active restores the window), so default-on is safe.
-        self.gpu_renderer_on = bool(s.get("gpu_renderer", True))
+        # GPU-driven lyric renderer — DEFAULT OFF. The CPU Tk renderer is the
+        # reliable default (full furigana/romaji/EN layout, confirmed working).
+        # The GPU child renders at 100+ fps internally, but its full-screen
+        # transparent window did NOT composite visibly on this user's display
+        # even with ShowWindow + re-asserted per-pixel-alpha — so it stays
+        # OPT-IN via the tray "GPU renderer" toggle (the choice persists) until
+        # its on-screen visibility can be debugged with eyes on the screen.
+        self.gpu_renderer_on = bool(s.get("gpu_renderer", False))
         # TICKET-100: opt-in Discord Rich Presence reader; default OFF (mirrors
         # generate_on — both are "extra effort" features users opt into). Persists
         # under settings key 'discord_rpc'. Tray toggle and tune knob both write
@@ -1988,6 +2006,7 @@ class Overlay:
         self._deep_token = 0          # bumped on track change → cancels in-flight deep transcription
         self._deep_tried = set()      # song slugs we've already attempted a deep upgrade for
         self._title_locked = False    # exact clean-title match → sound can't override
+        self._title_locked_at = 0.0   # wall-clock when the lock was set (fast-escalation time-gate)
         self._api = None
         self._boundary = None         # song-change detector thread
         self._last_boundary = 0.0     # throttle: last boundary-triggered identify
@@ -2176,6 +2195,7 @@ class Overlay:
         # shipped — overrides reset to these on restart.
         self._tune = {
             "deadband":              0.8,   # |drift| below this is left alone
+            "display_lead_s":        0.3,   # lead the audio by this many s so the highlight isn't systematically BEHIND (SMTC + render latency); 0 = off
             "agree":                 2.0,   # 2-read agreement window (s)
             "agree_live":            4.0,   # live-arrangement agreement window
             "live_max_jump_s":      45.0,   # reject a live-follow correction that jumps >this from a STABLE offset (a chorus-repeat mismatch, e.g. -170s on a 4-min song) — not real tempo drift
@@ -2265,6 +2285,8 @@ class Overlay:
             "unconfirmed_backoff_s": 30.0,  # settled-but-unconfirmable song → slow the Shazam poll (anti-stutter)
             "confirmed_recal_s":     45.0,  # confirmed+watched song → slow Shazam re-lock (tier handles drift)
             "wrong_song_strikes":     5,    # heard the SAME other song this many × → loaded song is wrong, switch
+            "wrong_song_uncorroborated_strikes": 3,  # faster escalation once an uncorroborated body is past the energy-align window (Play On!/kamone poisoned-cache fix)
+            "uncorroborated_fast_after_s":   50.0,   # only apply the reduced threshold this many s AFTER title-lock (lets energy-align corroborate a correct body first)
             "sync_reject_strikes":    3,    # sync-by-ear heard vocals but couldn't ANCHOR them to the loaded
                                             # lyrics this many × in a row → the cache is the WRONG song (a
                                             # mislabeled/poisoned LRC that title+Shazam pass on NAME) → reject
@@ -2903,6 +2925,15 @@ class Overlay:
         # should search "Coffee" by "Alka", not by "Lumi".
         fetch_artist = artist
         if self._is_cover:
+            # Curated original-artist hint (e.g. 'BANG!!!' → EGOIST) when the title
+            # didn't name the original. Routes the fetch to the ORIGINAL's lyrics
+            # instead of a same-title wrong-language hit — 'BANG!!!' is EGOIST's JP
+            # song, never the K-pop 'BANG'. Checked before the title-only fallback.
+            if not self._cover_original_artist:
+                _hint = _known_cover_original(title)
+                if _hint:
+                    self._cover_original_artist = _hint
+                    log.info("cover: curated original-artist hint %r for %r", _hint, title)
             if self._cover_original_artist:
                 fetch_artist = self._cover_original_artist
                 log.info("cover: using original artist %r instead of channel %r",
@@ -3190,6 +3221,28 @@ class Overlay:
                 self._ocr_harvest_seq = self._track_seq
                 if self._begin_ocr_harvest(track_seq):
                     return
+            # Shazam-heard-artist re-fetch (before generating). A fan LYRIC-VIDEO
+            # uploads under the CHANNEL name (YohaNico / Yuan), so the fetch ran
+            # 'Aishiteru Banzai!' by 'Yoha Nico' → empty → about to generate. But
+            # Shazam already heard the REAL artist (µ's). Re-fetch with the heard
+            # artist first — it's fingerprinted from the actual audio, so it's the
+            # most reliable signal of who really performs the song. Once per track.
+            heard = self._sound_song
+            heard_artist = (heard[1] if heard else "") or ""
+            if (heard_artist.strip()
+                    and self._track_seq != getattr(self, "_sound_refetch_seq", None)
+                    and heard_artist.strip().lower()
+                        != (self._last_artist or "").strip().lower()):
+                self._sound_refetch_seq = self._track_seq
+                log.info("pre-generation: Shazam heard artist %r (channel was %r) → "
+                         "re-fetching with the heard artist before generating",
+                         heard_artist, self._last_artist)
+                self._start_fetch(heard_artist, (heard[0] or "").strip() or None,
+                                  self._cur_duration)
+                # let the re-fetch run; the _fetching defer above re-fires this and
+                # generates only if the heard-artist fetch ALSO comes up empty.
+                self.root.after(4000, lambda t=track_seq: self._maybe_generate(t))
+                return
             self._begin_generation()
 
     def _trusted_duration(self, state):
@@ -4230,6 +4283,7 @@ class Overlay:
                                  "→ LOCKING (resetting offset/drift state)",
                                  f_title, loaded_title)
                         self._title_locked = True
+                        self._title_locked_at = time.time()
                         self.offset = 0.0                 # direct write, NOT _smooth_offset
                         self._pending_offset = None
                         self._pending_corr = 1e9
@@ -4481,6 +4535,17 @@ class Overlay:
                     else:
                         self._last_heard_contra, self._sound_fail_streak = heard, 1
                     base_strikes = self._tune.get("wrong_song_strikes", 5)
+                    # A title-locked BODY that has NOT been corroborated should fail
+                    # FAST when Shazam repeatedly disagrees (the Play On!/kamone
+                    # poisoned-cache case) — but only AFTER the initial energy-align
+                    # window (~50s) has had its chance to corroborate a correct-but-
+                    # uncorroborated body, so 2 transient mis-reads can't tear down a
+                    # correctly-synced fetched song in the lock→align gap.
+                    if (not getattr(self, "_body_corroborated", False)
+                            and getattr(self, "_title_locked_at", 0.0)
+                            and time.time() - self._title_locked_at
+                                > float(self._tune.get("uncorroborated_fast_after_s", 50.0))):
+                        base_strikes = self._tune.get("wrong_song_uncorroborated_strikes", 3)
                     # TICKET-081: artist disagreement → DOUBLE the bar before
                     # overriding (the GHOST/Suisei case where Shazam mis-IDs to a
                     # halloween track by some unrelated artist). When SMTC artist
@@ -5751,8 +5816,16 @@ class Overlay:
         #              unsung highlight tracks the ACTUAL song clock, not the
         #              easing ramp. Decoupling the two stops the "fill races
         #              ahead then snaps back" stutter the user kept seeing.
-        pos = state["position"] + self._eased_offset()
-        pos_raw = state["position"] + self.offset
+        # display_lead_s: lead the audio by a small constant to cancel the
+        # SYSTEMATIC lag the user kept reporting ("highlights constantly behind").
+        # The browser's SMTC position is reported slightly stale + there's a
+        # render/tick latency, so the highlighted line trails the vocals by a
+        # fixed amount on every song. Adding a small lead to BOTH timebases
+        # shifts the line-index AND the karaoke fill earlier so they track the
+        # singing. Tunable (default 0.3s); set 0 to disable.
+        _lead = float(self._tune.get("display_lead_s", 0.3))
+        pos = state["position"] + self._eased_offset() + _lead
+        pos_raw = state["position"] + self.offset + _lead
         # ── GPU-RENDERER FAST PATH (v1.1.15 — the performance fix) ──────────
         # When the GL child process is drawing, the MAIN process must do ZERO
         # Pillow/canvas rendering. That CPU text work holds the GIL on the Tk
@@ -5766,8 +5839,8 @@ class Overlay:
         # the normal CPU render resumes automatically next tick.
         if self._gpu_active():
             new = -1
-            for i, ln in enumerate(self.lines):
-                if ln.start <= pos < ln.end:
+            for i, ln in enumerate(self.lines):     # raw clock — same as the fill
+                if ln.start <= pos_raw < ln.end:
                     new = i
                     break
             self.idx = new
@@ -5798,9 +5871,16 @@ class Overlay:
             self.root.after(self._fps, self._tick)
             return
 
+        # LINE-INDEX from pos_raw (the RAW clock), NOT the eased pos. The eased
+        # offset ramps over several frames when sync corrects, so the line-index
+        # (on eased pos) lagged while the karaoke FILL (on pos_raw) raced ahead —
+        # that divergence IS the user's "fill stops midway, then snaps full +
+        # fills the next" jarring. self.offset only changes at line boundaries
+        # (boundary-deferred via _smooth_offset), so pos_raw is smooth mid-line:
+        # index + fill now track on ONE clock and the highlight just runs.
         new = -1
         for i, ln in enumerate(self.lines):
-            if ln.start <= pos < ln.end:
+            if ln.start <= pos_raw < ln.end:
                 new = i
                 break
         if new != self.idx:
@@ -8725,7 +8805,13 @@ class Overlay:
         is the wrong-lyrics counterpart to the no-lyrics OCR trigger in _maybe_generate;
         OCR commits source='ocr' (body-trusted) and supersedes the wrong body."""
         try:
-            if (self.generate_on and not self._live_mode
+            # NO generate_on gate here. OCR escalation for WRONG lyrics (decision-
+            # engine SWITCH/REGEN) is independent of the AI-generation toggle —
+            # reading burned-in lyrics off one frame is a screen-read, not audio
+            # encoding. (generate_on still gates ONLY the no-lyrics deadline
+            # fallback in _maybe_generate.) Per-track + _ocr_gpu_safe guards keep
+            # this from spamming or hitching a game. Fixes Play On! → burned-in OCR.
+            if (not self._live_mode
                     and any(h in (self._last_src or "") for h in BROWSER_HINTS)
                     and self._track_seq != self._ocr_harvest_seq):
                 self._ocr_harvest_seq = self._track_seq
