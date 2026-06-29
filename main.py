@@ -3888,14 +3888,42 @@ class Overlay:
             seconds = max(seconds, 8)   # live arrangements need more signal to ID
 
         def work():
+            # TICKET-135: run identify in a SEPARATE PROCESS. The Shazam
+            # capture+fingerprint is GIL-heavy (~4s) and, on a worker THREAD,
+            # still stalled the render (150-475 ms frames) — the "highlight
+            # sticks then jumps to the 2nd/3rd line", worst on unfingerprintable
+            # songs that recal hammers. A child PROCESS can't touch our GIL, so
+            # the render keeps running smoothly; this thread just waits + reads
+            # one JSON line. t_cap is wall-clock (same system clock), so the
+            # offset alignment is unaffected.
             res = None
             try:
-                from recognize import recognize_playing
-                t, a, off, t_cap = recognize_playing(seconds, attempts)
-                if t:
-                    res = (t, a or "", off, t_cap)
+                import subprocess as _sp, json as _json, sys as _sys
+                if getattr(_sys, "frozen", False):
+                    cmd = [_sys.executable, "--recognize-child", str(seconds), str(attempts)]
+                else:
+                    cmd = [_sys.executable, str(Path(__file__).parent / "recognize.py"),
+                           "--child", str(seconds), str(attempts)]
+                p = _sp.run(cmd, capture_output=True, text=True,
+                            timeout=float(seconds) * max(1, attempts) + 30,
+                            creationflags=0x08000000)   # CREATE_NO_WINDOW
+                for line in reversed((p.stdout or "").splitlines()):
+                    line = line.strip()
+                    if line.startswith("{"):
+                        d = _json.loads(line)
+                        if d.get("t"):
+                            res = (d["t"], d.get("a") or "", d.get("off"), d.get("tc"))
+                        break
             except Exception:
-                res = None
+                # Fall back to in-process recognize if the child can't spawn
+                # (keeps identification working even if the subprocess path fails).
+                try:
+                    from recognize import recognize_playing
+                    t, a, off, t_cap = recognize_playing(seconds, attempts)
+                    if t:
+                        res = (t, a or "", off, t_cap)
+                except Exception:
+                    res = None
             self._identify_result = ("done", res)
 
         threading.Thread(target=work, daemon=True).start()
@@ -11449,6 +11477,29 @@ def main():
             gpu_renderer.run_ipc_child()
         except Exception as e:
             print(f"gpu_renderer child died: {e!s}", file=sys.stderr)
+        return
+    if "--recognize-child" in sys.argv[1:]:
+        # TICKET-135: identify-by-sound in a SEPARATE PROCESS so the GIL-heavy
+        # capture+fingerprint can't stall the parent's render thread (the
+        # "highlight sticks then jumps" fix). Prints ONE JSON line, then exits.
+        import json as _json
+        _a = sys.argv[1:]
+        _i = _a.index("--recognize-child")
+        try:
+            _secs = float(_a[_i + 1]) if len(_a) > _i + 1 else 6.0
+        except Exception:
+            _secs = 6.0
+        try:
+            _atts = int(_a[_i + 2]) if len(_a) > _i + 2 else 1
+        except Exception:
+            _atts = 1
+        try:
+            from recognize import recognize_playing
+            t, ar, off, tc = recognize_playing(_secs, _atts)
+            sys.stdout.write(_json.dumps({"t": t, "a": ar, "off": off, "tc": tc}) + "\n")
+        except Exception as e:
+            sys.stdout.write(_json.dumps({"t": None, "err": str(e)}) + "\n")
+        sys.stdout.flush()
         return
     if not _is_only_instance():
         return                 # another Desktop Karaoke is already running

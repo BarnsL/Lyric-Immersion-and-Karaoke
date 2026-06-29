@@ -94,7 +94,30 @@ def recognize_playing(seconds=_DUR, attempts=2):
 
 
 if __name__ == "__main__":
-    print("Listening to system audio…")
-    t, a, off, _ = recognize_playing()
-    print(f"Heard: {t!r} — {a!r}  (offset {off}s)" if t
-          else "Could not identify the audio.")
+    import sys as _sys
+    if "--child" in _sys.argv[1:]:
+        # SUBPROCESS mode (TICKET-135): the parent runs identify in a child
+        # PROCESS so the GIL-heavy capture+fingerprint can't stall its render
+        # thread (the "highlight sticks then jumps" fix). Print ONE JSON line.
+        import json as _json
+        _a = _sys.argv[1:]
+        _i = _a.index("--child")
+        try:
+            _secs = float(_a[_i + 1]) if len(_a) > _i + 1 else _DUR
+        except Exception:
+            _secs = _DUR
+        try:
+            _atts = int(_a[_i + 2]) if len(_a) > _i + 2 else 1
+        except Exception:
+            _atts = 1
+        try:
+            t, a, off, tc = recognize_playing(_secs, _atts)
+            _sys.stdout.write(_json.dumps({"t": t, "a": a, "off": off, "tc": tc}) + "\n")
+        except Exception as e:
+            _sys.stdout.write(_json.dumps({"t": None, "err": str(e)}) + "\n")
+        _sys.stdout.flush()
+    else:
+        print("Listening to system audio…")
+        t, a, off, _ = recognize_playing()
+        print(f"Heard: {t!r} — {a!r}  (offset {off}s)" if t
+              else "Could not identify the audio.")
