@@ -290,6 +290,13 @@ def make_handler(app, log_file, token):
                         self._send(200, {"ok": True, **app.get_diag()})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/syncdiag":
+                    # ring buffer of sync events (hi-snap, idx-skip, offset defer/commit,
+                    # drift read, mode change, captions) + a live clock/offset snapshot
+                    try:
+                        self._send(200, {"ok": True, **app.get_sync_diag()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/metrics":
                     try:
                         self._send(200, {"ok": True, **app.get_metrics()})
