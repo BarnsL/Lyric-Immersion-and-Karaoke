@@ -4,19 +4,62 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.1.7** (released 2026-06-28). Read this START-HERE block, then
+Suisei). **Current build: v1.1.17** (released 2026-06-28). Read this START-HERE block, then
 `ISSUES.md` (per-ticket detail) + `ARCHITECTURE.md`. The deep per-ticket history for
 v1.0.69→v1.0.96 is preserved further down this file.
 
 ---
 
-## ⭐ START HERE — state as of v1.1.7 (2026-06-28)
+## ⭐ START HERE — state as of v1.1.17 (2026-06-28)
 
-**Everything is committed + pushed + released.** `master` HEAD is the v1.1.7 commit;
-GitHub releases exist through `v1.1.7` (notes-only — prior releases carry NO binary assets).
-The deployed app at `D:\DesktopKaraoke` is live and verified (`/metrics` → `current_version`).
+**Everything is committed + pushed + released.** `master` HEAD is the v1.1.17 commit;
+GitHub releases exist through `v1.1.17` (notes-only — prior releases carry NO binary assets).
+The deployed app at `D:\DesktopKaraoke` is live and verified (`/health`→version, `/metrics`).
 
-### What the v1.1.x train added (since v1.0.96)
+### What the v1.1.8 → v1.1.17 train added (this session)
+- **GPU DISPLAY RENDERER — DONE (M1+M2+M3).** `gpu_renderer.py` is a process-split
+  Pygame-CE + SDL2 + moderngl overlay (per-pixel alpha + click-through + topmost) that draws
+  on the idle GPU (the 3080 eGPU) at **100-250 fps**. Rich content: **furigana ruby** (sky
+  blue, parsed via `split_furigana`), **gold karaoke fill** (scissored two-pass), green
+  **romaji** + gray **English** sub-lines, dimmed context lines, **keep-last-line** during
+  short inter-line gaps. **DEFAULT ON** (persisted setting `gpu_renderer`); tray toggle "GPU
+  renderer"; `/tune gpu_renderer_on=0` falls back to Tk; a child crash auto-restores the Tk
+  window (`_gpu_active()`). **THE perf fix:** when the GPU child is alive, `main.py._tick`
+  does ZERO Pillow/canvas work — it only computes the active line + pushes it over stdin
+  NDJSON IPC. That removed the GIL contention that caused the audio stutter + the
+  disappear/reappear flicker + the highlight lag (all three were CPU-Tk-renderer symptoms).
+  IPC: `{type:song, lines, meta}` on load (via `_relayout_song`→`_gpu_send_song`), `{type:state,
+  pos_raw, idx, fill_frac}` per tick, `{type:quit}`. Spec pins `gpu_renderer`/`moderngl`/`pygame`;
+  child dispatch = `--gpu-renderer-child` (frozen) / `--ipc` (dev). NOT YET: scroll modes +
+  user pos_y/pos_x placement (GPU window is full-screen, block centered); a true force-2080/3080
+  GL pin (the GL context uses the display GPU — generation already targets the idle GPU separately).
+- **Lyric-finding fixes:** agency-prefix unit extraction (`agency_unit_names`: 'hololive
+  DEV_IS ReGLOSS' → also query 'ReGLOSS'; Flashpoint was EMPTY/44s, now lrclib/search 8.5s —
+  `_pick_lrclib`/`_lrclib_candidates` take `arts`). JP-act language guards widened: `is_jp_vagency`
+  (regex from `confidence._KNOWN_JA` + kana + kanji-no-hangul, `strict=` for ZH) rejects
+  ko/zh/es/de/ru/fr/it/pt bodies AND captions for JP acts (`_apply_captions`), plus a post-load
+  language sanity check that re-fetches a wrong-lang body immediately (no waiting for strikes).
+  Tofu strip (`_strip_tofu`) now runs on EVERY loaded line via `_clean` (BEEP BEEP 'Stop!□Oh
+  woah woah□'). **Social-page block:** `_is_junk_track_title` rejects bare 'Instagram'/'TikTok'/
+  etc. tab titles (no artist) — a poisoned `instagram.json` was showing junk lyrics over reels;
+  also added to `window_titles._BARE_NON_MUSIC`.
+- **Sync/highlight fixes:** removed the v1.0.85 fine-tune PAUSE freeze (it froze the highlight —
+  "always pausing"); corrections now go through `_smooth_offset` boundary-deferred. CPU renderer
+  keep-last-line during gaps (`keep_last_line_gap_s`). kamone energy floor 0.10→0.045 (its correct
+  0.049 shift was rejected so it loaded right but never locked); alpha formula anchored at the
+  live floor. New **`GET /measure_sync`** quantifies shown-vs-should line + lag in seconds/lines.
+
+### What's PENDING / next (in priority order)
+1. **GPU renderer polish** — scroll modes + honoring the user's pos_y/pos_x/opacity/font-scale
+   in the GL renderer (currently full-screen, centered block, fixed style). And a real
+   force-2080/3080 GL pin if wanted (hard on Windows; low value since the eGPU 3080 drives display).
+2. **TICKET-126 (open) — feelingradation katakana cross-script title match.** Spotify titles
+   it フィーリングラデーション, YouTube "feelingradation"; `clean_title` differs per source so
+   the code-fetch can lose it. Needs katakana↔romaji↔English title matching.
+3. **Sync success rate** — `/metrics` per-version success; now also measurable live via
+   `/measure_sync`. Why do real LRCs load but never reach `_set_verified` on ambient MVs?
+
+### Earlier in the v1.1.x train (v1.0.96 → v1.1.7) — historical context
 - **Burned-in lyric OCR** (`ocr_lyrics.py`) — reads lyrics off the *video* (self-read-safe
   `PrintWindow` capture + WinRT OCR, EN/JP) when no provider/caption LRC exists, AND on
   decision-engine SWITCH/REGEN when the matched lyrics are wrong. `source="ocr"`. TICKET-120.
@@ -42,23 +85,8 @@ The deployed app at `D:\DesktopKaraoke` is live and verified (`/metrics` → `cu
 - **Multi-GPU/CPU compatibility** — `gpu_setup` degrades to CPU (no CUDA / missing NVML /
   single GPU / non-NVIDIA); CPU masks are computed from live topology (1..64 threads, SMT or
   not). Generation targets the idlest GPU via `pick_inference_device`.
-
-### What's PENDING / next (in priority order)
-1. **GPU display renderer (the big one)** — display is still CPU Tkinter/Pillow. The
-   transparency+click-through+~109fps bet PASSED on the 3080 (`spikes/gpu_overlay_autotest.py`),
-   so a Pygame-CE+SDL2+moderngl process-split renderer is now buildable. Milestones: **M1** =
-   standalone GL renderer process (renders + highlights lines on the idle GPU); **M2** = IPC
-   from the main SMTC/sync/decision process; **M3** = swap behind a toggle + GPU-pin/override
-   menu (force 2080 / 3080 / CPU). This single track ALSO delivers the user's "GPU drive the
-   current-line highlighting" + the explicit GPU-override menu.
-2. **TICKET-126 (open) — feelingradation katakana cross-script title match.** Spotify titles
-   it フィーリングラデーション, YouTube "feelingradation"; `clean_title` differs per source so
-   the code-fetch can lose it. Needs katakana↔romaji↔English title matching. More important now
-   that bundles are gone.
-3. **Sync success rate is LOW** — `/metrics` shows many tracks "never synced" (wobblers with
-   `time_to_sync=None`) and per-version success 0-50%. Worth a focused pass: why do real LRCs
-   load but never reach `_set_verified`? (energy-lock failing on ambient MVs; OCR not
-   committing 3 stable lines; etc.) The telemetry is now there to measure it.
+(GPU display renderer M1-M3 was the #1 pending item here — it is now SHIPPED; see the
+v1.1.8→v1.1.17 summary above. The current PENDING list is the one near the top of START HERE.)
 
 ---
 
