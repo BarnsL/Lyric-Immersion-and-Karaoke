@@ -10802,11 +10802,23 @@ class Overlay:
         import subprocess as _sp
         if getattr(self, "_gpu_child", None) is not None and self._gpu_child.poll() is None:
             return True
+        # CRITICAL: the child's stdout+stderr go to a LOG FILE, never an unread
+        # PIPE. An unread stderr=PIPE is the classic subprocess deadlock — the
+        # child's pygame/SDL/GL warnings + heartbeat eventually fill the ~64 KB
+        # pipe buffer, the child blocks on the next write, stops draining its
+        # stdin, our 60 Hz IPC writes then fail, and the child gets orphaned →
+        # silent CPU fallback (the "GPU renderer reverted to the old look" bug).
+        # A file sink never blocks and doubles as the GPU render log.
+        self._gpu_fail_streak = 0
+        try:
+            self._gpu_log_fh = open(LOG_FILE.with_name("gpu_renderer.log"), "wb")
+        except Exception:
+            self._gpu_log_fh = _sp.DEVNULL
         try:
             CREATE_NO_WINDOW = 0x08000000   # don't pop a console for the child
             self._gpu_child = _sp.Popen(
                 self._gpu_child_cmd(),
-                stdin=_sp.PIPE, stdout=None, stderr=_sp.PIPE,
+                stdin=_sp.PIPE, stdout=self._gpu_log_fh, stderr=self._gpu_log_fh,
                 bufsize=0,
                 creationflags=CREATE_NO_WINDOW,
             )
@@ -10838,18 +10850,27 @@ class Overlay:
         ch = getattr(self, "_gpu_child", None)
         if ch is not None:
             try:
-                self._gpu_send({"type": "quit"})
+                ch.stdin.write(b'{"type": "quit"}\n'); ch.stdin.flush()
             except Exception:
                 pass
             try:
-                ch.wait(timeout=2.0)
+                ch.wait(timeout=1.5)
             except Exception:
+                pass
+            if ch.poll() is None:                 # didn't exit on its own → force it
                 try:
-                    ch.terminate()
+                    ch.kill()
                 except Exception:
                     pass
             self._gpu_child = None
             log.info("gpu_renderer: child stopped (%s)", reason)
+        fh = getattr(self, "_gpu_log_fh", None)   # close the render-log file handle
+        if fh not in (None, getattr(__import__("subprocess"), "DEVNULL", -3)):
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self._gpu_log_fh = None
         try:
             self.root.deiconify()             # restore Tk overlay
         except Exception:
@@ -10883,9 +10904,17 @@ class Overlay:
         try:
             ch.stdin.write((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
             ch.stdin.flush()
+            self._gpu_fail_streak = 0
         except Exception as e:
-            log.info("gpu_renderer: send failed (%s) — stopping child", e)
-            self._stop_gpu_renderer(reason="pipe-error")
+            # Tolerate a transient write hiccup — a single failed 60 Hz state
+            # send must NOT orphan a healthy child (that was the silent-fallback
+            # bug). Only give up after a sustained streak, and only if the
+            # process is actually gone.
+            self._gpu_fail_streak = getattr(self, "_gpu_fail_streak", 0) + 1
+            if self._gpu_fail_streak >= 30 or ch.poll() is not None:
+                log.info("gpu_renderer: send failing (%s, streak=%d) — stopping child",
+                         e, self._gpu_fail_streak)
+                self._stop_gpu_renderer(reason="pipe-error")
 
     def _gpu_send_song(self):
         ch = getattr(self, "_gpu_child", None)
