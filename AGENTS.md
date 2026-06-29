@@ -22,7 +22,7 @@ song genuinely isn't on any provider — do not fake it. For those, add a local
 `.lrc` instead:
 
 ```bash
-python add_lrc.py "Song.lrc" --title "Song" --artist "Artist"   # or --folder manual
+python scripts/add_lrc.py "Song.lrc" --title "Song" --artist "Artist"   # or --folder manual
 ```
 
 It parses the timing and annotates (furigana/romaji/translation) exactly like a
@@ -31,10 +31,10 @@ fetched song, saving it with `source: "manual"`.
 ## Add many songs
 
 Append `(title, artist, bake_english)` tuples to the `SONGS` list in
-`preload.py`, then:
+`scripts/preload.py`, then:
 
 ```bash
-python preload.py            # skips songs already cached
+python scripts/preload.py            # skips songs already cached
 ```
 
 ## Sync a user's Spotify playlists
@@ -51,8 +51,8 @@ romaji), which segments correctly where the old pykakasi path failed (今生き�
 fix files annotated by an older version, rewrite the cache in place:
 
 ```bash
-python reannotate.py          # rebuild jp/rm for every lang=="ja" file
-python reannotate.py --dry    # preview, write nothing
+python scripts/reannotate.py          # rebuild jp/rm for every lang=="ja" file
+python scripts/reannotate.py --dry    # preview, write nothing
 ```
 
 It only touches `jp`/`rm`; timestamps and `en` are preserved. Idempotent. It
@@ -67,7 +67,7 @@ Three layers make sure a Japanese line always gets furigana/romaji (and a
 translation):
 
 1. **`annotate()`** romanizes each line by its own script at fetch time.
-2. **`reannotate.py`** fixes the existing cache.
+2. **`scripts/reannotate.py`** fixes the existing cache.
 3. **`backfill_file()`** + the overlay's `_maybe_translate` self-heal a song at
    runtime: the first time it plays, any CJK line missing romaji gets it, and
    any untranslated line gets English — then the file is re-saved.
@@ -99,7 +99,7 @@ translation):
    Common titles ("Lucky Star", "Paradise") match many wrong songs without
    these checks.
 2. **Language must match.** A CJK-titled song must have CJK lyrics. Run
-   `python validate.py --purge` after bulk edits to catch mismatches.
+   `python scripts/validate.py --purge` after bulk edits to catch mismatches.
 3. **Never hardcode user/account/machine data.** Only public song
    title/artist strings may be sent to providers. No telemetry.
 4. **Don't commit `lyrics/`, `spotify_config.json`, or `.spotify_cache`** —
@@ -120,12 +120,12 @@ When a katakana English phrase romanizes phonetically instead of as English
 ```
 
 `_segment_katakana()` uses the keys to split run-together katakana and cutlet
-exceptions render the English. After adding entries, run `python reannotate.py`
+exceptions render the English. After adding entries, run `python scripts/reannotate.py`
 to refresh the cached romaji. No code changes needed — it's pure data.
 
 ## Verify your changes
 
 ```bash
 python -c "import ast;[ast.parse(open(f,encoding='utf-8').read()) for f in ('main.py','fetch_lyrics.py')]"
-python validate.py
+python scripts/validate.py
 ```

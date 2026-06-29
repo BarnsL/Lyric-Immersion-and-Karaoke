@@ -246,7 +246,7 @@ loaded lyrics, they're corrected on the spot. It also unwraps the common
 Japanese-MV title format — `Artist / Song -anniversary special ver.- (MUSIC
 VIDEO)` is matched on the **song** part, so wrapped uploads still find their
 cached lyrics. Force a correction any time with the tray's **⚑ Wrong lyrics**, or
-sweep the whole library with `python validate.py --purge`.
+sweep the whole library with `python scripts/validate.py --purge`.
 
 Every one of these decisions is written to a **log** (`karaoke.log`) you (or an
 agent) can read — see [Automation](#-automation--local-api) below.
@@ -320,9 +320,9 @@ For a *known* missing song you'd rather supply exactly, find or make a timed
 it gets the same furigana / romaji / translation as a fetched song:
 
 ```bash
-python add_lrc.py "TIME TO LUV.lrc" --title "TIME TO LUV" --artist "ピーナッツくん"
+python scripts/add_lrc.py "TIME TO LUV.lrc" --title "TIME TO LUV" --artist "ピーナッツくん"
 # or drop "Artist - Title.lrc" files into a folder:
-python add_lrc.py --folder manual
+python scripts/add_lrc.py --folder manual
 ```
 
 ---
@@ -351,8 +351,8 @@ build.bat        # → dist\DesktopKaraoke.exe  (+ DesktopKaraoke-Setup.exe if I
 
 ### Build a starter library
 ```bash
-python preload.py                  # fetch a curated ReGLOSS / hololive / J-pop set
-python preload.py --translate-all  # also bake English into every song (slow)
+python scripts/preload.py                  # fetch a curated ReGLOSS / hololive / J-pop set
+python scripts/preload.py --translate-all  # also bake English into every song (slow)
 ```
 
 ### Pre-cache your playlists
@@ -499,14 +499,14 @@ it, the instant best-effort generation still works.
 | `api.py` | The local HTTP API (status / logs / identify) for agents & scripts |
 | `gairaigo.py` | Katakana → English loanword table (so ベイビー → "baby") |
 | `character.py` | The optional dancing on-screen companion |
-| `preload.py` | Bulk-build the local lyric library from a curated list |
-| `add_lrc.py` | Add **any** song from a local `.lrc` file (for tracks no provider has) |
-| `reannotate.py` | Re-generate furigana / romaji for the cache after a romanizer change |
+| `scripts/preload.py` | Bulk-build the local lyric library from a curated list |
+| `scripts/add_lrc.py` | Add **any** song from a local `.lrc` file (for tracks no provider has) |
+| `scripts/reannotate.py` | Re-generate furigana / romaji for the cache after a romanizer change |
 | `playlist_import.py` | Core import logic — Exportify CSV parser, `ImportJob`, all three import paths |
 | `playlist_import_gui.py` | Tkinter Import Playlist window (opened from the tray) |
 | `sync_playlists.py` | Pre-cache every track in your Spotify playlists (CLI; used by playlist_import) |
 | `youtube_music.py` | Pre-cache YouTube Music playlists via yt-dlp (CLI; used by playlist_import) |
-| `validate.py` | Scan the cache for bad / mismatched files (`--purge`) |
+| `scripts/validate.py` | Scan the cache for bad / mismatched files (`--purge`) |
 | `lyrics/*.json` | Cached, annotated, timed lyrics (git-ignored — not redistributed) |
 
 ### Documentation

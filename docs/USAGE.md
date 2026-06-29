@@ -65,7 +65,7 @@ synced line. English translation fills in on first play and is cached.
 
 - It builds itself as you listen — every identified song is cached to
   `lyrics/*.json` **next to the app** and never fetched again.
-- Seed a big set: `python preload.py` (ReGLOSS/hololive/V.W.P/J-pop/K/C-pop/
+- Seed a big set: `python scripts/preload.py` (ReGLOSS/hololive/V.W.P/J-pop/K/C-pop/
   corridos/classic anime…).
 - Pull your playlists: `python sync_playlists.py` (Spotify) /
   `python youtube_music.py` (YouTube Music).

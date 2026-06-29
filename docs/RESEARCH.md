@@ -102,7 +102,7 @@ every result verified by duration + language. See `fetch_lyrics.py`.
   line's own script. This is better than pulling a foreign romaji/translation
   source: the local analyzer + translator cover *every* song, not just charted
   anime, and stay consistent with the rest of the library. Three layers now
-  guarantee it: `annotate()` (fetch), `reannotate.py` (cache — found 5 mixed
+  guarantee it: `annotate()` (fetch), `scripts/reannotate.py` (cache — found 5 mixed
   files), and `backfill_file()` + `_maybe_translate` (runtime self-heal).
 - ✅ **Romaji-upload upgrade (this pass) — ROOT CAUSE.** A Japanese song could
   show **romaji only, no kanji and no translation** (e.g. *Into Starlight* / IA).
@@ -387,7 +387,7 @@ quality lever is **Demucs vocal isolation** before ASR (heavy; deferred).
 | Sync | PlaybackRate-aware position + calibration | `main.py` `MediaWatcher`, `_consume_async` |
 | Perf | Reuse GSMTC session manager across polls | `main.py` `MediaWatcher._loop` |
 | Translation | Use DeepL when `DEEPL_API_KEY` is set | `fetch_lyrics.py` `_make_translator` |
-| Coverage | Per-line furigana/romaji + runtime self-heal (no more bare Japanese) | `fetch_lyrics.py` `annotate`/`backfill_file`, `main.py` `_maybe_translate`, `reannotate.py` |
+| Coverage | Per-line furigana/romaji + runtime self-heal (no more bare Japanese) | `fetch_lyrics.py` `annotate`/`backfill_file`, `main.py` `_maybe_translate`, `scripts/reannotate.py` |
 | Display | Fixed click-through window (no drift), per-script fonts (no boxes), kana⇒ja, Spanish detection, responsive scaling | `main.py` `_relayout_song`/`_script_of`/`_auto_scale`, `fetch_lyrics.py` `_song_lang`/`_ES_WORDS` |
 | Companion | Optional tray-toggled dancing character themed to the artist | `character.py`, `main.py` |
 | Spaces | `to_furigana` preserves whitespace (fugashi dropped it); cache re-spaced | `fetch_lyrics.py` `to_furigana` |
