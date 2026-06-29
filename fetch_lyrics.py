@@ -1401,11 +1401,20 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     # transcribe the REAL audio than to display the wrong song.
     if t and not strict:
         lrc = _try(t)
-        if lrc and verify_lrc(lrc, t, duration) and _strict_ok(lrc, t, duration):
+        # _lrc_artist_conflict: a bare-title search for a generic title ("Rainy
+        # Day", "Play On!") routinely returns a DIFFERENT same-title song; if its
+        # [ar:] tag names an artist that clearly isn't the one playing, reject it
+        # instead of mislabelling it with the player's artist (the "no beer in
+        # this song" bug). Conservative — only fires on a clear cross-script /
+        # no-shared-token artist mismatch.
+        if (lrc and verify_lrc(lrc, t, duration) and _strict_ok(lrc, t, duration)
+                and not _lrc_artist_conflict(lrc, a)):
             r = take(lrc, {"source": "syncedlyrics/title", "artist": a or None,
                            "duration": duration})
             if r:
                 return r
+        elif lrc and a and _lrc_artist_conflict(lrc, a):
+            log.info("title-only: rejected %r — LRC artist conflicts with %r", t, a)
 
     # 5. NetEase Cloud Music (网易云音乐) — direct provider, gated to Chinese-
     # script tracks only (lang=="zh"). Chinese pop / rap / indie long-tail is
