@@ -102,6 +102,12 @@ LYRICS_DIR = _DATA / "lyrics"
 SETTINGS = _DATA / "settings.json"
 LOG_FILE = _DATA / "karaoke.log"
 
+# ── success/failure telemetry ──────────────────────────────────────────
+# Module-level so the title→cache matcher (a plain function) can record hits
+# without an app handle; the app folds it into /diag.success_rate alongside its
+# own per-instance counters.
+_TITLE_STATS = {"hit": 0, "miss": 0}
+
 # ── Logging ──────────────────────────────────────────────────────────
 # A rolling log of what the app is doing — track changes, title vs. sound
 # matches, swaps, sync corrections, errors — so a human OR an automated agent
@@ -1739,7 +1745,9 @@ class LyricsIndex:
                 best, best_score = e["path"], score
         if best and best_score >= 60:
             log.info("title-match %r -> %s (score %d)", title, best.name, best_score)
+            _TITLE_STATS["hit"] += 1
             return best
+        _TITLE_STATS["miss"] += 1
         log.info("no confident title-match for %r (best %d); will use sound", title, best_score)
         return None
 
@@ -2216,7 +2224,15 @@ class Overlay:
         # shipped — overrides reset to these on restart.
         self._tune = {
             "deadband":              0.8,   # |drift| below this is left alone
-            "display_lead_s":        0.3,   # lead the audio by this many s so the highlight isn't systematically BEHIND (SMTC + render latency); 0 = off
+            "display_lead_s":        0.12,  # lead the audio so the highlight sits JUST AHEAD of the vocal (the tolerated/desired direction; within the ~170ms AV binding window). Was 0.3 to mask the choppy-clock lag the slew-limited clock now removes. 0 = off
+            # ── PERCEPTUAL in-sync window (asymmetric; ITU-R BT.1359 + AV binding window) ──
+            # The old symmetric ±deadband(0.8s) called anything within ~800ms "in
+            # sync" — 4-9x looser than a listener can perceive. Humans tolerate the
+            # highlight running slightly AHEAD of the vocal far better than BEHIND
+            # (sound-before-visual is the annoying direction). So: leave it alone
+            # only inside [-ahead, +behind]; correct once it drifts outside.
+            "sync_win_ahead_s":      0.17,  # highlight may lead the vocal by up to this (diff<0, forgiving direction)
+            "sync_win_behind_s":     0.09,  # but only lag it by this before we correct (diff>0, "lyrics late")
             "agree":                 2.0,   # 2-read agreement window (s)
             "agree_live":            4.0,   # live-arrangement agreement window
             "live_max_jump_s":      45.0,   # reject a live-follow correction that jumps >this from a STABLE offset (a chorus-repeat mismatch, e.g. -170s on a 4-min song) — not real tempo drift
@@ -2616,6 +2632,17 @@ class Overlay:
         self._pending_swap_t = 0.0
         self._swap_fetch_token = 0       # monotonic; older fetch completions are dropped
         self._swap_commit_seq = 0        # /diag counter
+        # ── success/failure telemetry (surfaced via /diag.success_rate) ──
+        # Session counters; the success:failure ratio is a live readout instead
+        # of something reverse-engineered from the log.
+        self._stats = {
+            "id_match": 0, "id_mismatch": 0,        # heard vs loaded (per Shazam read)
+            "by_ear": 0, "track_loads": 0,          # generate/OCR fallback rate
+            "sync_in_window": 0, "sync_reads": 0,   # perceptual-window adherence
+            "regen": 0, "switch": 0,                # decision-engine actions
+            "fetch_timeout": 0,                     # swap fetches that blew the hard cap
+        }
+        self._fetch_durations = []                  # seconds per applied swap fetch (P50/P95)
         self._idx_minus_one_since = 0.0  # wall-time of the first tick idx hit -1 (for instrumental-gap boundary)
         self._live_arrangement = False  # LIVE/short/alt version → FOLLOW the offset, don't reset
         # Concert applause/cheering-pause detection (TICKET-061): a live cut pauses
@@ -2895,6 +2922,7 @@ class Overlay:
         self._gen_token += 1       # cancel any in-flight lyric generation
         self._deep_token += 1      # cancel any in-flight deep (offline) transcription
         self._track_seq += 1
+        self._stats_bump("track_loads")
         self._generating = False
         self._gen_defers = 0       # fresh defer budget for this track's fetch
         self._fetch_key = None     # let this track re-attempt a real fetch (upgrade path)
@@ -3247,6 +3275,7 @@ class Overlay:
         if st and st.get("status") == PLAYING:
             why = "lookup came up empty" if not self._fetching else "lookup still running"
             log.info("no lyrics after the grace window (%s) → OCR / generating by ear", why)
+            self._stats_bump("by_ear")
             # TICKET-120: BEFORE generating by ear, try to READ the lyrics burned into
             # the video (niche Vocaloid / fan karaoke have no fetchable LRC but the words
             # are on screen). Browser source only, once per track. OCR success pre-empts
@@ -4312,6 +4341,7 @@ class Overlay:
                         and self._titles_match(self._sound_title_alias, f_title)))
                 log.info("heard %r / %r | loaded %r | match=%s",
                          f_title, f_artist, self.meta.get("title", ""), loaded_ok)
+                self._stats_bump("id_match" if loaded_ok else "id_mismatch")
                 if loaded_ok:
                     # CALIBRATE timing ONLY when the heard song is the loaded one.
                     # (Applying a heard song's offset to *different* lyrics — e.g.
@@ -4416,11 +4446,24 @@ class Overlay:
                                      diff, corr, self.offset, "live" if live else "studio",
                                      spread, st["position"], self.idx, cur_t,
                                      ("%+.2f" % self._pending_corr) if self._pending_corr < 1e8 else "-")
+                            # success telemetry: was this read inside the perceptual window?
+                            self._stats_bump("sync_reads")
+                            if (-float(self._tune.get("sync_win_ahead_s", 0.17))
+                                    <= diff <= float(self._tune.get("sync_win_behind_s", 0.09))):
+                                self._stats_bump("sync_in_window")
                             if abs(corr) >= cap:
                                 # matched a different recording/segment — no usable info; ignore.
                                 self._pending_corr = 1e9
-                            elif abs(diff) <= DEADBAND:
-                                self._pending_corr = 1e9      # already in sync — leave it
+                            elif (-float(self._tune.get("sync_win_ahead_s", 0.17))
+                                  <= diff <=
+                                  float(self._tune.get("sync_win_behind_s", 0.09))):
+                                # PERCEPTUALLY in sync (asymmetric window): the highlight
+                                # may run a little AHEAD of the vocal (diff<0, forgiving)
+                                # but is corrected quickly once it falls BEHIND (diff>0,
+                                # "lyrics late" — the annoying direction). Replaces the
+                                # old symmetric ±deadband(0.8s) that tolerated drift no
+                                # listener would call "in sync".
+                                self._pending_corr = 1e9      # already perceptibly in sync — leave it
                             elif live:
                                 # FOLLOW: the offset is real. Apply a corroborated reading even
                                 # when large, smoothing toward it to ride tempo drift without
@@ -9730,6 +9773,65 @@ class Overlay:
             self._decision_state = new
             self._fire_decision_action(new, dims)
 
+    # ── success/failure telemetry helpers ───────────────────────────────
+    def _stats_bump(self, key, n=1):
+        try:
+            self._stats[key] = self._stats.get(key, 0) + n
+        except Exception:
+            pass
+
+    def _stats_fetch_done(self, secs):
+        try:
+            self._fetch_durations.append(round(float(secs), 2))
+            if len(self._fetch_durations) > 200:
+                del self._fetch_durations[:len(self._fetch_durations) - 200]
+        except Exception:
+            pass
+
+    def success_rate_snapshot(self):
+        """ID-match %, title-hit %, fetch P50/P95, by-ear %, sync-in-window %,
+        REGEN/SWITCH counts — measured against the perceptual + reliability
+        targets so the success:failure ratio is a live /diag readout."""
+        s = dict(getattr(self, "_stats", {}) or {})
+        ts = dict(_TITLE_STATS)
+
+        def pct(a, b):
+            t = a + b
+            return round(100.0 * a / t, 1) if t else None
+        fd = sorted(getattr(self, "_fetch_durations", []) or [])
+
+        def pctile(p):
+            return fd[min(len(fd) - 1, int(p * (len(fd) - 1) + 0.5))] if fd else None
+        loads = s.get("track_loads", 0)
+        synt = s.get("sync_reads", 0)
+        return {
+            "id_match_pct":       pct(s.get("id_match", 0), s.get("id_mismatch", 0)),
+            "id_checks":          s.get("id_match", 0) + s.get("id_mismatch", 0),
+            "title_hit_pct":      pct(ts.get("hit", 0), ts.get("miss", 0)),
+            "title_lookups":      ts.get("hit", 0) + ts.get("miss", 0),
+            "by_ear_pct":         (round(100.0 * s.get("by_ear", 0) / loads, 1) if loads else None),
+            "track_loads":        loads,
+            "sync_in_window_pct": (round(100.0 * s.get("sync_in_window", 0) / synt, 1) if synt else None),
+            "sync_reads":         synt,
+            "fetch_p50_s":        pctile(0.50),
+            "fetch_p95_s":        pctile(0.95),
+            "fetch_timeouts":     s.get("fetch_timeout", 0),
+            "regen":              s.get("regen", 0),
+            "switch":             s.get("switch", 0),
+            "llm":                self._llm_status(),
+            "targets": {"id_match_pct": 90, "title_hit_pct": 70, "by_ear_pct_max": 20,
+                        "sync_in_window_pct": 95, "fetch_p95_s_max": 6.0},
+        }
+
+    def _llm_status(self):
+        """Whether the optional Claude disambiguator is armed (key present) + model."""
+        try:
+            import llm_disambiguate as _llm
+            on = _llm.available()
+            return {"available": on, "model": _llm.model() if on else None}
+        except Exception:
+            return {"available": False, "model": None}
+
     def _fire_decision_action(self, state, dims):
         now = time.time()
         log.info("decision-engine: %s -> %s (strikes=%d dims=%s)",
@@ -9784,6 +9886,11 @@ class Overlay:
                      "REGEN by ear in cover language", _cl,
                      self.meta.get("lang") if isinstance(self.meta, dict) else None)
             state = "REGEN"
+        # success telemetry: a decision action is firing (past the cooldown gate)
+        if state == "REGEN":
+            self._stats_bump("regen")
+        elif state == "SWITCH":
+            self._stats_bump("switch")
         if state == "SWITCH" and track:
             artist, title = track
             hint = f"🔁 Switched to alternative lyric source for {title}…"
@@ -9978,8 +10085,31 @@ class Overlay:
         age = time.time() - self._pending_swap_t
         cap = float(p.get("max_s") or self._tune.get("swap_defer_max_s", 8.0))
         if p.get("lines") is None:
-            # Fetch / gen still running.
-            if age > 2 * cap:
+            # Fetch / gen still running. HARD CAP (TICKET-136): a correction/switch
+            # fetch that never lands must not hang forever — observed 24-54s with
+            # the WRONG/stale body frozen on screen while this logged EVERY tick
+            # (1179×). Cap the wait, log only ONCE; if it was REPLACING wrong lyrics
+            # (a REGEN), fall back to generate-by-ear so the screen isn't stuck on
+            # the wrong song. The cap (default 30s) stays above the legit slow-fetch
+            # window (niche/VTuber lookups can take 25-35s and still win).
+            hard = float(self._tune.get("swap_fetch_hard_cap_s", 30.0))
+            if age > hard:
+                regen = bool(p.get("force_ai_gen"))
+                log.info("swap: fetch TIMED OUT after %.1fs (hard cap %.1fs) token=%d kind=%s → abandon%s",
+                         age, hard, p.get("fetch_token"), p.get("kind"),
+                         " + by-ear" if regen else "")
+                self._cancel_pending_swap("fetch-timeout")
+                self._stats_bump("fetch_timeout")
+                if regen and getattr(self, "generate_on", True):
+                    self._lyrics_path = None
+                    self.lines, self.idx, self._kara = [], -1, []
+                    self._force_ai_gen = True
+                    try:
+                        self.root.after(0, lambda t=self._track_seq: self._maybe_generate(t))
+                    except Exception:
+                        pass
+            elif age > 2 * cap and not p.get("_pending_logged"):
+                p["_pending_logged"] = True      # once, not every tick (kills the spam)
                 log.info("swap: fetch still pending after %.1fs (cap=%.1fs) token=%d",
                          age, cap, p.get("fetch_token"))
             return
@@ -9996,6 +10126,7 @@ class Overlay:
         if p is None:
             return
         age = time.time() - self._pending_swap_t
+        self._stats_fetch_done(age)              # success telemetry: swap fetch latency
         kind = p.get("kind"); site = p.get("source_site")
         token = p.get("fetch_token")
         # 1. Cancel any in-flight LINE-mode slide-in so it can't snap the new line.
@@ -10197,7 +10328,39 @@ class Overlay:
                             ranked = sorted(align.score_candidates(heard, libpool)
                                             + [(loaded_score, loaded_key)], reverse=True)
                             expanded = True
-                    res = {"heard": heard, "ranked": ranked, "expanded": expanded}
+                    # OPTIONAL LLM disambiguation (gated on an Anthropic API key),
+                    # on the HARD cases only — the loaded song looks wrong, the top
+                    # fuzzy scores are close, or we expanded to the whole library.
+                    # Claude matches a short/noisy transcript to the right lyrics far
+                    # better than char-fuzzy; it is the lever for the wrong-song +
+                    # title-miss failures. No key → no-op, rapidfuzz stands.
+                    llm = None
+                    try:
+                        import llm_disambiguate as _llm
+                        top = ranked[:6]
+                        ambiguous = len(top) >= 2 and abs(top[0][0] - top[1][0]) < 8.0
+                        if _llm.available() and top and (
+                                loaded_score < wrong_floor or ambiguous or expanded):
+                            bodymap = dict(pool)
+                            if expanded:
+                                bodymap.update(dict(libpool))
+                            cands = [{
+                                "key": k,
+                                "title": (self.meta.get("title") or "?") if k == loaded_key
+                                         else Path(k).stem,
+                                "artist": self.meta.get("artist") or "?",
+                                "body": bodymap.get(k, ""),
+                            } for _, k in top]
+                            llm = _llm.pick_best_match(heard, cands)
+                            if llm:
+                                _bk = llm.get("key")
+                                log.info("decide-by-ear: LLM → best=%s conf=%.2f match=%s (%s)",
+                                         (Path(_bk).name if _bk and _bk != loaded_key else _bk),
+                                         llm.get("confidence", 0.0), llm.get("matches_audio"),
+                                         (llm.get("reason") or "")[:80])
+                    except Exception as _e:
+                        log.info("decide-by-ear: LLM disambig skipped: %s", _e)
+                    res = {"heard": heard, "ranked": ranked, "expanded": expanded, "llm": llm}
             except Exception as e:
                 log.info("decide-by-ear error: %s", e)
             self.root.after(0, lambda: self._apply_decision(res, track_seq, loaded_key))
@@ -10234,6 +10397,34 @@ class Overlay:
             log.info("decide-by-ear: only %d chars heard — inconclusive, no action",
                      len(heard_text.strip()))
             return
+        # LLM-AUTHORITATIVE decision (gated on an API key): when the optional
+        # disambiguator is confident the vocals ARE a specific candidate, trust it
+        # over the fuzzy scores — it read the actual transcript + lyric bodies.
+        # Same file-validity safety as the score path; if it confirms the LOADED
+        # song, that corroborates the body. No key → res["llm"] is None, skipped.
+        llm = res.get("llm")
+        if llm and llm.get("matches_audio") and llm.get("confidence", 0.0) >= 0.7:
+            lk = llm.get("key")
+            if lk and lk not in ("loaded", loaded_key):
+                try:
+                    p = Path(lk)
+                    if p.exists() and self._file_valid(p, self._cur_duration):
+                        log.info("decide-by-ear: LLM-CONFIRMED switch to %s (conf %.2f) — %s",
+                                 p.name, llm.get("confidence", 0.0), (llm.get("reason") or "")[:80])
+                        self._fine_exit("song-switch")
+                        self.load(p)
+                        self._maybe_translate()
+                        self._sound_title_alias = None
+                        self.offset = 0.0
+                        self.idx = -1
+                        self._body_corroborated = True
+                        self._hint("🎯 Corrected to the song being sung")
+                        self.root.after(700, lambda: self._auto_align_by_energy("post-decide"))
+                        return
+                except Exception as e:
+                    log.info("decide-by-ear: LLM switch failed: %s", e)
+            elif lk in ("loaded", loaded_key):
+                self._body_corroborated = True      # LLM confirms loaded IS playing
         # kamone fix: a healthy by-ear read of the LOADED body (real >=20-char transcript
         # scoring at the in-sync bar) is positive proof the body matches the singing —
         # corroborate so this verified+locked song earns by-ear immunity going forward.
