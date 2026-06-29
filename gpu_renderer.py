@@ -504,14 +504,18 @@ class LyricRenderer:
         # (advance-based) line up with the base ink.
         bx = cx_center - rl.base_adv / 2.0
         by = base_cy - base.h / 2.0
-        base_tint = self.BASE_COLOR if (is_active or draw_sub) else self.CTX_COLOR
+        # Only the ACTIVE line is bright; context lines are DIM. (Belt previously
+        # tied brightness to draw_sub, so every scrolling line lit up bright =
+        # the user's "permanent on highlights".) The gold karaoke fill is the
+        # active line's sung portion; context lines never get it.
+        base_tint = self.BASE_COLOR if is_active else self.CTX_COLOR
         self._draw_quad(bx, by, base.w, base.h, base, base_tint)
         if is_active and fill > 0:
             fw = max(1, int(base.w * fill))
             self._draw_quad(bx, by, base.w, base.h, base, self.FILL_COLOR,
                             scissor=(bx, by, fw, base.h))
         # ruby above the base run
-        ruby_a = 1.0 if (is_active or draw_sub) else 0.7
+        ruby_a = 1.0 if is_active else 0.55
         ruby_y = by - self.ruby_h - 1
         rcol = (self.RUBY_COLOR[0], self.RUBY_COLOR[1], self.RUBY_COLOR[2], ruby_a)
         for rt, cx in rl.rubies:
@@ -585,15 +589,19 @@ class LyricRenderer:
         v = max(self.scroll_speed, 60.0)
         d = 1.0 if self.scroll_dir == "rl" else -1.0
         cy = self.H * 0.5
-        margin = 1500.0
+        # Tighter window than before (1500 → ~half the screen each side) so only a
+        # few lines are on the belt at once instead of the whole screen full.
+        margin = self.W * 0.55
         for i, ln in enumerate(self.lines):
             t = ln.get("t") or (0.0, 0.0)
             mid = (t[0] + t[1]) / 2.0
             cx = center + d * v * (mid - pos)
             if -margin < cx < self.W + margin:
                 is_act = (i == active)
+                # Only the ACTIVE line carries the romaji+english (draw_sub); the
+                # scrolling context lines are dim JP only — far less clutter.
                 self._draw_line_block(i, cy, fill=(fill if is_act else 0.0),
-                                      is_active=is_act, cx_center=cx, draw_sub=True)
+                                      is_active=is_act, cx_center=cx, draw_sub=is_act)
 
     def _swap(self):
         pygame.display.flip()
