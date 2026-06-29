@@ -6852,12 +6852,27 @@ class Overlay:
             elif abs(gap_p) > 0.05:
                 self._hi_corr = gap_p                      # schedule smooth catch-up
 
-        # ── 2) frozen sync offset ──
+        # ── 2) sync offset ──
+        gap_o = target - self._hi_offset
+        live = getattr(self, "_live_mode", False) or getattr(self, "_live_arrangement", False)
+        if live:
+            # LIVE / concert version: the performance timing drifts away from the
+            # studio LRC, and the engine re-syncs aggressively (the live resync
+            # loop). The highlight must FOLLOW those corrections — freezing the
+            # offset here is what made the user say "it's not aggressively syncing
+            # on this concert version". Fast-glide toward the measured offset so
+            # each re-sync lands within a fraction of a second (smooth, not a
+            # teleport). The smooth song clock above still glides between syncs.
+            rate = float(self._tune.get("hi_live_pull_per_sec", 4.0))
+            self._hi_offset += max(-rate * dt, min(rate * dt, gap_o))
+            self._hi_locked = False           # re-freeze fresh if it later goes studio
+            return self._hi_clock + self._hi_offset + lead
+        # STUDIO version: freeze the offset mid-song so a sync re-estimate can't
+        # snap the fill across lines.
         settle_s  = float(self._tune.get("hi_settle_s", 22.0))
         pull_band = float(self._tune.get("hi_pull_band_s", 3.0))
         pull_rate = float(self._tune.get("hi_pull_per_sec", 0.6))
         dead      = float(self._tune.get("hi_deadzone_s", 0.12))
-        gap_o = target - self._hi_offset
         if not getattr(self, "_hi_locked", False):
             self._hi_offset = target
             if abs(target) > 0.05 or self._hi_clock >= settle_s:
