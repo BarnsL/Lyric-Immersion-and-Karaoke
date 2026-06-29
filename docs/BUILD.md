@@ -77,12 +77,12 @@ $S.TargetPath="$PWD\dist\DesktopKaraoke\DesktopKaraoke.exe"; $S.IconLocation="$P
 
 ## The app icon
 
-`icon.ico` is generated reproducibly by **`make_icon.py`** (a karaoke microphone
+`icon.ico` is generated reproducibly by **`scripts/make_icon.py`** (a karaoke microphone
 with sound waves on a purple gradient). To tweak it, edit the colours/geometry
 constants at the top of that file and regenerate:
 
 ```bat
-python make_icon.py --preview     :: rewrites icon.ico + a _icon_preview.png contact sheet
+python scripts/make_icon.py --preview     :: rewrites icon.ico + a _icon_preview.png contact sheet
 ```
 
 It writes a multi-size `.ico` (16–256 px); the small tray sizes use a bolder,

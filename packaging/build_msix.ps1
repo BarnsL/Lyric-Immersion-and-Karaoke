@@ -60,7 +60,7 @@ Copy-Item "$bundle\*" $layout -Recurse -Force
 # 3) Generate the Store logo assets from the app icon.
 Write-Host "[3/5] Generating Store logo assets..." -ForegroundColor Cyan
 Push-Location $repo
-& $venvPy "make_assets.py" $assets
+& $venvPy "scripts/make_assets.py" $assets
 $rc = $LASTEXITCODE
 Pop-Location
 if ($rc -ne 0) { throw "Asset generation failed." }
