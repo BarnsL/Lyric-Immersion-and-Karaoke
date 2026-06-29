@@ -2373,6 +2373,15 @@ class Overlay:
             # the non-game-card when gaming).
             "gpu_solo_override":            0,  # 1 = allow GPU on single-GPU machines, 0 = stay on CPU per policy
             "ocr_when_gaming":              0,  # TICKET-125: 1 = allow OCR (capture+WinRT-OCR, GPU-backed) even while a game uses the GPU; 0 = back off so it can't hitch the game
+            # ── TICKET-129 CPU policy ──
+            # 1 (default) = "the last core drives the product": pin this process to
+            # the LAST PHYSICAL core and run it ABOVE_NORMAL. Dedicating one core keeps
+            # the overlay perfectly smooth while a game (using the other cores) is
+            # barely touched. 0 = legacy spread (upper cores + BELOW_NORMAL), which is
+            # better on a CPU-only box doing heavy lyric *generation* (it can then use
+            # many cores). Hardware-agnostic: the mask is computed from the live CPU
+            # topology, so it is correct on 2..64-thread machines, SMT or not.
+            "cpu_dedicate_last_core":       1,
             # ── TICKET-089 Whisper language lock ──
             # 1 = pin Whisper to the song's known language for deep transcription
             # (the auto-detect default lets Whisper hallucinate Japanese on
@@ -5118,29 +5127,30 @@ class Overlay:
     # ── monitor topology watchdog ──
 
     def _apply_dynamic_priority(self):
-        """TICKET-127: the lyric app must be LOWER PRIORITY THAN ANY GAME. Baseline is
-        BELOW_NORMAL (set at startup); when a game is detected (exclusive-fullscreen via
-        SHQueryUserNotificationState, OR any GPU ≥45% util = a borderless game) we drop
-        to IDLE_PRIORITY_CLASS so the game wins every CPU contest, then restore
-        BELOW_NORMAL when the game's gone. Only calls SetPriorityClass on a change."""
+        """TICKET-129 CPU policy: 'the last core drives the product'. By default this
+        process is pinned to the LAST PHYSICAL core and run ABOVE_NORMAL — dedicating a
+        single core keeps the overlay perfectly smooth while a game, which runs on the
+        other cores, is barely affected (the core isolation is what protects the game
+        now, replacing TICKET-127's IDLE-while-gaming downgrade). Override with tune
+        knob `cpu_dedicate_last_core=0` for the legacy spread (upper cores +
+        BELOW_NORMAL), which suits a CPU-only box doing heavy lyric generation.
+
+        Hardware-agnostic: the mask comes from the live CPU topology, so it is correct
+        on 2..64-thread machines, SMT or not. Idempotent — only touches the OS on a
+        change, so this can be called every monitor tick and a live /tune flip lands
+        within ~3s. Affinity is RE-asserted alongside priority so it self-heals."""
         try:
-            import gpu_setup
-            gaming = gpu_setup.game_active()
-            if not gaming:
-                try:
-                    u = gpu_setup._gpu_utils()
-                    gaming = bool(u and max(u.values()) >= 45)
-                except Exception:
-                    pass
-            want = 0x00000040 if gaming else 0x00004000   # IDLE vs BELOW_NORMAL
-            if want != getattr(self, "_cur_prio", None):
-                k32 = ctypes.windll.kernel32
-                k32.GetCurrentProcess.restype = ctypes.c_void_p
-                k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-                k32.SetPriorityClass(k32.GetCurrentProcess(), want)
-                self._cur_prio = want
-                log.info("priority → %s (game active=%s)",
-                         "IDLE" if gaming else "BELOW_NORMAL", gaming)
+            import os as _os
+            n = _os.cpu_count() or 1
+            dedicate = int(self._tune.get("cpu_dedicate_last_core", 1) or 0)
+            if dedicate and n >= 3:
+                mask, prio, label = _dedicate_last_core_mask(n), _PRIO_ABOVE_NORMAL, "last-core/above-normal"
+            else:
+                mask, prio, label = _upper_cores_mask(n), _PRIO_BELOW_NORMAL, "upper-cores/below-normal"
+            if (mask, prio) != getattr(self, "_cur_cpu_policy", None):
+                ok, _ = _apply_affinity_priority(mask, prio)
+                self._cur_cpu_policy = (mask, prio)
+                log.info("cpu policy → %s (cpus=%d mask=0x%x set=%s)", label, n, mask, ok)
         except Exception:
             pass
 
@@ -10652,6 +10662,97 @@ def _is_only_instance():
         return True
 
 
+# ── CPU affinity / priority policy (hardware-agnostic) ───────────────────────────
+# Windows PRIORITY_CLASS constants.
+_PRIO_ABOVE_NORMAL = 0x00008000
+_PRIO_NORMAL       = 0x00000020
+_PRIO_BELOW_NORMAL = 0x00004000
+_PRIO_IDLE         = 0x00000040
+
+
+def _last_physical_core_mask():
+    """Affinity mask covering ONLY the LAST physical core (including both SMT threads
+    if the CPU is hyper-threaded), via GetLogicalProcessorInformation. Returns an int
+    mask, or 0 if it can't be determined. Single processor-group only (≤64 logical
+    CPUs) — that covers every consumer CPU; multi-group servers fall back to the
+    caller's heuristic. SMT-aware and core-count-agnostic, so it is correct whether
+    the box is a 4-thread laptop or a 32-thread desktop, Intel or AMD."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+
+        class _SLPI(ctypes.Structure):   # SYSTEM_LOGICAL_PROCESSOR_INFORMATION
+            _fields_ = [
+                ("ProcessorMask", ctypes.c_size_t),
+                ("Relationship", ctypes.c_int),
+                ("_union", ctypes.c_ubyte * 16),   # largest union member (CACHE/NUMA)
+            ]
+
+        RelationProcessorCore = 0
+        length = wintypes.DWORD(0)
+        k32.GetLogicalProcessorInformation(None, ctypes.byref(length))
+        if not length.value:
+            return 0
+        count = length.value // ctypes.sizeof(_SLPI)
+        arr = (_SLPI * count)()
+        if not k32.GetLogicalProcessorInformation(arr, ctypes.byref(length)):
+            return 0
+        best = 0
+        for i in range(count):
+            e = arr[i]
+            if e.Relationship == RelationProcessorCore and int(e.ProcessorMask) > best:
+                best = int(e.ProcessorMask)          # highest-indexed physical core
+        return best
+    except Exception:
+        return 0
+
+
+def _upper_cores_mask(n):
+    """Legacy spread mask: upper-half-plus-one cores, never core 0 (Windows runs the
+    audio engine + most DPC/ISR on core 0, so staying off it keeps audio clean).
+    16-thread → 0xff80; 8-thread → 0xf8; 4-thread → 0xe."""
+    if n >= 4:
+        mask = 0
+        for c in range(max(1, (n // 2) - 1), n):
+            mask |= (1 << c)
+        return mask
+    if n >= 2:
+        return ((1 << n) - 1) & ~1        # everything except core 0
+    return 1
+
+
+def _dedicate_last_core_mask(n):
+    """Mask for 'the last core drives the product'. Prefers the exact last PHYSICAL
+    core (SMT-aware, via the Win32 topology API); falls back to the last logical CPU
+    (plus its likely SMT sibling on an even, ≥8-thread machine) if the API is
+    unavailable. Always lands on the highest cores, off core 0."""
+    m = _last_physical_core_mask()
+    if m:
+        return m
+    if n >= 8 and n % 2 == 0:
+        return (1 << (n - 1)) | (1 << (n - 2))      # assume one SMT pair
+    return 1 << (n - 1)
+
+
+def _apply_affinity_priority(mask, prio):
+    """Best-effort SetProcessAffinityMask + SetPriorityClass on this process. Returns
+    (affinity_ok, mask). Uses 64-bit-correct ctypes signatures — without them ctypes
+    truncates the pseudo-handle (-1) and the DWORD_PTR mask to 32 bits and the call
+    silently no-ops. Reversible by the user via Task Manager."""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    k32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    k32.SetProcessAffinityMask.restype = ctypes.c_int
+    k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    h = k32.GetCurrentProcess()
+    ok = bool(k32.SetProcessAffinityMask(h, mask)) if mask else False
+    if prio:
+        k32.SetPriorityClass(h, prio)
+    return ok, mask
+
+
 def main():
     if not _is_only_instance():
         return                 # another Desktop Karaoke is already running
@@ -10669,47 +10770,12 @@ def main():
         ctypes.windll.winmm.timeBeginPeriod(1)
     except Exception:
         pass
-    # CPU AFFINITY: keep this app OFF the first core(s). Windows runs the audio
-    # engine and most device interrupts (DPC/ISR) on core 0, so a CPU-busy app
-    # sharing core 0 shows up as a STATIC STUTTER in playing audio. Pinning our
-    # threads to the LATER cores (upper half + 1, never core 0) leaves the audio
-    # path clean on a typical 4+ core machine; on 2-3 cores we just avoid core 0.
-    # On a 16-core box this is cores 7-15 (mask 0xff80, 9 cores) — the extra core
-    # below the upper half gives the fill-paint loop more PIL headroom for the
-    # newly raised scroll_heavy_budget_ms / scroll_repaint_budget without crowding audio.
-    # Best-effort and reversible by the user via Task Manager.
-    try:
-        import os as _os
-        k32 = ctypes.windll.kernel32
-        # 64-bit-correct signatures — without these ctypes truncates the pseudo
-        # handle (-1) and the DWORD_PTR mask to 32 bits and the call no-ops.
-        k32.GetCurrentProcess.restype = ctypes.c_void_p
-        k32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-        k32.SetProcessAffinityMask.restype = ctypes.c_int
-        k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        n = _os.cpu_count() or 1
-        if n >= 4:
-            mask = 0
-            # upper half PLUS one extra core below it: e.g. 16-core → cores 7-15
-            # (mask 0xff80); 8-core → cores 3-7 (mask 0xf8); 4-core → cores 1-3.
-            start = max(1, (n // 2) - 1)     # never include core 0
-            for c in range(start, n):
-                mask |= (1 << c)
-        elif n >= 2:
-            mask = ((1 << n) - 1) & ~1        # all cores except core 0
-        else:
-            mask = 1
-        h = k32.GetCurrentProcess()
-        ok = k32.SetProcessAffinityMask(h, mask)
-        # Below-normal priority so we yield to the foreground game/player.
-        k32.SetPriorityClass(h, 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
-        log.info("cpu affinity: %d cores → mask 0x%x (set=%s), priority below-normal",
-                 n, mask, bool(ok))
-    except Exception as e:
-        try:
-            log.info("cpu affinity set failed: %s", e)
-        except Exception:
-            pass
+    # CPU AFFINITY + PRIORITY are applied via ov._apply_dynamic_priority() right after
+    # the Overlay is built (TICKET-129) — a single code path that reads the override
+    # knob, so 'last core @ ABOVE_NORMAL' (or the legacy spread) is honored immediately
+    # and re-asserted on every monitor tick. Letting Overlay.__init__ run unpinned at
+    # normal priority just makes startup a touch faster. Keeping the app OFF core 0
+    # (where Windows runs the audio engine + DPC/ISR) is preserved by the masks.
     offset = 0.0
     args = sys.argv[1:]
     for i, a in enumerate(args):
@@ -10721,6 +10787,7 @@ def main():
 
     LYRICS_DIR.mkdir(exist_ok=True)
     ov = Overlay(offset=offset)
+    ov._apply_dynamic_priority()   # TICKET-129: pin to last core @ ABOVE_NORMAL (override: tune cpu_dedicate_last_core)
 
     def _reset(*_):   ov.root.after(0, ov.reset_offset)
     def _toggle(*_):  ov.root.after(0, ov.toggle)
