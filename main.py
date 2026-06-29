@@ -1290,12 +1290,33 @@ def _live_cue_is_parenthetical_aside(t, m):
     return len(re.sub(r"\s", "", head)) >= 2     # a substantive song title precedes the aside
 
 
+# A SINGLE song LOOPED / EXTENDED into a long video — "Seamless 30min Ver",
+# "1 hour loop", "作業用 BGM", "2時間耐久", "10分ループ" — is ONE song, NOT a
+# multi-song concert. It would otherwise trip the >10-min concert rule and get
+# driven by sound + concert-OCR (which, with another window visible, has even
+# OCR'd off-video text as "lyrics"). These load the song's lyrics and FOLLOW the
+# offset like any long single track.
+_LOOP_VER_RE = re.compile(
+    r"seamless|\bloop(?:ed|ing)?\b|"
+    r"\d+\s*(?:min(?:ute)?s?|h(?:ou)?rs?)\s*(?:ver(?:sion)?|loop|mix|edit|bgm)\b|"
+    r"(?:extended|continuous)\s*(?:ver(?:sion)?|mix|edit|play)\b|"
+    r"作業用|\d+\s*時間|\d+\s*分\s*(?:耐久|ループ)|耐久",
+    re.I,
+)
+
+
 def is_live_or_compilation(title, duration=None):
     """True for a long video, or one whose title says 'live / concert / festival /
     medley / 3D LIVE / メドレー' — almost always MANY songs under one title, where
     the title names the EVENT, not the song. Such videos must be driven by SOUND:
     title-matching them is what makes a whole concert show one (wrong) song's
     lyrics, with no way for Shazam to override a title that's a real song name."""
+    t = title or ""
+    # A single song LOOPED/EXTENDED into a long video is NOT a concert — load its
+    # lyrics + follow the offset, even though it's long. (Stops the >10-min rule
+    # misfiring on "Seamless 30min Ver" / "作業用" / "N時間耐久" → wrong song.)
+    if _LOOP_VER_RE.search(t):
+        return False
     if duration and duration > 10 * 60:      # >10 min ⇒ concert/compilation (multi-song) in practice
         return True
     m = _LIVE_RE.search(title or "")
@@ -5239,10 +5260,18 @@ class Overlay:
             _blang = (self.meta.get("lang") or "").lower()
             _btitle = self.meta.get("title") or ""
             _bartist = self.meta.get("artist") or ""
+            # Include the RAW player title so hangul in it (e.g. TAK "PPPP" feat
+            # 하츠네 미쿠 — a JP+Korean song) suppresses Korean rejection: those
+            # Korean lyrics are correct, not a wrong-language body.
+            try:
+                _ptitle = (self.media.get() or {}).get("title") or ""
+            except Exception:
+                _ptitle = ""
             if (self.lines and _xsrc not in ("bundled",)
                     and self._track_seq != getattr(self, "_lang_rejected_seq", None)
                     and _blang in _BAD_LANGS_FOR_JP
-                    and is_jp_vagency(_btitle, _bartist, strict=(_blang == "zh"))):
+                    and is_jp_vagency(_btitle, _bartist, extras=[_ptitle],
+                                      strict=(_blang == "zh"))):
                 log.info("load: rejected lang=%s body for JP-act %r / %r "
                          "(src=%s) → re-fetching", _blang, _btitle, _bartist, _xsrc)
                 self._lang_rejected_seq = self._track_seq
