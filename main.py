@@ -1100,6 +1100,23 @@ def _is_event_bracket(text, m):
     return bool(_EVENT_BRACKET_LEADIN_RE.search(lead))
 
 
+_CREDIT_SUFFIX_RE = re.compile(r"\s*[\(（\[［【][^\)）\]］】]*[\)）\]］】]\s*$")
+
+
+def _strip_title_credits(t):
+    """Strip trailing parenthetical/bracket credits ('(feat. X)', '(Live)',
+    '[Remix]', '（…）', '【…】') so VARIANT titles of the SAME song compare equal.
+    Peels repeated/nested trailing brackets. Shared by the source-agreement
+    scorer (so a feat. credit isn't a false mismatch → false decision SWITCH)
+    and by concert title parsing."""
+    t = (t or "").strip()
+    prev = None
+    while t and t != prev:
+        prev = t
+        t = _CREDIT_SUFFIX_RE.sub("", t).strip()
+    return t
+
+
 def clean_title(title, source="", artist=""):
     """Reduce a media title to the actual SONG NAME so it matches lyric metadata.
 
@@ -2803,7 +2820,7 @@ class Overlay:
             if self.lines or self._lyrics_path is not None:
                 self.lines, self.meta, self._lyrics_path = [], {"source": ""}, None
                 self.idx = -1
-                self._cancel_pending_swap() if hasattr(self, "_cancel_pending_swap") else None
+                self._cancel_pending_swap("non-music-page") if hasattr(self, "_cancel_pending_swap") else None
                 try:
                     self.cv.delete("all")
                 except Exception:
@@ -5888,7 +5905,8 @@ class Overlay:
             cur_pos = state["position"] + self.offset
             cur_end = self.lines[self.idx].end if self.idx >= 0 else 0.0
             if (self.idx < 0 or cur_pos >= cur_end
-                    or (time.time() - self._pending_offset_t) > 8.0):
+                    or (time.time() - self._pending_offset_t)
+                        > float(self._tune.get("offset_defer_cap_s", 3.0))):
                 new_off = self._pending_offset
                 self._pending_offset = None
                 log.info("sync: deferred commit %+.2fs → %+.2fs (line ended)",
@@ -7051,14 +7069,17 @@ class Overlay:
         gap_o = target - self._hi_offset
         live = getattr(self, "_live_mode", False) or getattr(self, "_live_arrangement", False)
         if live:
-            # LIVE / concert version: the performance timing drifts away from the
-            # studio LRC and the engine re-syncs aggressively. The highlight must
-            # FOLLOW those corrections — freezing the offset here is what made the
-            # user say "it's not aggressively syncing on this concert version".
-            # Fast-glide toward the measured offset; the output slew-limit (§3)
-            # keeps even an aggressive re-sync smooth instead of a teleport.
-            rate = float(self._tune.get("hi_live_pull_per_sec", 4.0))
-            self._hi_offset += max(-rate * dt, min(rate * dt, gap_o))
+            # LIVE / concert version: FOLLOW the measured offset, but only when it
+            # actually COMMITS. self.offset (== target) is boundary-deferred via
+            # _smooth_offset, so it changes at line boundaries, not mid-line.
+            # Snapping _hi_offset to it (instead of the old per-frame glide) keeps
+            # the gold fill STEADY within a line and re-anchors only at a boundary
+            # — the user's "only the lyrics follow sync; the highlight just
+            # proceeds". Following stays aggressive (a committed correction is
+            # taken in full), and the §3 output slew-limit smooths the boundary
+            # hand-off so it's never a teleport. The old continuous glide
+            # (hi_live_pull_per_sec) was the main cause of concert fill jitter.
+            self._hi_offset = target
             self._hi_locked = False           # re-freeze fresh if it later goes studio
         else:
             # STUDIO version: freeze the offset mid-song so a sync re-estimate
@@ -9645,11 +9666,23 @@ class Overlay:
     # User asked for this: "tell me what happened and make a plan. this needs to
     # work algorithmically and without lyrics in repo."
     def _score_source_agree(self):
-        """SMTC vs Shazam title/artist agreement. Cover-aware (skip on covers)."""
+        """SMTC vs Shazam title/artist agreement. Cover-aware (skip on covers).
+
+        A feat./remix/parenthetical VARIANT of the SAME song with an AGREEING
+        artist is NOT a disagreement. The old code returned DEGRADED whenever one
+        title was a substring of the other ("Tokyo Friday Night" ⊂ "Tokyo Friday
+        Night (feat. Kana Hanazawa & Mori Calliope)"), which drove a false
+        TRUST→CAUTION→SWITCH that BLACKLISTED the correct lyrics — the user's
+        "lost lyrics completely then got them back". Closed captions are the
+        video's own lyrics → ground truth, never a source mismatch."""
         if getattr(self, "_is_cover", False):
             return "OK"
+        src = (self.meta.get("source") or "") if isinstance(self.meta, dict) else ""
+        if src == "youtube-captions":
+            return "OK"
         st = self.media.get() or {}
-        smtc_t = _norm_title(st.get("title") or "")
+        raw_smtc_t = st.get("title") or ""
+        smtc_t = _norm_title(raw_smtc_t)
         smtc_a = _norm_title(st.get("artist") or "")
         snd = getattr(self, "_sound_song", None)
         if not snd or not smtc_t:
@@ -9658,8 +9691,15 @@ class Overlay:
         s_artist = _norm_title(snd[1] or "")
         if s_title == smtc_t and s_artist == smtc_a:
             return "OK"
+        artist_ok = bool(smtc_a and s_artist and
+                         (s_artist == smtc_a or s_artist in smtc_a or smtc_a in s_artist))
+        # Same song minus a trailing (feat. …)/(Live)/[Remix] variant tag + artist agrees?
+        bare_smtc  = _norm_title(_strip_title_credits(raw_smtc_t))
+        bare_sound = _norm_title(_strip_title_credits(snd[0] or ""))
+        if bare_smtc and bare_sound and bare_smtc == bare_sound and artist_ok:
+            return "OK"
         if s_title and (s_title in smtc_t or smtc_t in s_title):
-            return "DEGRADED"
+            return "OK" if artist_ok else "DEGRADED"   # title overlap: trust iff artist agrees
         return "BAD"
 
     def _score_sync_stable(self):
