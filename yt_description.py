@@ -126,7 +126,7 @@ _LABEL_TABLE: list[tuple[re.Pattern, list[str], bool]] = [
 # Caught by: contains URL, '@handle', '#hashtag', or markers like 'Subscribe',
 # 'Listen on', 'Follow', 'Twitter', 'Spotify', 'Apple Music', 'Bandcamp'.
 _BOILERPLATE = re.compile(
-    r"(https?://|www\.|@\w+|#\w+|"
+    r"(https?://|www\.|@\w+|(?<![-\w])#\w+|"
     r"\b(?:subscribe|follow|listen\s+on|stream|buy|download|"
     r"twitter|instagram|tiktok|spotify|apple\s*music|bandcamp|"
     r"discord|patreon|merch)\b)",
