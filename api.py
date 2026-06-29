@@ -176,6 +176,10 @@ def _status(app):
         # so a watcher (or the tray hint) can see TRUST -> CAUTION -> SWITCH
         # -> REGEN promotions live, including which dimension drove them.
         "decision_engine": _decision_engine_snapshot(app),
+        # success/failure scorecard vs the perceptual + reliability targets:
+        # ID-match %, title-hit %, fetch P50/P95, by-ear %, sync-in-window %.
+        "success_rate": (app.success_rate_snapshot()
+                         if hasattr(app, "success_rate_snapshot") else None),
         "heard_by_sound": app._sound_song,
         "boundary_detect": getattr(app, "boundary_on", None),
         # TICKET-102: capability flags for the window-title scraper, mirrored
