@@ -320,6 +320,12 @@ def make_handler(app, log_file, token):
                         self._send(200, {"ok": True, **app.get_lyric_state()})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/overlay":
+                    # compact render state for an external overlay client (Tauri PoC)
+                    try:
+                        self._send(200, {"ok": True, **app.get_overlay_state()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/import/status":
                     self._send(200, {"ok": True, **_import_status()})
                 elif path == "/yt-meta":
