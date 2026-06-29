@@ -168,11 +168,13 @@ def is_jp_vagency(title: str, artist: str, extras=None, *,
 
     Use strict=True for ZH rejection paths. Use the default for KO and
     European-language rejection paths (where signal 3 has no false positive)."""
-    if artist and _HANGUL.search(artist):
-        return False  # hangul present → don't auto-reject a Korean reading
-    if title and _HANGUL.search(title):
-        return False
     parts = [s for s in (title or "", artist or "", *(extras or [])) if s]
+    # Hangul ANYWHERE in the context (title, artist, OR extras like the raw
+    # player title) suppresses rejection — a song whose own metadata carries
+    # hangul is Korean or bilingual (e.g. TAK "PPPP" feat 하츠네 미쿠, which is
+    # JP + Korean), so its Korean lyrics are CORRECT and must not be rejected.
+    if any(_HANGUL.search(p) for p in parts):
+        return False
     hay = " ".join(parts)
     # Signal 1: known JP-act name.
     if _JP_VAGENCY_RE and _JP_VAGENCY_RE.search(hay):
