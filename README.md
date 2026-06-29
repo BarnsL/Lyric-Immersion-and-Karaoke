@@ -32,6 +32,7 @@ while it runs.
 *Watch on YouTube: [demo 1](https://youtu.be/AQfNzmsx1qU) · [demo 2](https://youtu.be/IxX9lKV7oZc) · [demo 3](https://youtu.be/BPQ6ZDHNM28) — AI song recognition + lyric synchronization in action.*
 
 ---
+<img width="975" height="547" alt="image" src="https://github.com/user-attachments/assets/63cec435-0e43-4749-9041-19b861ed044b" />
 
 ## ✨ What it does
 
