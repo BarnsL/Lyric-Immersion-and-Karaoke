@@ -4,7 +4,61 @@ A live, click-through desktop overlay (Python/Tkinter, Windows) that floats sync
 with furigana / romaji / pinyin / romaja / translation over whatever music is playing —
 **audio-source agnostic** (YouTube / Spotify / Niconico in a browser, or a desktop player).
 A language-learning + karaoke tool, heavy on VTuber/J-music (hololive, ReGLOSS, V.W.P,
-Suisei). **Current build: v1.0.96.** Read this, then `ARCHITECTURE.md` + `ISSUES.md`.
+Suisei). **Current build: v1.1.7** (released 2026-06-28). Read this START-HERE block, then
+`ISSUES.md` (per-ticket detail) + `ARCHITECTURE.md`. The deep per-ticket history for
+v1.0.69→v1.0.96 is preserved further down this file.
+
+---
+
+## ⭐ START HERE — state as of v1.1.7 (2026-06-28)
+
+**Everything is committed + pushed + released.** `master` HEAD is the v1.1.7 commit;
+GitHub releases exist through `v1.1.7` (notes-only — prior releases carry NO binary assets).
+The deployed app at `D:\DesktopKaraoke` is live and verified (`/metrics` → `current_version`).
+
+### What the v1.1.x train added (since v1.0.96)
+- **Burned-in lyric OCR** (`ocr_lyrics.py`) — reads lyrics off the *video* (self-read-safe
+  `PrintWindow` capture + WinRT OCR, EN/JP) when no provider/caption LRC exists, AND on
+  decision-engine SWITCH/REGEN when the matched lyrics are wrong. `source="ocr"`. TICKET-120.
+  - `_strip_tofu()` removes OCR "box" glyphs (□ / U+FFFD) — TICKET-128.
+  - OCR-assisted sync: matches the on-screen line to the LRC to set the offset — TICKET-123.
+- **Per-release telemetry** (`metrics.py`) — success/wobbler/fail bucketed by version,
+  persisted to `metrics.json`, served at `GET /metrics`. SUCCESS = real lyrics synced ≤60s
+  with ≤2 resyncs, not generated; FAIL = generated OR >10 resyncs; CONCERT = ≥10 wrong
+  detections in a 5-min window. TICKET-121.
+- **Two-tier ground-truth barrier** — verified lyrics resist spurious switch/regen; OCR &
+  caption sources earn that immunity only once `_body_corroborated` (energy lock / by-ear).
+  TICKET-122.
+- **NO bundled lyrics** (TICKET-124, **PRODUCT/LEGAL — do not regress**) — the app ships
+  ZERO baked-in lyrics; every lyric is found by code at runtime (providers → YouTube
+  captions → OCR → AI-gen). `bundled_lyrics/` was removed from the repo + spec + startup seed.
+- **CPU policy — "the last core drives the product"** (TICKET-129, current): the process
+  pins itself to the LAST PHYSICAL core (SMT-aware) at **ABOVE_NORMAL**. Dedicating one core
+  keeps the overlay smooth while a game (on the other cores) is barely touched. Override:
+  tune `cpu_dedicate_last_core=0` → legacy upper-cores/BELOW_NORMAL spread. This REPLACED
+  TICKET-127's IDLE-while-gaming downgrade.
+- **OCR game-gating** — with ≥2 CUDA GPUs OCR runs during gaming (idle card's headroom);
+  single-GPU boxes back off while gaming. Override: `ocr_when_gaming=1`. TICKET-125/127.
+- **Multi-GPU/CPU compatibility** — `gpu_setup` degrades to CPU (no CUDA / missing NVML /
+  single GPU / non-NVIDIA); CPU masks are computed from live topology (1..64 threads, SMT or
+  not). Generation targets the idlest GPU via `pick_inference_device`.
+
+### What's PENDING / next (in priority order)
+1. **GPU display renderer (the big one)** — display is still CPU Tkinter/Pillow. The
+   transparency+click-through+~109fps bet PASSED on the 3080 (`spikes/gpu_overlay_autotest.py`),
+   so a Pygame-CE+SDL2+moderngl process-split renderer is now buildable. Milestones: **M1** =
+   standalone GL renderer process (renders + highlights lines on the idle GPU); **M2** = IPC
+   from the main SMTC/sync/decision process; **M3** = swap behind a toggle + GPU-pin/override
+   menu (force 2080 / 3080 / CPU). This single track ALSO delivers the user's "GPU drive the
+   current-line highlighting" + the explicit GPU-override menu.
+2. **TICKET-126 (open) — feelingradation katakana cross-script title match.** Spotify titles
+   it フィーリングラデーション, YouTube "feelingradation"; `clean_title` differs per source so
+   the code-fetch can lose it. Needs katakana↔romaji↔English title matching. More important now
+   that bundles are gone.
+3. **Sync success rate is LOW** — `/metrics` shows many tracks "never synced" (wobblers with
+   `time_to_sync=None`) and per-version success 0-50%. Worth a focused pass: why do real LRCs
+   load but never reach `_set_verified`? (energy-lock failing on ambient MVs; OCR not
+   committing 3 stable lines; etc.) The telemetry is now there to measure it.
 
 ---
 
@@ -16,9 +70,12 @@ Suisei). **Current build: v1.0.96.** Read this, then `ARCHITECTURE.md` + `ISSUES
   accounts; never let commits land as `purpleindustries@pm.me` or the AWS `barnslau@amazon.com`.
   Repo git config is set correctly; `gh` is authed as **BarnsL** (verify with `gh auth status`).
 - **Public/private split:** CODE → public repo above. **Copyrighted content stays OUT of public:**
-  `bundled_lyrics/` (the baked-in LRCs) is untracked + gitignored, backed up to **private
-  `BarnsL/Desktop-Karaoke-library`**. `SALES_CONSIDERATIONS.md` is **local-only** (gitignored;
-  never commit — sales/business notes). The lyric cache (`lyrics/`) is gitignored.
+  the app ships **ZERO bundled lyrics** (TICKET-124 — sellable product; lyrics are found by
+  code at runtime). `bundled_lyrics/` was REMOVED from the repo + spec + startup seed; it is
+  gitignored and backed up to **private `BarnsL/Desktop-Karaoke-library`** (and a local
+  `D:\Desktop-Karaoke-bundled-backup`). **Do NOT re-add bundled lyrics.** `SALES_CONSIDERATIONS.md`
+  is **local-only** (gitignored; never commit — sales/business notes). The lyric cache
+  (`lyrics/`) is gitignored.
 - **Deployed app:** `D:\DesktopKaraoke\` — exe is **`Lyric-Immersion-and-Karaoke.exe`** (renamed
   from `DesktopKaraoke.exe` 2026-06-27). The deploy FOLDER + the internal data-dir name stay
   `DesktopKaraoke` on purpose (renaming would orphan the lyric cache/models). Runtime siblings:
@@ -29,25 +86,37 @@ Suisei). **Current build: v1.0.96.** Read this, then `ARCHITECTURE.md` + `ISSUES
 - **Local control API:** `http://127.0.0.1:8765` (api.py) — the eyes/hands for live verification:
   `/health /diag /tune /scroll /position /forcesync /align /decide /wrong /purgecache …`.
 
-## Build + deploy (the proven recipe — do it exactly)
-- **The app pins ITSELF to cores 7-15 (0xFF80, 9 cores) at BelowNormal** (audio-stutter fix +
-  fill-paint headroom). So a build MUST run isolated on **cores 3-6** (one less than before) or
-  it overlaps the app on core 7 and causes audio stutter during builds. Run PyInstaller via a
-  HIDDEN, core-pinned, foreground-waited process (never `run_in_background`, never a visible
-  window — the user games fullscreen):
+## Build + deploy + release (the proven recipe — do it exactly)
+- **CPU policy (v1.1.7+):** the app pins ITSELF to the **LAST PHYSICAL core at ABOVE_NORMAL**
+  (on this 16-thread box that is mask `0xC000`, cores 14-15). A build therefore runs fine on the
+  **lower/upper cores away from the last core** — `0xF8` (cores 3-7) at BelowNormal is what's used
+  and never overlaps the app's `0xC000`. Run PyInstaller via a `-NoNewWindow`, core-pinned,
+  foreground-waited process (never `run_in_background`, never a visible window — the user games
+  fullscreen). `build.bat` is INTERACTIVE (it prompts), so invoke PyInstaller directly:
   ```powershell
-  $p = Start-Process -FilePath <py312> -ArgumentList '-m','PyInstaller','--noconfirm','DesktopKaraoke.spec' `
-       -WorkingDirectory 'D:\Desktop-Karaoke' -WindowStyle Hidden -PassThru `
-       -RedirectStandardOutput build.log -RedirectStandardError build.err
-  $p.ProcessorAffinity = [IntPtr]120   # 0x78 = cores 3-6 (avoids the app's core 7)
-  $p.PriorityClass = 'Normal'; $p.WaitForExit()
+  $env:PYTHONPATH = ".deps"; Remove-Item Env:LEAN_BUILD -ErrorAction SilentlyContinue
+  $p = Start-Process -FilePath python -ArgumentList '-m','PyInstaller','--noconfirm','--log-level=WARN','DesktopKaraoke.spec' `
+       -WorkingDirectory 'D:\Desktop-Karaoke' -NoNewWindow -PassThru
+  try { $p.ProcessorAffinity = [IntPtr]0xF8 } catch {}   # cores 3-7, off the app's last core
+  try { $p.PriorityClass = 'BelowNormal' } catch {}
+  $p.WaitForExit(); "EXITCODE=$($p.ExitCode)"
   ```
-  `.deps\` present → full Whisper build (~774 MB `_internal`, exe ~21 MB). `LEAN_BUILD=1` env →
-  ~120 MB Whisper-free build. `py_compile` first as a quick syntax gate.
-- **Deploy:** stop the app (`Stop-Process -Name Lyric-Immersion-and-Karaoke` — or `DesktopKaraoke`
-  if an old one's running) → `robocopy "$src\_internal" "$dst\_internal" /MIR` (exit 0-3 = OK; ≥8 =
-  error) → `Copy-Item` the exe → relaunch (`Start-Process` from `D:\DesktopKaraoke`) → poll `/health`
-  for the new version. PRESERVE the runtime siblings (`/MIR` is on `_internal` only).
+  **NON-LEAN is required** (`.deps\` present + `LEAN_BUILD` unset) or whisper is stripped →
+  generation/sync-by-listening break. Verify: `dist\DesktopKaraoke\_internal\ctranslate2\` exists.
+  `LEAN_BUILD=1` → ~120 MB whisper-free build (don't ship). `py_compile main.py` first as a gate.
+- **Deploy** (PRESERVE runtime siblings — `/MIR` on `_internal` only): stop the app
+  (`Get-Process -Name Lyric-Immersion-and-Karaoke | Stop-Process -Force`) →
+  `robocopy "$src\_internal" "$dst\_internal" /MIR` (exit **0-7 = OK**; ≥8 = error — robocopy's
+  success code propagates as the tool's exit status, so a non-zero exit here is normal) →
+  `Copy-Item` the exe → relaunch `Start-Process ... -WindowStyle Minimized` from `D:\DesktopKaraoke`
+  → poll `http://127.0.0.1:8765/metrics` for `current_version`. `src = D:\Desktop-Karaoke\dist\DesktopKaraoke`,
+  `dst = D:\DesktopKaraoke`.
+- **Bump `version.py` AND `installer.iss` `#define AppVer`** each release (keep in sync).
+- **Commit + release:** identity MUST be `BarnsL <barnsl@pm.me>` (author+committer), NO
+  `Co-Authored-By` trailer; `git fetch` first (user works from multiple machines — never push
+  divergent history); push to `master`; `gh release create vX.Y.Z --target master --title ... --notes ...`
+  (notes-only — Inno `iscc` is NOT installed on this box, so no Setup.exe asset). Stray
+  `harness_orig.py` stays untracked (do not commit it).
 - **⚠️ Deletion guard:** the sandbox BLOCKS PowerShell `Remove-Item` under `D:\DesktopKaraoke`
   (and near the source repo) — "path is protected from removal", and it aborts the WHOLE command.
   Use the **Bash tool `rm`** for deletions there, or `/purgecache`. (Copy/robocopy are fine.)
