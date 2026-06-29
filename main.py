@@ -5947,14 +5947,21 @@ class Overlay:
         # line boundary instead of freezing the highlight mid-line.
         branch_tag = "line"
 
+        # BELT MOTION + FILL both ride pos_hi (the slew-limited highlight clock).
+        # CRITICAL: the belt's per-frame scroll is v·(pos − last_pos), so feeding
+        # it the raw choppy SMTC clock (the old `pos`) made the WHOLE BELT lurch
+        # 2-3 lines every time SMTC held-then-jumped — the user's "jumping and
+        # skipping" in the scroll view. pos_hi is continuous and monotonic, so the
+        # belt now glides; using the SAME clock for motion and fill also keeps the
+        # gold fill locked to each line's on-screen position (no divergence).
         if self.scroll_dir in ("lr", "rl"):       # continuous horizontal scroll-through
-            self._ticker_update(pos, pos_hi)       # fill rides the free-running highlight clock
+            self._ticker_update(pos_hi, pos_hi)
             self._render_frame = True
             self._perf_record(state, pos, pos_raw, "scroll-h")
             self.root.after(self._fps, self._tick)
             return
         if self.scroll_dir in ("tb", "bt"):       # continuous vertical scroll-through
-            self._ticker_update_v(pos, pos_hi)     # fill rides the free-running highlight clock
+            self._ticker_update_v(pos_hi, pos_hi)
             self._render_frame = True
             self._perf_record(state, pos, pos_raw, "scroll-v")
             self.root.after(self._fps, self._tick)
@@ -6542,11 +6549,23 @@ class Overlay:
         # All blocks share the same per-frame motion, so move the whole stream
         # in ONE call (keeps a sub-pixel remainder so it doesn't drift).
         if self._stream:
-            dx_f = -d * v * (pos - self._last_pos) + self._strm_rem
-            dx = round(dx_f)
-            self._strm_rem = dx_f - dx
-            if dx:
-                self.cv.move("strm", dx, 0)
+            delta = pos - self._last_pos
+            # BELT DISCONTINUITY GUARD: a smooth frame advances pos by < ~0.1s
+            # (pos_hi is slew-limited). A LARGE jump means pos_hi was legitimately
+            # cut — a track change (pos snaps to ~0 while _last_pos still holds the
+            # old song's position), a real seek, or the first frame after a mode
+            # switch. Moving the belt by v×(that jump) would lurch it across the
+            # screen in one frame, so RESEED the baseline and skip the move; the
+            # want-window respawns blocks at their correct absolute X within a
+            # frame or two. This makes the belt immune to ANY pos_hi discontinuity.
+            if abs(delta) > float(self._tune.get("belt_reseed_s", 0.5)):
+                self._strm_rem = 0.0
+            else:
+                dx_f = -d * v * delta + self._strm_rem
+                dx = round(dx_f)
+                self._strm_rem = dx_f - dx
+                if dx:
+                    self.cv.move("strm", dx, 0)
         self._last_pos = pos
 
         # The belt move above (one cv.move) is cheap and runs EVERY frame for
@@ -6682,11 +6701,18 @@ class Overlay:
         center, v = self.work_h / 2.0, max(self.scroll_speed, self._v_floor)
         d = 1 if self.scroll_dir == "bt" else -1          # bt: mid-pos (up); tb: pos-mid (down)
         if self._stream:
-            dy_f = -d * v * (pos - self._last_pos) + self._strm_rem
-            dy = round(dy_f)
-            self._strm_rem = dy_f - dy
-            if dy:
-                self.cv.move("strm", 0, dy)
+            delta = pos - self._last_pos
+            # BELT DISCONTINUITY GUARD (see _ticker_update): a large pos jump =
+            # track change / seek / mode switch. Reseed instead of lurching the
+            # whole column by v×jump in one frame; blocks respawn at correct Y.
+            if abs(delta) > float(self._tune.get("belt_reseed_s", 0.5)):
+                self._strm_rem = 0.0
+            else:
+                dy_f = -d * v * delta + self._strm_rem
+                dy = round(dy_f)
+                self._strm_rem = dy_f - dy
+                if dy:
+                    self.cv.move("strm", 0, dy)
         self._last_pos = pos
         self._tick_n += 1
         if self._tick_n % int(self._tune.get("scroll_fill_skip", self._fill_skip) or 1):
@@ -6891,7 +6917,12 @@ class Overlay:
            mid-song deltas are ignored. ("let the highlights run on what they
            think they are; if they stop because of sync, ignore it.")
 
-        Pauses freeze the clock (status≠PLAYING); seeks snap it.
+        A third layer (§3) slew-limits the VISIBLE output so the belt/index/fill
+        can never lurch: the true clock may step (a stall credit, a correction),
+        but the displayed position chases it at a bounded per-frame rate — zero
+        lag in steady state, a quick smooth catch-up after any step, and a clean
+        cut only on a real seek or track change. Sustained non-PLAYING freezes
+        the clock; a brief blip does not (sticky playback).
         """
         raw_pos = state.get("position", 0.0) if isinstance(state, dict) else 0.0
         playing = True
@@ -6909,11 +6940,14 @@ class Overlay:
             self._hi_locked = False
             self._hi_last_raw = raw_pos        # last SMTC reading seen (change-detect)
             self._hi_corr = 0.0                # pending position correction, bled smoothly
-            return self._hi_clock + self._hi_offset + lead
+            self._hi_play_since = now          # wall-time of the last PLAYING reading
+            self._hi_out = self._hi_clock + self._hi_offset + lead   # slew-limited display
+            return self._hi_out
         raw_dt = now - getattr(self, "_hi_t", now)
         self._hi_t = now
+        nominal_dt = max(0.008, float(self._fps) / 1000.0)   # one frame's worth, in seconds
 
-        # ── 1) smooth song clock ──
+        # ── 1) smooth song clock (ground-truth position estimate) ──
         # Free-run at 1× while playing. CRITICAL: do NOT pull toward the reported
         # position every frame — the browser HOLDS a stale value between SMTC
         # updates, so a continuous pull drags the clock backward (it lags ~1.5s
@@ -6921,35 +6955,36 @@ class Overlay:
         # (a fresh reading = the true position): snap on a seek, else schedule a
         # small correction that bleeds in smoothly over the next few frames.
         #
-        # STALL HANDLING (the "skips a couple lines" bug): a long frame gap means
-        # the Tk thread was BLOCKED (a ~4s sync-read capture, a decide-by-ear
-        # transcribe, a lyric fetch) and the overlay was frozen anyway. Clamping
-        # dt would credit only a fraction of the real elapsed time, so the clock
-        # LOSES time, lags, and SNAPS forward 10-15s later (observed: Δ+15.03s) —
-        # skipping lines mid-song. Instead, on a stall RE-ANCHOR straight to the
-        # player's true position: one accurate catch-up (the render was frozen
-        # regardless), no accumulated lag, no delayed multi-line snap.
-        stall = float(self._tune.get("hi_stall_s", 0.40))
-        if raw_dt > stall:
-            self._hi_clock = raw_pos
-            self._hi_corr = 0.0
-            self._hi_last_raw = raw_pos
-            dt = 0.0
+        # STICKY PLAYBACK (the "fell 7.77s behind then snapped" bug): a brief
+        # non-PLAYING reading (buffering, a tab/SMTC handoff, an app switch) must
+        # NOT freeze the clock. If it does, the clock loses real playback time and
+        # then SNAPS forward when status returns — lurching the belt 2-3 lines.
+        # Keep crediting time through blips shorter than pause_debounce_s; only a
+        # SUSTAINED non-PLAYING state is treated as a real pause.
+        debounce = float(self._tune.get("hi_pause_debounce_s", 0.6))
+        if playing:
+            self._hi_play_since = now
+            play_active = True
         else:
-            dt = max(0.0, raw_dt)
-            if playing:
-                self._hi_clock += dt
-        corr = getattr(self, "_hi_corr", 0.0)              # bleed any pending correction
-        if abs(corr) > 1e-4:
-            cap = 2.0 * dt                                 # up to 2 s/s — fast but continuous
-            step = max(-cap, min(cap, corr))
-            self._hi_clock += step
-            self._hi_corr = corr - step
-        # Only a genuine SEEK (big jump) snaps; sub-threshold gaps bleed in
-        # smoothly via _hi_corr. Raised 1.75→4.0: stalls are already re-anchored
-        # above, so the only gaps left here are small drift + the occasional ~2s
-        # residual — gliding those (instead of snapping) keeps the fill smooth.
+            play_active = (now - getattr(self, "_hi_play_since", now)) < debounce
+
+        # Credit REAL elapsed time every active frame — EVEN across a Tk-thread
+        # stall. The song advanced by raw_dt whether or not we rendered, so
+        # advancing the clock by raw_dt keeps it matching true position with NO
+        # jump. (The old code zeroed dt and hard-set _hi_clock=raw_pos on a stall;
+        # that hard set was itself the visible skip.) Cap one credit at
+        # max_credit_s so a sleep / lid-close / debugger-pause outlier can't
+        # fast-forward minutes; that rare case reconciles via the bleed below.
+        max_credit = float(self._tune.get("hi_max_credit_s", 5.0))
+        dt = max(0.0, min(raw_dt, max_credit))
+        if play_active:
+            self._hi_clock += dt
+
+        # Reconcile to the reported position — only on a FRESH reading, and only
+        # via the bounded bleed (never a hard set) unless it's a genuine large
+        # seek. This keeps drift from accumulating without ever yanking the clock.
         seek_snap = float(self._tune.get("hi_seek_snap_s", 4.0))
+        snapped = False
         if abs(raw_pos - getattr(self, "_hi_last_raw", raw_pos)) > 1e-6:   # fresh reading
             self._hi_last_raw = raw_pos
             gap_p = raw_pos - self._hi_clock
@@ -6957,43 +6992,74 @@ class Overlay:
                 if int(self._tune.get("hi_diag", 1)):
                     log.info("hi-snap: clock %.2f→%.2f (Δ%+.2f) playing=%s",
                              self._hi_clock, raw_pos, gap_p, playing)
-                self._hi_clock = raw_pos                   # seek / big drift → snap
+                self._hi_clock = raw_pos                   # real seek / track scrub → cut
                 self._hi_corr = 0.0
+                snapped = True
             elif abs(gap_p) > 0.05:
                 self._hi_corr = gap_p                      # schedule smooth catch-up
+        corr = getattr(self, "_hi_corr", 0.0)              # bleed any pending correction
+        if abs(corr) > 1e-4:
+            cap = 2.0 * max(dt, nominal_dt)                # up to 2 s/s — fast but continuous
+            step = max(-cap, min(cap, corr))
+            self._hi_clock += step
+            self._hi_corr = corr - step
 
-        # ── 2) sync offset ──
+        # ── 2) sync offset (frozen studio / fast-glide live) ──
         gap_o = target - self._hi_offset
         live = getattr(self, "_live_mode", False) or getattr(self, "_live_arrangement", False)
         if live:
             # LIVE / concert version: the performance timing drifts away from the
-            # studio LRC, and the engine re-syncs aggressively (the live resync
-            # loop). The highlight must FOLLOW those corrections — freezing the
-            # offset here is what made the user say "it's not aggressively syncing
-            # on this concert version". Fast-glide toward the measured offset so
-            # each re-sync lands within a fraction of a second (smooth, not a
-            # teleport). The smooth song clock above still glides between syncs.
+            # studio LRC and the engine re-syncs aggressively. The highlight must
+            # FOLLOW those corrections — freezing the offset here is what made the
+            # user say "it's not aggressively syncing on this concert version".
+            # Fast-glide toward the measured offset; the output slew-limit (§3)
+            # keeps even an aggressive re-sync smooth instead of a teleport.
             rate = float(self._tune.get("hi_live_pull_per_sec", 4.0))
             self._hi_offset += max(-rate * dt, min(rate * dt, gap_o))
             self._hi_locked = False           # re-freeze fresh if it later goes studio
-            return self._hi_clock + self._hi_offset + lead
-        # STUDIO version: freeze the offset mid-song so a sync re-estimate can't
-        # snap the fill across lines.
-        settle_s  = float(self._tune.get("hi_settle_s", 22.0))
-        pull_band = float(self._tune.get("hi_pull_band_s", 3.0))
-        pull_rate = float(self._tune.get("hi_pull_per_sec", 0.6))
-        dead      = float(self._tune.get("hi_deadzone_s", 0.12))
-        if not getattr(self, "_hi_locked", False):
-            self._hi_offset = target
-            if abs(target) > 0.05 or self._hi_clock >= settle_s:
-                self._hi_locked = True
-        elif abs(gap_o) <= dead:
-            self._hi_offset = target
-        elif abs(gap_o) <= pull_band:
-            step = pull_rate * dt
-            self._hi_offset += max(-step, min(step, gap_o))
-        # else: |gap_o| > pull_band, locked → IGNORE (no snap from a re-estimate)
-        return self._hi_clock + self._hi_offset + lead
+        else:
+            # STUDIO version: freeze the offset mid-song so a sync re-estimate
+            # can't snap the fill across lines.
+            settle_s  = float(self._tune.get("hi_settle_s", 22.0))
+            pull_band = float(self._tune.get("hi_pull_band_s", 3.0))
+            pull_rate = float(self._tune.get("hi_pull_per_sec", 0.6))
+            dead      = float(self._tune.get("hi_deadzone_s", 0.12))
+            if not getattr(self, "_hi_locked", False):
+                self._hi_offset = target
+                if abs(target) > 0.05 or self._hi_clock >= settle_s:
+                    self._hi_locked = True
+            elif abs(gap_o) <= dead:
+                self._hi_offset = target
+            elif abs(gap_o) <= pull_band:
+                step = pull_rate * dt
+                self._hi_offset += max(-step, min(step, gap_o))
+            # else: |gap_o| > pull_band, locked → IGNORE (no snap from a re-estimate)
+
+        # ── 3) OUTPUT SLEW LIMIT — the hard no-lurch guarantee ──
+        # The scroll belt, the active-line index, the karaoke fill, AND the GPU
+        # child all read this one return value, and the belt moves by
+        # v·(pos − last_pos) per frame — so any single-frame jump in the output
+        # lurches the belt by multiple lines. _hi_clock above is the true
+        # position and may legitimately STEP (a full-rate elapsed credit after a
+        # stall, a corr bleed, the offset settling). A real Tk-thread stall also
+        # draws NO frames while it lasts, so the first frame afterward would move
+        # the belt by the whole stall in one step. So the VISIBLE output chases
+        # the true clock at a bounded PER-FRAME rate: in steady state it equals
+        # the clock (zero lag — the budget exceeds one frame of real time), and
+        # after any step it catches up over a few frames (a quick smooth scroll,
+        # never a teleport). A genuine seek / track change bypasses the limit
+        # (the belt SHOULD jump there).
+        out_target = self._hi_clock + self._hi_offset + lead
+        prev_out = getattr(self, "_hi_out", out_target)
+        if snapped or abs(out_target - prev_out) > seek_snap:
+            self._hi_out = out_target                      # seek / track change → cut through
+        else:
+            catchup = float(self._tune.get("hi_out_catchup", 4.0))
+            fwd_cap = nominal_dt * (1.0 + catchup)         # forward: realtime + catch-up budget
+            back_cap = nominal_dt * min(catchup, 1.5)      # backward: gentle (reverse-scroll is jarring)
+            delta = max(-back_cap, min(fwd_cap, out_target - prev_out))
+            self._hi_out = prev_out + delta
+        return self._hi_out
 
     def _eased_offset(self):
         """The DISPLAY offset the lyrics + karaoke fill actually use. It EASES
