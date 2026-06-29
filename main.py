@@ -9913,6 +9913,41 @@ class Overlay:
         except Exception:
             return {"available": False, "model": None}
 
+    def get_overlay_state(self):
+        """Compact render state for an EXTERNAL overlay client (the Tauri PoC):
+        the CURRENT line (furigana `漢字(かな)` / romaji / translation), its song-time
+        bounds, and the current display position — so the client renders the line
+        and runs a STEADY LOCAL fill animation (frac = (pos − start)/(end − start),
+        interpolated client-side between polls). Only a LINE CHANGE re-anchors the
+        fill, which is the "only the lyrics follow sync; the highlight just
+        proceeds" principle realized in the renderer itself. Read-only."""
+        st = self.media.get() or {}
+        playing = (st.get("status", PLAYING) == PLAYING)
+        lead = float(self._tune.get("display_lead_s", 0.12))
+        pos = float(st.get("position", 0.0) or 0.0) + float(self.offset) + lead
+        n = len(self.lines)
+
+        def _ln(i):
+            if 0 <= i < n:
+                l = self.lines[i]
+                return {"jp": l.jp, "rm": l.rm, "en": l.en,
+                        "start": round(l.start, 3), "end": round(l.end, 3)}
+            return None
+        idx = self.idx if 0 <= self.idx < n else -1
+        m = self.meta if isinstance(self.meta, dict) else {}
+        return {
+            "playing": playing,
+            "position": round(pos, 3),
+            "idx": idx,
+            "line_count": n,
+            "line": _ln(idx),
+            "next": _ln(idx + 1) if idx >= 0 else None,
+            "title": m.get("title"),
+            "artist": m.get("artist"),
+            "source": m.get("source"),
+            "ts": time.time(),
+        }
+
     def _fire_decision_action(self, state, dims):
         now = time.time()
         log.info("decision-engine: %s -> %s (strikes=%d dims=%s)",
