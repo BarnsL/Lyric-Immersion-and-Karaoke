@@ -6782,59 +6782,93 @@ class Overlay:
 
     def _hi_pos(self, state, lead):
         """The FREE-RUNNING highlight clock — the single timebase for the active
-        line index + karaoke fill (CPU and GPU). It is `song position + a STABLE
-        highlight offset (+lead)`. The highlight offset is FROZEN during steady
-        playback, so mid-song sync re-estimates (boundary-deferred commits,
-        drift nudges, REGEN re-locks, energy corrections) do NOT yank the fill —
-        that yank was the user's "no highlight, then it catches up and snap-fills
-        3 lines". This is the literal implementation of the user's instruction:
-        "let the highlights run on what they think they are; if they're stopping
-        because of sync, ignore it for the highlight only."
+        line index + karaoke fill (CPU and GPU). It is
 
-        The highlight offset re-locks to self.offset ONLY at discrete moments:
-          • a new track (seq change) → lock to the current offset;
-          • the initial lock-in (the early settle window, or any time we haven't
-            locked yet) → a single snap when the real offset first lands;
-          • once locked & steady → a SLOW deadbanded pull that absorbs small
-            clock drift (|gap| ≤ hi_pull_band_s) while IGNORING large deltas.
-        A real video SEEK needs no special case: `position` jumps and pos_hi
-        follows it, keeping the same alignment.
+            (smooth song clock)  +  (frozen sync offset)  +  lead
+
+        and it solves the user's "fill stops halfway, then jumps 2-3 lines fully
+        filled" with TWO independent free-runs:
+
+        1) SMOOTH SONG CLOCK. The browser's SMTC position is reported choppily —
+           it FREEZES for a second or two then JUMPS to catch up. Reading it raw
+           made the fill freeze then leap. Instead we advance our own clock at 1×
+           every frame while playing and only RE-ANCHOR to the reported position:
+           a real seek / big drift (> hi_seek_snap_s) snaps; small drift is gently
+           pulled. In normal playback our 1× clock already matches the true
+           position, so the reported value confirms it (gap ≈ 0) and the fill
+           just glides — it never stops and never jumps.
+
+        2) FROZEN SYNC OFFSET. Mid-song sync re-estimates (boundary-deferred
+           commits, drift nudges, REGEN re-locks, energy corrections) do NOT yank
+           the fill. The offset re-locks only at discrete moments: a new track,
+           the initial lock-in, or a slow deadbanded pull for small drift; large
+           mid-song deltas are ignored. ("let the highlights run on what they
+           think they are; if they stop because of sync, ignore it.")
+
+        Pauses freeze the clock (status≠PLAYING); seeks snap it.
         """
-        position = state.get("position", 0.0) if isinstance(state, dict) else 0.0
+        raw_pos = state.get("position", 0.0) if isinstance(state, dict) else 0.0
+        playing = True
+        if isinstance(state, dict):
+            playing = (state.get("status", PLAYING) == PLAYING)
         target = float(self.offset)
         now = time.time()
         seq = getattr(self, "_track_seq", 0)
-        # (re)initialise on first use or a track change → lock to current offset
-        if getattr(self, "_hi_offset", None) is None or getattr(self, "_hi_seq", -1) != seq:
+        # (re)initialise on first use or a track change → lock to current values
+        if getattr(self, "_hi_clock", None) is None or getattr(self, "_hi_seq", -1) != seq:
+            self._hi_clock = raw_pos
             self._hi_offset = target
             self._hi_seq = seq
             self._hi_t = now
             self._hi_locked = False
-            return position + self._hi_offset + lead
+            self._hi_last_raw = raw_pos        # last SMTC reading seen (change-detect)
+            self._hi_corr = 0.0                # pending position correction, bled smoothly
+            return self._hi_clock + self._hi_offset + lead
         dt = max(0.0, min(0.5, now - getattr(self, "_hi_t", now)))
         self._hi_t = now
+
+        # ── 1) smooth song clock ──
+        # Free-run at 1× while playing. CRITICAL: do NOT pull toward the reported
+        # position every frame — the browser HOLDS a stale value between SMTC
+        # updates, so a continuous pull drags the clock backward (it lags ~1.5s
+        # and zig-zags). Only re-anchor when the reported value actually CHANGES
+        # (a fresh reading = the true position): snap on a seek, else schedule a
+        # small correction that bleeds in smoothly over the next few frames.
+        if playing:
+            self._hi_clock += dt
+        corr = getattr(self, "_hi_corr", 0.0)              # bleed any pending correction
+        if abs(corr) > 1e-4:
+            cap = 2.0 * dt                                 # up to 2 s/s — fast but continuous
+            step = max(-cap, min(cap, corr))
+            self._hi_clock += step
+            self._hi_corr = corr - step
+        seek_snap = float(self._tune.get("hi_seek_snap_s", 1.75))
+        if abs(raw_pos - getattr(self, "_hi_last_raw", raw_pos)) > 1e-6:   # fresh reading
+            self._hi_last_raw = raw_pos
+            gap_p = raw_pos - self._hi_clock
+            if abs(gap_p) > seek_snap:
+                self._hi_clock = raw_pos                   # seek / big drift → snap
+                self._hi_corr = 0.0
+            elif abs(gap_p) > 0.05:
+                self._hi_corr = gap_p                      # schedule smooth catch-up
+
+        # ── 2) frozen sync offset ──
         settle_s  = float(self._tune.get("hi_settle_s", 22.0))
         pull_band = float(self._tune.get("hi_pull_band_s", 3.0))
         pull_rate = float(self._tune.get("hi_pull_per_sec", 0.6))
         dead      = float(self._tune.get("hi_deadzone_s", 0.12))
-        gap = target - self._hi_offset
+        gap_o = target - self._hi_offset
         if not getattr(self, "_hi_locked", False):
-            # PRE-LOCK: track the offset closely so the first real alignment
-            # (decide-by-ear / energy align landing a few seconds in) shows
-            # immediately. We consider ourselves locked once a meaningful offset
-            # has been applied OR the settle window elapses — after which a big
-            # mid-song re-estimate is ignored instead of snapping the fill.
             self._hi_offset = target
-            if abs(target) > 0.05 or position >= settle_s:
+            if abs(target) > 0.05 or self._hi_clock >= settle_s:
                 self._hi_locked = True
-        elif abs(gap) <= dead:
-            self._hi_offset = target                       # already aligned
-        elif abs(gap) <= pull_band:
-            step = pull_rate * dt                          # slow drift correction
-            self._hi_offset += max(-step, min(step, gap))
-        # else: |gap| > pull_band, locked → IGNORE (the highlight free-runs; a
-        #       sync re-estimate must not snap the fill across lines).
-        return position + self._hi_offset + lead
+        elif abs(gap_o) <= dead:
+            self._hi_offset = target
+        elif abs(gap_o) <= pull_band:
+            step = pull_rate * dt
+            self._hi_offset += max(-step, min(step, gap_o))
+        # else: |gap_o| > pull_band, locked → IGNORE (no snap from a re-estimate)
+        return self._hi_clock + self._hi_offset + lead
 
     def _eased_offset(self):
         """The DISPLAY offset the lyrics + karaoke fill actually use. It EASES
@@ -11116,6 +11150,10 @@ class Overlay:
             "idx": idx,
             "fill_frac": round(fill, 4),
             "playing": True,
+            # scroll config so the GL overlay matches the Tk layout (horizontal
+            # belt vs centered block). Cheap; the child treats it as idempotent.
+            "scroll_dir": getattr(self, "scroll_dir", "none"),
+            "scroll_speed": float(getattr(self, "scroll_speed", 200.0) or 200.0),
         })
 
     def _apply_gpu_renderer_toggle(self, on: bool):

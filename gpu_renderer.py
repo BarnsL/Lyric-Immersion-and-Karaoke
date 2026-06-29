@@ -84,6 +84,13 @@ SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
 DWM_BB_ENABLE = 0x01
 DWM_BB_BLURREGION = 0x02
+LWA_COLORKEY = 0x01
+# The chroma key. The GL scene clears to this color (opaque) and DWM makes every
+# pixel exactly this color fully transparent. Pure black: glyphs are bright tints
+# (gold/white/sky/green/gray) so no glyph pixel is ever (0,0,0); the premultiplied
+# fill leaves anti-aliased edges as tint×coverage (a subtle dark rim that reads as
+# a readable outline over video), and only the true-black background is keyed out.
+COLOR_KEY_RGB = 0x000000
 
 
 class DWM_BLURBEHIND(ctypes.Structure):
@@ -92,10 +99,25 @@ class DWM_BLURBEHIND(ctypes.Structure):
 
 
 def enable_per_pixel_alpha(hwnd):
+    # LEGACY (kept for the --opaque-bg self-test only). DWM blur-behind with an
+    # empty region was the original transparency bet, but on Win10/11 it
+    # composites as a SOLID DARK backdrop on the live display (confirmed via a
+    # real screen capture) — the "black background" the overlay showed over
+    # video. The shipping path is set_colorkey() below, which is what the Tk
+    # overlay uses and is immune to the "Transparency effects" setting + MPO
+    # hardware-video planes.
     region = gdi32.CreateRectRgn(0, 0, -1, -1)
     bb = DWM_BLURBEHIND(DWM_BB_ENABLE | DWM_BB_BLURREGION, True, region, False)
     dwmapi.DwmEnableBlurBehindWindow(hwnd, ctypes.byref(bb))
     gdi32.DeleteObject(region)
+
+
+def set_colorkey(hwnd, colorref: int = COLOR_KEY_RGB):
+    """Make `colorref` (a Win32 0x00BBGGRR COLORREF) fully transparent on a
+    LAYERED window via DWM color-keying. Reliable over hardware video and
+    independent of the Windows transparency-effects toggle — unlike blur-behind.
+    The window must already have WS_EX_LAYERED (set by set_exstyle)."""
+    user32.SetLayeredWindowAttributes(hwnd, colorref, 0, LWA_COLORKEY)
 
 
 def set_exstyle(hwnd, click_through: bool, topmost: bool):
@@ -266,9 +288,12 @@ class LyricRenderer:
                                 pygame.OPENGL | pygame.DOUBLEBUF | pygame.NOFRAME)
         pygame.display.set_caption("gpu_renderer (M1)")
         self.hwnd = pygame.display.get_wm_info()["window"]
-        enable_per_pixel_alpha(self.hwnd)
         # Click-through ON from the start: the overlay is non-interactive.
+        # set_exstyle MUST run before set_colorkey (color-key needs WS_EX_LAYERED).
         set_exstyle(self.hwnd, click_through=True, topmost=True)
+        self._opaque_bg = opaque_bg
+        if not opaque_bg:
+            set_colorkey(self.hwnd)         # black → transparent (the real overlay)
         # SDL centers a NOFRAME window; pin it to (0,0) so a full-screen-sized
         # window actually covers the screen and the centered block lands mid-screen.
         # A window spawned from a DETACHED (CREATE_NO_WINDOW) child can come up
@@ -279,9 +304,10 @@ class LyricRenderer:
             user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, self.W, self.H,
                                 SWP_NOACTIVATE)
             user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
-            # Re-assert per-pixel alpha AFTER the show+resize — DWM can drop the
-            # blur-behind region when the window is resized to full-screen.
-            enable_per_pixel_alpha(self.hwnd)
+            # Re-assert the color key AFTER the show+resize (SetWindowLong/Pos
+            # can clear the layered attributes on some drivers).
+            if not opaque_bg:
+                set_colorkey(self.hwnd)
         except Exception:
             pass
 
@@ -311,6 +337,9 @@ class LyricRenderer:
         # State driven by set_state()/tick().
         self._cur_idx = -1                                  # active line index, -1 = none
         self._fill_frac = 0.0                               # 0..1 across active line
+        self._pos = 0.0                                     # song clock (pos_hi) from parent
+        self.scroll_dir = "none"                            # none|lr|rl (vertical block otherwise)
+        self.scroll_speed = 200.0                           # px/s for the horizontal belt
         self._self_heal_t = 0.0                             # SDL ex-style re-assert clock
         # keep-last-line: when idx goes -1 (inter-line gap) hold the previous
         # line on screen for a short window so the overlay never flickers blank.
@@ -383,6 +412,7 @@ class LyricRenderer:
         from the same sync clock that drives the Tk overlay), so the two
         renderers stay byte-identical on which line is active. If the parent
         didn't supply them, fall back to local computation via tick()."""
+        self._pos = pos_raw                  # song clock drives the scroll belt
         if idx is None or fill_frac is None:
             self.tick(pos_raw)
         else:
@@ -395,6 +425,15 @@ class LyricRenderer:
             self._gap_since = None
         elif self._gap_since is None:
             self._gap_since = time.perf_counter()
+
+    def set_scroll(self, scroll_dir: str | None, scroll_speed: float | None = None):
+        """Update the scroll mode/speed the parent (main.py) is using, so the GL
+        overlay matches the Tk overlay's layout (horizontal belt vs centered
+        block). Cheap no-op when unchanged."""
+        if scroll_dir is not None:
+            self.scroll_dir = scroll_dir
+        if scroll_speed is not None and scroll_speed > 0:
+            self.scroll_speed = float(scroll_speed)
 
     def set_lines(self, lines, field: str | None = None):
         """Swap the loaded song. Frees the OLD line-texture cache. Idempotent:
@@ -446,40 +485,47 @@ class LyricRenderer:
             self.ctx.scissor = None
         self.vao.render(mode=moderngl.TRIANGLE_STRIP)
 
-    def _draw_line_block(self, i: int, base_cy: float, fill: float, is_active: bool):
-        """Render one lyric line centered horizontally with its base text at
-        vertical center `base_cy`. Active lines get ruby + romaji + english +
-        the gold karaoke fill; context lines get the dim base + ruby only."""
+    def _draw_line_block(self, i: int, base_cy: float, fill: float, is_active: bool,
+                         cx_center: float | None = None, draw_sub: bool | None = None):
+        """Render one lyric line with its base text horizontally centered on
+        `cx_center` (screen centre by default) and vertically on `base_cy`.
+        Active lines get the gold karaoke fill; `draw_sub` (defaults to
+        is_active) forces romaji+english + bright ruby — the scroll belt passes
+        draw_sub=True so every moving block carries its own translations."""
         rl = self._line_for(i)
         if rl is None or rl.base is None:
             return
+        if cx_center is None:
+            cx_center = self.W / 2.0
+        if draw_sub is None:
+            draw_sub = is_active
         base = rl.base
         # Horizontal origin = the advance-width centering point, so ruby x-centers
         # (advance-based) line up with the base ink.
-        bx = (self.W - rl.base_adv) / 2.0
+        bx = cx_center - rl.base_adv / 2.0
         by = base_cy - base.h / 2.0
-        base_tint = self.BASE_COLOR if is_active else self.CTX_COLOR
+        base_tint = self.BASE_COLOR if (is_active or draw_sub) else self.CTX_COLOR
         self._draw_quad(bx, by, base.w, base.h, base, base_tint)
         if is_active and fill > 0:
             fw = max(1, int(base.w * fill))
             self._draw_quad(bx, by, base.w, base.h, base, self.FILL_COLOR,
                             scissor=(bx, by, fw, base.h))
         # ruby above the base run
-        ruby_a = 1.0 if is_active else 0.7
+        ruby_a = 1.0 if (is_active or draw_sub) else 0.7
         ruby_y = by - self.ruby_h - 1
         rcol = (self.RUBY_COLOR[0], self.RUBY_COLOR[1], self.RUBY_COLOR[2], ruby_a)
         for rt, cx in rl.rubies:
             self._draw_quad(bx + cx - rt.w / 2.0, ruby_y, rt.w, rt.h, rt, rcol)
-        if not is_active:
+        if not draw_sub:
             return
-        # romaji + english stacked under the base
+        # romaji + english stacked under the base (centered on the same cx)
         yb = by + base.h + 6
         if rl.rm:
-            self._draw_quad((self.W - rl.rm.w) / 2.0, yb, rl.rm.w, rl.rm.h,
+            self._draw_quad(cx_center - rl.rm.w / 2.0, yb, rl.rm.w, rl.rm.h,
                             rl.rm, self.RM_COLOR)
             yb += rl.rm.h + 4
         if rl.en:
-            self._draw_quad((self.W - rl.en.w) / 2.0, yb, rl.en.w, rl.en.h,
+            self._draw_quad(cx_center - rl.en.w / 2.0, yb, rl.en.w, rl.en.h,
                             rl.en, self.EN_COLOR)
 
     def draw(self):
@@ -488,11 +534,16 @@ class LyricRenderer:
         if now - self._self_heal_t > 0.5:
             self._self_heal_t = now
             set_exstyle(self.hwnd, click_through=True, topmost=True)
+            if not self.opaque_bg:
+                set_colorkey(self.hwnd)      # re-assert the chroma key too
 
         if self.opaque_bg:
             self.ctx.clear(0.06, 0.06, 0.09, 1.0)            # debug: opaque dark fill
         else:
-            self.ctx.clear(0.0, 0.0, 0.0, 0.0)
+            # OPAQUE black clear so DWM color-keying (black → transparent) works.
+            # Premultiplied glyph blend over black leaves tint×coverage edges (a
+            # subtle readable rim); only the true-black background is keyed out.
+            self.ctx.clear(0.0, 0.0, 0.0, 1.0)
 
         # Effective active line: the real one, or — during a SHORT inter-line gap
         # — the held previous line (fill=full), so the overlay never flickers
@@ -501,6 +552,13 @@ class LyricRenderer:
         if active < 0 and self._held_idx >= 0 and self._gap_since is not None \
                 and (now - self._gap_since) < self._hold_gap_s:
             active, fill = self._held_idx, 1.0
+
+        # HORIZONTAL SCROLL-THROUGH (mirrors the Tk lr/rl belt). Drawn even during
+        # an inter-line gap so the belt keeps moving; lines are positioned by time.
+        if self.scroll_dir in ("lr", "rl") and self.lines:
+            self._draw_scroll_belt(active, fill)
+            return self._swap()
+
         if active < 0:
             return self._swap()
 
@@ -515,6 +573,27 @@ class LyricRenderer:
             self._draw_line_block(active + 1, cy + dn_pitch, fill=0.0, is_active=False)
         self._draw_line_block(active, cy, fill=fill, is_active=True)
         self._swap()
+
+    def _draw_scroll_belt(self, active: int, fill: float):
+        """Continuous horizontal belt: each line sits at
+        cx = centre + dir·speed·(line_midtime − song_pos), so lines glide across
+        and the one the parent flagged active carries the gold karaoke fill. The
+        song clock (_pos) and scroll config come from the parent each tick, so
+        the belt tracks the SAME free-running highlight clock as the Tk overlay."""
+        pos = self._pos
+        center = self.W / 2.0
+        v = max(self.scroll_speed, 60.0)
+        d = 1.0 if self.scroll_dir == "rl" else -1.0
+        cy = self.H * 0.5
+        margin = 1500.0
+        for i, ln in enumerate(self.lines):
+            t = ln.get("t") or (0.0, 0.0)
+            mid = (t[0] + t[1]) / 2.0
+            cx = center + d * v * (mid - pos)
+            if -margin < cx < self.W + margin:
+                is_act = (i == active)
+                self._draw_line_block(i, cy, fill=(fill if is_act else 0.0),
+                                      is_active=is_act, cx_center=cx, draw_sub=True)
 
     def _swap(self):
         pygame.display.flip()
@@ -695,11 +774,15 @@ def run_ipc_child(width: int | None = None, height: int | None = None,
                 t = msg.get("type")
                 if t == "song":
                     r.set_lines(msg.get("lines") or [], field=msg.get("field"))
+                    if "scroll_dir" in msg or "scroll_speed" in msg:
+                        r.set_scroll(msg.get("scroll_dir"), msg.get("scroll_speed"))
                 elif t == "state":
                     pos_raw = float(msg.get("pos_raw", pos_raw))
                     idx = int(msg.get("idx", -1))
                     fill_frac = float(msg.get("fill_frac", 0.0))
                     playing = bool(msg.get("playing", True))
+                    if "scroll_dir" in msg or "scroll_speed" in msg:
+                        r.set_scroll(msg.get("scroll_dir"), msg.get("scroll_speed"))
                 elif t == "window":
                     # M2 keeps a fixed window; resize is M3 work.
                     pass
