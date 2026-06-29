@@ -1328,6 +1328,30 @@ _LOOP_VER_RE = re.compile(
 )
 
 
+_FROM_EVENT_RE = re.compile(
+    r"\bfrom\b.{0,40}?(?:one[\s-]?man|live|tour|公演|ワンマン|ライヴ|ライブ|フェス|festival)",
+    re.I)
+
+
+def _has_single_song_at_event(title):
+    """True when the title is ONE song performed at a named event — a 'from … LIVE/
+    ONE-MAN/TOUR' reference WITH a real song before it (a quoted 「…」/『…』 head, or
+    non-generic text). Such a video is a single-song LIVE ARRANGEMENT (follow the
+    offset, trust the title, fetch its lyrics/captions), NOT a multi-song concert.
+    Multi-song events are caught by the >10-min length rule and have no single-song
+    head. Fixes 'V.W.P 4th ONE-MAN LIVE「現象Ⅳ」「言葉」' being driven sound-only with
+    captions skipped, when it is just 言葉 performed live."""
+    t = title or ""
+    m = _FROM_EVENT_RE.search(t)
+    if not m:
+        return False
+    pre = t[:m.start()]
+    if re.search(r"[「『][^」』]{1,40}[」』]", pre):     # quoted song before the 'from … LIVE'
+        return True
+    head = pre.strip(" 　【】[]()（）-–—|/・「」『』")
+    return bool(head and not _is_generic_title(head))
+
+
 def is_live_or_compilation(title, duration=None):
     """True for a long video, or one whose title says 'live / concert / festival /
     medley / 3D LIVE / メドレー' — almost always MANY songs under one title, where
@@ -1345,9 +1369,11 @@ def is_live_or_compilation(title, duration=None):
     m = _LIVE_RE.search(title or "")
     if not m:
         return False
-    # A '<song> (from … ONE-MAN LIVE「Event」)' aside is a single song at a concert, not
-    # the concert itself — leave it to is_live_arrangement (FOLLOW offset, trust title).
-    if _live_cue_is_parenthetical_aside(title or "", m):
+    # A single song performed at a concert — '<song> (from … ONE-MAN LIVE「Event」)'
+    # (parenthetical aside) OR '「言葉」from V.W.P 4th ONE-MAN LIVE「現象Ⅳ」' (the head song
+    # + an event reference) — is NOT a multi-song event. Leave it to is_live_arrangement
+    # (FOLLOW the offset, trust the title, fetch lyrics/captions), not sound-only.
+    if _live_cue_is_parenthetical_aside(title or "", m) or _has_single_song_at_event(t):
         return False
     return True
 
@@ -4536,6 +4562,21 @@ class Overlay:
                                 log.info("sync: CONFIRMED offset %+.2fs (two reads agree) → applied", corr)
                                 self._smooth_offset(round(corr, 2), "sync-confirmed")    # TICKET-081
                                 self._last_sound_lock_t = time.time()
+                            elif (getattr(self, "_verified", False)
+                                  and getattr(self, "_title_locked", False)
+                                  and abs(corr) <= float(self._tune.get("fast_lock_max_s", 6.0))):
+                                # FAST-LOCK (TICKET-146): on a VERIFIED + title-locked song
+                                # (already known to be the right song) a MODEST first-read
+                                # offset is real drift, not a chorus-repeat mismatch — commit
+                                # it NOW instead of waiting ~8s for the two-point confirm
+                                # (the studio "found sync at ~1 min" complaint). A LARGE first
+                                # offset (chorus match or big MV intro) still falls through to
+                                # the two-point verification below.
+                                self._pending_corr = 1e9
+                                log.info("sync: FAST-LOCK %+.2fs (verified+locked, modest) → applied", corr)
+                                self._smooth_offset(round(corr, 2), "sync-fast-lock")
+                                self._last_sound_lock_t = time.time()
+                                self._drift_integral = 0.0
                             else:
                                 # TWO-POINT VERIFICATION: a single read of a non-zero
                                 # offset is NEVER applied — on a song with choruses the
@@ -9900,6 +9941,16 @@ class Overlay:
         _authoritative = (_gsrc.startswith("bundled")
                           or (_gsrc in ("youtube-captions", "ocr")
                               and getattr(self, "_body_corroborated", False)))
+        # Closed captions are the video's OWN lyrics — a SWITCH (blacklist + re-fetch)
+        # is futile (the same video returns the same captions) and would blacklist the
+        # only ground-truth source for this concert. Suppress SWITCH on captions; a
+        # genuinely-wrong CC can still be replaced by REGEN (generate-by-ear) below.
+        if state == "SWITCH" and _gsrc == "youtube-captions":
+            log.info("decision: SWITCH suppressed on youtube-captions (re-fetch futile) — holding")
+            self._decision_strikes = max(0, self._decision_strikes - 2)
+            self._decision_state = "CAUTION" if self._decision_strikes >= int(
+                self._tune.get("decision_caution_strikes", 3)) else "TRUST"
+            return
         if state in ("SWITCH", "REGEN") and _authoritative:
             log.info("decision: %s suppressed — %r is authoritative ground truth (holding)",
                      state, _gsrc)
