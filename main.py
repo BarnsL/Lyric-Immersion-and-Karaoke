@@ -5842,6 +5842,13 @@ class Overlay:
         _lead = float(self._tune.get("display_lead_s", 0.3))
         pos = state["position"] + self._eased_offset() + _lead
         pos_raw = state["position"] + self.offset + _lead
+        # pos_hi — the FREE-RUNNING highlight clock. Drives the active-line
+        # index + karaoke fill (CPU and GPU). It rides the song's own position
+        # plus a STABLE offset that is frozen mid-song, so a sync re-estimate
+        # can't yank the fill forward ("no highlight, then snap-fill 3 lines").
+        # See _hi_pos. pos_raw is kept only for perf logging + the deferred-
+        # commit boundary test (the TRUE clock), never for the visible fill.
+        pos_hi = self._hi_pos(state, _lead)
         # ── GPU-RENDERER FAST PATH (v1.1.15 — the performance fix) ──────────
         # When the GL child process is drawing, the MAIN process must do ZERO
         # Pillow/canvas rendering. That CPU text work holds the GIL on the Tk
@@ -5855,13 +5862,13 @@ class Overlay:
         # the normal CPU render resumes automatically next tick.
         if self._gpu_active():
             new = -1
-            for i, ln in enumerate(self.lines):     # raw clock — same as the fill
-                if ln.start <= pos_raw < ln.end:
+            for i, ln in enumerate(self.lines):     # highlight clock — same as the fill
+                if ln.start <= pos_hi < ln.end:
                     new = i
                     break
             self.idx = new
             try:
-                self._gpu_send_state(pos_raw)
+                self._gpu_send_state(pos_hi)
             except Exception:
                 pass
             self.root.after(self._fps, self._tick)
@@ -5875,13 +5882,13 @@ class Overlay:
         branch_tag = "line"
 
         if self.scroll_dir in ("lr", "rl"):       # continuous horizontal scroll-through
-            self._ticker_update(pos, pos_raw)
+            self._ticker_update(pos, pos_hi)       # fill rides the free-running highlight clock
             self._render_frame = True
             self._perf_record(state, pos, pos_raw, "scroll-h")
             self.root.after(self._fps, self._tick)
             return
         if self.scroll_dir in ("tb", "bt"):       # continuous vertical scroll-through
-            self._ticker_update_v(pos, pos_raw)
+            self._ticker_update_v(pos, pos_hi)     # fill rides the free-running highlight clock
             self._render_frame = True
             self._perf_record(state, pos, pos_raw, "scroll-v")
             self.root.after(self._fps, self._tick)
@@ -5896,7 +5903,7 @@ class Overlay:
         # index + fill now track on ONE clock and the highlight just runs.
         new = -1
         for i, ln in enumerate(self.lines):
-            if ln.start <= pos_raw < ln.end:
+            if ln.start <= pos_hi < ln.end:
                 new = i
                 break
         if new != self.idx:
@@ -5923,7 +5930,7 @@ class Overlay:
                     self.cv.delete("all")
                     self._kara = []
         elif new >= 0:
-            self._karaoke(pos_raw)
+            self._karaoke(pos_hi)
 
         self._render_frame = True
         self._perf_record(state, pos, pos_raw, branch_tag)
@@ -5932,7 +5939,7 @@ class Overlay:
         # against the existing per-tick render work. Skipped early via the
         # nullable _gpu_child check inside _gpu_send_state.
         try:
-            self._gpu_send_state(pos_raw)
+            self._gpu_send_state(pos_hi)
         except Exception:
             pass
         self.root.after(self._fps, self._tick)
@@ -6772,6 +6779,62 @@ class Overlay:
         self._pending_offset_t = time.time()
         log.info("sync: deferring %+.2fs → %+.2fs until current line ends (%s)",
                  self.offset, new_off, reason or "auto")
+
+    def _hi_pos(self, state, lead):
+        """The FREE-RUNNING highlight clock — the single timebase for the active
+        line index + karaoke fill (CPU and GPU). It is `song position + a STABLE
+        highlight offset (+lead)`. The highlight offset is FROZEN during steady
+        playback, so mid-song sync re-estimates (boundary-deferred commits,
+        drift nudges, REGEN re-locks, energy corrections) do NOT yank the fill —
+        that yank was the user's "no highlight, then it catches up and snap-fills
+        3 lines". This is the literal implementation of the user's instruction:
+        "let the highlights run on what they think they are; if they're stopping
+        because of sync, ignore it for the highlight only."
+
+        The highlight offset re-locks to self.offset ONLY at discrete moments:
+          • a new track (seq change) → lock to the current offset;
+          • the initial lock-in (the early settle window, or any time we haven't
+            locked yet) → a single snap when the real offset first lands;
+          • once locked & steady → a SLOW deadbanded pull that absorbs small
+            clock drift (|gap| ≤ hi_pull_band_s) while IGNORING large deltas.
+        A real video SEEK needs no special case: `position` jumps and pos_hi
+        follows it, keeping the same alignment.
+        """
+        position = state.get("position", 0.0) if isinstance(state, dict) else 0.0
+        target = float(self.offset)
+        now = time.time()
+        seq = getattr(self, "_track_seq", 0)
+        # (re)initialise on first use or a track change → lock to current offset
+        if getattr(self, "_hi_offset", None) is None or getattr(self, "_hi_seq", -1) != seq:
+            self._hi_offset = target
+            self._hi_seq = seq
+            self._hi_t = now
+            self._hi_locked = False
+            return position + self._hi_offset + lead
+        dt = max(0.0, min(0.5, now - getattr(self, "_hi_t", now)))
+        self._hi_t = now
+        settle_s  = float(self._tune.get("hi_settle_s", 22.0))
+        pull_band = float(self._tune.get("hi_pull_band_s", 3.0))
+        pull_rate = float(self._tune.get("hi_pull_per_sec", 0.6))
+        dead      = float(self._tune.get("hi_deadzone_s", 0.12))
+        gap = target - self._hi_offset
+        if not getattr(self, "_hi_locked", False):
+            # PRE-LOCK: track the offset closely so the first real alignment
+            # (decide-by-ear / energy align landing a few seconds in) shows
+            # immediately. We consider ourselves locked once a meaningful offset
+            # has been applied OR the settle window elapses — after which a big
+            # mid-song re-estimate is ignored instead of snapping the fill.
+            self._hi_offset = target
+            if abs(target) > 0.05 or position >= settle_s:
+                self._hi_locked = True
+        elif abs(gap) <= dead:
+            self._hi_offset = target                       # already aligned
+        elif abs(gap) <= pull_band:
+            step = pull_rate * dt                          # slow drift correction
+            self._hi_offset += max(-step, min(step, gap))
+        # else: |gap| > pull_band, locked → IGNORE (the highlight free-runs; a
+        #       sync re-estimate must not snap the fill across lines).
+        return position + self._hi_offset + lead
 
     def _eased_offset(self):
         """The DISPLAY offset the lyrics + karaoke fill actually use. It EASES
