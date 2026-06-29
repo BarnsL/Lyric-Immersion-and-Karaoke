@@ -265,9 +265,17 @@ class LyricRenderer:
         set_exstyle(self.hwnd, click_through=True, topmost=True)
         # SDL centers a NOFRAME window; pin it to (0,0) so a full-screen-sized
         # window actually covers the screen and the centered block lands mid-screen.
+        # A window spawned from a DETACHED (CREATE_NO_WINDOW) child can come up
+        # hidden, so explicitly SHOW it without stealing focus (SW_SHOWNOACTIVATE)
+        # — this is the fix for "GPU child renders but nothing is visible".
+        SW_SHOWNOACTIVATE = 4
         try:
             user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, self.W, self.H,
                                 SWP_NOACTIVATE)
+            user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
+            # Re-assert per-pixel alpha AFTER the show+resize — DWM can drop the
+            # blur-behind region when the window is resized to full-screen.
+            enable_per_pixel_alpha(self.hwnd)
         except Exception:
             pass
 
