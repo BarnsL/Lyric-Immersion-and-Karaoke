@@ -11235,17 +11235,27 @@ class Overlay:
             ln = self.lines[idx]
             dur = max(0.001, ln.end - ln.start)
             fill = max(0.0, min(1.0, (pos_raw - ln.start) / dur))
+        try:
+            playing = (self.media.get() or {}).get("status") == PLAYING
+        except Exception:
+            playing = True
         self._gpu_send({
             "type": "state",
             "pos_raw": round(float(pos_raw), 3),
             "offset": round(float(self.offset), 3),
             "idx": idx,
             "fill_frac": round(fill, 4),
-            "playing": True,
+            "playing": bool(playing),
             # scroll config so the GL overlay matches the Tk layout (horizontal
             # belt vs centered block). Cheap; the child treats it as idempotent.
             "scroll_dir": getattr(self, "scroll_dir", "none"),
             "scroll_speed": float(getattr(self, "scroll_speed", 200.0) or 200.0),
+            # SETTINGS PARITY — opacity / position / font scale, same as the Tk
+            # overlay, so toggling the renderer doesn't change the look.
+            "opacity": round(float(getattr(self, "opacity", 1.0) or 1.0), 3),
+            "pos_y": getattr(self, "pos_y", "center"),
+            "pos_x": getattr(self, "pos_x", "center"),
+            "font_scale": round(float(getattr(self, "font_scale", 1.0) or 1.0), 3),
         })
 
     def _apply_gpu_renderer_toggle(self, on: bool):
