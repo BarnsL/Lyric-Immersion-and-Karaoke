@@ -88,13 +88,15 @@ _LC_HANGUL = re.compile(r"[가-힣ᄀ-ᇿ]")
 # artist (the channel/label is the reliable cue). Expand as needed; this is the
 # "ran against a database of known artists" cue the title/script alone can't give.
 _KNOWN_JA = (
-    "hololive", "regloss", "dev_is", "dev is", "holostars", "kamitsubaki",
+    "hololive", "regloss", "re gloss", "dev_is", "dev is", "holostars", "holo x",
+    "flow glow", "kamitsubaki",
     "v.w.p", "vwp", "virtual witch", "neko hacker", "phase connect", "phase-connect",
     # VTuber acts / J-artists the user plays
     "reol", "kanaria", "suisei", "hoshimachi", "hoshimatic", "kanade", "otonose",
     "ririka", "ichijou", "raden", "juufuutei", "hajime", "todoroki", "hiodoshi",
     "ouro kronii", "kaf", "kanaeru", "kobo", "michiru shisui", "kaneko lumi",
-    "harusaruhi", "isekaijoucho", "rim", "理芽", "幸祜",
+    "harusaruhi", "isekaijoucho", "rim", "laplus", "la+", "laplus darkness",
+    "kizuna ai", "kizunaai", "理芽", "幸祜",
 )
 
 # A subset of _KNOWN_JA that is UNAMBIGUOUS and consistent enough that the
