@@ -1436,6 +1436,33 @@ def clean_artist(artist, source=""):
     return a or (artist or "")
 
 
+# Bare social-media / site names that a browser tab title delivers as a fake
+# "track" — the PAGE, not a song. A poisoned instagram.json (literally titled
+# "Instagram") was matching the tab title and showing junk rap lyrics over
+# Instagram reels. Reject these as track titles when there's no real artist
+# (a genuine song titled "Instagram" by a named artist still works).
+_JUNK_SITE_NAMES = frozenset({
+    "instagram", "facebook", "tiktok", "twitter", "x", "reddit", "threads",
+    "snapchat", "linkedin", "pinterest", "tumblr", "whatsapp", "telegram",
+    "messenger", "new tab", "new private tab", "新しいタブ", "home",
+})
+
+
+def _is_junk_track_title(title: str, artist: str) -> bool:
+    """True when `title` is a bare social/site page name with no real artist —
+    i.e. the browser reported the tab, not a song. Strips a leading unread
+    count '(6) ' and a trailing ' • Messages' / ' • Reels' section marker."""
+    if artist and artist.strip():
+        return False                      # a named artist ⇒ treat as a real song
+    t = (title or "").strip().lower()
+    if not t:
+        return False
+    t = re.sub(r"^\(\d+\)\s*", "", t)     # '(6) Instagram' → 'Instagram'
+    t = re.split(r"\s*[•|]\s*", t)[0].strip()   # 'Instagram • Messages' → 'Instagram'
+    t = re.sub(r"\.(com|net|org)$", "", t)      # 'instagram.com' → 'instagram'
+    return t in _JUNK_SITE_NAMES
+
+
 # ── Lyrics data ──────────────────────────────────────────────────────
 
 @dataclass
@@ -1451,8 +1478,20 @@ _TS_RE = re.compile(r"\[\d+:\d+(?:\.\d+)?\]|<\d+:\d+(?:\.\d+)?>")
 
 
 def _clean(s):
-    """Strip any stray inline LRC timestamp tags ([mm:ss], <mm:ss>) from text."""
-    return _TS_RE.sub("", s).strip()
+    """Strip any stray inline LRC timestamp tags ([mm:ss], <mm:ss>) from text,
+    and the OCR-style tofu glyphs (□ / ◢ / U+FFFD / exotic whitespace) that
+    can also leak in from LRC providers. TICKET-128 originally limited
+    _strip_tofu() to ocr_lyrics; the BEEP BEEP / Hoshimatic Project case
+    ('Stop!□Oh woah woah woah □') showed syncedlyrics can deliver them too,
+    so apply it on EVERY load — covers cached files immediately without a
+    re-fetch."""
+    s = _TS_RE.sub("", s or "").strip()
+    try:
+        from ocr_lyrics import _strip_tofu
+        s = _strip_tofu(s)
+    except Exception:
+        pass
+    return s
 
 
 def load_lyrics(path):
@@ -1871,6 +1910,13 @@ class Overlay:
         self.generate_on = bool(s.get("generate", True))  # generate lyrics by ear
         self.captions_on = bool(s.get("captions", True))   # prefer YouTube caption track for browser videos
         self.concert_ocr = bool(s.get("concert_ocr", True)) # banner-text fallback song-ID during concerts
+        # v1.1.15: GPU-driven lyric renderer DEFAULT ON. The GL child process
+        # draws on the idle GPU at 100+ fps while the main process stops doing
+        # ANY Pillow/canvas work — that removes the GIL contention that caused
+        # audio stutter + the disappear/reappear flicker + highlight lag. If the
+        # child can't spawn or dies, the app silently falls back to the Tk
+        # renderer (_gpu_active restores the window), so default-on is safe.
+        self.gpu_renderer_on = bool(s.get("gpu_renderer", True))
         # TICKET-100: opt-in Discord Rich Presence reader; default OFF (mirrors
         # generate_on — both are "extra effort" features users opt into). Persists
         # under settings key 'discord_rpc'. Tray toggle and tune knob both write
@@ -2055,6 +2101,8 @@ class Overlay:
         self.lines: list[Line] = []
         self.meta: dict = {}
         self.idx = -1
+        self._last_line_idx = -1        # previous real line, held during short gaps
+        self._gap_start_t = None        # wall-time we entered an inter-line gap
         self._track = None
         self._lyrics_path = None
         self._kara = []
@@ -2311,10 +2359,11 @@ class Overlay:
                                             # (so it can't lock inside ONE repeating chorus pass)
             "force_sync_top_n":        6,   # candidate offsets ranked per read (try best→next on failure)
             "energy_apply_min":      0.4,   # min |new-old| to apply correlation
-            "energy_lift_floor":     0.10,  # min peak-vs-median lift to accept
+            "energy_lift_floor":     0.045, # min peak-vs-median lift to accept (was 0.10; kamone's correct shift had lift≈0.049 and was being rejected, so the cache loaded right but sync never locked). Rival-peak margin + Shazam sanity + energy_apply_min still guard false alarms.
             "energy_max_offset":    60.0,   # |new_off| < this for sanity
             "energy_shift_penalty":  0.012, # per-second penalty for large offset changes (small-shift prior)
             "energy_peak_margin":    0.06,  # reject if a distant rival peak is within this of the best
+            "keep_last_line_gap_s":  0.6,   # CPU renderer: hold the previous line on-canvas during inter-line gaps shorter than this, to kill the disappear/reappear flicker (GPU renderer holds independently)
             # ── render perf knobs (SCROLL-MODE ONLY — scroll-through smoothness) ──
             # scroll_heavy_budget_ms caps the per-frame spawn/repaint work so a PIL
             # paste can't stall the scroll belt; 0 disables the cap. NONE of these
@@ -2382,6 +2431,14 @@ class Overlay:
             # many cores). Hardware-agnostic: the mask is computed from the live CPU
             # topology, so it is correct on 2..64-thread machines, SMT or not.
             "cpu_dedicate_last_core":       1,
+            # ── GPU-driven lyric renderer (M2) ──
+            # 1 = spawn gpu_renderer.py as a child process, feed it state over
+            # stdin NDJSON, hide the Tk overlay window. The child window does
+            # the actual drawing on the idle GPU (3080 eGPU here) at 100+ FPS
+            # with per-pixel-alpha + click-through + topmost. 0 (default) =
+            # Tk renderer drives display as it always has. Flip via /tune
+            # gpu_renderer_on=1 (live); a track change is not required.
+            "gpu_renderer_on":              0,  # 1 = GPU child renderer, 0 = legacy Tk
             # ── TICKET-089 Whisper language lock ──
             # 1 = pin Whisper to the song's known language for deep transcription
             # (the auto-detect default lets Whisper hallucinate Japanese on
@@ -2665,6 +2722,27 @@ class Overlay:
         if not artist and " - " in title:
             a, t = title.split(" - ", 1)
             artist, title = a.strip(), t.strip()
+        # Reject a bare social/site page title ('Instagram', '(6) Instagram',
+        # 'TikTok' …) — that's the browser tab, not a song. Clear the overlay so
+        # lyrics vanish when the user is just browsing a feed, and bail before
+        # any fetch / title-match (a poisoned instagram.json used to load junk
+        # rap lyrics over Instagram reels — the "stop it" bug).
+        if _is_junk_track_title(title, artist):
+            log.info("ignoring non-music page %r — not a song; clearing overlay", title)
+            self._track = (artist, title)
+            if self.lines or self._lyrics_path is not None:
+                self.lines, self.meta, self._lyrics_path = [], {"source": ""}, None
+                self.idx = -1
+                self._cancel_pending_swap() if hasattr(self, "_cancel_pending_swap") else None
+                try:
+                    self.cv.delete("all")
+                except Exception:
+                    pass
+                try:
+                    self._gpu_send_song()      # tell the GL child to go blank too
+                except Exception:
+                    pass
+            return
         # TICKET-114: re-anchor the instrumental-gap timer on EVERY SMTC track
         # event (including the same-song re-report below). Without this, the
         # boot-time stamp from __init__ (line 2042) is never cleared when the
@@ -2677,6 +2755,8 @@ class Overlay:
         # re-stamps on the very next tick where idx is still -1, so this
         # zero-then-restamp is safe for both branches.
         self._idx_minus_one_since = 0.0
+        self._last_line_idx = -1        # new song → forget the prior song's held line
+        self._gap_start_t = None        # …and its gap timer (keep-last-line state)
         # SMTC re-reports the SAME song mid-playback (YouTube nudges its metadata —
         # a channel suffix appears/disappears, the title reflows), which flips the
         # cleaned (artist,title) tuple and used to re-enter here and WIPE a confirmed
@@ -5065,6 +5145,39 @@ class Overlay:
             self.lines, self.meta, self._lyrics_path = [], {"source": ""}, None
             self.root.after(50, self._begin_generation)
             return
+        # Fast-switch language sanity check: a cached body's lang is incompatible
+        # with the artist's known language (Kanade / 音乃瀬奏 cover of 怪獣の花唄
+        # loaded a Spanish body with lang=es; without this the decision engine
+        # took ~30 s of strikes to switch, eating most of a 3:47 song). Reject
+        # the bad cache + re-fetch immediately — bypasses the strike accumulator
+        # for the unambiguous "wrong-language-for-artist" case. Once-per-track
+        # via _lang_rejected_seq so a stubborn provider can't loop.
+        try:
+            from fetch_lyrics import is_jp_vagency
+            _BAD_LANGS_FOR_JP = ("ko", "zh", "es", "de", "ru", "fr", "it", "pt")
+            _blang = (self.meta.get("lang") or "").lower()
+            _btitle = self.meta.get("title") or ""
+            _bartist = self.meta.get("artist") or ""
+            if (self.lines and _xsrc not in ("bundled",)
+                    and self._track_seq != getattr(self, "_lang_rejected_seq", None)
+                    and _blang in _BAD_LANGS_FOR_JP
+                    and is_jp_vagency(_btitle, _bartist, strict=(_blang == "zh"))):
+                log.info("load: rejected lang=%s body for JP-act %r / %r "
+                         "(src=%s) → re-fetching", _blang, _btitle, _bartist, _xsrc)
+                self._lang_rejected_seq = self._track_seq
+                # Bin the stale file so the re-fetch doesn't immediately re-pick it.
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self.lines, self.meta, self._lyrics_path = [], {"source": ""}, None
+                # Kick a fresh fetch chain. report_wrong() is the existing
+                # re-identify path — it clears decision state + re-runs the
+                # full provider chain (now under v1.1.10's stricter guards).
+                self.root.after(50, self.report_wrong)
+                return
+        except Exception as e:
+            log.info("load: language sanity check raised %s — continuing", e)
         self._lyrics_path = Path(path)
         self._block_cache.clear()      # PERF-102: line idx → bitmap cache is per-song
         self._prewarm_token += 1       # cancel any prewarm still running for the old song
@@ -5194,14 +5307,14 @@ class Overlay:
     def _tick_body(self):
         # TICKET-088: CANONICAL same-tick offset-write ordering — every path that
         # writes self.offset within ONE _tick MUST run in this order, and the
-        # combined writes for a single tick must stay ≤ 2 (one tier/deferred
-        # commit + one pause-end re-base at most). Anything else is a race that
-        # can produce a visible snap.
+        # combined writes for a single tick must stay ≤ 1 (one tier/deferred
+        # commit at most). Anything else is a race that can produce a visible
+        # snap.
         #   1. deferred-commit consumes self._pending_offset       (queued earlier)
-        #   2. fine-tune pause-end re-bases self.offset            (or re-queues)
-        #   3. eased display offset is read for THIS frame's render
-        # The race guard (`had_pending_pre`) below makes step 2 yield to step 1
-        # when both fire on the same tick; step 2 then re-queues its delta into
+        #   2. eased display offset is read for THIS frame's render
+        # (The historical step 2 — fine-tune pause-end re-base — was retired
+        # when the fine-tune PAUSE freeze was removed; corrections now route
+        # through _smooth_offset and land in step 1's pending_offset queue.)
         # _pending_offset (TICKET-088 item 4) rather than dropping it.
         # The _tick_offset_writes counter is bumped by _commit_offset; if more
         # than 2 writes land in one tick AND assert_same_tick is enabled, we
@@ -5578,10 +5691,9 @@ class Overlay:
         # before the next line is picked under the new offset. Capped at 8s in
         # case idx gets stuck so a pending correction can't strand forever.
         # SAME-TICK RACE GUARD: snapshot whether a deferred commit was pending
-        # BEFORE we consume it, so the fine-tune pause-end below can tell the
-        # difference between "no commit was ever queued" (safe to apply pause
-        # subtraction) and "commit just fired this tick" (subtraction would
-        # corrupt the freshly-set offset).
+        # BEFORE we consume it. Historically used by the fine-tune pause-end
+        # block (now retired); kept because TICKET-088's same-tick assertion
+        # still reads it via _tick_offset_writes accounting.
         had_pending_pre = self._pending_offset is not None
         if self._pending_offset is not None and self.lines:
             cur_pos = state["position"] + self.offset
@@ -5613,47 +5725,10 @@ class Overlay:
             self._try_apply_swap()
         except Exception as e:
             log.info("swap: _try_apply_swap raised %s", e)
-        # FINE-TUNE pause EXPIRY (placed ABOVE the pos computation so the offset
-        # adjustment is reflected in THIS frame's pos / pos_raw — zero visible
-        # discontinuity: the held frame becomes the resumed frame).
-        # RACE GUARD: if a tier commit queued a `_pending_offset` (consumed THIS
-        # tick OR still pending), that commit's offset is authoritative;
-        # subtracting our pause delta on top would corrupt it. Just drop the
-        # pause buffers and let the deferred commit drive the next frames.
-        if self._fine_pause_until and time.time() >= self._fine_pause_until:
-            amt = self._fine_pause_amount
-            if not had_pending_pre and self._pending_offset is None:
-                new_off = round(self.offset - amt, 2)
-                # also slide the eased display offset in lockstep so _eased_offset
-                # doesn't see a spurious target jump and re-ramp.
-                cur_disp = getattr(self, "_display_offset", None)
-                if cur_disp is not None:
-                    self._display_offset = cur_disp - amt
-                    self._display_offset_t = time.time()
-                log.info("fine-tune pause end: applied %+.2fs (offset %+.2fs → %+.2fs)",
-                         -amt, self.offset, new_off)
-                # TICKET-088: route through atomic _commit_offset (reset_display
-                # =False because we just slid display_offset in lockstep above).
-                self._commit_offset(new_off, reset_display=False)
-            else:
-                # TICKET-088: instead of DROPPING the pause delta (the old code
-                # silently lost the fine-tune correction whenever a tier commit
-                # raced it), FOLD it into the pending offset so the deferred
-                # commit picks it up at the next line boundary. Combines both
-                # corrections in a single atomic write instead of either-or.
-                existing = self._pending_offset if self._pending_offset is not None else self.offset
-                merged = round(existing - amt, 2)
-                self._pending_offset = merged
-                self._pending_offset_t = time.time()
-                log.info("fine-tune pause end: tier commit pending → re-queued pause delta "
-                         "%+.2fs into pending offset (was %s, now %+.2fs)",
-                         -amt,
-                         "None" if not had_pending_pre else f"{existing:+.2f}",
-                         merged)
-            self._fine_pause_until = 0.0
-            self._fine_pause_pos_eased = None
-            self._fine_pause_pos_raw = None
-            self._fine_pause_amount = 0.0
+        # (v1.0.85 fine-tune PAUSE expiry block removed — the freeze it managed
+        # was retired in favor of _smooth_offset boundary-deferred rewinds. The
+        # _fine_pause_* fields stay on the instance at their default 0.0/None for
+        # /diag telemetry continuity but are never set anywhere.)
         # TICKET-088: same-tick offset-write assertion. _commit_offset bumps
         # _tick_offset_writes; the canonical max within one tick is 2
         # (deferred-commit + pause-end). More than that is a race regression.
@@ -5678,32 +5753,48 @@ class Overlay:
         #              ahead then snaps back" stutter the user kept seeing.
         pos = state["position"] + self._eased_offset()
         pos_raw = state["position"] + self.offset
-        # FINE-TUNE pause OVERRIDE: if a pause is in flight, FREEZE both pos and
-        # pos_raw to the values captured at pause entry. Scroll belt, line idx,
-        # and karaoke fill all key off these — they freeze together with no work
-        # done to them individually. The held frame remains on screen for the
-        # pause duration; pause-end (above) then re-bases self.offset so the
-        # resumed frame equals the held frame.
+        # ── GPU-RENDERER FAST PATH (v1.1.15 — the performance fix) ──────────
+        # When the GL child process is drawing, the MAIN process must do ZERO
+        # Pillow/canvas rendering. That CPU text work holds the GIL on the Tk
+        # thread and was the root cause of the THREE symptoms the user reported
+        # together: audio stutter, the "lyrics disappear for a millisecond then
+        # reappear" frame-drop flicker, and the highlight lagging ~2 lines (the
+        # tick that computes the active line was being blocked by render work).
+        # Here we ONLY compute the active-line index + push it to the child over
+        # IPC, then reschedule and return — every _render/_karaoke/scroll-belt
+        # path below is skipped. If the child dies, _gpu_active() flips False and
+        # the normal CPU render resumes automatically next tick.
+        if self._gpu_active():
+            new = -1
+            for i, ln in enumerate(self.lines):
+                if ln.start <= pos < ln.end:
+                    new = i
+                    break
+            self.idx = new
+            try:
+                self._gpu_send_state(pos_raw)
+            except Exception:
+                pass
+            self.root.after(self._fps, self._tick)
+            return
+        # Highlight + line index + scroll belt always track the current raw clock.
+        # The v1.0.85 fine-tune PAUSE override (freezing pos/pos_raw on forward
+        # drift) was removed — the user reported the freeze as "unreliable
+        # highlighting, always pausing". Sync corrections now go through
+        # _smooth_offset (boundary-deferred) so the offset commits at the next
+        # line boundary instead of freezing the highlight mid-line.
         branch_tag = "line"
-        if self._fine_pause_until and time.time() < self._fine_pause_until:
-            if self._fine_pause_pos_eased is not None:
-                pos = self._fine_pause_pos_eased
-            if self._fine_pause_pos_raw is not None:
-                pos_raw = self._fine_pause_pos_raw
-            branch_tag = "fine-pause"
 
         if self.scroll_dir in ("lr", "rl"):       # continuous horizontal scroll-through
             self._ticker_update(pos, pos_raw)
             self._render_frame = True
-            self._perf_record(state, pos, pos_raw,
-                              branch_tag if branch_tag == "fine-pause" else "scroll-h")
+            self._perf_record(state, pos, pos_raw, "scroll-h")
             self.root.after(self._fps, self._tick)
             return
         if self.scroll_dir in ("tb", "bt"):       # continuous vertical scroll-through
             self._ticker_update_v(pos, pos_raw)
             self._render_frame = True
-            self._perf_record(state, pos, pos_raw,
-                              branch_tag if branch_tag == "fine-pause" else "scroll-v")
+            self._perf_record(state, pos, pos_raw, "scroll-v")
             self.root.after(self._fps, self._tick)
             return
 
@@ -5715,15 +5806,39 @@ class Overlay:
         if new != self.idx:
             self.idx = new
             if new >= 0:
+                # Entering a real line — render it + arm the held-line state.
+                self._last_line_idx = new
+                self._gap_start_t = None
                 self._render(self.lines[new])
             else:
-                self.cv.delete("all")
-                self._kara = []
+                # Entering an inter-line gap (new == -1). Hold the previous line
+                # on-canvas for gaps shorter than keep_last_line_gap_s so the
+                # overlay doesn't flicker blank between consecutive lines; clear
+                # only once the gap is genuinely long (instrumental) or there's
+                # no prior line. _gap_start_t is reset on track change AND armed
+                # here, so a stale value can't leak across songs.
+                if self._gap_start_t is None:
+                    self._gap_start_t = time.time()
+                gap_dur = time.time() - self._gap_start_t
+                gap_hold = float(self._tune.get("keep_last_line_gap_s", 0.6))
+                hold_ok = (gap_dur < gap_hold
+                           and 0 <= self._last_line_idx < len(self.lines))
+                if not hold_ok:
+                    self.cv.delete("all")
+                    self._kara = []
         elif new >= 0:
             self._karaoke(pos_raw)
 
         self._render_frame = True
         self._perf_record(state, pos, pos_raw, branch_tag)
+        # M2: feed the GPU renderer child (if active) one state message per
+        # tick. The cost is one JSON-encode + pipe-write of ~80 bytes; cheap
+        # against the existing per-tick render work. Skipped early via the
+        # nullable _gpu_child check inside _gpu_send_state.
+        try:
+            self._gpu_send_state(pos_raw)
+        except Exception:
+            pass
         self.root.after(self._fps, self._tick)
 
     # ── drawing ──
@@ -6837,6 +6952,67 @@ class Overlay:
             "fine_tuning": bool(getattr(self, "_fine_active", False)),
         }
 
+    def get_measure_sync(self) -> dict:
+        """Snapshot for GET /measure_sync — the SYNC ACCURACY METER. Quantifies the
+        'highlight is N lines behind' symptom by comparing the line currently SHOWN
+        against the line that SHOULD be active for the real audio position.
+
+        shown_idx      = the line the overlay is highlighting right now (self.idx)
+        should_idx     = the line whose [start,end] contains pos_raw
+        lag_lines      = should_idx - shown_idx (positive = highlight is BEHIND)
+        lag_s          = how far pos_raw is past the shown line's window (0 if inside)
+        plus the offset, last energy best_shift/score, and the last heard transcription.
+        """
+        st = self.media.get() or {}
+        player_pos = float(st.get("position") or 0.0)
+        pos_raw = player_pos + self.offset
+        lines = self.lines or []
+
+        def _window(i):
+            return [lines[i].start, lines[i].end] if 0 <= i < len(lines) else None
+
+        should_idx = -1
+        for i, ln in enumerate(lines):
+            if ln.start <= pos_raw < ln.end:
+                should_idx = i
+                break
+        shown_idx = self.idx if 0 <= self.idx < len(lines) else -1
+
+        # seconds the audio is past the SHOWN line's end (the visible lag), or
+        # negative if the shown line hasn't started yet.
+        lag_s = None
+        sw = _window(shown_idx)
+        if sw is not None:
+            if pos_raw > sw[1]:
+                lag_s = round(pos_raw - sw[1], 2)      # audio past the shown line
+            elif pos_raw < sw[0]:
+                lag_s = round(pos_raw - sw[0], 2)      # audio before it (negative)
+            else:
+                lag_s = 0.0
+        en = getattr(self, "_last_energy", None) or {}
+        sound = getattr(self, "_sound_song", None)
+        return {
+            "player_pos_s": round(player_pos, 2),
+            "offset_s": round(self.offset, 2),
+            "pos_raw_s": round(pos_raw, 2),
+            "shown_idx": shown_idx,
+            "shown_window": sw,
+            "shown_text": (lines[shown_idx].jp if 0 <= shown_idx < len(lines) else None),
+            "should_idx": should_idx,
+            "should_window": _window(should_idx),
+            "should_text": (lines[should_idx].jp if 0 <= should_idx < len(lines) else None),
+            "lag_lines": (should_idx - shown_idx) if (should_idx >= 0 and shown_idx >= 0) else None,
+            "lag_s": lag_s,
+            "n_lines": len(lines),
+            "source": self.meta.get("source"),
+            "gpu_renderer": bool(getattr(self, "gpu_renderer_on", False)),
+            "energy_best_shift": en.get("best_shift"),
+            "energy_best_score": en.get("best_score"),
+            "energy_ambiguous": en.get("ambiguous"),
+            "heard_song": list(sound) if sound else None,
+            "in_sync": bool(should_idx == shown_idx),
+        }
+
     def force_resync(self):
         """POST /resync — hammer every sync method at once: an energy re-align (which
         escalates to OCR on a weak peak) plus a direct OCR-assisted alignment. Spawns a
@@ -7368,6 +7544,14 @@ class Overlay:
                 )
             except Exception:
                 pass
+        # M2: a /tune flip of gpu_renderer_on starts or stops the GL child
+        # immediately. The Tk overlay window is hidden while the child is
+        # alive so the user sees only the GPU-driven render.
+        if key == "gpu_renderer_on":
+            try:
+                self._apply_gpu_renderer_toggle(bool(new))
+            except Exception as e:
+                log.info("gpu_renderer toggle failed: %s", e)
         return True, f"{key}: {old} → {new}"
 
     # ── appearance (persisted) ──
@@ -7678,6 +7862,7 @@ class Overlay:
                         "character": self.character_on, "api": self.api_on,
                         "boundary": self.boundary_on, "generate": self.generate_on,
                         "captions": self.captions_on,
+                        "gpu_renderer": self.gpu_renderer_on,
                         "discord_rpc": self.discord_rpc_on,
                         "window_titles": self.window_titles_on,
                         "window_titles_generic_browsers":
@@ -8255,6 +8440,14 @@ class Overlay:
         shrink/grow per song and re-anchor to the bottom). Here only the content
         offset `_lane_y0` changes, so bottom-anchored lines stay pinned to the
         bottom and simply grow upward when there are more rows."""
+        # M2: notify the GPU renderer child (if running) that a new song is
+        # loaded. Hooked here because _relayout_song() is the canonical
+        # "lyrics are now ready to render" entry point — load(), captions,
+        # generation, OCR, /forcesync all flow through here.
+        try:
+            self._gpu_send_song()
+        except Exception:
+            pass
         s = self.font_scale * self._auto_scale
         has_rm = has_en = False
         for ln in getattr(self, "lines", None) or []:
@@ -8616,7 +8809,23 @@ class Overlay:
         it. Captions are ground truth → they replace whatever LRC was showing."""
         if seq != self._track_seq or not lines:
             return
-        from fetch_lyrics import slugify
+        # JP-vagency language guard: a known JP act (ReGLOSS / hololive / Hajime /
+        # Suisei / Kanade …) doesn't release Korean/Chinese/European-language
+        # songs, so a ko/zh/es/de/ru/fr/it/pt captions track is a fan-translation
+        # upload — applying it shows wrong-language lyrics over Japanese vocals
+        # (the flashpoint.json Korean case + the 怪獣の花唄 Spanish case). Same
+        # rejection set as fetch_lyrics.take()'s European-language guard. Single
+        # source of truth is fetch_lyrics._JP_VAGENCY_RE (built from
+        # confidence._KNOWN_JA).
+        from fetch_lyrics import is_jp_vagency, slugify
+        _BAD_CAPTIONS_LANGS = ("ko", "zh", "es", "de", "ru", "fr", "it", "pt")
+        # ZH bodies are STRICT-checked (kanji-only doesn't count as JP signal)
+        # so a legit Chinese-captions track for a kanji-titled Chinese song
+        # (e.g. 孤勇者 / 陈奕迅) isn't wrongly rejected.
+        if lang in _BAD_CAPTIONS_LANGS and is_jp_vagency(title, artist, strict=(lang == "zh")):
+            log.info("captions: rejected %s track for JP-act %r / %r — wrong-language collision",
+                     lang, title, artist)
+            return
         try:
             out = LYRICS_DIR / f"{slugify(title)}.json"
             data = {"meta": {"title": title, "artist": artist, "lang": lang,
@@ -10039,8 +10248,11 @@ class Overlay:
         # snaps to the measurement; a marginal peak blends conservatively
         # toward it via EMA. Avoids yanking the offset on noisy detections
         # while still converging quickly when the signal is strong.
-        # alpha=1.0 when lift≥0.30, falls linearly to 0.3 at the 0.10 floor.
-        alpha = max(0.3, min(1.0, (lift - 0.10) / 0.20 + 0.3))
+        # alpha=1.0 when lift≥0.30, falls linearly to 0.3 at the energy_lift_floor.
+        # Anchored at the LIVE floor (not a hardcoded 0.10) so lowering the floor
+        # for weak-but-clear peaks like kamone keeps the confidence gradient intact.
+        _floor = float(self._tune.get("energy_lift_floor", 0.045))
+        alpha = max(0.3, min(1.0, (lift - _floor) / 0.20 + 0.3))
         prev = self.offset
         blended = round((1.0 - alpha) * prev + alpha * new_off, 2)
         log.info("energy-align: offset %+.2fs → %+.2fs (α=%.2f, score %.3f, lift %.3f)",
@@ -10388,38 +10600,6 @@ class Overlay:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _fine_pause(self, drift):
-        """Pause the lyric procession by `drift` seconds (capped by max_pause and
-        80% of the current line's remaining time so a pause can't cross a line
-        boundary). Captures pos/pos_raw ONCE so the held frame is stable during
-        the pause. The pause-end block in _tick re-bases self.offset by the same
-        amount so the resumed frame equals the held frame."""
-        min_step = float(self._tune.get("fine_tune_min_step_s", 0.2))
-        max_pause = float(self._tune.get("fine_tune_max_pause_s", 1.0))
-        amount = max(min_step, min(drift, max_pause))
-        # BOUND by line-remaining (80%) so the pause can't strand the next line.
-        st = self.media.get()
-        if not st:
-            log.info("fine-tune: media state unavailable — skipping pause (drift %+.2fs)", drift)
-            return False
-        cur_pos = float(st.get("position") or 0.0)
-        pos_raw_now = cur_pos + self.offset
-        if 0 <= self.idx < len(self.lines):
-            remaining = self.lines[self.idx].end - pos_raw_now
-            if remaining > 0:
-                amount = min(amount, remaining * 0.8)
-        if amount < min_step:
-            # not enough time left on this line — skip; next listen will catch it.
-            log.info("fine-tune: drift %+.2fs but only %.2fs left on line — skip pause",
-                     drift, amount / 0.8 if amount > 0 else 0.0)
-            return False
-        self._fine_pause_pos_eased = cur_pos + self._eased_offset()
-        self._fine_pause_pos_raw = pos_raw_now
-        self._fine_pause_amount = amount
-        self._fine_pause_until = time.time() + amount
-        log.info("fine-tune pause %.2fs (lyrics ahead by %+.2fs)", amount, drift)
-        return True
-
     def _apply_fine_listen(self, res):
         """Classify the fine-tune Whisper read into one of:
           (a) |drift| ≤ target  → in sync, reset incon, reschedule.
@@ -10460,17 +10640,22 @@ class Overlay:
             self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
             return
 
-        # (b) Lyrics ahead — pause to let vocals catch up.
+        # (b) Lyrics ahead — boundary-deferred backward nudge (replaces v1.0.85
+        # PAUSE which froze pos_raw for up to max_pause seconds). _smooth_offset
+        # queues at the next line boundary so the current line plays out, then
+        # the next line begins at the corrected offset; the highlight never
+        # freezes. Symmetric with (c)'s catch-up nudge but in the opposite
+        # direction. Clamped by fine_tune_max_pause_s (kept as the magnitude
+        # cap so the knob remains meaningful in /tune).
         if drift > min_step:
-            ok = self._fine_pause(drift)
+            max_rewind = max_pause                     # reuse the existing cap knob
+            step = min(drift, max_rewind)
+            new_off = round(self.offset - step, 2)
+            log.info("fine-tune rewind nudge: %+.2fs (drift %+.2fs, cap %.2f)",
+                     -step, drift, max_rewind)
+            self._smooth_offset(new_off, "fine-tune-rewind")
             self._fine_incon = 0
-            # Schedule next listen AFTER the pause expires + one cadence (so the
-            # subsequent measurement sees the rebased offset, not the in-flight pause).
-            if ok:
-                wait_ms = int((self._fine_pause_amount * 1000) + interval_ms)
-            else:
-                wait_ms = interval_ms
-            self._fine_listen_after = self.root.after(wait_ms, self._fine_listen_tick)
+            self._fine_listen_after = self.root.after(interval_ms, self._fine_listen_tick)
             return
 
         # (c) Lyrics behind — tiny forward nudge via the boundary-deferred path.
@@ -10592,7 +10777,171 @@ class Overlay:
         else:
             self._hint(f"🎤 Auto-synced ({offset:+.1f}s)")
 
+    # ── M2: GPU-driven renderer (subprocess child) ─────────────────────────
+    # The Tk overlay drives all the SMTC/sync/decision/lyric-fetch logic. When
+    # gpu_renderer_on flips True we spawn gpu_renderer.py as a child process,
+    # hide the Tk display window, and pipe state to the child over stdin:
+    #   - {"type":"song", lines, meta, field}        on track change / load
+    #   - {"type":"state", pos_raw, idx, fill_frac}  every Tk tick (~60 Hz)
+    #   - {"type":"quit"}                            on toggle-off / app quit
+    # If the child crashes / can't start, we fall back to the Tk renderer.
+    def _gpu_child_cmd(self):
+        """Build the argv to spawn the GPU renderer child. Frozen build → run
+        the same EXE with the dispatch flag (main() in the child re-enters this
+        file and routes to gpu_renderer.run_ipc_child()). Dev → run
+        gpu_renderer.py with python directly."""
+        import sys as _sys
+        if getattr(_sys, "frozen", False):
+            return [_sys.executable, "--gpu-renderer-child"]
+        here = Path(__file__).parent / "gpu_renderer.py"
+        return [_sys.executable, str(here), "--ipc"]
+
+    def _start_gpu_renderer(self):
+        """Spawn the GPU child + hide the Tk overlay window. Idempotent: a
+        second call while the child is alive returns True without re-spawning."""
+        import subprocess as _sp
+        if getattr(self, "_gpu_child", None) is not None and self._gpu_child.poll() is None:
+            return True
+        try:
+            CREATE_NO_WINDOW = 0x08000000   # don't pop a console for the child
+            self._gpu_child = _sp.Popen(
+                self._gpu_child_cmd(),
+                stdin=_sp.PIPE, stdout=None, stderr=_sp.PIPE,
+                bufsize=0,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except Exception as e:
+            log.info("gpu_renderer spawn failed: %s", e)
+            self._gpu_child = None
+            return False
+        # Seed the child with the current song (if any) so it can render
+        # immediately instead of waiting for the next track change.
+        if self.lines:
+            self._gpu_send({
+                "type": "song",
+                "lines": [
+                    {"t": [ln.start, ln.end], "jp": ln.jp, "rm": ln.rm, "en": ln.en}
+                    for ln in self.lines
+                ],
+                "meta": dict(self.meta or {}),
+                "field": "jp",
+            })
+        try:
+            self.root.withdraw()              # hide Tk window — GPU child draws now
+        except Exception:
+            pass
+        log.info("gpu_renderer: child PID=%s started, Tk overlay hidden",
+                 self._gpu_child.pid)
+        return True
+
+    def _stop_gpu_renderer(self, reason="off"):
+        ch = getattr(self, "_gpu_child", None)
+        if ch is not None:
+            try:
+                self._gpu_send({"type": "quit"})
+            except Exception:
+                pass
+            try:
+                ch.wait(timeout=2.0)
+            except Exception:
+                try:
+                    ch.terminate()
+                except Exception:
+                    pass
+            self._gpu_child = None
+            log.info("gpu_renderer: child stopped (%s)", reason)
+        try:
+            self.root.deiconify()             # restore Tk overlay
+        except Exception:
+            pass
+
+    def _gpu_active(self):
+        """True when the GPU child is alive and should be the renderer. _tick
+        reads this to skip ALL CPU canvas work (the perf fix). If the child
+        died, this flips False and the next tick resumes the Tk renderer; we
+        also restore the (withdrawn) Tk window so the user never sees a blank
+        screen after a child crash."""
+        ch = getattr(self, "_gpu_child", None)
+        if ch is None:
+            return False
+        if ch.poll() is not None:
+            # Child exited unexpectedly — tear down cleanly + restore Tk.
+            log.info("gpu_renderer: child exited (code %s) — restoring Tk renderer",
+                     ch.returncode)
+            self._gpu_child = None
+            try:
+                self.root.deiconify()
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _gpu_send(self, msg):
+        ch = getattr(self, "_gpu_child", None)
+        if ch is None or ch.poll() is not None:
+            return
+        try:
+            ch.stdin.write((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+            ch.stdin.flush()
+        except Exception as e:
+            log.info("gpu_renderer: send failed (%s) — stopping child", e)
+            self._stop_gpu_renderer(reason="pipe-error")
+
+    def _gpu_send_song(self):
+        ch = getattr(self, "_gpu_child", None)
+        if ch is None or ch.poll() is not None:
+            return
+        self._gpu_send({
+            "type": "song",
+            "lines": [
+                {"t": list(ln.t), "jp": ln.jp, "rm": ln.rm, "en": ln.en}
+                for ln in (self.lines or [])
+            ],
+            "meta": dict(self.meta or {}),
+            "field": "jp",
+        })
+
+    def _gpu_send_state(self, pos_raw):
+        ch = getattr(self, "_gpu_child", None)
+        if ch is None or ch.poll() is not None:
+            return
+        # Compute fill_frac the same way the active line is filled in Tk's
+        # _karaoke() — using the active line's t-window. Keeps the GPU child
+        # exactly in lockstep with the Tk renderer rather than re-deriving
+        # idx independently (which could drift by ±1 line on close boundaries).
+        idx = self.idx if 0 <= self.idx < len(self.lines) else -1
+        fill = 0.0
+        if idx >= 0:
+            ln = self.lines[idx]
+            dur = max(0.001, ln.end - ln.start)
+            fill = max(0.0, min(1.0, (pos_raw - ln.start) / dur))
+        self._gpu_send({
+            "type": "state",
+            "pos_raw": round(float(pos_raw), 3),
+            "offset": round(float(self.offset), 3),
+            "idx": idx,
+            "fill_frac": round(fill, 4),
+            "playing": True,
+        })
+
+    def _apply_gpu_renderer_toggle(self, on: bool):
+        """Live toggle hook from set_tune('gpu_renderer_on', …), the tray menu,
+        and Overlay startup. Persists the choice so it survives a restart."""
+        self.gpu_renderer_on = bool(on)
+        if on:
+            ok = self._start_gpu_renderer()
+            if not ok:
+                # Spawn failed — fall back to Tk and don't lie about being on.
+                self.gpu_renderer_on = False
+        else:
+            self._stop_gpu_renderer(reason="toggle-off")
+        try:
+            self._persist()
+        except Exception:
+            pass
+
     def quit(self):
+        self._stop_gpu_renderer(reason="app-quit")
         self._m(self.metrics.finalize)      # TICKET-121: flush the last in-flight play
         self._destroy_mirrors()
         if self._boundary is not None:
@@ -10754,6 +11103,19 @@ def _apply_affinity_priority(mask, prio):
 
 
 def main():
+    # M2 GPU-renderer child mode dispatch — runs BEFORE _is_only_instance() so
+    # the parent (which already holds the named mutex) can spawn us without
+    # being kicked out for "another instance is running". The child has no
+    # SMTC / sync / decision pipeline; it just reads NDJSON from stdin and
+    # paints. Done before everything else so the spawn doesn't drag along the
+    # whole audio engine + tray icon for the child.
+    if "--gpu-renderer-child" in sys.argv[1:]:
+        try:
+            import gpu_renderer
+            gpu_renderer.run_ipc_child()
+        except Exception as e:
+            print(f"gpu_renderer child died: {e!s}", file=sys.stderr)
+        return
     if not _is_only_instance():
         return                 # another Desktop Karaoke is already running
     # TICKET-105: heal up the rebrand-stale Start Menu shortcut before
@@ -10788,6 +11150,11 @@ def main():
     LYRICS_DIR.mkdir(exist_ok=True)
     ov = Overlay(offset=offset)
     ov._apply_dynamic_priority()   # TICKET-129: pin to last core @ ABOVE_NORMAL (override: tune cpu_dedicate_last_core)
+    # v1.1.15: the GPU renderer is the DEFAULT (persisted setting, default True).
+    # Bring it up after Overlay.__init__ so tray/api/SMTC are wired and Tk has a
+    # root window to withdraw. A spawn failure leaves the Tk window visible.
+    if getattr(ov, "gpu_renderer_on", True):
+        ov._apply_gpu_renderer_toggle(True)
 
     def _reset(*_):   ov.root.after(0, ov.reset_offset)
     def _toggle(*_):  ov.root.after(0, ov.toggle)
@@ -10917,6 +11284,8 @@ def main():
     def _toggle_bound(*_): ov.root.after(0, lambda: ov.set_boundary(not ov.boundary_on))
     def _toggle_gen(*_):   ov.root.after(0, lambda: ov.set_generate(not ov.generate_on))
     def _toggle_caps(*_):  ov.root.after(0, lambda: ov.set_captions(not ov.captions_on))
+    def _toggle_gpu_render(*_):
+        ov.root.after(0, lambda: ov._apply_gpu_renderer_toggle(not ov.gpu_renderer_on))
     # TICKET-100: Discord Rich Presence reader toggle (default OFF, opt-in).
     def _toggle_discord_rpc(*_):
         ov.root.after(0, lambda: ov.set_discord_rpc(not ov.discord_rpc_on))
@@ -11193,6 +11562,9 @@ def main():
         pystray.Menu.SEPARATOR,
         # 5. PERFORMANCE ──────────────────────────────────────────────────
         pystray.MenuItem("Performance", perf_menu),
+        pystray.MenuItem("GPU renderer (smooth · draws on the idle GPU)",
+                         _toggle_gpu_render,
+                         checked=lambda i: ov.gpu_renderer_on),
         pystray.MenuItem(_gpu_label, _on_gpu,
                          enabled=lambda i: not _gpu["busy"] and not gpu_setup.gpu_ready(),
                          visible=lambda i: gpu_setup.nvidia_gpu_present()),

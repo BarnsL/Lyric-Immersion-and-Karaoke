@@ -60,6 +60,7 @@ _ROUTES = {
         "/diag": "deep diagnostics: full sync state machine, last energy-correlation, FPS/frame-timing, pending-swap (TICKET-111)",
         "/metrics": "per-release success/wobbler/fail telemetry counter (TICKET-121)",
         "/sync": "current offset lock state: offset, last energy-align, last OCR-assisted align, verify cadence (TICKET-123)",
+        "/measure_sync": "sync accuracy meter: which line is HIGHLIGHTED vs which SHOULD be active for the audio position, the lag in seconds AND lines, offset, last energy best_shift/score, last heard transcription — quantifies the 'highlight is N lines behind' symptom",
         "/source": "video/music source view: raw SMTC data + what the app derived from it",
         "/audio": "audio listener: live loudness + vocal-band ratio + recent on/off pattern",
         "/lyricstate": "lyric current-state analyzer: current/prev/next lines, fill, structural checks",
@@ -298,6 +299,11 @@ def make_handler(app, log_file, token):
                 elif path == "/source":
                     try:
                         self._send(200, {"ok": True, **app.get_source()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/measure_sync":
+                    try:
+                        self._send(200, {"ok": True, **app.get_measure_sync()})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/audio":

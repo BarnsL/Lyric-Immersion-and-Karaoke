@@ -47,6 +47,14 @@ hiddenimports = [
     "audible_sessions",
     "pycaw", "pycaw.pycaw",
     "comtypes", "comtypes.gen",
+    # M2: GPU-driven lyric renderer child process. Lazy-imported in main.py
+    # ONLY when sys.argv contains --gpu-renderer-child (dispatched from the
+    # same exe). pygame + moderngl + PIL are picked up via collect_all; the
+    # renderer module itself needs an explicit pin since it's not imported in
+    # the normal startup path.
+    "gpu_renderer",
+    "moderngl", "moderngl.context", "moderngl.program",
+    "pygame", "pygame.image", "pygame.display", "pygame.event", "pygame.time",
 ]
 
 # Packages that ship data files / dynamically-imported submodules.
@@ -60,6 +68,10 @@ for pkg in ("winsdk", "soundcard", "shazamio", "pykakasi", "jaconv",
             # — collect_all pulls the data files / lazy submodules PyInstaller
             # would otherwise miss in the frozen build.
             "pycaw", "comtypes",
+            # M2: pygame-ce (SDL2) + moderngl drive the GPU renderer child.
+            # collect_all pulls the SDL DLLs, OpenGL fallback, and moderngl's
+            # platform-specific extension modules.
+            "pygame", "moderngl",
             # yt-dlp: pulls a YouTube video's own caption track (accurate lyrics
             # + perfect timing, locked to the video) — strictly better than a
             # provider LRC for browser videos. ~10 MB, pure Python.

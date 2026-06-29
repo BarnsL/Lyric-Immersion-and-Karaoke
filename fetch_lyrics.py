@@ -124,6 +124,69 @@ from pathlib import Path
 import confidence   # language_confidence — prefer the artist's usual language
 
 
+# ── JP-act haystack regex (single source of truth = confidence._KNOWN_JA) ───
+# fetch_lrc's ko/zh body rejection (jp_vagency) used to hand-code a short subset
+# (regloss|hololive|holostars|kamitsubaki|神椿|v.w.p|花譜|理芽|ヰ世界情緒|harusaruhi|laplus)
+# that drifted out of sync with confidence._KNOWN_JA — so a romanized credit like
+# 'Hajime Todoroki' or 'Suisei' fetched a Korean body unrejected. Now compiled
+# ONCE from _KNOWN_JA + the CJK-script forms the old regex carried (神椿/花譜/
+# ヰ世界情緒/あんは) so the rejection covers every known JP act + future
+# additions to _KNOWN_JA flow through automatically. Latin tokens word-boundaried
+# so "rim" / "kaf" / "kobo" don't false-positive inside unrelated words.
+_KNOWN_JA_CJK_EXTRAS = ("神椿", "花譜", "ヰ世界情緒", "あんは")
+
+def _compile_jp_vagency_re():
+    parts = []
+    for k in (*getattr(confidence, "_KNOWN_JA", ()), *_KNOWN_JA_CJK_EXTRAS):
+        esc = re.escape(k)
+        if all(ord(c) < 128 for c in k):
+            parts.append(rf"\b{esc}\b")    # Latin: require word boundary
+        else:
+            parts.append(esc)              # CJK: bare (Python \b is Latin-only)
+    return re.compile("|".join(parts), re.I) if parts else None
+
+_JP_VAGENCY_RE = _compile_jp_vagency_re()
+
+
+def is_jp_vagency(title: str, artist: str, extras=None, *,
+                  strict: bool = False) -> bool:
+    """Public helper: True when title/artist (+ optional extras like split
+    artists, yt_description vocals) tag this as a Japanese-language song.
+    Independent signals (any one trips it):
+      1. _JP_VAGENCY_RE (the _KNOWN_JA regex — Latin act names like ReGLOSS,
+         hololive, Suisei, Hajime, Reol, Kanaria …).
+      2. Kana anywhere in title/artist — uniquely Japanese (Korean is hangul,
+         Chinese has neither kana nor hangul). Closes the Hajime/轟はじめ gap.
+      3. (strict=False only) Kanji anywhere AND no hangul — Korean lyrics
+         are written in hangul, so a kanji-only artist is unlikely to be a
+         Korean song; signals JP for kanji-only acts like 音乃瀬奏 (Kanade).
+         Pass strict=True when discriminating against a ZH body — pure kanji
+         is ambiguous JP↔ZH, and signal 3 would wrongly tag legit Chinese
+         songs like 孤勇者 / 陈奕迅.
+    Hangul anywhere in artist suppresses (a genuine Korean entry by a JP-
+    affiliated artist would carry hangul itself).
+
+    Use strict=True for ZH rejection paths. Use the default for KO and
+    European-language rejection paths (where signal 3 has no false positive)."""
+    if artist and _HANGUL.search(artist):
+        return False  # hangul present → don't auto-reject a Korean reading
+    if title and _HANGUL.search(title):
+        return False
+    parts = [s for s in (title or "", artist or "", *(extras or [])) if s]
+    hay = " ".join(parts)
+    # Signal 1: known JP-act name.
+    if _JP_VAGENCY_RE and _JP_VAGENCY_RE.search(hay):
+        return True
+    # Signal 2: kana anywhere (uniquely JP).
+    if any(_KANA.search(p) for p in parts):
+        return True
+    # Signal 3: kanji + no hangul. Skipped in strict mode because kanji alone
+    # is shared JP↔ZH (Chinese songs would otherwise be tagged JP).
+    if not strict and any(_HAN.search(p) for p in parts):
+        return True
+    return False
+
+
 # ── TICKET-113: lyric-body signature for the per-track blacklist ─────
 # Defined ONCE at module top so the capture site (main.py) and the
 # rejection site (the take() chokepoint in fetch_lrc) use byte-identical
@@ -400,6 +463,41 @@ def split_artists(artist: str) -> list[str]:
             seen.add(p.lower())
             out.append(p)
     return out
+
+
+# Agency / label PREFIXES that wrap the real performing UNIT. Lyric providers
+# index the UNIT name ("ReGLOSS", "FLOW GLOW") — NOT the full agency credit
+# ("hololive DEV_IS ReGLOSS") that SMTC delivers — so a fetch with the raw
+# artist string finds NOTHING while the unit-only query hits instantly.
+# VERIFIED LIVE: fetch_lrc('Flashpoint', 'hololive DEV_IS ReGLOSS') was EMPTY
+# after 44s, but ('Flashpoint', 'ReGLOSS') returned the correct 53-line
+# Japanese LRC in 8.5s. clean_artist() only strips an agency token that follows
+# a DASH ('‐ ReGLOSS'); the space-separated PREFIX form is what leaks through.
+# Ordered LONGEST-first so 'hololive DEV_IS' is matched before bare 'hololive'.
+_AGENCY_PREFIXES = (
+    "hololive dev_is", "hololive dev is", "hololive english", "hololive indonesia",
+    "hololive en", "hololive id", "hololive jp", "hololive",
+    "holostars english", "holostars uprising", "holostars en", "holostars",
+    "kamitsubaki studio", "kamitsubaki", "phase connect", "phase-connect",
+    "phaseconnect", "nijisanji en", "nijisanji", "vshojo", "vspo",
+)
+
+
+def agency_unit_names(artist: str) -> list[str]:
+    """Derive the performing UNIT name from an agency-prefixed credit:
+    'hololive DEV_IS ReGLOSS' → ['ReGLOSS']; 'hololive DEV_IS FLOW GLOW' →
+    ['FLOW GLOW']. Returns [] when the artist isn't agency-prefixed (a song
+    genuinely credited to the whole label is left untouched). Longest prefix
+    wins so the sub-label is stripped along with the parent."""
+    a = (artist or "").strip()
+    al = a.lower()
+    for pre in _AGENCY_PREFIXES:
+        if al.startswith(pre + " "):
+            rest = a[len(pre):].strip(" -–—‐:·・|/").strip()
+            if rest and rest.lower() != al:
+                return [rest]
+            break
+    return []
 
 
 # ── Romanization ─────────────────────────────────────────────────────
@@ -733,10 +831,16 @@ def _lrclib_get(title, artist, duration):
     return None
 
 
-def _lrclib_candidates(title, artist):
+def _lrclib_candidates(title, artist, arts=None):
     cands, seen = [], set()
     urls = [f"https://lrclib.net/api/search?{urllib.parse.urlencode({'q': f'{title} {artist}'.strip()})}"]
-    for ar in ([artist] + split_artists(artist))[:3]:
+    # When fetch_lrc supplies `arts`, it already carries the agency-UNIT name
+    # ('ReGLOSS') at the front + YT-description vocalists — query THOSE so the
+    # form providers actually index is searched, not just the full agency
+    # credit ('hololive DEV_IS ReGLOSS') that returns nothing. (Verified: this is
+    # what gets Flashpoint to lrclib in ~8s instead of the 27s syncedlyrics fallback.)
+    cand_artists = arts if arts is not None else ([artist] + split_artists(artist))
+    for ar in cand_artists[:4]:
         if ar:
             urls.append("https://lrclib.net/api/search?"
                         + urllib.parse.urlencode({"track_name": title, "artist_name": ar}))
@@ -757,11 +861,15 @@ def _norm(s):
     return re.sub(r"[^\w가-힣一-鿿ぁ-ヶ]+", "", (s or "").lower())
 
 
-def _pick_lrclib(title, artist, duration):
+def _pick_lrclib(title, artist, duration, arts=None):
     best, best_score = None, 0
     nt = _norm(title)
-    nas = [_norm(x) for x in split_artists(artist)] or [_norm(artist)]
-    for c in _lrclib_candidates(title, artist):
+    # Score against the agency-unit + YT-vocalist candidate list when supplied,
+    # so a hit indexed under 'ReGLOSS' substring-matches and clears the 4-pt
+    # threshold (the full 'hololive dev_is regloss' credit would not).
+    _nas_src = arts if arts is not None else split_artists(artist)
+    nas = [_norm(x) for x in _nas_src] or [_norm(artist)]
+    for c in _lrclib_candidates(title, artist, arts=arts):
         ct, ca = _norm(c.get("trackName")), _norm(c.get("artistName"))
         score = 0
         if nt and (nt in ct or ct in nt):
@@ -1053,6 +1161,13 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     or None the behavior is identical to v1.0.93."""
     t, a = title.strip(), artist.strip()
     arts = split_artists(a)
+    # Agency-prefix unit extraction (verified Flashpoint fix). A credit like
+    # 'hololive DEV_IS ReGLOSS' must ALSO try the unit-only 'ReGLOSS' that
+    # providers index — injected at the FRONT so the high-hit form is queried
+    # FIRST instead of after a 44s full-credit miss that eats the whole song.
+    for _unit in agency_unit_names(a):
+        if _unit and _unit.lower() not in {x.lower() for x in arts}:
+            arts.insert(0, _unit)
     # TICKET-112: prepend YT-description vocalists / original-artist /
     # composer / lyricist as additional artist candidates. Vocals come first
     # (most likely to BE the recording artist), then original_artist (for
@@ -1089,16 +1204,21 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     # Suppressed when the title/artist ITSELF carries hangul (a real Korean entry).
     han_song = (bool(_HAN.search(t)) or bool(_HAN.search(a))) \
         and not (title_ko or bool(_HANGUL.search(a)))
-    # A known JAPANESE VTuber act/agency (ReGLOSS / hololive / 神椿·V.W.P …) marks a
-    # JAPANESE song even when BOTH the title and artist are romanized/English — e.g.
-    # 'ReGLOSS - Flashpoint': no kana/kanji anywhere, so the script guards above can't
-    # fire, and a Korean fan-LRC would otherwise be accepted. These acts don't release
-    # Korean/Chinese-language songs, so reject a ko/zh body for them. (Suppressed when
-    # the title/artist itself carries hangul — a genuine Korean entry.)
-    jp_vagency = bool(re.search(
-        r"regloss|hololive|holostars|holo\s*x|kamitsubaki|神椿|"
-        r"v\.?\s?w\.?\s?p\b|花譜|理芽|ヰ世界情緒|あんは|harusaruhi|laplus",
-        f"{t} {a}", re.I)) and not (title_ko or bool(_HANGUL.search(a)))
+    # A known JAPANESE VTuber act/agency (ReGLOSS / hololive / 神椿·V.W.P / Hajime /
+    # Suisei / Reol / Isekaijoucho …) marks a JAPANESE song even when BOTH the title
+    # and artist are romanized/English — e.g. 'Hajime Todoroki - Deep Dive': no
+    # kana/kanji anywhere after clean_artist strips the channel ('Hajime Ch. 轟はじめ
+    # ‐ ReGLOSS' → '轟はじめ' which DOES carry kanji, but a Spotify/desktop-player
+    # SMTC field can deliver the bare romanized 'Hajime Todoroki' with no script
+    # signal at all). These acts don't release Korean/Chinese-language songs, so
+    # reject a ko/zh body for them. Single source of truth = confidence._KNOWN_JA
+    # via _JP_VAGENCY_RE. Scan the title + primary artist + split-artist credits
+    # (so an extra_artists entry from yt_description 'vocals: ["Hajime Todoroki"]'
+    # or a feat. token still trips the guard). Suppressed when the title/artist
+    # itself carries hangul — a genuine Korean entry.
+    jp_vagency_hay = " ".join(s for s in (t, a, *arts) if s)
+    jp_vagency = bool(_JP_VAGENCY_RE and _JP_VAGENCY_RE.search(jp_vagency_hay)) \
+        and not (title_ko or bool(_HANGUL.search(a)))
 
     def take(lrc, meta):
         """Accept this match now — unless it's romanized Japanese (stash + keep
@@ -1112,8 +1232,12 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
                      (meta or {}).get("source", "?"))
             return None
         body = re.sub(r"\[[^\]]*\]", "", lrc)
-        if exp_cjk and detect_lang(body) in ("de", "es", "ru", "fr", "it", "pt"):
-            return None   # CJK artist + European-language lyrics → collision, skip
+        if (exp_cjk or jp_vagency) and detect_lang(body) in ("de", "es", "ru", "fr", "it", "pt"):
+            # CJK artist OR known JP act (Suisei / hololive / ReGLOSS / Hajime …)
+            # + European-language lyrics → same-title collision OR a romaji body
+            # detect_lang misclassifies as Spanish ("Ano tasogare mo oritatameba
+            # shijima" — Suisei's Soirée). Either way, not the right body.
+            return None
         body_lang = detect_lang(body)
         if title_ja and body_lang in ("zh", "ko"):
             return None   # kana title = Japanese song; zh/ko hit is a collision
@@ -1121,8 +1245,12 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
             return None   # hangul title = Korean song; zh/ja hit is a collision
         if han_song and body_lang == "ko":
             return None   # kanji (JA/ZH) song; a Korean body is a wrong-language collision
-        if jp_vagency and body_lang in ("ko", "zh"):
-            return None   # JP VTuber act (ReGLOSS/hololive/神椿…); ko/zh body = wrong-language collision
+        if jp_vagency and body_lang == "ko":
+            return None   # JP VTuber act + Korean body = collision (KO is unambiguously not JP)
+        if body_lang == "zh" and is_jp_vagency(t, a, strict=True):
+            return None   # ZH check uses strict — kanji-only artist alone is ambiguous JP↔ZH,
+                          # so we only reject ZH when there's a stronger JP signal
+                          # (known act name OR kana anywhere)
         # LANGUAGE-CONFIDENCE guard (TICKET-062): a kana/hangul-named artist almost
         # never IS an English same-title song — Suisei's 星街すいせい "GHOST" pulled an
         # English "Ghost". When confidence clearly favours a CJK language over English
@@ -1158,7 +1286,7 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
                 return r
 
     # 2. LRCLIB scored search (artist/title/duration)
-    hit = _pick_lrclib(t, a, duration)
+    hit = _pick_lrclib(t, a, duration, arts=arts)
     if hit and verify_lrc(hit["lrc"], t, duration):
         r = take(hit["lrc"], {"source": "lrclib/search", "artist": hit["artist"],
                               "duration": hit.get("duration")})

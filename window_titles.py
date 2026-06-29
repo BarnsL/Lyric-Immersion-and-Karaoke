@@ -137,11 +137,17 @@ _NEG_SUFFIX_RE = re.compile(
     re.VERBOSE | re.IGNORECASE,
 )
 
-# Pure hostnames / empty-tab placeholders.
+# Pure hostnames / empty-tab placeholders / bare social-feed page names. A tab
+# titled just "Instagram" / "Facebook" / "TikTok" is the FEED, not a song — it
+# was matching a poisoned instagram.json and showing junk lyrics over reels.
 _BARE_NON_MUSIC = frozenset({
-    "new tab", "new private tab", "新しいタブ",
+    "new tab", "new private tab", "新しいタブ", "home",
     "youtube.com", "youtube", "music.youtube.com",
     "soundcloud.com", "spotify.com", "open.spotify.com",
+    "instagram", "instagram.com", "facebook", "facebook.com",
+    "tiktok", "tiktok.com", "twitter", "twitter.com", "x", "x.com",
+    "reddit", "reddit.com", "threads", "threads.net", "snapchat",
+    "linkedin", "linkedin.com", "pinterest", "pinterest.com", "tumblr",
 })
 
 
