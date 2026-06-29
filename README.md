@@ -6,7 +6,7 @@
 lyrics over whatever you're playing — built for learning Japanese (plus Chinese,
 Korean, Spanish, German, and Russian) by singing along.**
 
-> ### ⬇️ Just want to use it? [**Download the latest release**](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest) → unzip → double-click `DesktopKaraoke.exe`. No install, no Python, no account. That's it.
+> ### ⬇️ Just want to use it? [**Download the latest release**](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest) → unzip → double-click `Lyric-Immersion-and-Karaoke.exe`. No install, no Python, no account. That's it.
 
 Play a song in **Spotify, YouTube, or any app** that talks to Windows' media
 controls, and Desktop Karaoke pulls the **real playback position** and streams
@@ -25,9 +25,11 @@ while it runs.
 
 ## ▶️ Demo
 
-[![Desktop Karaoke — AI song recognition & lyric synchronization](https://img.youtube.com/vi/AQfNzmsx1qU/hqdefault.jpg)](https://youtu.be/AQfNzmsx1qU)
+[![Demo 1 — AI song recognition & lyric synchronization](https://img.youtube.com/vi/AQfNzmsx1qU/hqdefault.jpg)](https://youtu.be/AQfNzmsx1qU)
+[![Demo 2](https://img.youtube.com/vi/IxX9lKV7oZc/hqdefault.jpg)](https://youtu.be/IxX9lKV7oZc)
+[![Demo 3](https://img.youtube.com/vi/BPQ6ZDHNM28/hqdefault.jpg)](https://youtu.be/BPQ6ZDHNM28)
 
-*[Watch on YouTube](https://youtu.be/AQfNzmsx1qU) — AI song recognition + lyric synchronization in action.*
+*Watch on YouTube: [demo 1](https://youtu.be/AQfNzmsx1qU) · [demo 2](https://youtu.be/IxX9lKV7oZc) · [demo 3](https://youtu.be/BPQ6ZDHNM28) — AI song recognition + lyric synchronization in action.*
 
 ---
 
@@ -91,7 +93,7 @@ The easy path for everyone:
 1. Open the **[latest release](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest)**.
 2. Download **`LyricImmersion-portable.zip`**.
 3. Right-click → **Extract All**.
-4. Double-click **`DesktopKaraoke.exe`** inside.
+4. Double-click **`Lyric-Immersion-and-Karaoke.exe`** inside.
 
 That's it. The app starts in your **system tray** (the little purple microphone by
 the clock), and lyrics appear the moment you play a song. It's **fully portable** —
@@ -346,7 +348,7 @@ python  main.py --offset -1.5    # nudge sync earlier for an intro-heavy video
 **Build the one-click installer yourself** — see [BUILD.md](docs/BUILD.md):
 
 ```bash
-build.bat        # → dist\DesktopKaraoke.exe  (+ DesktopKaraoke-Setup.exe if Inno Setup is installed)
+build.bat        # → dist\Lyric-Immersion-and-Karaoke.exe  (+ DesktopKaraoke-Setup.exe if Inno Setup is installed)
 ```
 
 ### Build a starter library
