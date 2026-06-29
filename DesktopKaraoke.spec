@@ -27,6 +27,9 @@ hiddenimports = [
     # local modules imported lazily inside functions — pin them so the
     # frozen build always includes them.
     "appdata", "version", "updater", "songchange", "align", "api", "character", "recognize", "fetch_lyrics", "gpu_setup", "metrics",
+    # optional Claude lyric disambiguator — lazy-imported inside _decide_by_ear;
+    # pin so the frozen build includes it (stdlib urllib only, no new deps).
+    "llm_disambiguate",
     "playlist_import", "playlist_import_gui", "concert_ocr", "ocr_lyrics", "deep_transcribe", "confidence",
     # TICKET-100: Discord IPC reader (lazy-imported in main.py only when the
     # tray toggle is ON, but pin it here so the frozen build includes it).
