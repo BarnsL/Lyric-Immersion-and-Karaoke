@@ -3898,22 +3898,27 @@ class Overlay:
             # offset alignment is unaffected.
             res = None
             try:
-                import subprocess as _sp, json as _json, sys as _sys
+                import subprocess as _sp, json as _json, sys as _sys, tempfile as _tf, os as _os
+                outp = _os.path.join(_tf.gettempdir(),
+                                     "li_recog_%d_%d.json" % (_os.getpid(), int(time.time() * 1000) % 100000))
                 if getattr(_sys, "frozen", False):
-                    cmd = [_sys.executable, "--recognize-child", str(seconds), str(attempts)]
+                    cmd = [_sys.executable, "--recognize-child", str(seconds), str(attempts), "--out", outp]
                 else:
                     cmd = [_sys.executable, str(Path(__file__).parent / "recognize.py"),
-                           "--child", str(seconds), str(attempts)]
-                p = _sp.run(cmd, capture_output=True, text=True,
+                           "--child", str(seconds), str(attempts), "--out", outp]
+                try:
+                    _sp.run(cmd, capture_output=True,
                             timeout=float(seconds) * max(1, attempts) + 30,
                             creationflags=0x08000000)   # CREATE_NO_WINDOW
-                for line in reversed((p.stdout or "").splitlines()):
-                    line = line.strip()
-                    if line.startswith("{"):
-                        d = _json.loads(line)
-                        if d.get("t"):
-                            res = (d["t"], d.get("a") or "", d.get("off"), d.get("tc"))
-                        break
+                    with open(outp, "r", encoding="utf-8") as _f:
+                        d = _json.load(_f)
+                    if d.get("t"):
+                        res = (d["t"], d.get("a") or "", d.get("off"), d.get("tc"))
+                finally:
+                    try:
+                        _os.remove(outp)
+                    except Exception:
+                        pass
             except Exception:
                 # Fall back to in-process recognize if the child can't spawn
                 # (keeps identification working even if the subprocess path fails).
@@ -11481,25 +11486,47 @@ def main():
     if "--recognize-child" in sys.argv[1:]:
         # TICKET-135: identify-by-sound in a SEPARATE PROCESS so the GIL-heavy
         # capture+fingerprint can't stall the parent's render thread (the
-        # "highlight sticks then jumps" fix). Prints ONE JSON line, then exits.
-        import json as _json
-        _a = sys.argv[1:]
-        _i = _a.index("--recognize-child")
+        # "highlight sticks then jumps" fix). Writes the result to the --out FILE
+        # (a windowed PyInstaller app has no reliable stdout — sys.stdout.flush()
+        # raised [Errno 22] and PyInstaller popped a crash dialog). EVERYTHING is
+        # wrapped so this child can NEVER raise an unhandled exception.
         try:
-            _secs = float(_a[_i + 1]) if len(_a) > _i + 1 else 6.0
+            import json as _json
+            _a = sys.argv[1:]
+            def _flag(name):
+                try:
+                    j = _a.index(name)
+                    return _a[j + 1] if j + 1 < len(_a) and not _a[j + 1].startswith("--") else None
+                except ValueError:
+                    return None
+            _i = _a.index("--recognize-child")
+            def _num(k, default):
+                try:
+                    v = _a[_i + k]
+                    return v if (_i + k < len(_a) and not v.startswith("--")) else None
+                except Exception:
+                    return None
+            _secs = float(_num(1, None) or 6.0)
+            _atts = int(_num(2, None) or 1)
+            _out = _flag("--out")
+            _res = {"t": None}
+            try:
+                from recognize import recognize_playing
+                t, ar, off, tc = recognize_playing(_secs, _atts)
+                _res = {"t": t, "a": ar, "off": off, "tc": tc}
+            except Exception as e:
+                _res = {"t": None, "err": str(e)}
+            try:
+                if _out:
+                    with open(_out, "w", encoding="utf-8") as _f:
+                        _f.write(_json.dumps(_res))
+                else:
+                    sys.stdout.write(_json.dumps(_res) + "\n")
+                    sys.stdout.flush()
+            except Exception:
+                pass
         except Exception:
-            _secs = 6.0
-        try:
-            _atts = int(_a[_i + 2]) if len(_a) > _i + 2 else 1
-        except Exception:
-            _atts = 1
-        try:
-            from recognize import recognize_playing
-            t, ar, off, tc = recognize_playing(_secs, _atts)
-            sys.stdout.write(_json.dumps({"t": t, "a": ar, "off": off, "tc": tc}) + "\n")
-        except Exception as e:
-            sys.stdout.write(_json.dumps({"t": None, "err": str(e)}) + "\n")
-        sys.stdout.flush()
+            pass
         return
     if not _is_only_instance():
         return                 # another Desktop Karaoke is already running

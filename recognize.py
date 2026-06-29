@@ -98,24 +98,40 @@ if __name__ == "__main__":
     if "--child" in _sys.argv[1:]:
         # SUBPROCESS mode (TICKET-135): the parent runs identify in a child
         # PROCESS so the GIL-heavy capture+fingerprint can't stall its render
-        # thread (the "highlight sticks then jumps" fix). Print ONE JSON line.
-        import json as _json
-        _a = _sys.argv[1:]
-        _i = _a.index("--child")
+        # thread. Writes the result to --out (or stdout). Fully wrapped so the
+        # child can NEVER raise an unhandled exception.
         try:
-            _secs = float(_a[_i + 1]) if len(_a) > _i + 1 else _DUR
+            import json as _json
+            _a = _sys.argv[1:]
+            _i = _a.index("--child")
+            def _val(k):
+                v = _a[_i + k] if _i + k < len(_a) else None
+                return v if (v and not v.startswith("--")) else None
+            def _flag(name):
+                try:
+                    j = _a.index(name)
+                    return _a[j + 1] if j + 1 < len(_a) else None
+                except ValueError:
+                    return None
+            _secs = float(_val(1) or _DUR)
+            _atts = int(_val(2) or 1)
+            _out = _flag("--out")
+            try:
+                t, a, off, tc = recognize_playing(_secs, _atts)
+                _res = {"t": t, "a": a, "off": off, "tc": tc}
+            except Exception as e:
+                _res = {"t": None, "err": str(e)}
+            try:
+                if _out:
+                    with open(_out, "w", encoding="utf-8") as _f:
+                        _f.write(_json.dumps(_res))
+                else:
+                    _sys.stdout.write(_json.dumps(_res) + "\n")
+                    _sys.stdout.flush()
+            except Exception:
+                pass
         except Exception:
-            _secs = _DUR
-        try:
-            _atts = int(_a[_i + 2]) if len(_a) > _i + 2 else 1
-        except Exception:
-            _atts = 1
-        try:
-            t, a, off, tc = recognize_playing(_secs, _atts)
-            _sys.stdout.write(_json.dumps({"t": t, "a": a, "off": off, "tc": tc}) + "\n")
-        except Exception as e:
-            _sys.stdout.write(_json.dumps({"t": None, "err": str(e)}) + "\n")
-        _sys.stdout.flush()
+            pass
     else:
         print("Listening to system audio…")
         t, a, off, _ = recognize_playing()
