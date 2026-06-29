@@ -18,8 +18,9 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
-## v1.1.x — Shipped (2026-06-28 session, TICKET-119 → 125)
-Release train v1.0.97 → v1.1.3. All built non-lean (whisper bundled) + deployed.
+## v1.1.x — Shipped (2026-06-28 session, TICKET-119 → 129)
+Release train v1.0.97 → v1.1.7. All built non-lean (whisper bundled) + deployed.
+- **TICKET-129 — "last core drives the product" CPU policy + multi-CPU/GPU compatibility** 🟢 Replaces TICKET-127's IDLE-while-gaming downgrade. Default = pin this process to the LAST PHYSICAL core (SMT-aware mask via `GetLogicalProcessorInformation`) and run it ABOVE_NORMAL: dedicating one core keeps the overlay smooth while a game (on the other cores) is barely touched. Hardware-agnostic helpers (`_last_physical_core_mask` / `_dedicate_last_core_mask` / `_upper_cores_mask` / `_apply_affinity_priority`) compute the mask from live topology, verified correct + off-core-0 on 1..64-thread machines (SMT or not). Single code path: `ov._apply_dynamic_priority()` is called once after Overlay build and idempotently re-asserted each monitor tick (a live `/tune cpu_dedicate_last_core 0` reverts to the legacy upper-cores/BELOW_NORMAL spread within ~3s). GPU side already degrades cleanly (`gpu_setup`: no-CUDA → CPU, NVML-missing → {}, single-GPU → CPU, AMD/Intel → CPU) so generation/OCR are GPU-agnostic.
 - **TICKET-119 — ルフラン live-title** 🟢 `clean_title` was extracting the concert name from `(from … ONE-MAN LIVE「NEUROMANCE Ⅱ」)`; now keeps the head song + reclassifies as a live arrangement (not compilation). Also: THE FIRST TAKE → live arrangement; sync menu ±5s.
 - **TICKET-120 — OCR burned-in lyrics** 🟢 `ocr_lyrics.py` (PrintWindow capture = self-read-safe, WinRT OCR EN+JP, metadata/CJK filter, timed `LyricOcrHarvester`). Wired BEFORE generation (no-lyrics path) AND on decision-engine SWITCH/REGEN (wrong-lyrics path, e.g. Play On! → Sixth Sense). source="ocr".
 - **TICKET-121 — release telemetry** 🟢 `metrics.py` `ReleaseMetrics`; GET `/metrics`. success/wobbler/fail bucketed by version, persisted to `metrics.json`. Success=synced ≤60s real source (incl ocr) ≤2 resyncs; Fail=generated OR >10 resyncs; Concert=≥10 wrong-detections/5min window.
