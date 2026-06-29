@@ -326,6 +326,8 @@ class LyricRenderer:
 
         # Three font sizes: base (kanji/kana), ruby (furigana, ~42%), sub
         # (romaji + english, ~52%). PIL handles CJK + advance metrics cleanly.
+        self._font_path = font_path
+        self._base_font_size = font_size      # before font_scale (rescaled by set_opts)
         self.font = ImageFont.truetype(font_path, font_size)
         self.ruby_font = ImageFont.truetype(font_path, max(10, int(font_size * 0.42)))
         self.sub_font = ImageFont.truetype(font_path, max(12, int(font_size * 0.52)))
@@ -338,8 +340,15 @@ class LyricRenderer:
         self._cur_idx = -1                                  # active line index, -1 = none
         self._fill_frac = 0.0                               # 0..1 across active line
         self._pos = 0.0                                     # song clock (pos_hi) from parent
+        self._pos_recv = time.perf_counter()                # wall time the last _pos arrived
+        self._playing = True                                # advance the belt only when playing
         self.scroll_dir = "none"                            # none|lr|rl (vertical block otherwise)
         self.scroll_speed = 200.0                           # px/s for the horizontal belt
+        # SETTINGS PARITY with the Tk overlay (sent by the parent each tick).
+        self.opacity = 1.0                                  # 0..1 — dims glyph RGB (color-key safe)
+        self.pos_y = "center"                               # top|center|bottom
+        self.pos_x = "center"                               # left|center|right (block mode)
+        self.font_scale = 1.0                               # 0.25..2.0
         self._self_heal_t = 0.0                             # SDL ex-style re-assert clock
         # keep-last-line: when idx goes -1 (inter-line gap) hold the previous
         # line on screen for a short window so the overlay never flickers blank.
@@ -413,6 +422,7 @@ class LyricRenderer:
         renderers stay byte-identical on which line is active. If the parent
         didn't supply them, fall back to local computation via tick()."""
         self._pos = pos_raw                  # song clock drives the scroll belt
+        self._pos_recv = time.perf_counter() # anchor for between-message extrapolation
         if idx is None or fill_frac is None:
             self.tick(pos_raw)
         else:
@@ -434,6 +444,40 @@ class LyricRenderer:
             self.scroll_dir = scroll_dir
         if scroll_speed is not None and scroll_speed > 0:
             self.scroll_speed = float(scroll_speed)
+
+    def set_opts(self, opacity=None, pos_y=None, pos_x=None, font_scale=None):
+        """Mirror the Tk overlay's display SETTINGS so the GPU overlay honours the
+        same opacity / position / font scale. font_scale changes rebuild the fonts
+        + drop the glyph cache (rare, so the cost is fine)."""
+        if opacity is not None:
+            try:
+                self.opacity = max(0.05, min(1.0, float(opacity)))
+            except Exception:
+                pass
+        if pos_y:
+            self.pos_y = pos_y
+        if pos_x:
+            self.pos_x = pos_x
+        if font_scale is not None:
+            try:
+                fsx = max(0.25, min(2.5, float(font_scale)))
+            except Exception:
+                fsx = self.font_scale
+            if abs(fsx - self.font_scale) > 1e-3:
+                self.font_scale = fsx
+                self._rebuild_fonts()
+
+    def _rebuild_fonts(self):
+        fs = max(10, int(self._base_font_size * self.font_scale))
+        self.font = ImageFont.truetype(self._font_path, fs)
+        self.ruby_font = ImageFont.truetype(self._font_path, max(10, int(fs * 0.42)))
+        self.sub_font = ImageFont.truetype(self._font_path, max(12, int(fs * 0.52)))
+        self.base_h = fs
+        self.ruby_h = max(10, int(fs * 0.42))
+        self.sub_h = max(12, int(fs * 0.52))
+        for rl in self._line_cache.values():
+            rl.release()
+        self._line_cache.clear()
 
     def set_lines(self, lines, field: str | None = None):
         """Swap the loaded song. Frees the OLD line-texture cache. Idempotent:
@@ -476,7 +520,12 @@ class LyricRenderer:
         self.vbo.write(data.tobytes())
         atlas.tex.use(0)
         self.prog["tex"].value = 0
-        self.prog["tint"].value = tint
+        # OPACITY (color-key safe): scale the glyph RGB toward the keyed-out black
+        # background. Per-pixel alpha can't carry opacity here (color-key uses RGB),
+        # so a lower opacity dims the text and lets more of its edge key out.
+        op = self.opacity
+        self.prog["tint"].value = ((tint[0] * op, tint[1] * op, tint[2] * op, tint[3])
+                                   if op < 0.999 else tint)
         if scissor is not None:
             sx, sy, sw, sh = scissor
             sy_gl = self.H - sy - sh
@@ -532,6 +581,24 @@ class LyricRenderer:
             self._draw_quad(cx_center - rl.en.w / 2.0, yb, rl.en.w, rl.en.h,
                             rl.en, self.EN_COLOR)
 
+    def _row_cy(self):
+        """Vertical centre of the lyric row, from the pos_y setting (parity with Tk)."""
+        if self.pos_y == "top":
+            return self.H * 0.24
+        if self.pos_y == "bottom":
+            return self.H * 0.76
+        return self.H * 0.5
+
+    def _eff_pos(self):
+        """The belt's effective song position: the last value the parent sent plus
+        the time elapsed since (capped), so the belt keeps gliding even when the
+        parent thread STALLS (a ~4s Shazam capture, a lyric op) instead of freezing
+        — the child renders at its own ~90fps and the parent re-anchors on resume."""
+        if not self._playing:
+            return self._pos
+        ahead = time.perf_counter() - self._pos_recv
+        return self._pos + max(0.0, min(ahead, 1.2))   # +1.2s cap: a dead parent can't run away
+
     def draw(self):
         # Self-heal the ex-style ~2×/sec so SDL events can't drop click-through.
         now = time.perf_counter()
@@ -568,7 +635,7 @@ class LyricRenderer:
 
         # Vertical layout: active block centered; one context line above (clear of
         # the ruby) and one below (clear of the romaji+english).
-        cy = self.H * 0.5
+        cy = self._row_cy()                    # honour the pos_y setting
         up_pitch = self.base_h + self.ruby_h + 34
         dn_pitch = self.base_h + self.sub_h * 2 + 42
         if active - 1 >= 0:
@@ -584,11 +651,11 @@ class LyricRenderer:
         and the one the parent flagged active carries the gold karaoke fill. The
         song clock (_pos) and scroll config come from the parent each tick, so
         the belt tracks the SAME free-running highlight clock as the Tk overlay."""
-        pos = self._pos
+        pos = self._eff_pos()                  # extrapolated → smooth during parent stalls
         center = self.W / 2.0
         v = max(self.scroll_speed, 60.0)
         d = 1.0 if self.scroll_dir == "rl" else -1.0
-        cy = self.H * 0.5
+        cy = self._row_cy()                    # honour the pos_y setting
         # Tighter window than before (1500 → ~half the screen each side) so only a
         # few lines are on the belt at once instead of the whole screen full.
         margin = self.W * 0.55
@@ -789,8 +856,12 @@ def run_ipc_child(width: int | None = None, height: int | None = None,
                     idx = int(msg.get("idx", -1))
                     fill_frac = float(msg.get("fill_frac", 0.0))
                     playing = bool(msg.get("playing", True))
+                    r._playing = playing
                     if "scroll_dir" in msg or "scroll_speed" in msg:
                         r.set_scroll(msg.get("scroll_dir"), msg.get("scroll_speed"))
+                    if any(k in msg for k in ("opacity", "pos_y", "pos_x", "font_scale")):
+                        r.set_opts(opacity=msg.get("opacity"), pos_y=msg.get("pos_y"),
+                                   pos_x=msg.get("pos_x"), font_scale=msg.get("font_scale"))
                 elif t == "window":
                     # M2 keeps a fixed window; resize is M3 work.
                     pass
@@ -804,8 +875,18 @@ def run_ipc_child(width: int | None = None, height: int | None = None,
                     break
 
             r.pump_events()
-            r.set_state(pos_raw, idx=idx, fill_frac=fill_frac)
-            r.draw()
+            try:
+                r.set_state(pos_raw, idx=idx, fill_frac=fill_frac)
+                r.draw()
+            except Exception as e:
+                # NEVER let one bad frame kill the child — a dead child can leave a
+                # black frame on screen and forces the CPU fallback. Log + continue.
+                print(f"gpu_renderer: draw error (continuing): {e!s}",
+                      file=sys.stderr, flush=True)
+                try:
+                    pygame.time.wait(8)
+                except Exception:
+                    pass
             if cap_path:
                 _grab(r.hwnd, cap_path)
                 print(f"gpu_renderer: captured -> {cap_path}", file=sys.stderr, flush=True)
