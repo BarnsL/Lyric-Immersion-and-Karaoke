@@ -3984,23 +3984,26 @@ class Overlay:
                     # with the live tempo), so poll fast regardless of the current offset.
                     if self._live_arrangement:
                         nxt = min(nxt, 8)
-                    elif abs(self.offset) > 0.8:
+                    elif abs(self.offset) > 0.8 and confirmed:
+                        # Only fast-re-sync a CONFIRMED song's drift. An UNCONFIRMED
+                        # song's offset won't be fixed by recognize (it can't even ID
+                        # it), so hammering it just freezes the render for nothing.
                         nxt = min(nxt, 12)
                     # ANTI-STUTTER BACK-OFF (de-escalation): a song Shazam simply
-                    # CAN'T fingerprint (an MMD/cover/performance arrangement) stays
-                    # "unconfirmed" forever, so the unconfirmed branch above polls
-                    # recognize every ~4 s indefinitely — and each recognize stalls
-                    # the render (GIL contention: ~150-475 ms frames, the visible
-                    # stutter). Once the track is clearly SETTLED — lyrics loaded, in
-                    # sync (|offset|≤1 s), and ~45 s have passed with no sound lock —
-                    # there's nothing left to confirm, so stop hammering: back the
-                    # poll off to a slow heartbeat. Song changes are still caught by
-                    # the boundary detector; live_mode (concert) is exempt (it needs
-                    # continuous polling to catch the next song).
-                    if (self.lines and abs(self.offset) <= 1.0 and not self._live_mode
-                            and time.time() - getattr(self, "_track_t0", 0.0) > 45.0
+                    # CAN'T fingerprint (an MMD/cover/niche feat — e.g. NTE "Play On!"
+                    # feat Reol) stays "unconfirmed" forever, so the unconfirmed branch
+                    # polls recognize every ~4 s — and each recognize STALLS the render
+                    # (GIL: ~150-475 ms frames = the highlight freezing every few sec).
+                    # Once it has lyrics and has played a bit, STOP hammering regardless
+                    # of the offset (recognize can't fix an unfingerprintable song's
+                    # sync; the energy tier handles drift, the boundary detector handles
+                    # song changes). live_mode (concert) is exempt — it polls to catch
+                    # the next song.
+                    if (self.lines and not self._live_mode
+                            and time.time() - getattr(self, "_track_t0", 0.0)
+                                > self._tune.get("unconfirmed_backoff_after_s", 25.0)
                             and ((not self._verified) or self._sound_song is None)):
-                        nxt = max(nxt, self._tune.get("unconfirmed_backoff_s", 22.0))
+                        nxt = max(nxt, self._tune.get("unconfirmed_backoff_s", 28.0))
         finally:
             self._arm_recal(nxt)
 
