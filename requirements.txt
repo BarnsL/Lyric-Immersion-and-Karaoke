@@ -11,6 +11,9 @@ syncedlyrics>=1.0
 deep-translator>=1.11
 spotipy>=2.23
 pypinyin>=0.49
+# Cantonese jyutping (Cantopop gets jyutping, not Mandarin pinyin). Pure-Python,
+# own trie. Optional: _zh_jyutping() falls back to pinyin if missing.
+ToJyutping>=3.2
 # Chinese word segmentation for grouped pinyin (行业 as one word, not 行+业).
 # Optional: romanize() falls back to per-character lazy_pinyin if missing.
 jieba>=0.42
