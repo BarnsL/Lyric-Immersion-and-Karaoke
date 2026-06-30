@@ -11659,54 +11659,23 @@ class Overlay:
         return [_sys.executable, str(here), "--ipc"]
 
     def _start_gpu_renderer(self):
-        """Spawn the GPU child + hide the Tk overlay window. Idempotent: a
-        second call while the child is alive returns True without re-spawning."""
-        import subprocess as _sp
-        if getattr(self, "_gpu_child", None) is not None and self._gpu_child.poll() is None:
-            return True
-        # CRITICAL: the child's stdout+stderr go to a LOG FILE, never an unread
-        # PIPE. An unread stderr=PIPE is the classic subprocess deadlock — the
-        # child's pygame/SDL/GL warnings + heartbeat eventually fill the ~64 KB
-        # pipe buffer, the child blocks on the next write, stops draining its
-        # stdin, our 60 Hz IPC writes then fail, and the child gets orphaned →
-        # silent CPU fallback (the "GPU renderer reverted to the old look" bug).
-        # A file sink never blocks and doubles as the GPU render log.
-        self._gpu_fail_streak = 0
-        try:
-            self._gpu_log_fh = open(LOG_FILE.with_name("gpu_renderer.log"), "wb")
-        except Exception:
-            self._gpu_log_fh = _sp.DEVNULL
-        try:
-            CREATE_NO_WINDOW = 0x08000000   # don't pop a console for the child
-            self._gpu_child = _sp.Popen(
-                self._gpu_child_cmd(),
-                stdin=_sp.PIPE, stdout=self._gpu_log_fh, stderr=self._gpu_log_fh,
-                bufsize=0,
-                creationflags=CREATE_NO_WINDOW,
-            )
-        except Exception as e:
-            log.info("gpu_renderer spawn failed: %s", e)
-            self._gpu_child = None
-            return False
-        # Seed the child with the current song (if any) so it can render
-        # immediately instead of waiting for the next track change.
-        if self.lines:
-            self._gpu_send({
-                "type": "song",
-                "lines": [
-                    {"t": [ln.start, ln.end], "jp": ln.jp, "rm": ln.rm, "en": ln.en}
-                    for ln in self.lines
-                ],
-                "meta": dict(self.meta or {}),
-                "field": "jp",
-            })
-        try:
-            self.root.withdraw()              # hide Tk window — GPU child draws now
-        except Exception:
-            pass
-        log.info("gpu_renderer: child PID=%s started, Tk overlay hidden",
-                 self._gpu_child.pid)
-        return True
+        """MOTHBALLED (v1.1.41). The in-process pygame/moderngl GPU CHILD renderer
+        is retired: it spawned but drew NOTHING (color-keyed GL surface stayed
+        blank) while HIDING the Tk overlay, so toggling "GPU renderer" left the
+        user with no lyrics at all. The GPU render path is now the separate **Tauri
+        overlay** (D:\\projects\\lyric-overlay-tauri) — a transparent, click-through
+        WebView with TRUE per-pixel alpha + native <ruby>, fed by the engine's
+        /overlay endpoint.
+
+        This stub keeps every call site (tray toggle, startup, /tune flip) HARMLESS:
+        it never spawns a child and never withdraws the Tk window, so the WORKING
+        Tk CPU renderer always stays on screen. `_apply_gpu_renderer_toggle` reads
+        the False return and flips gpu_renderer_on back off. The old spawn code +
+        gpu_renderer.py remain in git history for reference."""
+        log.info("gpu_renderer: Python pygame/moderngl child is MOTHBALLED — the GPU "
+                 "path is now the Tauri overlay; staying on the Tk CPU renderer")
+        self._gpu_child = None
+        return False
 
     def _stop_gpu_renderer(self, reason="off"):
         ch = getattr(self, "_gpu_child", None)
@@ -12512,9 +12481,12 @@ def main():
         pystray.Menu.SEPARATOR,
         # 5. PERFORMANCE ──────────────────────────────────────────────────
         pystray.MenuItem("Performance", perf_menu),
-        pystray.MenuItem("GPU renderer (smooth · draws on the idle GPU)",
-                         _toggle_gpu_render,
-                         checked=lambda i: ov.gpu_renderer_on),
+        # MOTHBALLED (v1.1.41): the in-process pygame/moderngl GPU renderer drew
+        # nothing while hiding the Tk overlay. The GPU path is now the separate
+        # Tauri overlay (D:\projects\lyric-overlay-tauri). Disabled + relabelled so
+        # it can't be toggled back into the blank state.
+        pystray.MenuItem("GPU renderer: retired → use the Tauri overlay",
+                         _toggle_gpu_render, enabled=False),
         pystray.MenuItem(_gpu_label, _on_gpu,
                          enabled=lambda i: not _gpu["busy"] and not gpu_setup.gpu_ready(),
                          visible=lambda i: gpu_setup.nvidia_gpu_present()),
