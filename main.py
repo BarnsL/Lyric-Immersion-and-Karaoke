@@ -6117,7 +6117,14 @@ class Overlay:
         # IPC, then reschedule and return — every _render/_karaoke/scroll-belt
         # path below is skipped. If the child dies, _gpu_active() flips False and
         # the normal CPU render resumes automatically next tick.
-        if self._gpu_active():
+        #
+        # v1.1.44: the **Tauri overlay** is also a "the GPU is the renderer now"
+        # path. When it's on (Tk window is withdrawn), do the SAME: compute only
+        # the active-line index so get_overlay_state()/`/overlay` stays fed, and
+        # skip ALL Tk canvas work — so we never render two overlays at once and
+        # the CPU isn't drawing lyrics the user can't see. The 2s watchdog clears
+        # tauri_overlay_on + restores Tk if the overlay child dies.
+        if self._gpu_active() or getattr(self, "tauri_overlay_on", False):
             new = -1
             for i, ln in enumerate(self.lines):     # highlight clock — same as the fill
                 if ln.start <= pos_hi < ln.end:
@@ -6126,7 +6133,7 @@ class Overlay:
             self._diag_idx_skip(new, pos_hi, state)
             self.idx = new
             try:
-                self._gpu_send_state(pos_hi)
+                self._gpu_send_state(pos_hi)        # no-op when there's no GL child
             except Exception:
                 pass
             self.root.after(self._fps, self._tick)
@@ -11928,17 +11935,57 @@ class Overlay:
         return True
 
     def _apply_tauri_overlay_toggle(self, on: bool):
-        """Tray-menu hook: start/stop the Tauri overlay child and persist the
-        choice so it survives a restart."""
+        """Tray-menu hook: the Tauri overlay BECOMES the renderer. Turning it on
+        HIDES the Tk overlay (only one overlay on screen — the GPU one) and the
+        _tick fast-path then skips all Tk canvas work; turning it off restores the
+        Tk overlay. The choice persists. A 2s watchdog restores Tk if the overlay
+        process dies, so a crash/close can never leave a blank screen."""
         on = bool(on)
         if on:
             ok = self._start_tauri_overlay()
             self.tauri_overlay_on = ok          # don't claim 'on' if it didn't launch
+            if ok:
+                try:
+                    self.root.withdraw()         # GPU overlay is the renderer now
+                except Exception:
+                    pass
+                self._arm_tauri_watchdog()
         else:
             self._stop_tauri_overlay(reason="toggle-off")
             self.tauri_overlay_on = False
+            try:
+                self.root.deiconify()            # restore the Tk overlay
+            except Exception:
+                pass
         try:
             self._persist()
+        except Exception:
+            pass
+
+    def _arm_tauri_watchdog(self):
+        """While the GPU overlay is the renderer (Tk withdrawn), poll the child
+        every 2s ON THE TK THREAD. If it died (crash / the user closed the
+        window), restore the Tk overlay so there's never NO overlay on screen."""
+        def _check():
+            if not getattr(self, "tauri_overlay_on", False):
+                return                           # toggled off elsewhere → stop polling
+            ch = getattr(self, "_tauri_child", None)
+            if ch is None or ch.poll() is not None:
+                self._tauri_child = None
+                self.tauri_overlay_on = False
+                log.info("tauri overlay: child gone — restoring Tk overlay")
+                try:
+                    self.root.deiconify()
+                except Exception:
+                    pass
+                try:
+                    self._persist()
+                except Exception:
+                    pass
+                return
+            self.root.after(2000, _check)
+        try:
+            self.root.after(2000, _check)
         except Exception:
             pass
 
@@ -12205,9 +12252,16 @@ def main():
         ov._apply_gpu_renderer_toggle(True)
     # v1.1.42: relaunch the Tauri overlay child if the user left it on. Mirror
     # the toggle path — reconcile the flag so a missing exe at launch clears it
-    # instead of silently re-persisting "on".
+    # instead of silently re-persisting "on". v1.1.44: when it launches, the
+    # GPU overlay is the renderer → hide the Tk overlay + arm the watchdog.
     if getattr(ov, "tauri_overlay_on", False):
         ov.tauri_overlay_on = ov._start_tauri_overlay()
+        if ov.tauri_overlay_on:
+            try:
+                ov.root.withdraw()
+            except Exception:
+                pass
+            ov._arm_tauri_watchdog()
 
     def _reset(*_):   ov.root.after(0, ov.reset_offset)
     def _toggle(*_):  ov.root.after(0, ov.toggle)
