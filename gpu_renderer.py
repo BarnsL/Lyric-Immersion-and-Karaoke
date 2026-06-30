@@ -7,7 +7,7 @@ Opens a borderless OpenGL overlay window with:
   - topmost + no focus steal (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
 and renders a karaoke-style lyric block from a cached lyrics JSON file (the
 app's `lyrics/` cache dir). The window's per-pixel-alpha + click-through bet
-was proven by spikes/gpu_overlay_autotest.py (PASSED on the 3080 ~109fps);
+was proven by spikes/gpu_overlay_autotest.py (PASSED on the high-perf GPU ~109fps);
 this file builds on that plumbing.
 
 What M1 does (self-contained):
