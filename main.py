@@ -1951,6 +1951,28 @@ class Overlay:
     def __init__(self, offset=0.0):
         self.root = tk.Tk()
         self.root.title("Lyric Immersion and Karaoke")
+        # CRASH-DIALOG SUPPRESSION: a TRANSIENT GDI/bitmap shortage — e.g. a 40-min
+        # concert in live mode + OCR full-frame captures (~8 MB DIBs) + Whisper all
+        # churning pixmaps at one instant — can make Tk's internal drawing fail with
+        # "Tk_GetPixmap: Error from CreateDIBSection — not enough memory resources"
+        # even with GBs of RAM free (it's the per-process GDI bitmap heap, not RAM).
+        # By default Tk pops a focus-stealing MessageBox for that, which is the worst
+        # possible thing while the user games fullscreen. Route BOTH Python-callback
+        # errors AND Tcl background errors (the path Tk_GetPixmap surfaces on) to the
+        # log and DROP the frame; the self-rescheduling render loop recovers on the
+        # next tick. Never pop a dialog.
+        def _silent_tk_error(exc, val, tb):
+            try:
+                log.info("tk callback error (suppressed): %s: %s",
+                         getattr(exc, "__name__", exc), val)
+            except Exception:
+                pass
+        self.root.report_callback_exception = _silent_tk_error
+        try:
+            self.root.tk.createcommand(
+                "bgerror", lambda msg: log.info("tk bgerror (suppressed): %s", msg))
+        except Exception:
+            pass
         self.offset = offset
 
         sw = self.root.winfo_screenwidth()
