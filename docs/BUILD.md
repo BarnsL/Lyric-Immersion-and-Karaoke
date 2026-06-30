@@ -99,7 +99,7 @@ when Shazam can't ID the exact cut. It needs **faster-whisper**, which is **heav
 first (kept off the C: drive):
 
 ```bat
-set PIP_CACHE_DIR=D:\pip-cache
+set PIP_CACHE_DIR=<pip-cache>
 pip install --target .deps faster-whisper
 pyinstaller --noconfirm DesktopKaraoke.spec    :: now auto-detects .deps and bundles it (~650 MB .exe)
 ```

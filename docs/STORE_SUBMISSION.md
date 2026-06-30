@@ -92,10 +92,10 @@ enforced** (it blocks the self-signed test signature) and **Developer Mode is
 off**. To do a real local install/launch test you'd need to, as **admin**:
 
 1. Enable **Developer Mode** (Settings → System → For developers), **or** trust
-   the dev cert: import `CN=BarnsL Website Console Dev` into
+   the dev cert: import `CN=Your Dev Cert` into
    `LocalMachine\TrustedPeople`.
 2. Build a **signed** test package:
-   `\.packaging\build_msix.ps1 -CertThumbprint C40DBB1204E80FA38A3CDDF9736551B7B211FD6A`
+   `\.packaging\build_msix.ps1 -CertThumbprint <YOUR_CERT_THUMBPRINT>`
 3. `Add-AppxPackage dist\DesktopKaraoke.msix`
 
 Note: even then, Smart App Control may block the inner `.exe` at launch because

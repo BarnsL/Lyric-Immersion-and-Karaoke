@@ -15,7 +15,7 @@ falls back to the existing rapidfuzz ranking. Mirrors the DeepL gating pattern
 
 Key resolution order (first non-empty wins):
   1. ANTHROPIC_API_KEY environment variable
-  2. D:\\secrets\\anthropic-api-key.txt   (this machine's secrets dir)
+  2. the file named by ANTHROPIC_API_KEY_FILE, if that env var is set
   3. <data_dir>/anthropic-api-key.txt     (portable: next to the exe / settings)
 
 Model: newest Claude by default; override with LYRIC_LLM_MODEL.
@@ -36,9 +36,15 @@ _ANTHROPIC_VERSION = "2023-06-01"
 # LYRIC_LLM_MODEL (e.g. claude-opus-4-8 for the hardest cases).
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 
-_KEY_FILES = [Path(r"D:\secrets\anthropic-api-key.txt")]
 _key_cache = None          # "" once resolved-empty, the key string once found
 _verdict_cache = {}        # (heard+cands) signature -> verdict | None
+
+
+def _env_key_file():
+    """Optional: a key file path supplied via ANTHROPIC_API_KEY_FILE. No path is
+    hardcoded so the repo carries no machine-specific filesystem reference."""
+    p = (os.environ.get("ANTHROPIC_API_KEY_FILE") or "").strip()
+    return Path(p) if p else None
 
 
 def _data_key_file():
@@ -55,7 +61,10 @@ def _read_key():
         return _key_cache or None
     key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
     if not key:
-        files = list(_KEY_FILES)
+        files = []
+        e = _env_key_file()
+        if e is not None:
+            files.append(e)
         d = _data_key_file()
         if d is not None:
             files.append(d)

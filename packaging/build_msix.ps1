@@ -4,7 +4,7 @@
   Run from anywhere; paths are resolved relative to the repo.
 
   Local TEST package (signed with your dev cert so you can install it yourself):
-      .\packaging\build_msix.ps1 -CertThumbprint C40DBB1204E80FA38A3CDDF9736551B7B211FD6A
+      .\packaging\build_msix.ps1 -CertThumbprint <YOUR_CERT_THUMBPRINT>
 
   STORE package (identity comes from Partner Center; leave it UNSIGNED - the
   Store re-signs it on submission). See STORE_SUBMISSION.md for the values:
@@ -16,7 +16,7 @@
 #>
 param(
   [string]$IdentityName     = "BarnsL.DesktopKaraoke",
-  [string]$Publisher        = "CN=BarnsL Website Console Dev",
+  [string]$Publisher        = "CN=Your Dev Cert",
   [string]$PublisherDisplay = "BarnsL",
   [string]$Version          = "1.0.0.0",
   [string]$CertThumbprint   = "",

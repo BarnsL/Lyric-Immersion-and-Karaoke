@@ -17,8 +17,8 @@ stopped."*
 
 **What it is:** Windows error **1450, ERROR_NO_SYSTEM_RESOURCES**. `CreateDIBSection` is the Win32
 call Tk uses to allocate an image pixmap. It failed because the box ran out of a **GDI / commit
-resource**, not RAM-in-general. This is the same **commit/handle-exhaustion class** logged for the
-Squad crash on this laptop (page file already set to Windows-managed).
+resource**, not RAM-in-general. It is a **commit/handle-exhaustion class** failure (commonly seen
+when the page file is constrained; setting it to Windows-managed helps).
 
 **Most likely cause here:** the **Tk CPU renderer** path was the one drawing (the GPU renderer is
 default-on but falls back to Tk when its child dies or is disabled), and the Tk renderer churns
@@ -32,7 +32,7 @@ returned 1450 and took the preview down with it.
 
 **Prevent (do this when resuming):**
 - Do **not** run the Tkinter overlay inside the Claude Code preview during a heavy workflow. Test
-  against the **deployed exe** at `D:\DesktopKaraoke` instead, driven via the control API
+  against the **deployed exe** at `<install-dir>` instead, driven via the control API
   (`http://127.0.0.1:8765`) — that path uses the GPU renderer and the existing live-verify endpoints.
 - Confirm the **GPU renderer is on** (`/tune gpu_renderer_on=1`, persisted `gpu_renderer`) so the
   GDI-heavy Tk CPU pixmap path is not the one rendering.
@@ -108,9 +108,9 @@ grounded root-cause list plus a 4-part fix design via the `sync-reliability-batc
    `/diag` while toggling the caption-first path.
 
 ## 3. Guardrails (carry over from AGENT_HANDOFF.md)
-- **Commit identity = `BarnsL <barnsl@pm.me>`** (author + committer), **no `Co-Authored-By: Claude`
+- **Commit identity = the repo owner's** (author + committer), **no `Co-Authored-By: Claude`
   trailer**. `git fetch` first (multi-machine), push to `master`.
-- **No bundled lyrics** ever (TICKET-124, product/legal). `SALES_CONSIDERATIONS.md` stays local-only.
+- **No bundled lyrics** ever (TICKET-124, product/legal). Any sales/business notes stay local-only.
 - Build/deploy recipe and the `Remove-Item` deletion guard are in `AGENT_HANDOFF.md` — follow exactly.
 - App-launch etiquette: launch minimized, never steal focus, never a visible terminal window
   (the user games fullscreen).
