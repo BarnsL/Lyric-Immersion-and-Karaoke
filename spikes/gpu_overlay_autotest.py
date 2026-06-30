@@ -8,6 +8,7 @@ import array
 import ctypes
 import os
 import sys
+import tempfile
 import time
 from ctypes import wintypes
 
@@ -22,7 +23,7 @@ import moderngl
 from PIL import ImageGrab
 from gpu_overlay_spike import enable_per_pixel_alpha, set_exstyle, VERT, FRAG, W, H
 
-SCRATCH = r"C:\Users\Burgboy\AppData\Local\Temp\claude\D--\1e3fdef9-0dbd-496e-8160-ecbb524749bf\scratchpad"
+SCRATCH = os.environ.get("SPIKE_SCRATCH") or os.path.join(tempfile.gettempdir(), "lyric-overlay-spike")
 
 
 def grab(hwnd, name):
