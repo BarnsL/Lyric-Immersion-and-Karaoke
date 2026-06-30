@@ -1,4 +1,4 @@
-"""
+﻿"""
 Desktop Karaoke — Transparent karaoke-style Japanese lyrics overlay.
 
 Reads the REAL playback position from Windows Media Transport Controls
@@ -2007,8 +2007,22 @@ class Overlay:
         self.pos_x = s.get("pos_x", {"left": "left", "right": "right"}.get(_op, "center"))
         self.display = s.get("display", "primary")     # 'primary' | 'mon:N' | 'span'
         self._display_fp = s.get("display_fp")         # fingerprint for monitor identity
+        # TICKET-FIX: auto-migrate — compute the fingerprint if settings didn't have one.
+        # Old settings.json (pre-v1.1.46) didn't persist display_fp, so _resolve_monitor
+        # had no fingerprint to match → fell to index lookup → failed on DisplayLink blinks.
+        if (not self._display_fp and isinstance(s.get("display"), str)
+                and s.get("display", "").startswith("mon:")):
+            try:
+                _mons = _monitors()
+                _idx = int(s["display"][4:])
+                if 0 <= _idx < len(_mons):
+                    self._display_fp = _mons[_idx]["fp"]
+                    log.info("auto-migrated display_fp: mon:%d → fp=%s", _idx, self._display_fp)
+            except Exception:
+                pass
         self._mon_snapshot = ()                         # current monitor topology
         self._last_mon_check = 0.0                     # throttle for _check_monitors
+        self._display_lost_t = 0.0      # wall-time when display fp was lost (grace period)
         self.scroll_dir = s.get("scroll", "left")      # 'none'|'left'|'right'|'top'|'bottom'|'lr'|'rl'|'tb'|'bt'
         self.scroll_speed = float(s.get("scroll_speed", SCROLL_SPEED))
         self.font_scale = float(s.get("font_scale", 1.0))  # 0.25 … 2.0
@@ -2114,6 +2128,10 @@ class Overlay:
         self._last_boundary = 0.0     # throttle: last boundary-triggered identify
         self._fps = 16
         self._last_pos = 0.0
+        self._smtc_pos_last = 0.0       # last SMTC-reported position (stale detect)
+        self._smtc_pos_last_t = 0.0     # wall-time when SMTC position last CHANGED
+        self._freerun_base_t = 0.0      # wall-time when free-running started
+        self._freerun_base_pos = 0.0    # pos snapshot when free-running kicked in
         self._strm_rem = 0.0
         self._tick_n = 0           # frame counter for throttling the heavy ticker work
         self._fill_skip = 3        # spawn/despawn/fill every Nth frame (set by _apply_perf)
@@ -2925,6 +2943,10 @@ class Overlay:
         self._cur_duration = duration
         self._health_attempts = 0
         self.offset = 0.0          # fresh baseline; sound calibration sets it
+        self._smtc_pos_last = 0.0          # TICKET-FIX: reset stale-position detector
+        self._smtc_pos_last_t = 0.0
+        self._freerun_base_t = 0.0
+        self._freerun_base_pos = 0.0
         self.meta = {}             # drop the PREVIOUS song's meta so a new song
         #                            with no lyrics yet can't show its stale source
         #                            (e.g. "youtube-captions / 0 lines")
@@ -4241,7 +4263,13 @@ class Overlay:
         window. Checked every ~3s."""
         try:
             if self.root.winfo_viewable():
-                self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self.work_top}")
+                # TICKET-FIX: skip re-asserting geometry during display-lost grace
+                # period — otherwise the watchdog cements the overlay on primary
+                # while the real monitor is still reconnecting (DisplayLink blink).
+                if getattr(self, "_display_lost_t", 0.0) > 0.0:
+                    pass   # in grace — don't move
+                else:
+                    self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self.work_top}")
                 if self.lines and self.scroll_dir in ("lr", "rl"):
                     bb = self.cv.bbox("all")
                     if bb and bb[3] > self.work_h and self._lanes > 1:
@@ -6084,9 +6112,36 @@ class Overlay:
         # fixed amount on every song. Adding a small lead to BOTH timebases
         # shifts the line-index AND the karaoke fill earlier so they track the
         # singing. Tunable (default 0.3s); set 0 to disable.
+        # ── TICKET-FIX: position-staleness free-running (v1.1.46) ────────────
+        # GSMTC can stop updating state["position"] while status=PLAYING:
+        #   • YouTube tab loses focus (media session goes stale)
+        #   • Browser throttles background tab media session updates
+        #   • DisplayLink/USB audio latency causes missed SMTC callbacks
+        # When this happens, pos_hi is frozen → line index never advances →
+        # lyrics appear stuck. Detect stale position (unchanged for >1.5s while
+        # PLAYING) and free-run from the last known position using wall-clock.
+        _reported_pos = state["position"]
+        _stale_thresh = float(self._tune.get("pos_stale_thresh_s", 1.5))
+        if abs(_reported_pos - self._smtc_pos_last) > 0.01:
+            # Position CHANGED → reset stale detection, record new baseline.
+            self._smtc_pos_last = _reported_pos
+            self._smtc_pos_last_t = time.time()
+            self._freerun_base_t = 0.0       # not free-running
+            _effective_pos = _reported_pos
+        elif self._smtc_pos_last_t > 0.0 and (time.time() - self._smtc_pos_last_t) > _stale_thresh:
+            # Position has been STALE for > threshold — free-run.
+            if self._freerun_base_t == 0.0:
+                self._freerun_base_t = time.time()
+                self._freerun_base_pos = _reported_pos
+                log.info("pos stale for %.1fs — starting free-run from %.2f",
+                         time.time() - self._smtc_pos_last_t, _reported_pos)
+            elapsed = time.time() - self._freerun_base_t
+            _effective_pos = self._freerun_base_pos + elapsed
+        else:
+            _effective_pos = _reported_pos
         _lead = float(self._tune.get("display_lead_s", 0.0))
-        pos = state["position"] + self._eased_offset() + _lead
-        pos_raw = state["position"] + self.offset + _lead
+        pos = _effective_pos + self._eased_offset() + _lead
+        pos_raw = _effective_pos + self.offset + _lead
         # ── v1.1.42 — HIGHLIGHT CLOCK REGRESSED TO THE JUN-26 BUILD ─────────
         # The user confirmed the highlight was PERFECT in the "Lyric Immersion
         # Test" video (uploaded 2026-06-26 22:11 UTC, build ~v1.0.74). That
@@ -8937,23 +8992,52 @@ class Overlay:
 
     def _resolve_monitor(self, mons):
         """Find the monitor matching ``self.display``, preferring fingerprint over
-        index so the choice survives monitor re-enumeration after sleep/wake."""
+        index so the choice survives monitor re-enumeration after sleep/wake.
+
+        TICKET-FIX (v1.1.46): DisplayLink USB monitors often blink off for up to
+        5 seconds during sleep/wake, resolution changes, or GPU driver reloads.
+        Instead of immediately falling back to primary when the fingerprint is
+        missing, wait for a grace period (display_lost_grace_s, default 10s).
+        During the grace window, return None to signal "don't move" — the caller
+        (_apply_display via _check_monitors) must handle a None return by keeping
+        the current placement. After the grace expires, fall to primary."""
         if self.display == "primary":
+            self._display_lost_t = 0.0
             return next((m for m in mons if m["primary"]), mons[0])
         if isinstance(self.display, str) and self.display.startswith("mon:"):
             fp = getattr(self, "_display_fp", None)
             if fp:
                 hit = next((m for m in mons if m["fp"] == fp), None)
                 if hit:
+                    self._display_lost_t = 0.0   # found — reset grace timer
                     return hit
-                log.info("saved monitor fp %s not found; trying index", fp)
+                # Fingerprint not found — DisplayLink blink?
+                now = time.time()
+                grace = float(self._tune.get("display_lost_grace_s", 10.0))
+                if self._display_lost_t == 0.0:
+                    self._display_lost_t = now
+                    log.info("display fp %s lost — starting %.0fs grace period", fp, grace)
+                if (now - self._display_lost_t) < grace:
+                    return None                   # still in grace — don't move
+                log.info("display fp %s lost for %.1fs > grace %.0fs; trying index fallback",
+                         fp, now - self._display_lost_t, grace)
             try:
                 idx = int(self.display[4:])
             except ValueError:
                 idx = 0
             if 0 <= idx < len(mons):
+                self._display_lost_t = 0.0
                 return mons[idx]
-            log.info("monitor index %s out of range (%d connected); falling back to primary", idx, len(mons))
+            # Index also out of range — same grace logic
+            now = time.time()
+            grace = float(self._tune.get("display_lost_grace_s", 10.0))
+            if self._display_lost_t == 0.0:
+                self._display_lost_t = now
+            if (now - self._display_lost_t) < grace:
+                return None
+            log.info("monitor index %s out of range (%d connected) for %.1fs; falling back to primary",
+                     idx, len(mons), now - self._display_lost_t)
+        self._display_lost_t = 0.0
         return next((m for m in mons if m["primary"]), mons[0])
 
     def _apply_display(self):
@@ -8983,6 +9067,10 @@ class Overlay:
             self.work_top, self.work_bottom = m["wy"], m["wy"] + m["wh"]
         else:
             m = self._resolve_monitor(mons)
+            if m is None:
+                # Grace period active — monitor temporarily lost (DisplayLink blink).
+                # Keep current placement, don't move. Skip the rest of _apply_display.
+                return
             self._display_fp = m["fp"]
             self.work_left, self.W = m["wx"], m["ww"]
             self.work_top, self.work_bottom = m["wy"], m["wy"] + m["wh"]
