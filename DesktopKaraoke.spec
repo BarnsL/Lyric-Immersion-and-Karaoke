@@ -65,7 +65,7 @@ hiddenimports = [
 # — collect_all is what pulls those data files into the exe.
 for pkg in ("winsdk", "soundcard", "shazamio", "pykakasi", "jaconv",
             "fugashi", "unidic_lite", "cutlet", "mojimoji",
-            "pypinyin", "hangul_romanize", "deep_translator", "syncedlyrics",
+            "pypinyin", "ToJyutping", "hangul_romanize", "deep_translator", "syncedlyrics",
             "pystray", "spotipy", "aiohttp", "aiosignal", "pydub", "numpy",
             # TICKET-118: pycaw uses comtypes-generated proxy stubs at runtime
             # — collect_all pulls the data files / lazy submodules PyInstaller
