@@ -111,8 +111,8 @@ def status() -> str:
 # Whisper (faster-whisper / ctranslate2) is the only GPU work the app does, and a
 # transcription briefly pegs the card — which can hitch a game. So during a
 # FULLSCREEN game we keep off the game's GPU: an idle SECOND NVIDIA GPU if one
-# exists, else the CPU. (ctranslate2 is CUDA-or-CPU only — an Intel iGPU can't run
-# it, so the iGPU can't serve as the spare.)
+# exists, else the CPU. (ctranslate2 is CUDA-or-CPU only — an integrated GPU can't run
+# it, so the integrated GPU can't serve as the spare.)
 _game_cache = {"t": -1e9, "on": False}
 _cuda_count = None
 
@@ -201,7 +201,7 @@ def pick_inference_device(avoid_when_gaming: bool = True,
     GPU use on a single-GPU machine when they want the speed.
 
     Picks the LEAST-utilized CUDA GPU instead of assuming the game is always on
-    GPU 0 (TICKET-080 — on this rig the eGPU 3080 is cuda:1 and gets the game,
+    GPU 0 (TICKET-080 — on this rig the the external GPU is cuda:1 and gets the game,
     so the old 'skip 0' rule put Whisper right on the game's card). When a
     fullscreen game is active, any GPU at >=30% util is treated as the game's
     and skipped; if everything is busy we fall to CPU so the transcribe can't

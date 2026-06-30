@@ -31,6 +31,12 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## v1.1.46 — 2026-06-30 session (TICKET-163 → 164)
+- **TICKET-163 — GPU overlay "no lyrics" → GUARANTEED CPU fallback via a CONFIRMED-rendering gate** 🟢 v1.1.46. Hiding Tk the instant the GPU overlay is toggled on meant any non-rendering overlay (blank window, slow WebView init, frozen JS) = blank screen. FIX: the Tk (CPU) overlay now stays up until the GPU overlay is PROVEN rendering, and RETURNS the moment it stops. The watchdog (1.5s, Tk-thread) confirms three things every tick — process alive AND a **visible 'Lyric Overlay' top-level window** (`_overlay_window_visible()` via ctypes EnumWindows, the ground-truth check the process/heartbeat proxies miss) AND a fresh `/overlay` heartbeat — and only then withdraws Tk (`_gpu_rendering=True`); if any fails it `deiconify()`s Tk. The `_tick` fast-path now keys off `_gpu_rendering` (confirmed), not `tauri_overlay_on` (wanted), so Tk keeps drawing until the hand-off. Net: the user ALWAYS sees lyrics — GPU overlay when it works, CPU overlay otherwise — never blank. (Builds on the v1.1.44.1 GUI-subsystem fix.)
+- **TICKET-164 — keep the repo generic about hardware + translation context confirmed** 🟢 v1.1.46. Per the user, genericized 31 specific-GPU references across docs + code COMMENTS (functional GPU selection still uses `cuda:N` indices, untouched). Local-path/identity sanitize re-confirmed clean. Translation context: `_translate_lines` already sends each line inside a 24-line block with ±2 overlap, so every line is translated with ample surrounding context (more than "2 prior + 2 after") — no change needed. NB the user asked: **don't cut GitHub releases unless asked or verified stable** ([[feedback-no-auto-release]]) — committed + pushed, NOT released.
+
+---
+
 ## v1.1.45 — 2026-06-29 session (TICKET-160 → 162)
 - **TICKET-160 — Chinese songs translated to garbage/original (the REAL "no English" cause)** 🟢 v1.1.45. The free Google endpoint with `source="auto"` SILENTLY FAILS on (Traditional) Chinese — it returns the INPUT UNCHANGED, which the code then stored as the "translation". Proven on the live cache: `karma_code.json` had **53/59 lines with en == the original Chinese**. (`source='zh-CN'` translates the exact same lines correctly: 種瓜得瓜→"If you sow melons, you will reap melons".) FIX: `_make_translator(source_lang)` maps the SONG language to an EXPLICIT translator source (`_SRC_LANG`: zh/yue→`zh-CN`, ja→`ja`, ko→`ko`, ru→`ru`; else `auto`) for both Google and DeepL; `_translate_lines` passes `song_lang`. DEFENSE-IN-DEPTH: `_translate_window` + the single-line fallback now REJECT any result that just echoes the source (`en == original`), and `want()` treats an existing `en == original` as MISSING so the bad cached files **self-heal** on replay (verified: karma_code 53→0 echoes, all real English after). Covers zh, yue (jyutping songs), and any CJK that slipped through auto-detect.
 - **TICKET-161 — GUARANTEED CPU fallback for the GPU overlay** 🟢 v1.1.45. Hiding the Tk overlay when the GPU overlay is on means a non-rendering GPU overlay = blank screen. The process-only watchdog missed "process alive but blank / no window / JS frozen". FIX: a HEARTBEAT — `get_overlay_state()` stamps `_overlay_ping_t` on every `/overlay` poll (the overlay polls ~4×/s only while its render loop runs). `_arm_tauri_watchdog` (2s, Tk-thread) restores the Tk (CPU) overlay if the child died OR the heartbeat is stale (>`overlay_heartbeat_stale_s`=6s). So the user ALWAYS ends with a working overlay, never blank. Pairs with the v1.1.44.1 GUI-subsystem fix (the overlay debug build was console-subsystem → `CREATE_NO_WINDOW` suppressed its WebView window → the engine-launched overlay had no window; `#![windows_subsystem="windows"]` unconditional fixed it, also killing the stray console/"terminal").
@@ -109,10 +115,10 @@ Release train v1.0.97 → v1.1.7. All built non-lean (whisper bundled) + deploye
 - **TICKET-122 — ground-truth barrier (2-tier)** 🟢 Bundled=unconditional immunity; captions/OCR=PROVISIONAL (immune only once `_body_corroborated` earned). Fixes feelingradation (bundled) regenerating on its instrumental outro (sync_stable=BAD). Also: アイドル English-translation-body rejection; jp_vagency (ReGLOSS/hololive/神椿 → reject ko/zh body); captions-escalation on SWITCH/REGEN; cover-speedup.
 - **TICKET-123 — OCR-assisted sync** 🟢 When energy-correlation lift < floor (ambient MVs like みらいのかたち, 2-3s off), OCR the on-screen burned-in line, match to the LRC, set offset precisely. New API: GET `/sync`, POST `/resync` + `/ocrsync`.
 - **TICKET-124 — NO bundled lyrics (sellable product)** 🟢 Removed `bundled_lyrics/` from the repo + build + `_seed_bundled_lyrics`. Every lyric is now FOUND BY CODE (providers / captions / OCR / by-ear). Copyrighted text never ships. (bundles backed up privately.)
-- **TICKET-125 — OCR backs off for games** 🟢 OCR (screen capture + GPU-backed WinRT OCR) was hitching a borderless game sharing the 3080. `_ocr_gpu_safe()` skips OCR when a game is active or any GPU ≥45% util (override: `ocr_when_gaming`). Generation already targets the idle 2080 via `pick_inference_device`.
-- **TICKET-127 — app yields to games + OCR-during-gaming revision** 🟢 `_apply_dynamic_priority()` (from `_check_monitors`, ~3s) drops the app to IDLE_PRIORITY_CLASS while a game is active (exclusive-fullscreen OR any GPU ≥45% util), restores BELOW_NORMAL otherwise. Revised TICKET-125: `_ocr_gpu_safe()` now ALLOWS OCR during gaming when ≥2 CUDA GPUs (rides the idle 2080's headroom + yields via IDLE priority); only a single-GPU box backs off. (WinRT OCR can't be GPU-pinned in code — "idle GPU" = IDLE priority + spare-card headroom.)
+- **TICKET-125 — OCR backs off for games** 🟢 OCR (screen capture + GPU-backed WinRT OCR) was hitching a borderless game sharing the high-perf GPU. `_ocr_gpu_safe()` skips OCR when a game is active or any GPU ≥45% util (override: `ocr_when_gaming`). Generation already targets the idle secondary GPU via `pick_inference_device`.
+- **TICKET-127 — app yields to games + OCR-during-gaming revision** 🟢 `_apply_dynamic_priority()` (from `_check_monitors`, ~3s) drops the app to IDLE_PRIORITY_CLASS while a game is active (exclusive-fullscreen OR any GPU ≥45% util), restores BELOW_NORMAL otherwise. Revised TICKET-125: `_ocr_gpu_safe()` now ALLOWS OCR during gaming when ≥2 CUDA GPUs (rides the idle secondary GPU's headroom + yields via IDLE priority); only a single-GPU box backs off. (WinRT OCR can't be GPU-pinned in code — "idle GPU" = IDLE priority + spare-card headroom.)
 - **TICKET-128 — OCR tofu/box-glyph strip** 🟢 OCR emitted a "tofu" box (□ / U+FFFD) where the burned-in frame had a decorative separator or wide space — overlay showed `S M T W T F S□Back to the beginning.` (isomers cover). `_strip_tofu()` in `ocr_lyrics.py` drops geometric-shapes / replacement / PUA / control code points + normalizes exotic spaces, run at the single `filter_lyric_lines` funnel before CJK-space collapse. Verified: `…S□Back…` → `…S Back…`.
-- **OPEN / NEXT:** GPU display renderer (spike PASSED — transparency+click-through+109fps on 3080; M1 = standalone GL renderer process, not yet built); GPU for current-line highlighting (part of renderer); explicit GPU-override menu (force 2080/3080/CPU per task); feelingradation katakana↔English cross-script title matching on Spotify (TICKET-126, open).
+- **OPEN / NEXT:** GPU display renderer (spike PASSED — transparency+click-through+109fps on high-perf GPU; M1 = standalone GL renderer process, not yet built); GPU for current-line highlighting (part of renderer); explicit GPU-override menu (force secondary GPU/high-perf GPU/CPU per task); feelingradation katakana↔English cross-script title matching on Spotify (TICKET-126, open).
 
 ---
 
@@ -420,7 +426,7 @@ Live-resync cadence retuned in the same edit: `live_resync_s` 12.0 → 6.0 (defa
 **Followups (need main.py edits, queued behind TICKET-102):**
 - Add tune knob `gpu_solo_override` default 0 — user who explicitly wants GPU on single-GPU machine can flip it.
 - Expose current device + reason in /diag: `gpu_device`, `gpu_index`, `gpu_reason`, `gpu_count`.
-- Richer tray label dynamically reflecting state: "⚡ GPU: cuda:1 (3080, active)" / "⚡ GPU: CPU (game running)" / "⚡ GPU: CPU (single-GPU policy)".
+- Richer tray label dynamically reflecting state: "⚡ GPU: cuda:1 (high-perf GPU, active)" / "⚡ GPU: CPU (game running)" / "⚡ GPU: CPU (single-GPU policy)".
 **Status:** core policy change applied 🟢; followups 🟢 (v1.0.91 — `gpu_solo_override` knob added, `/diag` exposes gpu_device/index/reason/count, live-tune flip propagates via `align.set_gpu_solo_override`).
 
 ---
@@ -571,7 +577,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 ---
 
 ## TICKET-092 — Pygame + OpenGL renderer substrate swap (GPU acceleration) 🔵
-**Symptom:** at 18 fps target 62 on Chinese rap rendering 3 lines of pinyin + hanzi + English in scroll-mode. Stutter pattern is 1-in-3 frames degrading to 190ms worst-case. Tk Canvas + PIL software rasterization is the bottleneck. User has TWO modern GPUs (RTX 3080 eGPU + RTX 2080 Max-Q internal) sitting idle.
+**Symptom:** at 18 fps target 62 on Chinese rap rendering 3 lines of pinyin + hanzi + English in scroll-mode. Stutter pattern is 1-in-3 frames degrading to 190ms worst-case. Tk Canvas + PIL software rasterization is the bottleneck. User has TWO modern GPUs (the high-perf GPU external GPU + the secondary GPU internal) sitting idle.
 **Path:** swap Tk Canvas → Pygame with SDL2's OpenGL backend.
 - Glyph atlas pre-rasterized via PIL ONCE, uploaded to GPU texture.
 - Karaoke fill = 1 shader uniform (no per-frame PIL composite).
@@ -582,7 +588,7 @@ User was actually listening to CS2 menu music in-game. SMTC had a stale paused Y
 **Wins:**
 - 60+ fps sustained, no stutter (the entire 1-in-3 pattern collapses).
 - Bouncing-animation feature unblocked.
-- Frees the 2080 Max-Q from idle (currently paperweight while not gaming).
+- Frees the secondary GPU from idle (currently paperweight while not gaming).
 **Risk:** transparent OpenGL overlays on Windows require specific window creation order (pre-create the HWND, set extended styles BEFORE first composite). Pattern is well-documented but needs careful porting of `_click_through` + topmost re-assert.
 **Status:** queued behind TICKET-088 + TICKET-082b (cheaper interim wins first).
 
@@ -830,11 +836,11 @@ Two compounding misses:
   by every condition — the strict gate was throwing away a clear net win for a slow
   re-fetch.
 - **`pick_inference_device` is now utilization-based always**, not just under games.
-  Drops the "game is on cuda:0" assumption (broken on this rig: 3080 eGPU is cuda:1
+  Drops the "game is on cuda:0" assumption (broken on this rig: the external GPU is cuda:1
   and gets the game; the old rule put Whisper RIGHT on the game's card). Picks the
   idlest GPU with a small cache-locality bias toward cuda:0. Under a fullscreen game,
-  any GPU at >=30% util is skipped; if all are busy → CPU. Verified live: cuda:0 (2080
-  Max-Q, idle) wins by cache-locality when 3080 is at low util; the dual-GPU swap
+  any GPU at >=30% util is skipped; if all are busy → CPU. Verified live: cuda:0 (secondary GPU
+  Max-Q, idle) wins by cache-locality when high-perf GPU is at low util; the dual-GPU swap
   triggers only when the spread widens. Now both GPUs are usable for Whisper since
   the Code 31 fix landed.
 

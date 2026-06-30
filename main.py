@@ -2566,7 +2566,7 @@ class Overlay:
             # ── GPU-driven lyric renderer (M2) ──
             # 1 = spawn gpu_renderer.py as a child process, feed it state over
             # stdin NDJSON, hide the Tk overlay window. The child window does
-            # the actual drawing on the idle GPU (3080 eGPU here) at 100+ FPS
+            # the actual drawing on the idle GPU (the external GPU here) at 100+ FPS
             # with per-pixel-alpha + click-through + topmost. 0 (default) =
             # Tk renderer drives display as it always has. Flip via /tune
             # gpu_renderer_on=1 (live); a track change is not required.
@@ -6124,7 +6124,7 @@ class Overlay:
         # skip ALL Tk canvas work — so we never render two overlays at once and
         # the CPU isn't drawing lyrics the user can't see. The 2s watchdog clears
         # tauri_overlay_on + restores Tk if the overlay child dies.
-        if self._gpu_active() or getattr(self, "tauri_overlay_on", False):
+        if self._gpu_active() or getattr(self, "_gpu_rendering", False):
             new = -1
             for i, ln in enumerate(self.lines):     # highlight clock — same as the fill
                 if ln.start <= pos_hi < ln.end:
@@ -11940,25 +11940,61 @@ class Overlay:
             return False
         return True
 
+    def _overlay_window_visible(self):
+        """True iff the Tauri overlay child has a VISIBLE top-level 'Lyric
+        Overlay' window right now. This is the ground-truth render check the
+        process/heartbeat proxies can't give — it catches 'process alive but no
+        window / window hidden'. On ANY error return False (be conservative: keep
+        the CPU overlay) so a check failure never blanks the screen."""
+        ch = getattr(self, "_tauri_child", None)
+        if ch is None or ch.poll() is not None:
+            return False
+        if sys.platform != "win32":
+            return True
+        try:
+            import ctypes
+            from ctypes import wintypes
+            pid = ch.pid
+            u = ctypes.windll.user32
+            hit = []
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            def _cb(hwnd, _l):
+                wp = wintypes.DWORD()
+                u.GetWindowThreadProcessId(hwnd, ctypes.byref(wp))
+                if wp.value == pid and u.IsWindowVisible(hwnd):
+                    n = u.GetWindowTextLengthW(hwnd)
+                    if n > 0:
+                        b = ctypes.create_unicode_buffer(n + 1)
+                        u.GetWindowTextW(hwnd, b, n + 1)
+                        if "Lyric Overlay" in b.value:
+                            hit.append(hwnd)
+                return True
+
+            u.EnumWindows(_cb, 0)
+            return bool(hit)
+        except Exception:
+            return False
+
     def _apply_tauri_overlay_toggle(self, on: bool):
-        """Tray-menu hook: the Tauri overlay BECOMES the renderer. Turning it on
-        HIDES the Tk overlay (only one overlay on screen — the GPU one) and the
-        _tick fast-path then skips all Tk canvas work; turning it off restores the
-        Tk overlay. The choice persists. A 2s watchdog restores Tk if the overlay
-        process dies, so a crash/close can never leave a blank screen."""
+        """Tray-menu hook. The GPU overlay BECOMES the renderer ONLY once it has
+        PROVEN it is rendering (a visible window + a fresh /overlay heartbeat);
+        the Tk (CPU) overlay stays up until then and RETURNS the instant the GPU
+        overlay stops rendering. So 'GPU on' can NEVER yield a blank screen —
+        worst case you keep the CPU overlay. The choice persists; the watchdog
+        does the gated hand-off (see _arm_tauri_watchdog)."""
         on = bool(on)
         if on:
             ok = self._start_tauri_overlay()
-            self.tauri_overlay_on = ok          # don't claim 'on' if it didn't launch
+            self.tauri_overlay_on = ok          # 'on' = we WANT the GPU overlay
+            self._gpu_rendering = False         # not confirmed yet → keep Tk visible
+            self._overlay_ping_t = time.time()  # grace for WebView init
             if ok:
-                try:
-                    self.root.withdraw()         # GPU overlay is the renderer now
-                except Exception:
-                    pass
                 self._arm_tauri_watchdog()
         else:
-            self._stop_tauri_overlay(reason="toggle-off")
             self.tauri_overlay_on = False
+            self._gpu_rendering = False
+            self._stop_tauri_overlay(reason="toggle-off")
             try:
                 self.root.deiconify()            # restore the Tk overlay
             except Exception:
@@ -11969,46 +12005,52 @@ class Overlay:
             pass
 
     def _arm_tauri_watchdog(self):
-        """CPU-FALLBACK GUARANTEE. While the GPU overlay is the renderer (Tk
-        withdrawn), poll every 2s ON THE TK THREAD and restore the Tk (CPU)
-        overlay if the GPU overlay is not actually rendering. We detect that two
-        ways: the child PROCESS died, OR the overlay stopped polling /overlay (a
-        stale heartbeat) — which catches the harder 'process alive but blank /
-        no window / JS frozen' failures the process check alone misses. Either
-        way the user always ends up with a working overlay, never a blank screen."""
-        self._overlay_ping_t = time.time()       # grace from launch for WebView init
+        """CPU-FALLBACK GUARANTEE (gated hand-off). Every 1.5s ON THE TK THREAD:
+        the GPU overlay is the renderer (Tk withdrawn, _gpu_rendering=True) ONLY
+        while CONFIRMED rendering — process alive AND a visible 'Lyric Overlay'
+        window AND a fresh /overlay heartbeat. The instant any fails, the Tk (CPU)
+        overlay is restored; if the process dies we abandon the GPU path. So the
+        user ALWAYS sees lyrics — the GPU overlay when it works, the CPU overlay
+        otherwise — never a blank screen."""
         stale_s = float(self._tune.get("overlay_heartbeat_stale_s", 6.0))
-
-        def _restore(reason):
-            self._tauri_child = None
-            self.tauri_overlay_on = False
-            log.info("tauri overlay: %s — falling back to the Tk (CPU) overlay", reason)
-            try:
-                self._stop_tauri_overlay(reason=reason)
-            except Exception:
-                pass
-            try:
-                self.root.deiconify()
-            except Exception:
-                pass
-            try:
-                self._persist()
-            except Exception:
-                pass
 
         def _check():
             if not getattr(self, "tauri_overlay_on", False):
-                return                           # toggled off elsewhere → stop polling
+                return                           # toggled off → stop polling
             ch = getattr(self, "_tauri_child", None)
             if ch is None or ch.poll() is not None:
-                _restore("overlay process gone")
+                self._tauri_child = None
+                self.tauri_overlay_on = False
+                self._gpu_rendering = False
+                log.info("tauri overlay: process gone — back to the Tk (CPU) overlay")
+                try:
+                    self.root.deiconify()
+                except Exception:
+                    pass
+                try:
+                    self._persist()
+                except Exception:
+                    pass
                 return
-            if (time.time() - getattr(self, "_overlay_ping_t", 0)) > stale_s:
-                _restore("overlay not rendering (stale heartbeat)")
-                return
-            self.root.after(2000, _check)
+            fresh = (time.time() - getattr(self, "_overlay_ping_t", 0)) < stale_s
+            confirmed = fresh and self._overlay_window_visible()
+            if confirmed and not getattr(self, "_gpu_rendering", False):
+                self._gpu_rendering = True       # GPU proven → it takes over
+                try:
+                    self.root.withdraw()
+                except Exception:
+                    pass
+                log.info("tauri overlay: confirmed rendering — Tk overlay hidden")
+            elif not confirmed and getattr(self, "_gpu_rendering", False):
+                self._gpu_rendering = False      # GPU stopped → CPU overlay back
+                try:
+                    self.root.deiconify()
+                except Exception:
+                    pass
+                log.info("tauri overlay: not rendering — Tk (CPU) overlay restored")
+            self.root.after(1500, _check)
         try:
-            self.root.after(2000, _check)
+            self.root.after(1500, _check)
         except Exception:
             pass
 
@@ -12279,12 +12321,10 @@ def main():
     # GPU overlay is the renderer → hide the Tk overlay + arm the watchdog.
     if getattr(ov, "tauri_overlay_on", False):
         ov.tauri_overlay_on = ov._start_tauri_overlay()
+        ov._gpu_rendering = False               # keep Tk visible until CONFIRMED rendering
+        ov._overlay_ping_t = time.time()
         if ov.tauri_overlay_on:
-            try:
-                ov.root.withdraw()
-            except Exception:
-                pass
-            ov._arm_tauri_watchdog()
+            ov._arm_tauri_watchdog()            # the watchdog hides Tk only once confirmed
 
     def _reset(*_):   ov.root.after(0, ov.reset_offset)
     def _toggle(*_):  ov.root.after(0, ov.toggle)

@@ -19,7 +19,7 @@ The deployed app at `<install-dir>` is live and verified (`/health`→version, `
 ### What the v1.1.8 → v1.1.17 train added (this session)
 - **GPU DISPLAY RENDERER — DONE (M1+M2+M3).** `gpu_renderer.py` is a process-split
   Pygame-CE + SDL2 + moderngl overlay (per-pixel alpha + click-through + topmost) that draws
-  on the idle GPU (the 3080 eGPU) at **100-250 fps**. Rich content: **furigana ruby** (sky
+  on the idle GPU (the the external GPU) at **100-250 fps**. Rich content: **furigana ruby** (sky
   blue, parsed via `split_furigana`), **gold karaoke fill** (scissored two-pass), green
   **romaji** + gray **English** sub-lines, dimmed context lines, **keep-last-line** during
   short inter-line gaps. **DEFAULT ON** (persisted setting `gpu_renderer`); tray toggle "GPU
@@ -31,7 +31,7 @@ The deployed app at `<install-dir>` is live and verified (`/health`→version, `
   IPC: `{type:song, lines, meta}` on load (via `_relayout_song`→`_gpu_send_song`), `{type:state,
   pos_raw, idx, fill_frac}` per tick, `{type:quit}`. Spec pins `gpu_renderer`/`moderngl`/`pygame`;
   child dispatch = `--gpu-renderer-child` (frozen) / `--ipc` (dev). NOT YET: scroll modes +
-  user pos_y/pos_x placement (GPU window is full-screen, block centered); a true force-2080/3080
+  user pos_y/pos_x placement (GPU window is full-screen, block centered); a true force-secondary GPU/high-perf GPU
   GL pin (the GL context uses the display GPU — generation already targets the idle GPU separately).
 - **Lyric-finding fixes:** agency-prefix unit extraction (`agency_unit_names`: 'hololive
   DEV_IS ReGLOSS' → also query 'ReGLOSS'; Flashpoint was EMPTY/44s, now lrclib/search 8.5s —
@@ -52,7 +52,7 @@ The deployed app at `<install-dir>` is live and verified (`/health`→version, `
 ### What's PENDING / next (in priority order)
 1. **GPU renderer polish** — scroll modes + honoring the user's pos_y/pos_x/opacity/font-scale
    in the GL renderer (currently full-screen, centered block, fixed style). And a real
-   force-2080/3080 GL pin if wanted (hard on Windows; low value since the eGPU 3080 drives display).
+   force-secondary GPU/high-perf GPU GL pin if wanted (hard on Windows; low value since the the external GPU drives display).
 2. **TICKET-126 (open) — feelingradation katakana cross-script title match.** Spotify titles
    it フィーリングラデーション, YouTube "feelingradation"; `clean_title` differs per source so
    the code-fetch can lose it. Needs katakana↔romaji↔English title matching.
@@ -589,7 +589,7 @@ v1.1.8→v1.1.17 summary above. The current PENDING list is the one near the top
   just-under-MIN library win when loaded is clearly wrong AND margin ≥ 3·MARGIN
   (kamone's 49-pt margin would now win). `pick_inference_device` is utilization-based
   always, not just when gaming — drops the "game on cuda:0" assumption (broken now
-  that the 2080 Max-Q Code 31 fix landed and the 3080 eGPU is cuda:1). Picks idlest
+  that the secondary GPU Code 31 fix landed and the the external GPU is cuda:1). Picks idlest
   GPU with a cache-locality bias to cuda:0; under games, skips any GPU ≥30% util.
 - **v1.0.79 — Concert SMTC wrapper song-ID (TICKET-079 a+c):** `_LIVE_VER_RE` now matches
   SMTC-truncated concert titles (`3rd ONE` / `5th LIVE` / `10th Anniversary` / `3rd Tour`)
@@ -625,8 +625,8 @@ v1.1.8→v1.1.17 summary above. The current PENDING list is the one near the top
 - **v1.0.75 — GPU game-guard:** during a fullscreen game, Whisper keeps OFF the game's GPU — uses
   an idle 2nd NVIDIA GPU if enumerated, else CPU (`gpu_setup.pick_inference_device` via NVML +
   `SHQueryUserNotificationState`; `align._select_device`, models cached per (size, device)). Default
-  on; `align.set_gpu_gaming_guard()`. NOTE: this rig has a 2080 Max-Q (Code 31 with the eGPU
-  attached → not enumerated) + a 3080 eGPU, so only the 3080 is visible → falls to CPU during games.
+  on; `align.set_gpu_gaming_guard()`. NOTE: this rig has a secondary GPU (Code 31 with the external GPU
+  attached → not enumerated) + a the external GPU, so only the high-perf GPU is visible → falls to CPU during games.
 - **v1.0.76 — yt-dlp anti-bot:** download resilience that does NOT regress normal videos — realistic
   UA + retries + polite delay; opt-in browser cookies via `DK_COOKIES_BROWSER` (Chromium locks its
   DB while running). Deliberately does NOT force player_client (forcing ios/tv mis-reports "DRM
