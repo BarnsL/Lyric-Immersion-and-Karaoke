@@ -117,6 +117,7 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -732,6 +733,54 @@ def _zh_pinyin(text: str) -> str:
     return result
 
 
+# ── Cantonese (jyutping) ────────────────────────────────────────────────────
+# Cantonese and Mandarin share Han characters, so a script-only detector cannot
+# tell them apart. Default to Mandarin PINYIN; switch a song to JYUTPING only on
+# positive Cantonese evidence: >=2 distinct Cantonese-only colloquial characters
+# in the body, an explicit 粵語/Cantonese tag, or a known Cantopop artist.
+# Conservative on purpose so a stray marker can't flip a Mandarin song.
+_CANTO_MARKERS = set("嘅唔喺咗佢冇睇嗰乜嘢啲哋嚟攞諗咁㗎喎嘞嗮閪咩嘥郁攰")
+_CANTO_TAGS = ("粵語", "粤语", "廣東話", "广东话", "cantonese")
+_CANTO_ARTISTS = ("beyond", "eason chan", "陳奕迅", "陈奕迅", "mirror", "容祖兒",
+                  "容祖儿", "張國榮", "张国荣", "譚詠麟", "谭咏麟", "李克勤",
+                  "古巨基", "謝霆鋒", "谢霆锋", "張學友", "张学友", "陳慧嫻",
+                  "twins", "rubberband", "dear jane", "my little airport")
+_ZH_JYUTPING_CACHE: dict[str, str] = {}
+
+
+def _is_cantonese(body: str, artist: str = "", title: str = "") -> bool:
+    meta = (artist or "") + "  " + (title or "")
+    low = meta.lower()
+    if any(t in meta or t in low for t in _CANTO_TAGS):
+        return True
+    if any(a in low for a in _CANTO_ARTISTS):
+        return True
+    return sum(1 for m in _CANTO_MARKERS if m in body) >= 2
+
+
+def _zh_jyutping(text: str) -> str:
+    """Cantonese jyutping via ToJyutping (pure-Python, own trie). Joins the
+    non-None syllables with spaces — same shape as the pinyin path. Falls back to
+    Mandarin pinyin if the library is missing so a build without it still shows a
+    romanization rather than nothing."""
+    cached = _ZH_JYUTPING_CACHE.get(text)
+    if cached is not None:
+        return cached
+    try:
+        import ToJyutping
+        pairs = ToJyutping.get_jyutping_list(text)
+        result = " ".join(jp for _ch, jp in pairs if jp).strip()
+    except Exception:
+        result = _zh_pinyin(text)
+    if len(_ZH_JYUTPING_CACHE) >= _ZH_PINYIN_CACHE_MAX:
+        try:
+            _ZH_JYUTPING_CACHE.pop(next(iter(_ZH_JYUTPING_CACHE)))
+        except StopIteration:
+            pass
+    _ZH_JYUTPING_CACHE[text] = result
+    return result
+
+
 def romanize(text: str, lang: str) -> str:
     """Romanize text for the given language: Japanese → Hepburn romaji (fugashi +
     cutlet, katakana English recovered as English), Chinese → pinyin, Korean →
@@ -751,8 +800,10 @@ def romanize(text: str, lang: str) -> str:
                 except Exception:
                     pass
             return " ".join(it["hepburn"] for it in _kakasi().convert(text)).strip()
+        if lang == "yue":
+            return _zh_jyutping(text)               # Cantonese → jyutping
         if lang == "zh":
-            return _zh_pinyin(text)
+            return _zh_pinyin(text)                 # Mandarin → pinyin
         if lang == "ko":
             return _korean().translit(text).replace("-", "").strip()
     except Exception:
@@ -1495,9 +1546,22 @@ def _translate_window(tr, idxs: list[int], raw_fn) -> dict:
         return {}
     numbered = "\n".join(f"{k + 1}. {(raw_fn(w).strip() or '　')}"
                          for k, w in enumerate(idxs))
-    try:
-        out = tr.translate(numbered) or ""
-    except Exception:
+    # RETRY: the free Google endpoint intermittently rate-limits / times out. A
+    # single failure used to leave these lines with NO English forever (the
+    # "Chinese/JP song shows romaji but no translation" bug — the local
+    # romanizer always succeeds, so the gap looked language-specific). Retry a
+    # couple of times with a short backoff before giving up on the window.
+    out = ""
+    for attempt in range(3):
+        try:
+            out = tr.translate(numbered) or ""
+            if out.strip():
+                break
+        except Exception:
+            out = ""
+        if attempt < 2:
+            time.sleep(0.6 * (attempt + 1))
+    if not out.strip():
         return {}
     res = {}
     for line in out.split("\n"):
@@ -1587,6 +1651,11 @@ def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict
     one whose language was mis-detected) still gets furigana/romaji instead of
     coming out as bare kanji. `lang` only disambiguates kanji-only lines
     (Japanese vs Chinese)."""
+    # Decide the Chinese romanization ONCE per song: jyutping for Cantonese,
+    # else Mandarin pinyin (only relevant when the song lang is zh).
+    zh_rom = "zh"
+    if lang == "zh" and _is_cantonese(" ".join(l.get("jp", "") for l in lines)):
+        zh_rom = "yue"
     for ln in lines:
         raw = ln["jp"]
         ll = detect_lang(raw)
@@ -1598,7 +1667,7 @@ def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict
         elif ll == "zh":
             # kanji-only: read as Japanese unless the whole song is Chinese
             if lang == "zh":
-                ln["rm"] = romanize(raw, "zh")
+                ln["rm"] = romanize(raw, zh_rom)    # pinyin, or jyutping if Cantonese
             else:
                 ln["jp"] = to_furigana(raw)
                 ln["rm"] = romanize(raw, "ja")
@@ -1627,7 +1696,14 @@ def backfill_file(path) -> bool:
     except Exception:
         return False
     lines = data.get("lines", [])
-    lang = data.get("meta", {}).get("lang")
+    meta = data.get("meta", {})
+    lang = meta.get("lang")
+    # Cantonese → jyutping (else Mandarin pinyin); body markers + artist/title.
+    zh_rom = "zh"
+    if lang == "zh" and _is_cantonese(
+            " ".join(ln.get("jp", "") for ln in lines),
+            meta.get("artist", ""), meta.get("title", "")):
+        zh_rom = "yue"
     changed = False
     for ln in lines:
         raw = re.sub(r"[(（][ぁ-ゟ゛゜ー]+[)）]", "", ln.get("jp", ""))  # strip existing furigana
@@ -1639,7 +1715,7 @@ def backfill_file(path) -> bool:
             ln["rm"] = romanize(raw, "ja")
             changed = True
         elif ll in ("zh", "ko"):
-            ln["rm"] = romanize(raw, ll)
+            ln["rm"] = romanize(raw, zh_rom if ll == "zh" else ll)
             changed = True
     n = _translate_lines(lines, lang, only_missing=True)   # fills lines missing 'en'
     if n:

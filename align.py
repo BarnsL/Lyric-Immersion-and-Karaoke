@@ -214,6 +214,31 @@ def _select_device():
     return (dev, idx, "float16" if dev == "cuda" else "int8", reason)
 
 
+def _affinity_cpu_count():
+    """How many logical CPUs THIS process is actually allowed to run on. Under
+    the single-core pin policy this is ~2 (one physical core's two SMT threads),
+    so we throttle Whisper to keep the audio render thread from being starved."""
+    try:
+        import psutil
+        n = len(psutil.Process().cpu_affinity())
+        if n > 0:
+            return n
+    except Exception:
+        pass
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        proc = ctypes.c_size_t()
+        sysm = ctypes.c_size_t()
+        if k.GetProcessAffinityMask(k.GetCurrentProcess(),
+                                    ctypes.byref(proc), ctypes.byref(sysm)):
+            return max(1, bin(proc.value).count("1"))
+    except Exception:
+        pass
+    import os as _os
+    return _os.cpu_count() or 4
+
+
 def _get_model(size=_MODEL):
     # Re-evaluated each call (cheap: game state is cached): the device can change when
     # a game starts/ends. Models are cached per (size, device) so flipping back never
@@ -228,10 +253,16 @@ def _get_model(size=_MODEL):
             os.environ.setdefault("HF_HOME", md)
             os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         from faster_whisper import WhisperModel
-        # Bound CPU inference to a FEW threads — CTranslate2 otherwise grabs every core
-        # and saturates the render cores (8-15) during a transcribe (audio/scroll
-        # stutter); ignored on CUDA. 4 keeps short int8 clips fast with render headroom.
-        kw = dict(compute_type=ctype, download_root=md, cpu_threads=4)
+        # Bound CPU inference threads. CTranslate2 otherwise grabs every core.
+        # CRITICAL (audio-glitch fix): under the DEFAULT single-core pin policy
+        # (main.py cpu_dedicate_last_core=1 pins the WHOLE process to ONE physical
+        # core), 4 Whisper threads SATURATE that shared core and can starve the
+        # user's music player's audio render thread → dropouts/"clipping". So cap
+        # threads to the process's ACTUAL affinity width: 1 when pinned to a single
+        # core, else a few with headroom. Ignored on CUDA.
+        nproc = _affinity_cpu_count()
+        cput = 1 if nproc <= 2 else min(4, nproc - 1)
+        kw = dict(compute_type=ctype, download_root=md, cpu_threads=cput)
         if dev == "cuda":
             kw["device_index"] = idx
         try:
@@ -239,7 +270,7 @@ def _get_model(size=_MODEL):
         except Exception:                            # GPU load failed → CPU fallback
             dev, idx, key = "cpu", 0, (size, "cpu", 0)
             m = _models.get(key) or WhisperModel(size, device="cpu", compute_type="int8",
-                                                 download_root=md, cpu_threads=4)
+                                                 download_root=md, cpu_threads=cput)
         _models[key] = m
         _device[key] = dev
         try:        # surface the device + reason once per (model, device) — visible in the log
