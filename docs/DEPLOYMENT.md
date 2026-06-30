@@ -28,7 +28,7 @@ Desktop-Karaoke/                      ← SOURCE (git: BarnsL/Lyric-Immersion-an
 └── bundled_lyrics/                   ← optional baked-in LRCs (gitignored; local-only)
 ```
 
-**Deployed app** lives separately at **`D:\DesktopKaraoke\`** (exe + `_internal/` +
+**Deployed app** lives separately at **`<install-dir>\`** (exe + `_internal/` +
 the runtime `lyrics/  models/  settings.json  *.log`). The deploy folder name stays
 `DesktopKaraoke` on purpose — renaming it would orphan the lyric cache / models.
 
@@ -96,7 +96,7 @@ the runtime `lyrics/  models/  settings.json  *.log`). The deploy folder name st
 
 ```
                        ┌─────────────────────────────────────────────┐
-  EDIT SOURCE          │  ~/lyric-overlay  (git, branch master)   │
+  EDIT SOURCE          │  <repo>  (git, branch master)   │
   bump version.py +    └───────────────────────┬─────────────────────┘
   installer.iss                                │
                                                ▼
@@ -113,13 +113,13 @@ the runtime `lyrics/  models/  settings.json  *.log`). The deploy folder name st
                           └── _internal\   (deps, models, cuda libs, gpu_renderer, …)
                                                │
                                                ▼
-  DEPLOY (robocopy)     robocopy dist\DesktopKaraoke  D:\DesktopKaraoke  /E
+  DEPLOY (robocopy)     robocopy dist\DesktopKaraoke  <install-dir>  /E
    • DO NOT /MIR and exclude settings.json — preserve the user's
      settings.json + lyrics\ cache + logs (they live in the deploy dir)
    • stop the running exe first (it locks its own files), then relaunch
                                                │
                                                ▼
-  RUN                   D:\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe
+  RUN                   <install-dir>\Lyric-Immersion-and-Karaoke.exe
    • tray app, transparent overlay, no normal window
    • reads settings.json; if gpu_renderer=true, spawns the GPU child
      (main.exe --gpu-renderer-child → gpu_renderer.run_ipc_child())

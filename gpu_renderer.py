@@ -5,8 +5,8 @@ Opens a borderless OpenGL overlay window with:
   - per-pixel alpha (DWM blur-behind with empty region — no UpdateLayeredWindow CPU readback)
   - click-through (WS_EX_TRANSPARENT)
   - topmost + no focus steal (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
-and renders a karaoke-style lyric block from a cached JSON file in
-D:\\DesktopKaraoke\\lyrics\\. The window's per-pixel-alpha + click-through bet
+and renders a karaoke-style lyric block from a cached lyrics JSON file (the
+app's `lyrics/` cache dir). The window's per-pixel-alpha + click-through bet
 was proven by spikes/gpu_overlay_autotest.py (PASSED on the 3080 ~109fps);
 this file builds on that plumbing.
 
@@ -24,7 +24,7 @@ What M1 does (self-contained):
     (last line end + 3 s) and quits.
 
 Run it:
-  python gpu_renderer.py D:\\DesktopKaraoke\\lyrics\\hour_time_yellow.json
+  python gpu_renderer.py path/to/lyrics/song.json
 Optional flags:
   --width / --height       window size (default 1280×320)
   --font-size              base font size (default 44)

@@ -31,6 +31,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import tempfile
 import time
 from ctypes import wintypes
 
@@ -42,7 +43,7 @@ except Exception:
 
 import ocr_lyrics as OL
 
-SCRATCH = r"C:\Users\user\AppData\Local\Temp\claude\D--\1e3fdef9-0dbd-496e-8160-ecbb524749bf\scratchpad"
+SCRATCH = os.environ.get("SPIKE_SCRATCH") or os.path.join(tempfile.gettempdir(), "lyric-overlay-spike")
 
 _BROWSER_PROCS = {"brave.exe", "chrome.exe", "msedge.exe", "firefox.exe",
                   "vivaldi.exe", "opera.exe", "arc.exe", "spotify.exe",

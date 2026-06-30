@@ -2030,8 +2030,8 @@ class Overlay:
         # its on-screen visibility can be debugged with eyes on the screen.
         self.gpu_renderer_on = bool(s.get("gpu_renderer", False))
         # v1.1.42: the GPU render path is now the standalone **Tauri overlay**
-        # (D:\projects\lyric-overlay-tauri) — a transparent, click-through,
-        # always-on-top WebView with TRUE per-pixel alpha + native <ruby>, fed
+        # (the separate lyric-overlay-tauri project) — a transparent,
+        # click-through, always-on-top WebView with per-pixel alpha + <ruby>, fed
         # over HTTP by the /overlay endpoint. It is an ADDITIVE second renderer
         # (it never hides the Tk overlay); the tray item toggles its child
         # process on/off and the choice persists. Default OFF (opt-in).
@@ -7418,7 +7418,7 @@ class Overlay:
         Usage:
           POST /tune?key=perf_record&value=1            # turn on
           POST /tune?key=perf_record&value=0            # turn off
-          tail -f D:/DesktopKaraoke/perf.log            # watch live
+          tail -f <install-dir>/perf.log                # watch live
         """
         try:
             if not int(self._tune.get("perf_record", 0)):
@@ -11690,8 +11690,8 @@ class Overlay:
         is retired: it spawned but drew NOTHING (color-keyed GL surface stayed
         blank) while HIDING the Tk overlay, so toggling "GPU renderer" left the
         user with no lyrics at all. The GPU render path is now the separate **Tauri
-        overlay** (D:\\projects\\lyric-overlay-tauri) — a transparent, click-through
-        WebView with TRUE per-pixel alpha + native <ruby>, fed by the engine's
+        overlay** (the separate lyric-overlay-tauri project) — a transparent,
+        click-through WebView with per-pixel alpha + <ruby>, fed by the engine's
         /overlay endpoint.
 
         This stub keeps every call site (tray toggle, startup, /tune flip) HARMLESS:
@@ -11843,20 +11843,24 @@ class Overlay:
 
     # ── Tauri overlay (the GPU render path) ────────────────────────────────
     def _tauri_overlay_cmd(self):
-        """Resolve the lyric-overlay.exe to launch. Order: an explicit tune
-        override, a copy bundled next to the frozen app (installed builds), then
-        the dev build under D:\\projects\\lyric-overlay-tauri (release before
-        debug). Returns the first path that exists, or None."""
-        override = (self._tune.get("tauri_overlay_exe") or "").strip()
+        """Resolve the lyric-overlay.exe to launch. Order (first that exists):
+        the `tauri_overlay_exe` tune override, the LYRIC_OVERLAY_EXE env var,
+        then an `overlay/lyric-overlay.exe` (or `lyric-overlay.exe`) sitting next
+        to the app — the frozen build dir, or this source file's dir in dev. No
+        path is hardcoded, so the repo carries no machine-specific filesystem
+        reference; on a dev box point LYRIC_OVERLAY_EXE (or the tune override) at
+        your local Tauri build, or drop the exe in an `overlay/` folder beside
+        the app. Returns the first path that exists, or None."""
+        base = (Path(sys.executable).parent if getattr(sys, "frozen", False)
+                else Path(__file__).parent)
         cands = []
+        override = (self._tune.get("tauri_overlay_exe") or "").strip()
         if override:
             cands.append(Path(override))
-        if getattr(sys, "frozen", False):
-            cands.append(Path(sys.executable).parent / "overlay" / "lyric-overlay.exe")
-        cands += [
-            Path(r"D:\projects\lyric-overlay-tauri\src-tauri\target\release\lyric-overlay.exe"),
-            Path(r"D:\projects\lyric-overlay-tauri\src-tauri\target\debug\lyric-overlay.exe"),
-        ]
+        env = (os.environ.get("LYRIC_OVERLAY_EXE") or "").strip()
+        if env:
+            cands.append(Path(env))
+        cands += [base / "overlay" / "lyric-overlay.exe", base / "lyric-overlay.exe"]
         for p in cands:
             try:
                 if p.is_file():
