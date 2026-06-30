@@ -2029,6 +2029,14 @@ class Overlay:
         # OPT-IN via the tray "GPU renderer" toggle (the choice persists) until
         # its on-screen visibility can be debugged with eyes on the screen.
         self.gpu_renderer_on = bool(s.get("gpu_renderer", False))
+        # v1.1.42: the GPU render path is now the standalone **Tauri overlay**
+        # (D:\projects\lyric-overlay-tauri) — a transparent, click-through,
+        # always-on-top WebView with TRUE per-pixel alpha + native <ruby>, fed
+        # over HTTP by the /overlay endpoint. It is an ADDITIVE second renderer
+        # (it never hides the Tk overlay); the tray item toggles its child
+        # process on/off and the choice persists. Default OFF (opt-in).
+        self.tauri_overlay_on = bool(s.get("tauri_overlay_on", False))
+        self._tauri_child = None
         # TICKET-100: opt-in Discord Rich Presence reader; default OFF (mirrors
         # generate_on — both are "extra effort" features users opt into). Persists
         # under settings key 'discord_rpc'. Tray toggle and tune knob both write
@@ -2289,7 +2297,7 @@ class Overlay:
         # shipped — overrides reset to these on restart.
         self._tune = {
             "deadband":              0.8,   # |drift| below this is left alone
-            "display_lead_s":        0.12,  # lead the audio so the highlight sits JUST AHEAD of the vocal (the tolerated/desired direction; within the ~170ms AV binding window). Was 0.3 to mask the choppy-clock lag the slew-limited clock now removes. 0 = off
+            "display_lead_s":        0.0,   # v1.1.42: ZERO lead = true Jun-26 (~v1.0.74) parity, the build the user confirmed "perfect". The lead (0.3→0.12) only ever existed to mask the choppy-/slew-limited-clock lag; that clock is now retired (pos_hi = pos), so the simple eased clock needs no lead. Bump to ~0.1 if a residual systematic lag ever reappears (highlight sits just ahead of the vocal, within the ~170ms AV-binding window)
             # ── PERCEPTUAL in-sync window (asymmetric; ITU-R BT.1359 + AV binding window) ──
             # The old symmetric ±deadband(0.8s) called anything within ~800ms "in
             # sync" — 4-9x looser than a listener can perceive. Humans tolerate the
@@ -6076,16 +6084,28 @@ class Overlay:
         # fixed amount on every song. Adding a small lead to BOTH timebases
         # shifts the line-index AND the karaoke fill earlier so they track the
         # singing. Tunable (default 0.3s); set 0 to disable.
-        _lead = float(self._tune.get("display_lead_s", 0.3))
+        _lead = float(self._tune.get("display_lead_s", 0.0))
         pos = state["position"] + self._eased_offset() + _lead
         pos_raw = state["position"] + self.offset + _lead
-        # pos_hi — the FREE-RUNNING highlight clock. Drives the active-line
-        # index + karaoke fill (CPU and GPU). It rides the song's own position
-        # plus a STABLE offset that is frozen mid-song, so a sync re-estimate
-        # can't yank the fill forward ("no highlight, then snap-fill 3 lines").
-        # See _hi_pos. pos_raw is kept only for perf logging + the deferred-
-        # commit boundary test (the TRUE clock), never for the visible fill.
-        pos_hi = self._hi_pos(state, _lead)
+        # ── v1.1.42 — HIGHLIGHT CLOCK REGRESSED TO THE JUN-26 BUILD ─────────
+        # The user confirmed the highlight was PERFECT in the "Lyric Immersion
+        # Test" video (uploaded 2026-06-26 22:11 UTC, build ~v1.0.74). That
+        # build drove the active-line index + karaoke fill + scroll belt from
+        # ONE simple timebase: the raw song position plus a smoothly-EASED sync
+        # offset — exactly `pos` above. The v1.1.23→1.1.41 two-layer
+        # slew-limited clock (_hi_pos) replaced it and was STARVING the fill —
+        # "really slow and snap", sometimes "no highlights" — because its §3
+        # output slew-limit caps forward motion to a few × realtime, so after
+        # any internal clock step the visible fill crawls and then jumps to
+        # catch up. Route every visible consumer back onto the Jun-26 clock.
+        # Sync still corrects via self.offset, which _eased_offset glides in
+        # over a few frames, so "only the lyrics follow sync; the highlight just
+        # steadily fills." _hi_pos is retained below (now unused) for reference.
+        # pos_raw stays the TRUE clock for perf logging + the deferred-commit
+        # boundary test only.
+        pos_hi = pos
+        self._pos_hi = pos_hi          # honest live value for /syncdiag (the retired
+        #                                _hi_clock/_hi_out are no longer written)
         # ── GPU-RENDERER FAST PATH (v1.1.15 — the performance fix) ──────────
         # When the GL child process is drawing, the MAIN process must do ZERO
         # Pillow/canvas rendering. That CPU text work holds the GIL on the Tk
@@ -6111,20 +6131,21 @@ class Overlay:
                 pass
             self.root.after(self._fps, self._tick)
             return
-        # Highlight + line index + scroll belt always track the current raw clock.
-        # The v1.0.85 fine-tune PAUSE override (freezing pos/pos_raw on forward
-        # drift) was removed — the user reported the freeze as "unreliable
-        # highlighting, always pausing". Sync corrections now go through
-        # _smooth_offset (boundary-deferred) so the offset commits at the next
-        # line boundary instead of freezing the highlight mid-line.
+        # Highlight + line index + scroll belt all track pos_hi, which since
+        # v1.1.42 IS the Jun-26 eased clock (pos = song position + eased offset
+        # + lead) — NOT the retired slew-limited _hi_pos. Sync corrections go
+        # through _smooth_offset (boundary-deferred) and are applied via
+        # _eased_offset, so the offset commits at a line boundary and glides in;
+        # the highlight itself just steadily fills.
         branch_tag = "line"
 
-        # BELT MOTION + FILL both ride pos_hi (the slew-limited highlight clock).
-        # CRITICAL: the belt's per-frame scroll is v·(pos − last_pos), so feeding
-        # it the raw choppy SMTC clock (the old `pos`) made the WHOLE BELT lurch
-        # 2-3 lines every time SMTC held-then-jumped — the user's "jumping and
-        # skipping" in the scroll view. pos_hi is continuous and monotonic, so the
-        # belt now glides; using the SAME clock for motion and fill also keeps the
+        # BELT MOTION + FILL both ride pos_hi (== pos, the eased song clock).
+        # The belt's per-frame scroll is v·(pos − last_pos); smoothness comes
+        # from _eased_offset (rate-capped) + the boundary-deferred offset, NOT a
+        # slew limiter. The belt's own discontinuity guard (_ticker_update /
+        # _ticker_update_v reseed when |Δpos| > belt_reseed_s) absorbs the
+        # track-change position snap to ~0, so the belt can't lurch backward by
+        # the whole song. Using the SAME clock for motion and fill keeps the
         # gold fill locked to each line's on-screen position (no divergence).
         if self.scroll_dir in ("lr", "rl"):       # continuous horizontal scroll-through
             self._ticker_update(pos_hi, pos_hi)
@@ -6139,13 +6160,13 @@ class Overlay:
             self.root.after(self._fps, self._tick)
             return
 
-        # LINE-INDEX from pos_raw (the RAW clock), NOT the eased pos. The eased
-        # offset ramps over several frames when sync corrects, so the line-index
-        # (on eased pos) lagged while the karaoke FILL (on pos_raw) raced ahead —
-        # that divergence IS the user's "fill stops midway, then snaps full +
-        # fills the next" jarring. self.offset only changes at line boundaries
-        # (boundary-deferred via _smooth_offset), so pos_raw is smooth mid-line:
-        # index + fill now track on ONE clock and the highlight just runs.
+        # LINE-INDEX + karaoke FILL both ride pos_hi (== the eased pos clock) —
+        # ONE timebase, exactly as the Jun-26 build did. (The TICKET-082 split
+        # that ran the index on eased pos and the fill on raw pos_raw is gone;
+        # it diverged on a correction — "fill stops midway, then snaps full" —
+        # and the unified clock fixes that.) self.offset only changes at line
+        # boundaries (boundary-deferred via _smooth_offset), so the clock is
+        # smooth mid-line and the highlight just runs.
         new = -1
         for i, ln in enumerate(self.lines):
             if ln.start <= pos_hi < ln.end:
@@ -7058,11 +7079,10 @@ class Overlay:
             if new >= 0 and prev >= 0 and abs(new - prev) > 1:
                 raw = state.get("position", 0.0) if isinstance(state, dict) else 0.0
                 live = getattr(self, "_live_mode", False) or getattr(self, "_live_arrangement", False)
-                log.info("hi-skip: idx %d→%d (Δ%d)  pos_hi=%.2f hi_clock=%.2f hi_off=%+.2f "
-                         "raw=%.2f off=%+.2f corr=%+.3f live=%s gpu=%s",
-                         prev, new, new - prev, pos_hi, getattr(self, "_hi_clock", 0.0),
-                         getattr(self, "_hi_offset", 0.0), raw, self.offset,
-                         getattr(self, "_hi_corr", 0.0), live, self._gpu_active())
+                # v1.1.42: pos_hi is now the eased pos clock (the slew-limited
+                # _hi_clock/_hi_offset/_hi_corr are retired and no longer logged).
+                log.info("hi-skip: idx %d→%d (Δ%d)  pos_hi=%.2f raw=%.2f off=%+.2f live=%s",
+                         prev, new, new - prev, pos_hi, raw, self.offset, live)
                 self._sync_event("idx_skip", frm=prev, to=new, delta=new - prev,
                                  pos_hi=round(pos_hi, 2), offset=round(self.offset, 2),
                                  drift=getattr(self, "_last_drift", None), live=live)
@@ -7106,8 +7126,11 @@ class Overlay:
             "events": list(self._sync_events)[-120:],
             "n_events": len(self._sync_events),
             "clock": {
-                "hi_clock": g("_hi_clock"), "hi_offset": g("_hi_offset"),
-                "hi_out": g("_hi_out"), "hi_corr": g("_hi_corr"), "offset": g("offset"),
+                # v1.1.42: pos_hi IS the live highlight clock (== eased pos). The
+                # old slew-limited _hi_clock/_hi_out/_hi_offset/_hi_corr are
+                # retired and no longer written — reporting pos_hi instead.
+                "pos_hi": g("_pos_hi"), "clock_model": "eased-pos (v1.1.42)",
+                "offset": g("offset"),
                 "pending_offset": (round(po, 3) if po is not None else None),
                 "last_drift": getattr(self, "_last_drift", None),
                 "drift_integral": g("_drift_integral"),
@@ -7487,9 +7510,10 @@ class Overlay:
             pass     # never let perf-logging break the tick
 
     def _karaoke(self, pos_raw):
-        """TICKET-082: takes pos_raw (raw song clock) so the fill ramps at the
-        actual song rate instead of the eased glide rate. Caller decides which
-        timebase — _tick passes pos_raw, legacy callers (if any) pass pos."""
+        """Fill the active line's chars up to (pos − line.start)/dur. The param
+        is named pos_raw for history, but since v1.1.42 _tick passes pos_hi
+        (== the eased pos clock) — index + fill share ONE timebase, as the
+        Jun-26 build did. (The TICKET-082 raw-vs-eased split is retired.)"""
         # A2: bracket the whole _karaoke() body. The early returns inside the
         # `with` block still let the context manager record elapsed time on the
         # way out (the value will be ~0ms for the empty/zero-dur fast paths,
@@ -8488,6 +8512,9 @@ class Overlay:
                         "boundary": self.boundary_on, "generate": self.generate_on,
                         "captions": self.captions_on,
                         "gpu_renderer": self.gpu_renderer_on,
+                        # NB: key MUST match the __init__ read s.get("tauri_overlay_on")
+                        # or the choice silently never persists.
+                        "tauri_overlay_on": getattr(self, "tauri_overlay_on", False),
                         "discord_rpc": self.discord_rpc_on,
                         "window_titles": self.window_titles_on,
                         "window_titles_generic_browsers":
@@ -11814,8 +11841,106 @@ class Overlay:
         except Exception:
             pass
 
+    # ── Tauri overlay (the GPU render path) ────────────────────────────────
+    def _tauri_overlay_cmd(self):
+        """Resolve the lyric-overlay.exe to launch. Order: an explicit tune
+        override, a copy bundled next to the frozen app (installed builds), then
+        the dev build under D:\\projects\\lyric-overlay-tauri (release before
+        debug). Returns the first path that exists, or None."""
+        override = (self._tune.get("tauri_overlay_exe") or "").strip()
+        cands = []
+        if override:
+            cands.append(Path(override))
+        if getattr(sys, "frozen", False):
+            cands.append(Path(sys.executable).parent / "overlay" / "lyric-overlay.exe")
+        cands += [
+            Path(r"D:\projects\lyric-overlay-tauri\src-tauri\target\release\lyric-overlay.exe"),
+            Path(r"D:\projects\lyric-overlay-tauri\src-tauri\target\debug\lyric-overlay.exe"),
+        ]
+        for p in cands:
+            try:
+                if p.is_file():
+                    return p
+            except Exception:
+                pass
+        return None
+
+    def _start_tauri_overlay(self):
+        """Launch the standalone Tauri overlay child (windowless spawn; the
+        overlay window itself is transparent + click-through + focus:false, so
+        it never steals focus from a fullscreen game). It polls /overlay over
+        HTTP and is fully decoupled from the Tk renderer — we do NOT hide Tk and
+        do NOT pipe state to it. Returns True if a live child is running."""
+        if self._tauri_active():
+            return True
+        exe = self._tauri_overlay_cmd()
+        if exe is None:
+            log.info("tauri overlay: lyric-overlay.exe not found — build it "
+                     "(cargo build in lyric-overlay-tauri\\src-tauri) or set "
+                     "tune tauri_overlay_exe")
+            return False
+        if not getattr(self, "api_on", True):
+            log.info("tauri overlay: the Local API is OFF — the overlay will show "
+                     "'waiting' until you enable it (it reads /overlay on :8765)")
+        try:
+            self._tauri_child = subprocess.Popen(
+                [str(exe)], cwd=str(exe.parent),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, creationflags=_NO_WINDOW)
+            log.info("tauri overlay: launched %s (pid %s)", exe, self._tauri_child.pid)
+            return True
+        except Exception as e:
+            log.info("tauri overlay: launch failed: %s", e)
+            self._tauri_child = None
+            return False
+
+    def _stop_tauri_overlay(self, reason="off"):
+        ch = getattr(self, "_tauri_child", None)
+        if ch is None:
+            return
+        try:
+            if ch.poll() is None:
+                ch.terminate()
+                try:
+                    ch.wait(timeout=2.0)
+                except Exception:
+                    pass
+                if ch.poll() is None:
+                    ch.kill()
+        except Exception:
+            pass
+        self._tauri_child = None
+        log.info("tauri overlay: stopped (%s)", reason)
+
+    def _tauri_active(self):
+        """True when the Tauri overlay child is alive. Self-heals the handle if
+        the user closed the overlay window (so the tray checkmark stays honest)."""
+        ch = getattr(self, "_tauri_child", None)
+        if ch is None:
+            return False
+        if ch.poll() is not None:
+            self._tauri_child = None
+            return False
+        return True
+
+    def _apply_tauri_overlay_toggle(self, on: bool):
+        """Tray-menu hook: start/stop the Tauri overlay child and persist the
+        choice so it survives a restart."""
+        on = bool(on)
+        if on:
+            ok = self._start_tauri_overlay()
+            self.tauri_overlay_on = ok          # don't claim 'on' if it didn't launch
+        else:
+            self._stop_tauri_overlay(reason="toggle-off")
+            self.tauri_overlay_on = False
+        try:
+            self._persist()
+        except Exception:
+            pass
+
     def quit(self):
         self._stop_gpu_renderer(reason="app-quit")
+        self._stop_tauri_overlay(reason="app-quit")
         self._m(self.metrics.finalize)      # TICKET-121: flush the last in-flight play
         self._destroy_mirrors()
         if self._boundary is not None:
@@ -12074,6 +12199,11 @@ def main():
     # root window to withdraw. A spawn failure leaves the Tk window visible.
     if getattr(ov, "gpu_renderer_on", True):
         ov._apply_gpu_renderer_toggle(True)
+    # v1.1.42: relaunch the Tauri overlay child if the user left it on. Mirror
+    # the toggle path — reconcile the flag so a missing exe at launch clears it
+    # instead of silently re-persisting "on".
+    if getattr(ov, "tauri_overlay_on", False):
+        ov.tauri_overlay_on = ov._start_tauri_overlay()
 
     def _reset(*_):   ov.root.after(0, ov.reset_offset)
     def _toggle(*_):  ov.root.after(0, ov.toggle)
@@ -12203,8 +12333,8 @@ def main():
     def _toggle_bound(*_): ov.root.after(0, lambda: ov.set_boundary(not ov.boundary_on))
     def _toggle_gen(*_):   ov.root.after(0, lambda: ov.set_generate(not ov.generate_on))
     def _toggle_caps(*_):  ov.root.after(0, lambda: ov.set_captions(not ov.captions_on))
-    def _toggle_gpu_render(*_):
-        ov.root.after(0, lambda: ov._apply_gpu_renderer_toggle(not ov.gpu_renderer_on))
+    def _toggle_tauri_overlay(*_):
+        ov.root.after(0, lambda: ov._apply_tauri_overlay_toggle(not ov._tauri_active()))
     # TICKET-100: Discord Rich Presence reader toggle (default OFF, opt-in).
     def _toggle_discord_rpc(*_):
         ov.root.after(0, lambda: ov.set_discord_rpc(not ov.discord_rpc_on))
@@ -12481,12 +12611,15 @@ def main():
         pystray.Menu.SEPARATOR,
         # 5. PERFORMANCE ──────────────────────────────────────────────────
         pystray.MenuItem("Performance", perf_menu),
-        # MOTHBALLED (v1.1.41): the in-process pygame/moderngl GPU renderer drew
-        # nothing while hiding the Tk overlay. The GPU path is now the separate
-        # Tauri overlay (D:\projects\lyric-overlay-tauri). Disabled + relabelled so
-        # it can't be toggled back into the blank state.
-        pystray.MenuItem("GPU renderer: retired → use the Tauri overlay",
-                         _toggle_gpu_render, enabled=False),
+        # v1.1.42: the GPU render path is the standalone Tauri overlay — a
+        # transparent, click-through, per-pixel-alpha WebView fed over HTTP by
+        # /overlay. This toggles its child process on/off (additive: the Tk
+        # overlay keeps running). The checkmark self-heals if the user closes
+        # the overlay window. The old in-process pygame/moderngl child stays
+        # MOTHBALLED (drew nothing); its toggle is gone.
+        pystray.MenuItem("GPU overlay (Tauri · smooth, click-through)",
+                         _toggle_tauri_overlay,
+                         checked=lambda i: ov._tauri_active()),
         pystray.MenuItem(_gpu_label, _on_gpu,
                          enabled=lambda i: not _gpu["busy"] and not gpu_setup.gpu_ready(),
                          visible=lambda i: gpu_setup.nvidia_gpu_present()),
