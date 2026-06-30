@@ -10091,6 +10091,12 @@ class Overlay:
         interpolated client-side between polls). Only a LINE CHANGE re-anchors the
         fill, which is the "only the lyrics follow sync; the highlight just
         proceeds" principle realized in the renderer itself. Read-only."""
+        # HEARTBEAT for the CPU-fallback watchdog: the overlay polls this every
+        # ~250ms WHILE it is actually running its render loop, so a fresh request
+        # proves the GPU overlay is alive AND rendering. If these stop (the
+        # overlay crashed, its window vanished, or its JS froze), the watchdog
+        # restores the Tk (CPU) overlay — guaranteeing a CPU fallback.
+        self._overlay_ping_t = time.time()
         st = self.media.get() or {}
         playing = (st.get("status", PLAYING) == PLAYING)
         lead = float(self._tune.get("display_lead_s", 0.12))
@@ -11963,25 +11969,42 @@ class Overlay:
             pass
 
     def _arm_tauri_watchdog(self):
-        """While the GPU overlay is the renderer (Tk withdrawn), poll the child
-        every 2s ON THE TK THREAD. If it died (crash / the user closed the
-        window), restore the Tk overlay so there's never NO overlay on screen."""
+        """CPU-FALLBACK GUARANTEE. While the GPU overlay is the renderer (Tk
+        withdrawn), poll every 2s ON THE TK THREAD and restore the Tk (CPU)
+        overlay if the GPU overlay is not actually rendering. We detect that two
+        ways: the child PROCESS died, OR the overlay stopped polling /overlay (a
+        stale heartbeat) — which catches the harder 'process alive but blank /
+        no window / JS frozen' failures the process check alone misses. Either
+        way the user always ends up with a working overlay, never a blank screen."""
+        self._overlay_ping_t = time.time()       # grace from launch for WebView init
+        stale_s = float(self._tune.get("overlay_heartbeat_stale_s", 6.0))
+
+        def _restore(reason):
+            self._tauri_child = None
+            self.tauri_overlay_on = False
+            log.info("tauri overlay: %s — falling back to the Tk (CPU) overlay", reason)
+            try:
+                self._stop_tauri_overlay(reason=reason)
+            except Exception:
+                pass
+            try:
+                self.root.deiconify()
+            except Exception:
+                pass
+            try:
+                self._persist()
+            except Exception:
+                pass
+
         def _check():
             if not getattr(self, "tauri_overlay_on", False):
                 return                           # toggled off elsewhere → stop polling
             ch = getattr(self, "_tauri_child", None)
             if ch is None or ch.poll() is not None:
-                self._tauri_child = None
-                self.tauri_overlay_on = False
-                log.info("tauri overlay: child gone — restoring Tk overlay")
-                try:
-                    self.root.deiconify()
-                except Exception:
-                    pass
-                try:
-                    self._persist()
-                except Exception:
-                    pass
+                _restore("overlay process gone")
+                return
+            if (time.time() - getattr(self, "_overlay_ping_t", 0)) > stale_s:
+                _restore("overlay not rendering (stale heartbeat)")
                 return
             self.root.after(2000, _check)
         try:

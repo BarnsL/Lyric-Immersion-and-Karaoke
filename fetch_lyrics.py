@@ -1516,20 +1516,32 @@ def _song_lang(lines: list[dict]) -> str:
     return detect_lang(body)
 
 
-def _make_translator():
+# Map our song language to an EXPLICIT translator source code. CRITICAL: Google's
+# source="auto" silently FAILS on (Traditional) Chinese — it returns the input
+# unchanged, which then got stored as the "translation" (the user's "no English
+# for Chinese songs", en==original). An explicit zh source translates it
+# correctly. Japanese/Korean auto-detect fine but explicit is harmless + safer.
+_SRC_LANG = {"zh": "zh-CN", "yue": "zh-CN", "ja": "ja", "ko": "ko", "ru": "ru"}
+
+
+def _make_translator(source_lang: str | None = None):
     """Prefer DeepL (noticeably better JP/CJK→EN) when a DEEPL_API_KEY is set in
     the environment; otherwise fall back to the free Google endpoint. Either way
-    no key is required to use the app."""
+    no key is required to use the app. `source_lang` is the SONG language — we map
+    it to an explicit translator source so CJK doesn't fall through auto-detect."""
+    src = _SRC_LANG.get(source_lang or "", "auto")
     key = os.environ.get("DEEPL_API_KEY")
     if key:
         try:
             from deep_translator import DeeplTranslator
-            return DeeplTranslator(api_key=key, source="auto", target="en",
-                                   use_free_api=True)
+            # DeepL wants the BCP-style code; zh-CN→ZH, else the auto path.
+            dsrc = {"zh-CN": "zh", "ja": "ja", "ko": "ko", "ru": "ru"}.get(src, None)
+            return DeeplTranslator(api_key=key, source=(dsrc or "auto"),
+                                   target="en-us", use_free_api=True)
         except Exception:
             pass
     from deep_translator import GoogleTranslator
-    return GoogleTranslator(source="auto", target="en")
+    return GoogleTranslator(source=src, target="en")
 
 
 def _translate_window(tr, idxs: list[int], raw_fn) -> dict:
@@ -1569,15 +1581,22 @@ def _translate_window(tr, idxs: list[int], raw_fn) -> dict:
         if not m:
             continue
         k = int(m.group(1)) - 1
-        if 0 <= k < len(idxs) and m.group(2).strip():
-            res[idxs[k]] = m.group(2).strip()
+        eng = m.group(2).strip()
+        if 0 <= k < len(idxs) and eng:
+            # REJECT a no-op "translation" that just echoes the source text (the
+            # translator returned the input untranslated). Storing that produced
+            # the "en shows the original Chinese" symptom. Leaving it unmapped
+            # keeps the line eligible for re-translation instead.
+            if eng == (raw_fn(idxs[k]).strip()):
+                continue
+            res[idxs[k]] = eng
     return res
 
 
 def _translate_lines(lines: list[dict], song_lang: str | None = None,
                      only_missing: bool = False) -> int:
     try:
-        tr = _make_translator()
+        tr = _make_translator(song_lang)
     except ImportError:
         return 0
     # TICKET-115: full non-English whitelist. Whole-song fallback covers any
@@ -1589,11 +1608,16 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
     whole = song_lang in (*_LANGS, "ja-romaji")
 
     def want(ln):
-        if only_missing and ln.get("en", "").strip():
-            return False                   # keep an existing translation
         raw = re.sub(r"\(.*?\)", "", ln["jp"])
         if not raw.strip():
             return False
+        en = ln.get("en", "").strip()
+        if only_missing and en:
+            # Keep a REAL translation, but RE-translate a failed one where the
+            # "translation" is just the original text (the source='auto' CJK bug
+            # stored en==original). Treat that as missing so it self-heals.
+            if en != raw.strip():
+                return False
         ll = detect_lang(raw)
         if ll in _LANGS:
             return True
@@ -1637,8 +1661,10 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
                 continue
             try:
                 t = raw(i)
-                lines[i]["en"] = tr.translate(t) if t.strip() else ""
-                done += 1
+                eng = (tr.translate(t) or "").strip() if t.strip() else ""
+                if eng and eng != t.strip():        # reject a no-op echo of the source
+                    lines[i]["en"] = eng
+                    done += 1
             except Exception:
                 pass
         pos = end
