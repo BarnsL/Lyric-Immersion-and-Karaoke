@@ -19,7 +19,9 @@ SECURITY (an updater downloads and runs code, so it's hardened):
     file or a 64-hex digest in the notes), the downloaded zip is verified against
     it and a mismatch **aborts** the update (fail-closed).
   • **Safe extraction.** The zip is extracted with path-traversal ("zip-slip")
-    protection, capped in size, and must contain ``DesktopKaraoke.exe``.
+    protection, capped in size, and must contain the app exe
+    (``Lyric-Immersion-and-Karaoke.exe``; legacy ``DesktopKaraoke.exe`` is also
+    accepted for older builds).
   • Best-effort + offline-safe: any network/parse/verify error falls back to just
     opening the Releases page; nothing is applied unless it passed every check.
 
@@ -43,7 +45,7 @@ from pathlib import Path
 import appdata
 from version import __version__
 
-REPO = "BarnsL/Desktop-Karaoke"
+REPO = "BarnsL/Lyric-Immersion-and-Karaoke"
 API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
 _UA = f"DesktopKaraoke/{__version__}"
@@ -132,7 +134,12 @@ def check(timeout: float = 8.0):
     zip_asset = None
     for a in assets:
         low = (a.get("name") or "").lower()
-        if low.startswith("desktopkaraoke") and low.endswith(".zip") \
+        release_zip = (
+            low.startswith("desktopkaraoke")
+            or low.startswith("lyricimmersion")
+            or low.startswith("lyric-immersion-and-karaoke")
+        )
+        if release_zip and low.endswith(".zip") \
                 and _is_github_https(a.get("browser_download_url", "")):
             zip_asset = a
             break

@@ -1,5 +1,5 @@
 @echo off
-REM ?? Build Desktop Karaoke into a single .exe (and, if Inno Setup is
+REM Build Lyric Immersion and Karaoke into a portable folder and, if Inno Setup is
 REM    installed, a one-click Setup installer). Run this from the repo folder.
 setlocal
 
@@ -20,25 +20,25 @@ if %errorlevel%==1 (
 )
 
 echo.
-echo [2/4] Building DesktopKaraoke.exe ...
+echo [2/4] Building Lyric-Immersion-and-Karaoke.exe ...
 python -m PyInstaller --noconfirm DesktopKaraoke.spec || goto :err
-echo     -> dist\DesktopKaraoke.exe
+echo     -> dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe
 
 echo [3/4] Building the installer (optional) ...
 where iscc >nul 2>nul
 if %errorlevel%==0 (
-    iscc installer.iss && echo     -> dist\DesktopKaraoke-Setup.exe
+    iscc installer.iss && echo     -> dist\Lyric-Immersion-and-Karaoke-Setup.exe
 ) else (
     echo     Inno Setup ^(iscc^) not found - skipping installer.
-    echo     dist\DesktopKaraoke.exe is portable: double-click to run.
+    echo     dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe is portable: double-click to run.
 )
 
 echo.
 echo [4/4] Done.
 echo.
 echo  Outputs:
-echo    dist\DesktopKaraoke\DesktopKaraoke.exe  (portable)
-if exist dist\DesktopKaraoke-Setup.exe echo    dist\DesktopKaraoke-Setup.exe        (installer)
+echo    dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe  (portable)
+if exist dist\Lyric-Immersion-and-Karaoke-Setup.exe echo    dist\Lyric-Immersion-and-Karaoke-Setup.exe        (installer)
 echo.
 goto :eof
 

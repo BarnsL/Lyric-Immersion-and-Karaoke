@@ -1904,10 +1904,66 @@ def _mon_fingerprint(m):
     return f"{m['x']},{m['y']},{m['w']}x{m['h']}"
 
 
+def _mon_stable_id(m):
+    """Best-effort persistent identity for a monitor across topology churn.
+
+    Prefer the monitor's device path / EDID-style id when Windows exposes it;
+    fall back to the adapter name, then finally the geometric fingerprint."""
+    return (m.get("device_id") or m.get("device") or _mon_fingerprint(m)).strip()
+
+
+_MON_FP_RE = re.compile(r"^(-?\d+),(-?\d+),(\d+)x(\d+)$")
+
+
+def _parse_mon_fingerprint(fp):
+    m = _MON_FP_RE.fullmatch(str(fp or ""))
+    if not m:
+        return None
+    x, y, w, h = map(int, m.groups())
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _rect_overlap(a, b):
+    ax2, ay2 = a["x"] + a["w"], a["y"] + a["h"]
+    bx2, by2 = b["x"] + b["w"], b["y"] + b["h"]
+    iw = min(ax2, bx2) - max(a["x"], b["x"])
+    ih = min(ay2, by2) - max(a["y"], b["y"])
+    return max(0, iw) * max(0, ih)
+
+
+def _center_dist2(a, b):
+    acx, acy = a["x"] + a["w"] / 2.0, a["y"] + a["h"] / 2.0
+    bcx, bcy = b["x"] + b["w"] / 2.0, b["y"] + b["h"] / 2.0
+    return (acx - bcx) ** 2 + (acy - bcy) ** 2
+
+
+def _closest_monitor_for_fp(mons, fp):
+    """Best-effort remap from an old monitor rectangle to the current topology.
+
+    Handles the common "same physical display, different geometry now" cases:
+    resolution changed, taskbar moved, docking station reshuffled, or the user
+    hot-plugged displays and Windows nudged their coordinates."""
+    old = _parse_mon_fingerprint(fp)
+    if not old or not mons:
+        return None
+    by_overlap = max(mons, key=lambda m: (_rect_overlap(old, m), -_center_dist2(old, m)))
+    if _rect_overlap(old, by_overlap) > 0:
+        return by_overlap
+    return min(mons, key=lambda m: (_center_dist2(old, m), not m["primary"]))
+
+
+def _mon_snapshot_key(mons):
+    """Topology signature used by the watchdog.
+
+    Includes both persistent ids and current geometry so hot-plug, re-ordering,
+    and resolution/layout changes all count as a topology change."""
+    return tuple(f"{m['id']}@{m['fp']}" for m in mons)
+
+
 def _monitors():
     """Every connected monitor as a list of dicts with FULL bounds (x,y,w,h) and the
     WORK area (wx,wy,ww,wh = bounds minus that monitor's taskbar) plus `primary`
-    and a stable `fp` fingerprint.
+    and stable identity fields (`id`, `device`, `device_id`, `fp`).
     Tkinter can't enumerate monitors, so use Win32 EnumDisplayMonitors. Primary
     first, then left-to-right. Falls back to a single primary entry on failure."""
     mons = []
@@ -1915,22 +1971,44 @@ def _monitors():
         from ctypes import wintypes
         user32 = ctypes.windll.user32
 
-        class MONITORINFO(ctypes.Structure):
+        class MONITORINFOEX(ctypes.Structure):
             _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
-                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD),
+                        ("szDevice", wintypes.WCHAR * 32)]
+
+        class DISPLAY_DEVICEW(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD),
+                        ("DeviceName", wintypes.WCHAR * 32),
+                        ("DeviceString", wintypes.WCHAR * 128),
+                        ("StateFlags", wintypes.DWORD),
+                        ("DeviceID", wintypes.WCHAR * 128),
+                        ("DeviceKey", wintypes.WCHAR * 128)]
 
         proc = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HMONITOR, wintypes.HDC,
                                   ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
 
         def _cb(hmon, hdc, lprc, lparam):
-            mi = MONITORINFO()
-            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            mi = MONITORINFOEX()
+            mi.cbSize = ctypes.sizeof(MONITORINFOEX)
             if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
                 m, w = mi.rcMonitor, mi.rcWork
+                dev = (mi.szDevice or "").rstrip("\x00")
+                dev_id = dev
+                dev_name = dev
+                try:
+                    dd = DISPLAY_DEVICEW()
+                    dd.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+                    if user32.EnumDisplayDevicesW(dev, 0, ctypes.byref(dd), 0):
+                        dev_id = (dd.DeviceID or dd.DeviceName or dev).rstrip("\x00")
+                        dev_name = (dd.DeviceString or dd.DeviceName or dev).rstrip("\x00")
+                except Exception:
+                    pass
                 mons.append({"x": m.left, "y": m.top, "w": m.right - m.left,
                              "h": m.bottom - m.top, "wx": w.left, "wy": w.top,
                              "ww": w.right - w.left, "wh": w.bottom - w.top,
-                             "primary": bool(mi.dwFlags & 1)})
+                             "primary": bool(mi.dwFlags & 1),
+                             "device": dev, "device_id": dev_id,
+                             "device_name": dev_name})
             return 1
         user32.EnumDisplayMonitors(0, 0, proc(_cb), 0)
     except Exception:
@@ -1938,10 +2016,13 @@ def _monitors():
     if not mons:
         l, t, r, b = _work_area() or (0, 0, 1920, 1032)
         mons = [{"x": l, "y": t, "w": r - l, "h": b - t, "wx": l, "wy": t,
-                 "ww": r - l, "wh": b - t, "primary": True}]
-    mons.sort(key=lambda d: (not d["primary"], d["x"]))
+                 "ww": r - l, "wh": b - t, "primary": True,
+                 "device": "primary", "device_id": "primary",
+                 "device_name": "Primary display"}]
+    mons.sort(key=lambda d: (not d["primary"], d["x"], d["y"]))
     for m in mons:
         m["fp"] = _mon_fingerprint(m)
+        m["id"] = _mon_stable_id(m)
     return mons
 
 
@@ -2007,6 +2088,7 @@ class Overlay:
         self.pos_x = s.get("pos_x", {"left": "left", "right": "right"}.get(_op, "center"))
         self.display = s.get("display", "primary")     # 'primary' | 'mon:N' | 'span'
         self._display_fp = s.get("display_fp")         # fingerprint for monitor identity
+        self._display_id = s.get("display_id")         # device-path identity for monitor persistence
         # TICKET-FIX: auto-migrate — compute the fingerprint if settings didn't have one.
         # Old settings.json (pre-v1.1.46) didn't persist display_fp, so _resolve_monitor
         # had no fingerprint to match → fell to index lookup → failed on DisplayLink blinks.
@@ -2051,6 +2133,7 @@ class Overlay:
         # process on/off and the choice persists. Default OFF (opt-in).
         self.tauri_overlay_on = bool(s.get("tauri_overlay_on", False))
         self._tauri_child = None
+        self._tauri_bounds = None
         # TICKET-100: opt-in Discord Rich Presence reader; default OFF (mirrors
         # generate_on — both are "extra effort" features users opt into). Persists
         # under settings key 'discord_rpc'. Tray toggle and tune knob both write
@@ -2163,6 +2246,11 @@ class Overlay:
         self._frame_worst = 0.0      # worst (longest) render-frame interval in the window
         self._frame_jitter = 0.0     # EWMA of |frame - target| — stutter metric
         self._frame_hist = []        # ring buffer of recent frame intervals (ms)
+        self._frame_event_hist = []  # (time, ms) ring buffer for current vs stale /diag status
+        self._last_bad_frame_t = 0.0
+        self._last_bad_frame_ms = 0.0
+        self._last_critical_frame_t = 0.0
+        self._last_critical_frame_ms = 0.0
         # TICKET-082: perf recorder — buffered append on the Tk thread so it
         # captures the truth of each frame without polling-induced contention.
         # Opens lazily on first frame when perf_record=1.
@@ -2181,6 +2269,25 @@ class Overlay:
         self._raw_dt_ms = None
         self._display_offset = None
         self._display_offset_t = 0.0
+        self._last_ease_step = 0.0
+        self._last_ease_delta = 0.0
+        self._jank_backoff_until = 0.0
+        self._jank_backoff_reason = ""
+        self._jank_backoff_logged_until = 0.0
+        self._jank_events = 0
+        self._identify_proc = None
+        self._identify_cancel_requested = False
+        self._identify_cancel_reason = ""
+        self._last_identify_cancel_reason = ""
+        self._last_identify_cancel_t = 0.0
+        self._identify_cancel_count = 0
+        self._smoothness_last_action = ""
+        self._smoothness_last_action_t = 0.0
+        self._scroll_motion_out = None
+        self._scroll_motion_seq = -1
+        self._scroll_motion_pos_live = None
+        self._overlay_pos = None
+        self._overlay_motion_pos = None
         self._spawn_budget = 1       # max scroll blocks to PIL-render per heavy frame
                                      # (1: spawning a block allocates a new image +
                                      # PhotoImage — the priciest op; off-screen, so
@@ -2400,7 +2507,7 @@ class Overlay:
             "title_alias_album_fallback":   1,   # 1 = album-string fallback on; 0 = off
             # ── TICKET batch4: verified→False render grace window ──
             # A True→False flip of self._verified used to start the teardown of
-            # lyrics immediately (the 71s outage in workflow w821l9jnw was a
+            # lyrics immediately (the 71s outage in one performance audit was a
             # benign Shazam disagreement that demoted verified, then the
             # downstream tear logic kicked in for the full window). Hold the
             # render-side teardown for this many seconds after the most recent
@@ -2431,7 +2538,7 @@ class Overlay:
             "perf_record_cap_mb":    20.0,  # rotate the perf log when it grows beyond this
             # A2 sub-branch timers: pipe-separated set of branches to bracket with
             # time.perf_counter() in the hot path. Default covers the three known
-            # offenders from workflow w821l9jnw (LINE-mode stutter root cause).
+            # offenders from the line-mode stutter audit.
             # Drop entries (e.g. "render|kara") once a branch is ruled out to
             # cut the per-frame overhead further. Unknown branches are no-ops.
             "perf_record_branches":  "render|kara|itemconfig",
@@ -2441,6 +2548,10 @@ class Overlay:
             "perf_record_raw_frame_ms": 1,
             "ease_slew_cap_s":       3.0,   # max seconds-per-second the eased offset can slew
             "ease_pull_per_sec":     3.5,   # exponential pull rate (higher = catches up faster)
+            "ease_snap_jump_s":     12.0,   # larger correction = seek/track-change; cut instead of long glide
+            "sync_apply_min_s":      0.22,   # ignore tiny Shazam wobble corrections below this
+            "sync_live_follow_alpha": 0.35,  # live-follow low-pass: target = old + alpha*(heard-old)
+            "sync_immediate_commit_s": 5.0,  # don't wait for line boundary beyond this; still glide visually
             # TICKET-088: per-frame fraction cap so a single heavy frame (e.g. 300ms
             # stall) cannot consume more than this fraction of the remaining delta.
             # The exponential-pull formula step = delta * (1 - exp(-pull * dt)) with
@@ -2455,6 +2566,20 @@ class Overlay:
             # writes happen in a single _tick (a sign the same-tick ordering is
             # being violated). 0 = silent, 1 = log warnings.
             "assert_same_tick":        0,   # 1 = log when >2 offset writes per tick
+            # Smoothness diagnostics + self-protection. Recognition runs in a child
+            # process, but the OS can still schedule it hard enough to blip browser
+            # audio. When /diag sees frame jank during identify/align, pause future
+            # automatic Shazam checks briefly; critical identify jank cancels the
+            # active child so playback does not keep glitching.
+            "smoothness_bad_frame_ms": 70.0,
+            "smoothness_critical_frame_ms": 180.0,
+            "smoothness_recent_window_s": 8.0,
+            "smoothness_kill_identify_ms": 220.0,
+            "smoothness_kill_identify": 1,
+            "recal_jank_backoff_s": 20.0,
+            "recal_critical_backoff_s": 60.0,
+            "recognize_in_process_fallback": 0,
+            "identify_respects_jank_backoff": 1,
             "decide_margin":         12.0,  # …and beat the loaded song's match by this much to switch
             "decide_wrong_floor":    32.0,  # loaded match below this = the lyrics are the wrong song → search the library
             "decide_listen_s":       12.0,  # seconds of vocals to transcribe for the decision
@@ -2524,6 +2649,8 @@ class Overlay:
             "scroll_fill_interval":   0.04, # scroll-mode only: min seconds between a block's fill repaints (25 fps cap; was 0.06=16 fps)
             "scroll_spawn_budget":     1.0, # scroll-mode only: max block PIL-renders per heavy frame (alloc spikes still dangerous, keep low)
             "scroll_fill_skip":        2.0, # scroll-mode only: heavy work runs every Nth frame (fills are sliver-cheap)
+            "scroll_motion_catchup":   4.0, # scroll-mode only: extra seconds-per-second the belt may catch up after a stall / sync nudge
+            "scroll_motion_seek_snap_s": 4.0, # scroll-mode only: large jump = real seek / track change, cut through instead of gliding
             # PERF-102 — scroll bitmap-area controls (the dominant scroll cost):
             "scroll_max_lanes":      3,     # stacked scrolling lines (capped to what fits on screen)
             "scroll_v_stagger":    250,     # VERTICAL scroll: horizontal stagger (px@scale1) between
@@ -2584,7 +2711,7 @@ class Overlay:
             # ── GPU-driven lyric renderer (M2) ──
             # 1 = spawn gpu_renderer.py as a child process, feed it state over
             # stdin NDJSON, hide the Tk overlay window. The child window does
-            # the actual drawing on the idle GPU (the external GPU here) at 100+ FPS
+            # the actual drawing on the selected GPU at 100+ FPS
             # with per-pixel-alpha + click-through + topmost. 0 (default) =
             # Tk renderer drives display as it always has. Flip via /tune
             # gpu_renderer_on=1 (live); a track change is not required.
@@ -4020,15 +4147,53 @@ class Overlay:
         except Exception:
             self._sync_confirm_after = None
 
+    def _cancel_identify(self, reason: str):
+        """Stop the active recognition child when diagnostics prove it is janky."""
+        try:
+            self._identify_cancel_requested = True
+            self._identify_cancel_reason = reason
+            self._last_identify_cancel_reason = reason
+            self._last_identify_cancel_t = time.time()
+            self._identify_cancel_count = int(getattr(self, "_identify_cancel_count", 0)) + 1
+            self._smoothness_last_action = f"cancelled identify: {reason}"
+            self._smoothness_last_action_t = self._last_identify_cancel_t
+            proc = getattr(self, "_identify_proc", None)
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    log.info("smoothness: terminated recognize child (%s)", reason)
+                except Exception as e:
+                    log.info("smoothness: recognize child terminate failed: %s", e)
+        except Exception:
+            pass
+
     def _start_identify(self, seconds=6, attempts=2):
         """Listen and identify by sound. Short captures (re-sync of a known
         song) finish faster; longer ones (first detection) recognize more
         reliably."""
         if self._identifying:
             return
+        now = time.time()
+        backoff_until = float(getattr(self, "_jank_backoff_until", 0.0) or 0.0)
+        if int(self._tune.get("identify_respects_jank_backoff", 1)) and now < backoff_until:
+            try:
+                st = self.media.get()
+            except Exception:
+                st = None
+            if st and st.get("status") == PLAYING:
+                remaining = max(0.0, backoff_until - now)
+                self._smoothness_last_action = f"skipped identify during smoothness backoff ({remaining:.0f}s)"
+                self._smoothness_last_action_t = now
+                log.info("smoothness: skipped identify for %.1fs after jank (%s)",
+                         remaining, getattr(self, "_jank_backoff_reason", "frame spike"))
+                return
         self._identifying = True
+        self._identify_cancel_requested = False
+        self._identify_cancel_reason = ""
+        self._identify_started_t = now
         if self._live_mode:
             seconds = max(seconds, 8)   # live arrangements need more signal to ID
+        self._identify_capture_s = float(seconds) * max(1, int(attempts or 1))
 
         def work():
             # TICKET-135: run identify in a SEPARATE PROCESS. The Shazam
@@ -4049,28 +4214,67 @@ class Overlay:
                 else:
                     cmd = [_sys.executable, str(Path(__file__).parent / "recognize.py"),
                            "--child", str(seconds), str(attempts), "--out", outp]
+                spawned = False
                 try:
-                    _sp.run(cmd, capture_output=True,
-                            timeout=float(seconds) * max(1, attempts) + 30,
-                            creationflags=0x08000000)   # CREATE_NO_WINDOW
-                    with open(outp, "r", encoding="utf-8") as _f:
-                        d = _json.load(_f)
-                    if d.get("t"):
-                        res = (d["t"], d.get("a") or "", d.get("off"), d.get("tc"))
+                    proc = _sp.Popen(
+                        cmd,
+                        stdout=_sp.PIPE,
+                        stderr=_sp.PIPE,
+                        creationflags=0x08000000 | 0x00000040,  # no window + IDLE_PRIORITY_CLASS
+                    )
+                    spawned = True
+                    self._identify_proc = proc
+                    if getattr(self, "_identify_cancel_requested", False) and proc.poll() is None:
+                        proc.terminate()
+                    try:
+                        proc.communicate(timeout=float(seconds) * max(1, attempts) + 30)
+                    except _sp.TimeoutExpired:
+                        self._identify_cancel_reason = "recognize timeout"
+                        try:
+                            proc.kill()
+                            proc.communicate(timeout=2)
+                        except Exception:
+                            pass
+                    finally:
+                        if getattr(self, "_identify_proc", None) is proc:
+                            self._identify_proc = None
+                    if getattr(self, "_identify_cancel_requested", False):
+                        res = None
+                        log.info("identify: cancelled (%s)", getattr(self, "_identify_cancel_reason", "smoothness"))
+                    elif proc.returncode not in (0, None):
+                        res = None
+                        log.info("identify: child exited with %s", proc.returncode)
+                    elif not _os.path.exists(outp):
+                        res = None
+                    else:
+                        with open(outp, "r", encoding="utf-8") as _f:
+                            d = _json.load(_f)
+                        if d.get("t"):
+                            res = (d["t"], d.get("a") or "", d.get("off"), d.get("tc"))
+                except Exception:
+                    if spawned or not int(self._tune.get("recognize_in_process_fallback", 0)):
+                        raise
+                    from recognize import recognize_playing
+                    t, a, off, t_cap = recognize_playing(seconds, attempts)
+                    if t:
+                        res = (t, a or "", off, t_cap)
                 finally:
                     try:
                         _os.remove(outp)
                     except Exception:
                         pass
             except Exception:
-                # Fall back to in-process recognize if the child can't spawn
-                # (keeps identification working even if the subprocess path fails).
-                try:
-                    from recognize import recognize_playing
-                    t, a, off, t_cap = recognize_playing(seconds, attempts)
-                    if t:
-                        res = (t, a or "", off, t_cap)
-                except Exception:
+                # Default to preserving playback smoothness: do not shove the
+                # recognizer back into this process unless explicitly enabled.
+                if int(self._tune.get("recognize_in_process_fallback", 0)):
+                    try:
+                        from recognize import recognize_playing
+                        t, a, off, t_cap = recognize_playing(seconds, attempts)
+                        if t:
+                            res = (t, a or "", off, t_cap)
+                    except Exception:
+                        res = None
+                else:
                     res = None
             self._identify_result = ("done", res)
 
@@ -4130,7 +4334,14 @@ class Overlay:
                     and self.concert_ocr and time.time() - self._last_ocr_t > 6.0):
                 self._last_ocr_t = time.time()
                 threading.Thread(target=self._concert_ocr_check, daemon=True).start()
-            if st and st.get("status") == PLAYING and not self._identifying:
+            if st and st.get("status") == PLAYING and time.time() < getattr(self, "_jank_backoff_until", 0.0):
+                remaining = max(1.0, self._jank_backoff_until - time.time())
+                nxt = max(nxt, remaining)
+                if time.time() >= getattr(self, "_jank_backoff_logged_until", 0.0):
+                    log.info("smoothness: delaying auto identify %.1fs after jank (%s)",
+                             remaining, getattr(self, "_jank_backoff_reason", "frame spike"))
+                    self._jank_backoff_logged_until = time.time() + 8.0
+            elif st and st.get("status") == PLAYING and not self._identifying:
                 if self._fast_calib > 0:
                     self._fast_calib -= 1
                     self._start_identify(seconds=4, attempts=1)   # short clip = fast turnaround
@@ -4342,6 +4553,7 @@ class Overlay:
                                 log.info("swap: pending-load failed (%s) "
                                          "falling back to direct load", e)
                                 self.load(Path(p))
+                                self._pending_switch = None
                                 self._start_translate(Path(p))
                                 if self.git_sync:
                                     self.git_backup()
@@ -4352,6 +4564,7 @@ class Overlay:
                                          completion_swap_token,
                                          (self._pending_swap or {}).get("fetch_token"))
                             self.load(Path(p))
+                            self._pending_switch = None
                             self._start_translate(Path(p))
                             if self.git_sync:           # back up the new song if opted in
                                 self.git_backup()
@@ -4620,9 +4833,11 @@ class Overlay:
                                 # nudges the offset).
                                 AGREE_LIVE = self._tune["agree_live"]
                                 if abs(corr - self._pending_corr) < AGREE_LIVE:
+                                    alpha = max(0.05, min(1.0, float(
+                                        self._tune.get("sync_live_follow_alpha", 0.35))))
                                     new = round(
                                         (corr if abs(self.offset) < DEADBAND
-                                         else 0.6 * corr + 0.4 * self.offset), 2)
+                                         else self.offset + alpha * (corr - self.offset)), 2)
                                     LIVE_MAX_JUMP = float(self._tune.get("live_max_jump_s", 45.0))
                                     if (abs(self.offset) > DEADBAND
                                             and abs(new - self.offset) > LIVE_MAX_JUMP):
@@ -4936,6 +5151,19 @@ class Overlay:
                     # re-reset the offset / re-fetch on every repeat hearing — that
                     # churned the sync and restarted generation. Just leave it be.
                     pass
+                elif (not self.lines and not self._live_mode and self._fetching
+                      and self._fetch_key and g_title
+                      and self._titles_match((self._fetch_key[1] or ""), g_title)
+                      and confidence.title_distinctiveness(g_title) >= 0.40
+                      and not self._titles_share_content(g_title, f_title)):
+                    # A distinctive SMTC title is still actively fetching; one bad
+                    # Shazam read must not immediately steal the fetch key and
+                    # throw away the good result before it lands.
+                    if heard != self._pending_switch:
+                        self._pending_switch = heard
+                        log.info("heard %r while title fetch for %r is still in flight "
+                                 "— holding sound override until the fetch resolves",
+                                 f_title, g_title)
                 elif self.lines and heard != self._pending_switch:
                     # Heard a DIFFERENT song while we already have lyrics for the
                     # current one. A single contradicting reading is usually a
@@ -5623,12 +5851,13 @@ class Overlay:
     def _check_monitors(self, now):
         """Every ~3 seconds, re-enumerate monitors and re-apply the display
         setting if the topology changed (monitor plugged/unplugged, sleep/wake
-        re-enumeration, resolution change).  Cheap: just compares fingerprints."""
+        re-enumeration, resolution change)."""
         if now - getattr(self, "_last_mon_check", 0) < 3.0:
             return
         self._last_mon_check = now
         self._apply_dynamic_priority()        # TICKET-127: yield harder to a running game
-        cur = tuple(m["fp"] for m in _monitors())
+        mons = _monitors()
+        cur = _mon_snapshot_key(mons)
         if cur == self._mon_snapshot:
             return
         log.info("monitor topology changed: %s → %s; re-applying display=%s",
@@ -5637,6 +5866,11 @@ class Overlay:
             self._apply_display()
         except Exception as e:
             log.info("display re-apply after topology change failed: %s", e)
+        try:
+            if self._icon is not None:
+                self._icon.update_menu()
+        except Exception:
+            pass
 
     # ── main loop ──
 
@@ -5677,7 +5911,7 @@ class Overlay:
         # /status render_fps readout — paused/no-music frames use a slower cadence
         # and would skew it, so they're excluded.
         now = time.time()
-        # A2 (workflow w821l9jnw): clear any prior tick's sub-branch timings, then
+        # A2: clear any prior tick's sub-branch timings, then
         # default raw dt to None so paused/no-music ticks (and rejected outliers)
         # render '-' in the perf log instead of a misleading value carried over.
         self._perf_branch_ms = {}
@@ -5685,7 +5919,7 @@ class Overlay:
         if self._render_frame and self._last_tick_t is not None:
             dt = (now - self._last_tick_t) * 1000.0
             # A2: cap raised 500ms → 5000ms. The old 500ms drop was hiding the
-            # 200-960ms stalls workflow w821l9jnw was hunting for. 5000ms still
+            # 200-960ms stalls the performance audit was hunting for. 5000ms still
             # rejects sleep/lid-close/debugger-pause outliers that would otherwise
             # drag the EWMA (published on /status) into nonsense for ~20 frames.
             if 0.0 < dt < 5000.0:
@@ -5702,6 +5936,49 @@ class Overlay:
                 if len(self._frame_hist) > 120:
                     del self._frame_hist[:len(self._frame_hist) - 120]
                 self._frame_worst = max(self._frame_hist)
+                try:
+                    bad_ms = float(self._tune.get("smoothness_bad_frame_ms", 70.0))
+                    critical_ms = float(self._tune.get("smoothness_critical_frame_ms", 180.0))
+                    rounded_dt = round(dt, 1)
+                    self._frame_event_hist.append((now, rounded_dt))
+                    if len(self._frame_event_hist) > 240:
+                        del self._frame_event_hist[:len(self._frame_event_hist) - 240]
+                    if dt >= bad_ms:
+                        self._last_bad_frame_t = now
+                        self._last_bad_frame_ms = rounded_dt
+                    if dt >= critical_ms:
+                        self._last_critical_frame_t = now
+                        self._last_critical_frame_ms = rounded_dt
+                    if (dt >= bad_ms and (getattr(self, "_identifying", False)
+                                          or getattr(self, "_aligning", False)
+                                          or getattr(self, "_deciding", False))):
+                        active = []
+                        if getattr(self, "_identifying", False):
+                            active.append("identifying")
+                        if getattr(self, "_aligning", False):
+                            active.append("aligning")
+                        if getattr(self, "_deciding", False):
+                            active.append("deciding")
+                        self._jank_events = int(getattr(self, "_jank_events", 0)) + 1
+                        critical = dt >= critical_ms
+                        backoff_s = float(self._tune.get("recal_jank_backoff_s", 20.0))
+                        if critical:
+                            backoff_s = max(backoff_s, float(self._tune.get("recal_critical_backoff_s", 60.0)))
+                        self._jank_backoff_until = max(
+                            getattr(self, "_jank_backoff_until", 0.0),
+                            now + backoff_s)
+                        self._jank_backoff_reason = (
+                            f"frame {dt:.0f}ms while {','.join(active)}")
+                        self._smoothness_last_action = (
+                            f"delayed auto identify for {backoff_s:.0f}s: {self._jank_backoff_reason}")
+                        self._smoothness_last_action_t = now
+                        kill_ms = float(self._tune.get("smoothness_kill_identify_ms", 220.0))
+                        if (int(self._tune.get("smoothness_kill_identify", 1))
+                                and getattr(self, "_identifying", False)
+                                and dt >= kill_ms):
+                            self._cancel_identify(self._jank_backoff_reason)
+                except Exception:
+                    pass
         self._last_tick_t = now
         self._render_frame = False
 
@@ -6142,6 +6419,9 @@ class Overlay:
         _lead = float(self._tune.get("display_lead_s", 0.0))
         pos = _effective_pos + self._eased_offset() + _lead
         pos_raw = _effective_pos + self.offset + _lead
+        scroll_pos = self._scroll_motion_pos(pos)
+        self._overlay_pos = pos
+        self._overlay_motion_pos = scroll_pos
         # ── v1.1.42 — HIGHLIGHT CLOCK REGRESSED TO THE JUN-26 BUILD ─────────
         # The user confirmed the highlight was PERFECT in the "Lyric Immersion
         # Test" video (uploaded 2026-06-26 22:11 UTC, build ~v1.0.74). That
@@ -6201,22 +6481,20 @@ class Overlay:
         # the highlight itself just steadily fills.
         branch_tag = "line"
 
-        # BELT MOTION + FILL both ride pos_hi (== pos, the eased song clock).
-        # The belt's per-frame scroll is v·(pos − last_pos); smoothness comes
-        # from _eased_offset (rate-capped) + the boundary-deferred offset, NOT a
-        # slew limiter. The belt's own discontinuity guard (_ticker_update /
-        # _ticker_update_v reseed when |Δpos| > belt_reseed_s) absorbs the
-        # track-change position snap to ~0, so the belt can't lurch backward by
-        # the whole song. Using the SAME clock for motion and fill keeps the
-        # gold fill locked to each line's on-screen position (no divergence).
+        # Scroll-through uses TWO closely related clocks:
+        #   scroll_pos = display-only belt motion (same eased target, but with a
+        #                final slew-limit so sync nudges / heavy frames glide)
+        #   pos_hi     = eased fill clock (same as line-mode highlight behaviour)
+        # This keeps the lyrics sliding smoothly to their corrected position
+        # without changing how the sung-vs-unsung fill reads.
         if self.scroll_dir in ("lr", "rl"):       # continuous horizontal scroll-through
-            self._ticker_update(pos_hi, pos_hi)
+            self._ticker_update(scroll_pos, pos_hi)
             self._render_frame = True
             self._perf_record(state, pos, pos_raw, "scroll-h")
             self.root.after(self._fps, self._tick)
             return
         if self.scroll_dir in ("tb", "bt"):       # continuous vertical scroll-through
-            self._ticker_update_v(pos_hi, pos_hi)
+            self._ticker_update_v(scroll_pos, pos_hi)
             self._render_frame = True
             self._perf_record(state, pos, pos_raw, "scroll-v")
             self.root.after(self._fps, self._tick)
@@ -7099,24 +7377,40 @@ class Overlay:
         line is on screen finishes naturally, then the following line is picked
         under the corrected offset — no jarring jump-cut. Big jumps (>5s),
         continuous-scroll modes, and corrections taken when no line is showing
-        all commit immediately, since deferring those would look worse than
-        snapping. A safety cap (8s) commits a stale queued offset regardless,
+        commit immediately to the target clock, while the displayed clock still
+        glides unless the change is seek-sized. A safety cap commits a stale queued offset regardless,
         so a stuck idx can't strand a pending correction forever."""
         new_off = round(new_off, 2)
         if new_off == self.offset and self._pending_offset is None:
             return
-        big_jump = abs(new_off - self.offset) > 5.0
+        delta = new_off - self.offset
+        apply_min = float(self._tune.get("sync_apply_min_s", 0.22))
+        if abs(delta) < apply_min and self._pending_offset is None:
+            self._sync_event("offset_skip_small", reason=reason or "auto",
+                             to=round(new_off, 2), frm=round(self.offset, 2),
+                             delta=round(delta, 3))
+            log.info("sync: ignoring tiny correction %+.2fs → %+.2fs (Δ=%+.2fs, %s)",
+                     self.offset, new_off, delta, reason or "auto")
+            return
+        big_jump = abs(delta) > float(self._tune.get("sync_immediate_commit_s", 5.0))
         no_line = self.idx < 0 or not self.lines
         # TICKET-082: scroll mode used to snap here (the bypass). It now also
         # queues at the next line boundary — the karaoke fill is computed
         # against pos_raw separately, so the belt can glide while the fill
         # waits to commit at the boundary, no more mid-line jump-cuts in
-        # scroll mode either. Big jumps and no-line still snap.
+        # scroll mode either. Big jumps and no-line commit immediately, but
+        # _eased_offset still glides anything below ease_snap_jump_s.
         if no_line or big_jump:
-            self.offset = new_off
+            old_off = self.offset
+            self._commit_offset(
+                new_off,
+                reset_display=abs(delta) > float(self._tune.get("ease_snap_jump_s", 12.0)))
             self.idx = -1
             self._drift_integral = 0.0
             self._pending_offset = None
+            self._sync_event("offset_commit", reason=reason or "auto",
+                             to=round(new_off, 2), frm=round(old_off, 2),
+                             immediate=True, no_line=bool(no_line), big_jump=bool(big_jump))
             return
         # TICKET-081: reset the timestamp on EVERY new queue so the 8s safety
         # cap measures "how long has this CURRENT correction been waiting,"
@@ -7400,9 +7694,12 @@ class Overlay:
         cur = getattr(self, "_display_offset", None)
         now = time.time()
         last_t = getattr(self, "_display_offset_t", 0.0)
-        if cur is None or abs(target - cur) > 5.0:
+        snap_jump = float(self._tune.get("ease_snap_jump_s", 12.0))
+        if cur is None or abs(target - cur) > snap_jump:
             self._display_offset = target            # first use / major re-sync → snap
             self._display_offset_t = now
+            self._last_ease_step = 0.0
+            self._last_ease_delta = 0.0
             return self._display_offset
         # TICKET-088: deadzone widened from a hardcoded 10 ms to a tunable
         # ease_deadzone_s (default 50 ms). Sub-deadzone drifts snap rather than
@@ -7412,6 +7709,8 @@ class Overlay:
         if abs(target - cur) <= deadzone:
             self._display_offset = target
             self._display_offset_t = now
+            self._last_ease_step = target - cur
+            self._last_ease_delta = 0.0
             return self._display_offset
         # TICKET-082: WALL-CLOCK based ease instead of per-frame, so a heavy
         # frame doesn't slow the glide — same offset change always finishes
@@ -7440,11 +7739,42 @@ class Overlay:
             step = sign * min(abs(step), frac_cap)
         self._display_offset = cur + step
         self._display_offset_t = now
+        self._last_ease_step = step
+        self._last_ease_delta = target - self._display_offset
         return self._display_offset
+
+    def _scroll_motion_pos(self, target):
+        """Visible belt position for scroll-through modes.
+
+        The true song clock (`target`) is already smooth in steady playback, but a
+        sync commit or a long Tk frame can still move it by multiple tenths in one
+        rendered frame. If the belt follows that raw step directly, the lyrics
+        "hesitate then lurch". Belt motion therefore gets its own display-only
+        slew-limit: steady-state stays glued to the target, but any sudden jump
+        catches up over a few frames. The karaoke fill keeps using the regular
+        eased clock, so only the line placement is softened."""
+        target = float(target)
+        seq = getattr(self, "_track_seq", 0)
+        prev = getattr(self, "_scroll_motion_out", None)
+        if prev is None or getattr(self, "_scroll_motion_seq", -1) != seq:
+            self._scroll_motion_out = target
+            self._scroll_motion_seq = seq
+            return self._scroll_motion_out
+        seek_snap = float(self._tune.get("scroll_motion_seek_snap_s", 4.0))
+        if abs(target - prev) > seek_snap:
+            self._scroll_motion_out = target
+            return self._scroll_motion_out
+        nominal_dt = max(0.008, float(self._fps) / 1000.0)
+        catchup = float(self._tune.get("scroll_motion_catchup", 4.0))
+        fwd_cap = nominal_dt * (1.0 + catchup)
+        back_cap = nominal_dt * min(catchup, 1.5)
+        delta = max(-back_cap, min(fwd_cap, target - prev))
+        self._scroll_motion_out = prev + delta
+        return self._scroll_motion_out
 
     @contextlib.contextmanager
     def _perf_branch(self, name):
-        """A2 sub-branch timer (workflow w821l9jnw).
+        """A2 sub-branch timer.
 
         Brackets a code region with time.perf_counter() ONLY when `name` is in
         the parsed `perf_record_branches` set, otherwise the manager is a
@@ -7589,8 +7919,8 @@ class Overlay:
                 return
             frac = max(0.0, min(1.0, (pos_raw - ln.start) / dur))
             # A2: wrap the per-char itemconfig loop ONCE (not per call). This
-            # measures the aggregate cost of the hot loop identified in
-            # workflow w821l9jnw without adding N time.perf_counter() calls per
+            # measures the aggregate cost of the hot loop identified in the
+            # performance audit without adding N time.perf_counter() calls per
             # frame. Per-call probing is deliberately out of scope (A3-shaped).
             with self._perf_branch("itemconfig"):
                 for tr in self._kara:                       # JP, romaji, English in lockstep
@@ -7737,6 +8067,98 @@ class Overlay:
         except Exception as e:
             log.info("force_resync error: %s", e)
 
+    def _diag_smoothness(self):
+        """Human-readable stutter + clock-smoothing diagnosis for /diag."""
+        try:
+            now = time.time()
+            hist = [float(x) for x in list(getattr(self, "_frame_hist", []))[-120:]]
+            bad_ms = float(self._tune.get("smoothness_bad_frame_ms", 70.0))
+            critical_ms = float(self._tune.get("smoothness_critical_frame_ms", 180.0))
+            recent_window_s = max(1.0, float(self._tune.get("smoothness_recent_window_s", 8.0)))
+            frame_events = []
+            for item in list(getattr(self, "_frame_event_hist", []))[-240:]:
+                try:
+                    ts, ms = item
+                    if now - float(ts) <= recent_window_s:
+                        frame_events.append(float(ms))
+                except Exception:
+                    pass
+            bad = [x for x in frame_events if x >= bad_ms]
+            critical = [x for x in frame_events if x >= critical_ms]
+            rolling_bad = [x for x in hist if x >= bad_ms]
+            rolling_critical = [x for x in hist if x >= critical_ms]
+            active = []
+            if getattr(self, "_identifying", False):
+                active.append("identifying")
+            if getattr(self, "_aligning", False):
+                active.append("aligning")
+            if getattr(self, "_deciding", False):
+                active.append("deciding")
+            if getattr(self, "_generating", False):
+                active.append("generating")
+            likely = []
+            if bad and active:
+                likely.append("audio-analysis-active")
+            if bad and not getattr(self, "_gpu_rendering", False):
+                likely.append("cpu-renderer-frame-work")
+            disp = getattr(self, "_display_offset", None)
+            pending = getattr(self, "_pending_offset", None)
+            backoff_until = getattr(self, "_jank_backoff_until", 0.0)
+            ease_delta = (round(float(self.offset - disp), 3)
+                          if disp is not None else None)
+            last_bad_t = float(getattr(self, "_last_bad_frame_t", 0.0) or 0.0)
+            last_critical_t = float(getattr(self, "_last_critical_frame_t", 0.0) or 0.0)
+            return {
+                "status": ("critical" if critical else ("janky" if bad else "smooth")),
+                "sample_count": len(frame_events),
+                "recent_window_s": round(recent_window_s, 1),
+                "bad_frame_ms": bad_ms,
+                "critical_frame_ms": critical_ms,
+                "bad_frames": len(bad),
+                "critical_frames": len(critical),
+                "worst_ms": round(max(frame_events), 1) if frame_events else 0.0,
+                "rolling_sample_count": len(hist),
+                "rolling_bad_frames": len(rolling_bad),
+                "rolling_critical_frames": len(rolling_critical),
+                "rolling_worst_ms": round(max(hist), 1) if hist else 0.0,
+                "last_bad_frame_ms": round(float(getattr(self, "_last_bad_frame_ms", 0.0)), 1),
+                "last_bad_frame_age_s": (
+                    round(now - last_bad_t, 1) if last_bad_t else None),
+                "last_critical_frame_ms": round(float(getattr(self, "_last_critical_frame_ms", 0.0)), 1),
+                "last_critical_frame_age_s": (
+                    round(now - last_critical_t, 1) if last_critical_t else None),
+                "active_work": active,
+                "likely_causes": likely,
+                "jank_events": int(getattr(self, "_jank_events", 0)),
+                "auto_backoff_remaining_s": (
+                    round(max(0.0, backoff_until - now), 1) if backoff_until else 0.0),
+                "auto_backoff_reason": getattr(self, "_jank_backoff_reason", ""),
+                "last_action": getattr(self, "_smoothness_last_action", ""),
+                "last_action_age_s": (
+                    round(now - float(getattr(self, "_smoothness_last_action_t", 0.0)), 1)
+                    if getattr(self, "_smoothness_last_action_t", 0.0) else None),
+                "identify_cancel_count": int(getattr(self, "_identify_cancel_count", 0)),
+                "identify_cancel_reason": getattr(self, "_last_identify_cancel_reason", ""),
+                "identify_cancel_age_s": (
+                    round(now - float(getattr(self, "_last_identify_cancel_t", 0.0)), 1)
+                    if getattr(self, "_last_identify_cancel_t", 0.0) else None),
+                "sync_target_offset": round(float(self.offset), 3),
+                "sync_display_offset": round(float(disp), 3) if disp is not None else None,
+                "sync_ease_delta_s": ease_delta,
+                "sync_ease_last_step_s": round(float(getattr(self, "_last_ease_step", 0.0)), 4),
+                "pending_offset": round(float(pending), 3) if pending is not None else None,
+                "pending_corr": (round(float(self._pending_corr), 3)
+                                 if getattr(self, "_pending_corr", 1e9) < 1e8 else None),
+                "identify_age_s": (
+                    round(now - getattr(self, "_identify_started_t", now), 1)
+                    if getattr(self, "_identifying", False) else None),
+                "identify_capture_s": (
+                    round(float(getattr(self, "_identify_capture_s", 0.0)), 1)
+                    if getattr(self, "_identifying", False) else None),
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
     def get_diag(self):
         """Rich diagnostics snapshot for GET /diag — everything needed to
         understand a desync or a stutter without rebuilding: the full sync
@@ -7863,6 +8285,7 @@ class Overlay:
                 "measure_text_cache_size": len(_MEASURE_CACHE),
                 "measure_text_cache_max": _MEASURE_CACHE_MAX,
             },
+            "smoothness": self._diag_smoothness(),
             "aligning": self._aligning,
             "identifying": self._identifying,
             # TICKET-102: window-title scraper telemetry. Surfaces the latest
@@ -8588,6 +9011,7 @@ class Overlay:
                         "pinned_session_app": self.pinned_session_app,
                         "concert_ocr": self.concert_ocr,
                         "display": self.display,
+                        "display_id": getattr(self, "_display_id", None),
                         "display_fp": getattr(self, "_display_fp", None)})
 
     def set_generate(self, on):
@@ -8990,37 +9414,55 @@ class Overlay:
         self.root.attributes("-topmost", True)
         self._click_through()      # a display move can reset the exstyle → re-assert
 
-    def _resolve_monitor(self, mons):
+    def _resolve_monitor(self, mons, quiet=False):
         """Find the monitor matching ``self.display``, preferring fingerprint over
         index so the choice survives monitor re-enumeration after sleep/wake.
 
-        TICKET-FIX (v1.1.46): DisplayLink USB monitors often blink off for up to
-        5 seconds during sleep/wake, resolution changes, or GPU driver reloads.
-        Instead of immediately falling back to primary when the fingerprint is
-        missing, wait for a grace period (display_lost_grace_s, default 10s).
-        During the grace window, return None to signal "don't move" — the caller
+        DisplayLink USB monitors often blink off for up to 5 seconds during
+        sleep/wake, resolution changes, or GPU driver reloads. Instead of
+        immediately falling back to primary when the fingerprint is missing,
+        wait for a grace period (display_lost_grace_s, default 10s). During the
+        grace window, return None to signal "don't move" — the caller
         (_apply_display via _check_monitors) must handle a None return by keeping
-        the current placement. After the grace expires, fall to primary."""
+        the current placement. After the grace expires, fall to the closest
+        remaining monitor, then index, then primary."""
+        def _log(msg, *args):
+            if not quiet:
+                log.info(msg, *args)
+
         if self.display == "primary":
             self._display_lost_t = 0.0
             return next((m for m in mons if m["primary"]), mons[0])
         if isinstance(self.display, str) and self.display.startswith("mon:"):
+            mon_id = getattr(self, "_display_id", None)
+            if mon_id:
+                hit = next((m for m in mons if m["id"] == mon_id), None)
+                if hit:
+                    return hit
+                _log("saved monitor id %s not found; trying geometry", mon_id)
             fp = getattr(self, "_display_fp", None)
             if fp:
                 hit = next((m for m in mons if m["fp"] == fp), None)
                 if hit:
                     self._display_lost_t = 0.0   # found — reset grace timer
                     return hit
-                # Fingerprint not found — DisplayLink blink?
+                # Fingerprint not found — possibly a DisplayLink blink. Hold
+                # position for a grace period before falling back.
                 now = time.time()
                 grace = float(self._tune.get("display_lost_grace_s", 10.0))
                 if self._display_lost_t == 0.0:
                     self._display_lost_t = now
-                    log.info("display fp %s lost — starting %.0fs grace period", fp, grace)
+                    _log("display fp %s lost — starting %.0fs grace period", fp, grace)
                 if (now - self._display_lost_t) < grace:
                     return None                   # still in grace — don't move
-                log.info("display fp %s lost for %.1fs > grace %.0fs; trying index fallback",
-                         fp, now - self._display_lost_t, grace)
+                # Grace expired — the monitor is really gone. Try the closest
+                # remaining monitor by geometry before index / primary.
+                near = _closest_monitor_for_fp(mons, fp)
+                if near is not None:
+                    _log("display fp %s lost for %.1fs > grace; using closest monitor %s",
+                         fp, now - self._display_lost_t, near["fp"])
+                    return near
+                _log("display fp %s lost for %.1fs > grace; trying index", fp, now - self._display_lost_t)
             try:
                 idx = int(self.display[4:])
             except ValueError:
@@ -9028,33 +9470,55 @@ class Overlay:
             if 0 <= idx < len(mons):
                 self._display_lost_t = 0.0
                 return mons[idx]
-            # Index also out of range — same grace logic
+            # Index also out of range — hold through the grace period too.
             now = time.time()
             grace = float(self._tune.get("display_lost_grace_s", 10.0))
             if self._display_lost_t == 0.0:
                 self._display_lost_t = now
             if (now - self._display_lost_t) < grace:
                 return None
-            log.info("monitor index %s out of range (%d connected) for %.1fs; falling back to primary",
-                     idx, len(mons), now - self._display_lost_t)
+            _log("monitor index %s out of range (%d connected) for %.1fs; falling back to primary",
+                 idx, len(mons), now - self._display_lost_t)
         self._display_lost_t = 0.0
         return next((m for m in mons if m["primary"]), mons[0])
+
+    def _tauri_target_bounds(self, mons=None):
+        """Raw window bounds the Tauri overlay should cover for the current display mode."""
+        mons = mons or _monitors()
+        if not mons:
+            return None
+        if self.display == "span" and len(mons) > 1:
+            left = min(m["x"] for m in mons)
+            top = min(m["y"] for m in mons)
+            right = max(m["x"] + m["w"] for m in mons)
+            bottom = max(m["y"] + m["h"] for m in mons)
+            return left, top, right - left, bottom - top
+        if self.display == "mirror" and len(mons) > 1:
+            m = next((m for m in mons if m["primary"]), mons[0])
+        elif self.display == "cycle" and len(mons) > 1:
+            m = mons[self._cycle_idx % len(mons)]
+        else:
+            m = self._resolve_monitor(mons, quiet=True)
+        return m["x"], m["y"], m["w"], m["h"]
 
     def _apply_display(self):
         """Place the overlay per ``self.display``: 'primary', 'mon:N', 'span',
         'mirror' (same lyrics on every screen), or 'cycle' (rotate screens per
         line). Recomputes the band's width / position / scale for the target."""
         mons = _monitors()
-        self._mon_snapshot = tuple(m["fp"] for m in mons)
+        self._mon_snapshot = _mon_snapshot_key(mons)
         self._destroy_mirrors()
         if self.display == "span" and len(mons) > 1:
             left = min(m["wx"] for m in mons)
             right = max(m["wx"] + m["ww"] for m in mons)
             prim = next((m for m in mons if m["primary"]), mons[0])
+            self._display_id = None
+            self._display_fp = None
             self.work_left, self.W = left, right - left
             self.work_top, self.work_bottom = prim["wy"], prim["wy"] + prim["wh"]
         elif self.display == "mirror" and len(mons) > 1:
             m = next((m for m in mons if m["primary"]), mons[0])
+            self._display_id = m["id"]
             self._display_fp = m["fp"]
             self.work_left, self.W = m["wx"], m["ww"]
             self.work_top, self.work_bottom = m["wy"], m["wy"] + m["wh"]
@@ -9062,6 +9526,7 @@ class Overlay:
         elif self.display == "cycle" and len(mons) > 1:
             self._cycle_idx = self._cycle_idx % len(mons)
             m = mons[self._cycle_idx]
+            self._display_id = m["id"]
             self._display_fp = m["fp"]
             self.work_left, self.W = m["wx"], m["ww"]
             self.work_top, self.work_bottom = m["wy"], m["wy"] + m["wh"]
@@ -9071,9 +9536,11 @@ class Overlay:
                 # Grace period active — monitor temporarily lost (DisplayLink blink).
                 # Keep current placement, don't move. Skip the rest of _apply_display.
                 return
+            self._display_id = m["id"]
             self._display_fp = m["fp"]
             self.work_left, self.W = m["wx"], m["ww"]
             self.work_top, self.work_bottom = m["wy"], m["wy"] + m["wh"]
+        tauri_bounds = self._tauri_target_bounds(mons)
         self.work_h = self.work_bottom - self.work_top
         self.H = self.work_h
         self._auto_scale = min(2.5, max(0.7, self.work_h / 1000.0))
@@ -9081,17 +9548,40 @@ class Overlay:
         self._apply_scale()          # re-font + re-layout for the new width/height
         self._place_window()
         self.root.update_idletasks()
+        restart_tauri = (
+            self.display not in ("mirror", "cycle")
+            and tauri_bounds is not None
+            and tauri_bounds != getattr(self, "_tauri_bounds", None)
+        )
+        self._tauri_bounds = tauri_bounds
+        if restart_tauri and getattr(self, "tauri_overlay_on", False):
+            try:
+                self._restart_tauri_overlay(reason="display-change")
+            except Exception as e:
+                log.info("tauri overlay restart after display change failed: %s", e)
 
-    def set_display(self, d):
+    def set_display(self, d, monitor=None):
         """Tray 'Display' submenu → move the overlay to a monitor, or span all."""
         self.display = d
+        if d == "span":
+            self._display_id = None
+            self._display_fp = None
+        elif monitor is not None:
+            self._display_id = monitor.get("id")
+            self._display_fp = monitor.get("fp")
         try:
             self._apply_display()
         except Exception as e:
             log.info("display switch failed: %s", e)
-        log.info("display set to %s (fp=%s)", d, getattr(self, "_display_fp", None))
+        log.info("display set to %s (id=%s fp=%s)", d,
+                 getattr(self, "_display_id", None), getattr(self, "_display_fp", None))
         if getattr(self, "idx", -1) >= 0 and getattr(self, "lines", None):
             self._render(self.lines[self.idx])
+        try:
+            if self._icon is not None:
+                self._icon.update_menu()
+        except Exception:
+            pass
         self._persist()
 
     def set_scroll(self, d):
@@ -10163,7 +10653,7 @@ class Overlay:
         }
 
     def _llm_status(self):
-        """Whether the optional Claude disambiguator is armed (key present) + model."""
+        """Whether the optional LLM disambiguator is armed (key present) + model."""
         try:
             import llm_disambiguate as _llm
             on = _llm.available()
@@ -10174,11 +10664,10 @@ class Overlay:
     def get_overlay_state(self):
         """Compact render state for an EXTERNAL overlay client (the Tauri PoC):
         the CURRENT line (furigana `漢字(かな)` / romaji / translation), its song-time
-        bounds, and the current display position — so the client renders the line
-        and runs a STEADY LOCAL fill animation (frac = (pos − start)/(end − start),
-        interpolated client-side between polls). Only a LINE CHANGE re-anchors the
-        fill, which is the "only the lyrics follow sync; the highlight just
-        proceeds" principle realized in the renderer itself. Read-only."""
+        bounds, the eased fill clock, and the visible scroll-motion clock — so the
+        client can keep the karaoke fill on the true lyric timing while letting
+        scroll-through placement glide through sync nudges and frame stalls.
+        Read-only."""
         # HEARTBEAT for the CPU-fallback watchdog: the overlay polls this every
         # ~250ms WHILE it is actually running its render loop, so a fresh request
         # proves the GPU overlay is alive AND rendering. If these stop (the
@@ -10187,8 +10676,11 @@ class Overlay:
         self._overlay_ping_t = time.time()
         st = self.media.get() or {}
         playing = (st.get("status", PLAYING) == PLAYING)
-        lead = float(self._tune.get("display_lead_s", 0.12))
-        pos = float(st.get("position", 0.0) or 0.0) + float(self.offset) + lead
+        lead = float(self._tune.get("display_lead_s", 0.0))
+        base = float(st.get("position", 0.0) or 0.0)
+        disp_off = getattr(self, "_display_offset", None)
+        pos = float(getattr(self, "_overlay_pos", base + (disp_off if disp_off is not None else float(self.offset)) + lead))
+        motion_pos = float(getattr(self, "_overlay_motion_pos", pos))
         n = len(self.lines)
 
         def _ln(i):
@@ -10199,9 +10691,60 @@ class Overlay:
             return None
         idx = self.idx if 0 <= self.idx < n else -1
         m = self.meta if isinstance(self.meta, dict) else {}
+        # ── RENDER STYLE (so the external/GPU overlay is visually INDISTINGUISHABLE
+        # from the CPU Tk overlay): every user-facing visual setting the Tk renderer
+        # honors, sent verbatim so the WebView reproduces position, font scale,
+        # opacity, and scroll behaviour 1:1. `font_scale` is pre-multiplied by
+        # `_auto_scale` (the responsive per-display factor) so the overlay applies it
+        # to the SAME base px (38/17/23/21) the Tk renderer uses — identical glyph
+        # sizes without the overlay re-deriving the display factor.
+        scroll = getattr(self, "scroll_dir", "left")
+        v_eff = max(float(getattr(self, "scroll_speed", 220.0)),
+                    float(getattr(self, "_v_floor", 0.0) or 0.0)) or 1.0
+        style = {
+            "scroll": scroll,
+            "scroll_speed": round(v_eff, 2),
+            "motion_catchup": round(float(self._tune.get("scroll_motion_catchup", 4.0)), 3),
+            "motion_seek_snap_s": round(float(self._tune.get("scroll_motion_seek_snap_s", 4.0)), 3),
+            "font_scale": round(float(getattr(self, "font_scale", 1.0))
+                                 * float(getattr(self, "_auto_scale", 1.0)), 4),
+            "opacity": round(float(getattr(self, "opacity", 1.0)), 3),
+            "pos_x": getattr(self, "pos_x", "center"),
+            "pos_y": getattr(self, "pos_y", "bottom"),
+            "screen_w": int(getattr(self, "W", 0) or 0),
+            "work_h": int(getattr(self, "work_h", 0) or 0),
+            # Belt geometry so the external renderer can place lines in the SAME
+            # staggered lanes / columns as the CPU Tk ticker, not a visual approximation.
+            "pad": int(getattr(self, "pad", 64) or 64),
+            "win_margin": int(getattr(self, "_win_margin", 28) or 28),
+            "bottom_clear": int(getattr(self, "_bottom_clear", 0) or 0),
+            "block_h": int(getattr(self, "_block_h", 0) or 0),
+            "lanes": int(getattr(self, "_lanes", 1) or 1),
+            "lane_gap": int(getattr(self, "_lane_gap", 0) or 0),
+            "lane_y0": int(getattr(self, "_lane_y0", 0) or 0),
+            "v_stagger": int(getattr(self, "_v_stagger", 0) or 0),
+        }
+        # WINDOW of nearby lines for the continuous scroll-through belt (lr/rl/tb/bt).
+        # In belt mode `idx` stays -1 (the belt position is the sync indicator, not a
+        # single active line), so we window by TIME: every line whose mid-time is
+        # within a half-screen + spawn-margin of `pos` — exactly the lines the Tk belt
+        # would have spawned. Cheap; only built for belt modes (line modes use `line`).
+        window = []
+        if scroll in ("lr", "rl", "tb", "bt") and n:
+            half = max(float(style["screen_w"] or 1920),
+                       float(style["work_h"] or 1080)) / 2.0
+            radius_s = (half + 1200.0) / v_eff + 1.0
+            for i, l in enumerate(self.lines):
+                mid = (l.start + l.end) / 2.0
+                if abs(mid - motion_pos) <= radius_s:
+                    window.append({"idx": i, "jp": l.jp, "rm": l.rm, "en": l.en,
+                                   "start": round(l.start, 3), "end": round(l.end, 3)})
+                    if len(window) >= 48:        # safety cap (dense/slow songs)
+                        break
         return {
             "playing": playing,
             "position": round(pos, 3),
+            "motion_position": round(motion_pos, 3),
             "idx": idx,
             "line_count": n,
             "line": _ln(idx),
@@ -10209,6 +10752,8 @@ class Overlay:
             "title": m.get("title"),
             "artist": m.get("artist"),
             "source": m.get("source"),
+            "style": style,
+            "window": window,
             "ts": time.time(),
         }
 
@@ -10721,7 +11266,7 @@ class Overlay:
                     # OPTIONAL LLM disambiguation (gated on an Anthropic API key),
                     # on the HARD cases only — the loaded song looks wrong, the top
                     # fuzzy scores are close, or we expanded to the whole library.
-                    # Claude matches a short/noisy transcript to the right lyrics far
+                    # It matches a short/noisy transcript to the right lyrics far
                     # better than char-fuzzy; it is the lever for the wrong-song +
                     # title-miss failures. No key → no-op, rapidfuzz stands.
                     llm = None
@@ -11947,11 +12492,12 @@ class Overlay:
         """Resolve the lyric-overlay.exe to launch. Order (first that exists):
         the `tauri_overlay_exe` tune override, the LYRIC_OVERLAY_EXE env var,
         then an `overlay/lyric-overlay.exe` (or `lyric-overlay.exe`) sitting next
-        to the app — the frozen build dir, or this source file's dir in dev. No
-        path is hardcoded, so the repo carries no machine-specific filesystem
-        reference; on a dev box point LYRIC_OVERLAY_EXE (or the tune override) at
-        your local Tauri build, or drop the exe in an `overlay/` folder beside
-        the app. Returns the first path that exists, or None."""
+        to the app. In frozen PyInstaller builds we also check `_internal/overlay`
+        because bundled sidecar data lives there. No path is hardcoded, so the
+        repo carries no machine-specific filesystem reference; on a dev box point
+        LYRIC_OVERLAY_EXE (or the tune override) at your local Tauri build, or
+        drop the exe in an `overlay/` folder beside the app. Returns the first
+        path that exists, or None."""
         base = (Path(sys.executable).parent if getattr(sys, "frozen", False)
                 else Path(__file__).parent)
         cands = []
@@ -11961,7 +12507,12 @@ class Overlay:
         env = (os.environ.get("LYRIC_OVERLAY_EXE") or "").strip()
         if env:
             cands.append(Path(env))
-        cands += [base / "overlay" / "lyric-overlay.exe", base / "lyric-overlay.exe"]
+        cands += [
+            base / "overlay" / "lyric-overlay.exe",
+            base / "lyric-overlay.exe",
+            base / "_internal" / "overlay" / "lyric-overlay.exe",
+            base / "_internal" / "lyric-overlay.exe",
+        ]
         for p in cands:
             try:
                 if p.is_file():
@@ -11969,6 +12520,18 @@ class Overlay:
             except Exception:
                 pass
         return None
+
+    def _tauri_overlay_env(self):
+        """Environment for the Tauri overlay child, including target monitor bounds."""
+        env = os.environ.copy()
+        bounds = self._tauri_target_bounds()
+        if bounds is not None:
+            x, y, w, h = bounds
+            env["LYRIC_OVERLAY_X"] = str(int(x))
+            env["LYRIC_OVERLAY_Y"] = str(int(y))
+            env["LYRIC_OVERLAY_W"] = str(int(w))
+            env["LYRIC_OVERLAY_H"] = str(int(h))
+        return env
 
     def _start_tauri_overlay(self):
         """Launch the standalone Tauri overlay child (windowless spawn; the
@@ -11991,13 +12554,30 @@ class Overlay:
             self._tauri_child = subprocess.Popen(
                 [str(exe)], cwd=str(exe.parent),
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, creationflags=_NO_WINDOW)
+                stderr=subprocess.DEVNULL, creationflags=_NO_WINDOW,
+                env=self._tauri_overlay_env())
             log.info("tauri overlay: launched %s (pid %s)", exe, self._tauri_child.pid)
             return True
         except Exception as e:
             log.info("tauri overlay: launch failed: %s", e)
             self._tauri_child = None
             return False
+
+    def _restart_tauri_overlay(self, reason="refresh"):
+        """Restart the Tauri child so it picks up new monitor bounds live."""
+        if not getattr(self, "tauri_overlay_on", False):
+            return
+        self._gpu_rendering = False
+        try:
+            self.root.deiconify()             # keep CPU lyrics visible during the hand-off
+        except Exception:
+            pass
+        self._stop_tauri_overlay(reason=reason)
+        ok = self._start_tauri_overlay()
+        self.tauri_overlay_on = ok
+        self._overlay_ping_t = time.time()
+        if ok:
+            self._arm_tauri_watchdog()
 
     def _stop_tauri_overlay(self, reason="off"):
         ch = getattr(self, "_tauri_child", None)
@@ -12101,15 +12681,20 @@ class Overlay:
         user ALWAYS sees lyrics — the GPU overlay when it works, the CPU overlay
         otherwise — never a blank screen."""
         stale_s = float(self._tune.get("overlay_heartbeat_stale_s", 6.0))
+        if getattr(self, "_tauri_wd_armed", False):
+            return                               # exactly one watchdog loop at a time
+        self._tauri_wd_armed = True
 
         def _check():
             if not getattr(self, "tauri_overlay_on", False):
-                return                           # toggled off → stop polling
+                self._tauri_wd_armed = False     # toggled off → stop polling
+                return
             ch = getattr(self, "_tauri_child", None)
             if ch is None or ch.poll() is not None:
                 self._tauri_child = None
                 self.tauri_overlay_on = False
                 self._gpu_rendering = False
+                self._tauri_wd_armed = False
                 log.info("tauri overlay: process gone — back to the Tk (CPU) overlay")
                 try:
                     self.root.deiconify()
@@ -12397,6 +12982,10 @@ def main():
 
     LYRICS_DIR.mkdir(exist_ok=True)
     ov = Overlay(offset=offset)
+    try:
+        ov._apply_display()          # honor the saved display immediately on startup
+    except Exception as e:
+        log.info("initial display apply failed: %s", e)
     ov._apply_dynamic_priority()   # TICKET-129: pin to last core @ ABOVE_NORMAL (override: tune cpu_dedicate_last_core)
     # v1.1.15: the GPU renderer is the DEFAULT (persisted setting, default True).
     # Bring it up after Overlay.__init__ so tray/api/SMTC are wired and Tk has a
@@ -12423,7 +13012,7 @@ def main():
     def _align(*_):   ov.root.after(0, ov.force_sync)
     def _about(*_):
         import webbrowser
-        webbrowser.open("https://github.com/BarnsL/Desktop-Karaoke#readme")
+        webbrowser.open("https://github.com/BarnsL/Lyric-Immersion-and-Karaoke#readme")
 
     def _open_import(*_):
         from playlist_import_gui import show_import_window
@@ -12475,21 +13064,37 @@ def main():
     )
 
     # ── Display (multi-monitor) ──────────────────────────────────────────
-    def _disp_item(label, key):
+    def _disp_item(label, key, mon=None):
         return pystray.MenuItem(
-            label, lambda *_: ov.root.after(0, lambda: ov.set_display(key)),
-            radio=True, checked=lambda i, key=key: ov.display == key)
-    _disp = []
-    for _i, _m in enumerate(_monitors()):
-        _key = "primary" if _i == 0 else f"mon:{_i}"
-        _tag = "  ·  primary" if _m["primary"] else ""
-        _disp.append(_disp_item(f"Screen {_i + 1}  ({_m['w']}×{_m['h']}){_tag}", _key))
-    if len(_disp) > 1:
-        _disp.append(pystray.Menu.SEPARATOR)
-        _disp.append(_disp_item("Mirror on ALL screens", "mirror"))
-        _disp.append(_disp_item("Cycle through screens  (rotate per line)", "cycle"))
-        _disp.append(_disp_item("Scroll across ALL screens  (one continuous band)", "span"))
-    display_menu = pystray.Menu(*_disp)
+            label,
+            lambda *_: ov.root.after(0, lambda key=key, mon=mon: ov.set_display(key, monitor=mon)),
+            radio=True,
+            checked=lambda i, key=key, mon=mon: _display_checked(key, mon))
+
+    def _display_checked(key, mon=None):
+        if key in ("mirror", "cycle", "span"):
+            return ov.display == key
+        try:
+            if ov.display in ("mirror", "cycle", "span"):
+                return False
+            cur = ov._resolve_monitor(_monitors(), quiet=True)
+            return bool(mon and cur and cur.get("id") == mon.get("id"))
+        except Exception:
+            return False
+
+    def _display_menu_items():
+        mons = _monitors()
+        items = []
+        for _i, _m in enumerate(mons):
+            _key = "primary" if _m["primary"] and _i == 0 else f"mon:{_i}"
+            _tag = "  ·  primary" if _m["primary"] else ""
+            items.append(_disp_item(f"Screen {_i + 1}  ({_m['w']}×{_m['h']}){_tag}", _key, _m))
+        if len(mons) > 1:
+            items.append(pystray.Menu.SEPARATOR)
+            items.append(_disp_item("Mirror on ALL screens", "mirror"))
+            items.append(_disp_item("Cycle through screens  (rotate per line)", "cycle"))
+            items.append(_disp_item("Scroll across ALL screens  (one continuous band)", "span"))
+        return pystray.Menu(*items)
     scroll_menu = pystray.Menu(
         _scr_item("Stationary (appear in place)", "none"),
         _scr_item("Slide in from left", "left"),
@@ -12543,7 +13148,11 @@ def main():
     def _toggle_gen(*_):   ov.root.after(0, lambda: ov.set_generate(not ov.generate_on))
     def _toggle_caps(*_):  ov.root.after(0, lambda: ov.set_captions(not ov.captions_on))
     def _toggle_tauri_overlay(*_):
-        ov.root.after(0, lambda: ov._apply_tauri_overlay_toggle(not ov._tauri_active()))
+        # Toggle the USER'S INTENT (tauri_overlay_on), not raw child liveness, so the
+        # button is a clean A/B switch: ON → GPU (Tauri) renders + Tk hides once it's
+        # confirmed; OFF → Tauri stops + the Tk (CPU) overlay returns immediately.
+        ov.root.after(0, lambda: ov._apply_tauri_overlay_toggle(
+            not getattr(ov, "tauri_overlay_on", False)))
     # TICKET-100: Discord Rich Presence reader toggle (default OFF, opt-in).
     def _toggle_discord_rpc(*_):
         ov.root.after(0, lambda: ov.set_discord_rpc(not ov.discord_rpc_on))
@@ -12810,7 +13419,7 @@ def main():
         # 4. VISUAL / DISPLAY ─────────────────────────────────────────────
         pystray.MenuItem("Show / Hide", _toggle),
         pystray.MenuItem("Position", position_menu),
-        pystray.MenuItem("Display", display_menu),
+        pystray.MenuItem("Display", _display_menu_items),
         pystray.MenuItem("Opacity", opacity_menu),
         pystray.MenuItem("Font size", font_menu),
         pystray.MenuItem("Scroll-in", scroll_menu),
@@ -12828,7 +13437,7 @@ def main():
         # MOTHBALLED (drew nothing); its toggle is gone.
         pystray.MenuItem("GPU overlay (Tauri · smooth, click-through)",
                          _toggle_tauri_overlay,
-                         checked=lambda i: ov._tauri_active()),
+                         checked=lambda i: getattr(ov, "tauri_overlay_on", False)),
         pystray.MenuItem(_gpu_label, _on_gpu,
                          enabled=lambda i: not _gpu["busy"] and not gpu_setup.gpu_ready(),
                          visible=lambda i: gpu_setup.nvidia_gpu_present()),

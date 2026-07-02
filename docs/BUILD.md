@@ -1,4 +1,4 @@
-# Building the Desktop Karaoke installer
+# Building the Lyric Immersion and Karaoke installer
 
 End users don't need any of this — they install from the **Microsoft Store**
 (one click, auto-updating, no security warnings). This page is for producing the
@@ -29,16 +29,16 @@ build.bat
 ```
 
 That installs the build tools, produces the app in **`dist\DesktopKaraoke\`**
-(with `DesktopKaraoke.exe` inside — Python and every dependency bundled, no
+(with `Lyric-Immersion-and-Karaoke.exe` inside — Python and every dependency bundled, no
 Python needed to run it), and — if [Inno Setup](https://jrsoftware.org/isdl.php)
-is installed — also **`dist\DesktopKaraoke-Setup.exe`**, the one-click installer.
+is installed — also **`dist\Lyric-Immersion-and-Karaoke-Setup.exe`**, the one-click installer.
 
 ## Manual steps
 
 ```bat
 pip install pyinstaller -r requirements.txt
-pyinstaller --noconfirm DesktopKaraoke.spec     :: -> dist\DesktopKaraoke\DesktopKaraoke.exe
-iscc installer.iss                              :: -> dist\DesktopKaraoke-Setup.exe
+pyinstaller --noconfirm DesktopKaraoke.spec     :: -> dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe
+iscc installer.iss                              :: -> dist\Lyric-Immersion-and-Karaoke-Setup.exe
 ```
 
 ## Why a **onedir** build (a folder, not a single .exe)
@@ -48,31 +48,31 @@ self-extracting `.exe`. A one-file build crams everything into one executable
 that **re-extracts ~1 GB — including the 50 MB UniDic dictionary — to a temp
 folder on every launch**, which is slow and can fail on machines with strict
 antivirus. The onedir build starts **instantly** and is far more reliable. The
-Inno Setup installer packs the folder into one `DesktopKaraoke-Setup.exe`, so the
+Inno Setup installer packs the folder into one `Lyric-Immersion-and-Karaoke-Setup.exe`, so the
 end-user experience is still a single download.
 
 ## What the installer does (the "layman" experience)
 
-1. Double-click `DesktopKaraoke-Setup.exe`, click **Next → Install** (no admin
+1. Double-click `Lyric-Immersion-and-Karaoke-Setup.exe`, click **Next → Install** (no admin
    rights needed — installs per-user).
 2. Two optional checkboxes: **desktop shortcut** and **Start with Windows**.
 3. Done. It adds a **Start menu** entry, launches, and lives in the system tray
    (the purple microphone). Play any song.
 
 The packaged app is **portable**: it keeps its lyric library (`lyrics/`) and
-`settings.json` right next to `DesktopKaraoke.exe`, so the whole folder is
+`settings.json` right next to `Lyric-Immersion-and-Karaoke.exe`, so the whole folder is
 self-contained — copy it anywhere, or make it a git repo to back up.
 
 ## No Inno Setup? Make a Start-menu entry directly
 
 If you only built the folder (no installer), you can still pin it to the Start
-menu with a shortcut to `dist\DesktopKaraoke\DesktopKaraoke.exe` (use `icon.ico`
+menu with a shortcut to `dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe` (use `icon.ico`
 as the icon). PowerShell one-liner:
 
 ```powershell
 $W=New-Object -ComObject WScript.Shell
-$S=$W.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Programs')) 'Desktop Karaoke.lnk'))
-$S.TargetPath="$PWD\dist\DesktopKaraoke\DesktopKaraoke.exe"; $S.IconLocation="$PWD\icon.ico"; $S.Save()
+$S=$W.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Programs')) 'Lyric Immersion and Karaoke.lnk'))
+$S.TargetPath="$PWD\dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe"; $S.IconLocation="$PWD\icon.ico"; $S.Save()
 ```
 
 ## The app icon
@@ -132,7 +132,7 @@ and the personal music DB are kept in a **private** repo, never the public one.)
 
 ## Notes
 
-- `DesktopKaraoke.exe` is windowed (no console) and bundles Python and every
+- `Lyric-Immersion-and-Karaoke.exe` is windowed (no console) and bundles Python and every
   dependency (winsdk, soundcard, shazamio, fugashi + UniDic, cutlet, …) via
   `DesktopKaraoke.spec`.
 - The lyric cache is **not** bundled (copyright) — it builds itself as songs play.

@@ -9,7 +9,7 @@ Korean, Spanish, German, and Russian) by singing along.**
 > ### ⬇️ Just want to use it? [**Download the latest release**](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest) → unzip → double-click `Lyric-Immersion-and-Karaoke.exe`. No install, no Python, no account. That's it.
 
 Play a song in **Spotify, YouTube, or any app** that talks to Windows' media
-controls, and Desktop Karaoke pulls the **real playback position** and streams
+controls, and Lyric Immersion and Karaoke pulls the **real playback position** and streams
 the lyrics across your screen — with furigana over every kanji, a reading you can
 pronounce, an English translation, and a karaoke fill that sweeps in time with
 the singing. There's no window and no panel: just clean, outlined text over your
@@ -92,7 +92,7 @@ while it runs.
 The easy path for everyone:
 
 1. Open the **[latest release](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest)**.
-2. Download **`LyricImmersion-portable.zip`**.
+2. Download **`LyricImmersion-portable-vX.Y.Z.zip`**.
 3. Right-click → **Extract All**.
 4. Double-click **`Lyric-Immersion-and-Karaoke.exe`** inside.
 
@@ -349,7 +349,7 @@ python  main.py --offset -1.5    # nudge sync earlier for an intro-heavy video
 **Build the one-click installer yourself** — see [BUILD.md](docs/BUILD.md):
 
 ```bash
-build.bat        # → dist\Lyric-Immersion-and-Karaoke.exe  (+ DesktopKaraoke-Setup.exe if Inno Setup is installed)
+build.bat        # -> dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe (+ dist\Lyric-Immersion-and-Karaoke-Setup.exe if Inno Setup is installed)
 ```
 
 ### Build a starter library

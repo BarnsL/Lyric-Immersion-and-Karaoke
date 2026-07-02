@@ -101,8 +101,8 @@ the runtime `lyrics/  models/  settings.json  *.log`). The deploy folder name st
   installer.iss                                │
                                                ▼
   BUILD (PyInstaller)   python -m PyInstaller --noconfirm DesktopKaraoke.spec
-   • run pinned to cores 3-7 (affinity 0xF8) @ BelowNormal so it
-     never starves the running app (which pins itself to the last cores)
+   • run at BelowNormal and, if you pin affinity, keep the build off the
+     app's dedicated last-core affinity so it never starves the running app
    • NON-LEAN build: faster-whisper IS bundled (LEAN_BUILD must NOT be 1)
    • whisper is pure-python → lands in the PYZ inside the exe, NOT a
      _internal\faster_whisper dir (its C-deps ctranslate2/av/tokenizers DO appear)
@@ -132,8 +132,9 @@ the runtime `lyrics/  models/  settings.json  *.log`). The deploy folder name st
 ### Gotchas (the ones that have bitten)
 - **Never build with `LEAN_BUILD=1`** for a deploy — it silently strips the bundled
   Whisper (AI lyric generation / sync-by-ear). See `BUILD.md`.
-- **Build affinity 0xF8 / BelowNormal** — the app pins itself to the last cores for
-  audio-stutter reasons; an un-pinned full-speed build starves it.
+- **Build priority / affinity** — the app pins itself to the last cores for
+  audio-stutter reasons; keep builds off that dedicated core set and run them at
+  `BelowNormal` so they do not starve the live app.
 - **robocopy exit code 1-7 = success** (3 = "files copied + extra files present").
   A locked `__mypyc*.pyd` can show a benign non-zero; the exe still copies.
 - **GPU child is the same exe** re-entered with `--gpu-renderer-child`; transparency

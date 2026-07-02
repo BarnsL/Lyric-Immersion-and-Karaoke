@@ -13,6 +13,9 @@ from PyInstaller.utils.hooks import collect_all
 WHISPER = os.path.isdir(".deps") and os.environ.get("LEAN_BUILD") != "1"
 
 datas = [("icon.ico", ".")]
+overlay_exe = os.path.join("overlay", "lyric-overlay.exe")
+if os.path.isfile(overlay_exe):
+    datas.append((overlay_exe, "overlay"))
 # TICKET-124: NO bundled lyrics are shipped. This is a sellable product — every lyric
 # must be FOUND BY CODE at runtime (providers / YouTube captions / OCR / by-ear), never
 # copyrighted text baked into the build. (bundled_lyrics/ was removed from the repo.)
@@ -27,7 +30,7 @@ hiddenimports = [
     # local modules imported lazily inside functions — pin them so the
     # frozen build always includes them.
     "appdata", "version", "updater", "songchange", "align", "api", "character", "recognize", "fetch_lyrics", "gpu_setup", "metrics",
-    # optional Claude lyric disambiguator — lazy-imported inside _decide_by_ear;
+    # optional LLM lyric disambiguator — lazy-imported inside _decide_by_ear;
     # pin so the frozen build includes it (stdlib urllib only, no new deps).
     "llm_disambiguate",
     "playlist_import", "playlist_import_gui", "concert_ocr", "ocr_lyrics", "deep_transcribe", "confidence",

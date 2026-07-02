@@ -229,7 +229,7 @@ def _ct_load():
 
 
 def available() -> bool:
-    """Cheap probe: are the Win32 APIs we need reachable on this box?
+    """Cheap probe: are the Win32 APIs we need reachable on this machine?
 
     True on a normal Windows install, False on Linux/macOS or a stripped
     Windows that's missing user32 (essentially never). Used by /diag and
