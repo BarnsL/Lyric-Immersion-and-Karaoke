@@ -77,15 +77,31 @@ async def _ocr_file(path, engine):
     return [ln.text.strip() for ln in res.lines if ln.text.strip()]
 
 
-def read_banner_lines() -> list:
-    """Grab the screen, OCR the top strip with every installed language, and return
-    the recognised text lines (de-duplicated). [] on any failure."""
+def read_banner_lines(hwnd=None) -> list:
+    """OCR the top strip of the MEDIA window and return the recognised text lines
+    (de-duplicated). [] on any failure.
+
+    v1.1.49 — when `hwnd` (the browser/media window) is supplied we capture THAT
+    window's own pixels via ocr_lyrics.capture_source_window (PrintWindow, occlusion-
+    safe), so the banner reader can never OCR whatever else sits top-left on the
+    desktop. Before this, a bare full-desktop ImageGrab.grab() would read a VS Code
+    window ("Diff looks clean. Committing and d…") instead of the concert banner.
+    Falls back to the full-desktop grab only when no hwnd is known or the window
+    capture fails."""
     engs = _engines()
     if not engs:
         return []
     try:
-        from PIL import ImageGrab
-        im = ImageGrab.grab()                       # COM grab OUTSIDE the asyncio loop
+        im = None
+        if hwnd:
+            try:
+                import ocr_lyrics
+                im = ocr_lyrics.capture_source_window(int(hwnd))   # PIL RGB of the media window
+            except Exception:
+                im = None
+        if im is None:
+            from PIL import ImageGrab
+            im = ImageGrab.grab()                   # COM grab OUTSIDE the asyncio loop
         # The song banner sits TOP-LEFT; the hashtag is top-right and the chat panel
         # is far right — so OCR only the top-LEFT region to skip that UI noise.
         strip = im.crop((0, 0, int(im.width * 0.60), int(im.height * _TOP_FRAC)))

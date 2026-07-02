@@ -136,6 +136,33 @@ def _is_hallucination(text: str) -> bool:
     return (not t) or bool(_HALLUCINATION_RE.search(t))
 
 
+def _is_degenerate(text: str) -> bool:
+    """True if a transcript is a REPETITION-dominated Whisper hallucination — the
+    kind a quiet/instrumental intro produces ("me me me me me", "んmememememe",
+    "la la la la"). These are not stock outro phrases (so _is_hallucination misses
+    them) but they are equally worthless, and worse: a repeated token fuzzy-matches
+    a WRONG song at a spuriously high score and switches away from the correct one
+    (kamone was title-matched at 112 then lost to feelingradation/ReGLOSS at 98 on
+    exactly such a transcript). Two independent signatures:
+      • very low character diversity (few distinct chars over a long string), and
+      • a single whitespace token making up most of the transcript.
+    Real lyrics — Japanese kana/kanji especially — are far more diverse than either.
+    """
+    t = (text or "").strip()
+    collapsed = t.replace(" ", "")
+    if len(collapsed) >= 10:
+        uniq = len(set(collapsed)) / float(len(collapsed))
+        if uniq < 0.30:
+            return True
+    toks = t.split()
+    if len(toks) >= 4:
+        from collections import Counter
+        most = Counter(toks).most_common(1)[0][1]
+        if most / float(len(toks)) >= 0.6:
+            return True
+    return False
+
+
 def _data_models_dir():
     try:
         from appdata import data_dir
@@ -332,7 +359,9 @@ def transcribe_vocals(lang="ja", seconds=12, size=_GEN_MODEL):
     # Drop Whisper's non-speech hallucinations so a quiet/instrumental clip can't
     # turn "thanks for watching" into a confident (wrong) song match.
     heard = _plain(" ".join(t for _, t in segs if not _is_hallucination(t)))
-    return heard if len(heard) >= 6 else None
+    if len(heard) < 6 or _is_degenerate(heard):
+        return None                                   # silence / repetition-hallucination
+    return heard
 
 
 def score_candidates(heard, candidates):
