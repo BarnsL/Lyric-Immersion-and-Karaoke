@@ -1517,15 +1517,18 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
         elif lrc and a and _lrc_artist_conflict(lrc, a):
             log.info("title-only: rejected %r — LRC artist conflicts with %r", t, a)
 
-    # 5. NetEase Cloud Music (网易云音乐) — direct provider, gated to Chinese-
-    # script tracks only (lang=="zh"). Chinese pop / rap / indie long-tail is
-    # often missing from lrclib + syncedlyrics' aggregators, and NetEase is the
-    # canonical Chinese lyrics source. Tried AFTER lrclib/syncedlyrics, BEFORE
-    # we return None (which upstream takes as the cue to AI-generate by ear).
-    # detect_lang(title) returns "zh" only when HAN is present with no kana and
-    # no hangul, so a kanji-heavy Japanese title (han_song above) won't reach
-    # this branch — _synced_cjk already covers that case via NetEase-thru-syncedlyrics.
-    if detect_lang(t) == "zh":
+    # 5. NetEase Cloud Music (网易云音乐) — direct provider for CJK tracks.
+    # v1.1.49: WIDENED from Chinese-only (lang=="zh") to also cover JAPANESE
+    # (lang=="ja", i.e. any kana-bearing native title). NetEase is the canonical
+    # source not just for Chinese but for VTuber originals, Vocaloid and JP covers,
+    # which lrclib + syncedlyrics' Western aggregators routinely miss — and the old
+    # `_synced_cjk` upgrade path only ran when lrclib ALREADY returned a romaji hit,
+    # so a native-JP title with no lrclib hit at all never reached NetEase and fell
+    # straight to AI-gen. Tried AFTER lrclib/syncedlyrics, BEFORE returning None
+    # (which upstream takes as the cue to AI-generate by ear). Korean is excluded
+    # (NetEase JP/CN catalog; Melon/Genie carry Korean). A kanji-only JP title is
+    # already caught by detect_lang=="zh"; this adds the kana-bearing majority.
+    if detect_lang(t) in ("zh", "ja"):
         lrc = _fetch_netease_lyrics(t, a)
         if lrc and verify_lrc(lrc, t, duration):
             r = take(lrc, {"source": "netease", "artist": a or None,

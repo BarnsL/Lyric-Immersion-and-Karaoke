@@ -332,6 +332,31 @@ def is_non_music_source(title, artist):
     return bool(t in _NON_MUSIC_TITLES and not (artist or "").strip())
 
 
+# Social / short-video FEED hosts. A Reel or Short there plays background music
+# that Windows SMTC reports as a real song (title + artist), so is_non_music_source
+# — which keys off a bare site-name title — can't catch it, and lyrics get slapped
+# over the clip (and, worse, the by-ear loop then latches onto the backing track).
+# The browser-pushed URL host is the reliable signal that we're on a feed.
+_SOCIAL_HOSTS = (
+    "instagram.com", "tiktok.com", "facebook.com", "fb.watch", "twitter.com",
+    "x.com", "reddit.com", "threads.net", "snapchat.com", "linkedin.com",
+    "pinterest.com", "tumblr.com", "discord.com",
+)
+
+
+def _is_social_url(url):
+    """True if the browser-pushed URL is a social/short-video feed host."""
+    u = (url or "").strip()
+    if not u:
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(u).hostname or "").lower()
+    except Exception:
+        return False
+    return bool(host) and any(host == h or host.endswith("." + h) for h in _SOCIAL_HOSTS)
+
+
 def _has_cjk(s):
     """True if the string contains any CJK or Hangul character."""
     return bool(_CJK_RE.search(s or ""))
@@ -2209,6 +2234,7 @@ class Overlay:
         self._api = None
         self._boundary = None         # song-change detector thread
         self._last_boundary = 0.0     # throttle: last boundary-triggered identify
+        self._non_music_page = False  # v1.1.49 sticky: on a social feed (Instagram/TikTok) → overlay off, no by-ear/decision/OCR
         self._fps = 16
         self._last_pos = 0.0
         self._smtc_pos_last = 0.0       # last SMTC-reported position (stale detect)
@@ -2434,6 +2460,7 @@ class Overlay:
             "agree":                 2.0,   # 2-read agreement window (s)
             "agree_live":            4.0,   # live-arrangement agreement window
             "live_max_jump_s":      45.0,   # reject a live-follow correction that jumps >this from a STABLE offset (a chorus-repeat mismatch, e.g. -170s on a 4-min song) — not real tempo drift
+            "live_song_max_s":     900.0,   # v1.1.49: in live/concert mode, a SMTC "duration" above this (the 51-min video container) is not a per-song length → dropped before fetch so verify_lrc/lrclib don't reject correct short-song lyrics
             # ── two-point sound-verification timing (TICKET-056) ──
             # hold a candidate offset, hesitate this long, then take a confirming
             # listen; the 2nd read must land within "agree" of the 1st to commit.
@@ -2635,6 +2662,8 @@ class Overlay:
             "force_sync_top_n":        6,   # candidate offsets ranked per read (try best→next on failure)
             "energy_apply_min":      0.4,   # min |new-old| to apply correlation
             "energy_lift_floor":     0.045, # min peak-vs-median lift to accept (was 0.10; kamone's correct shift had lift≈0.049 and was being rejected, so the cache loaded right but sync never locked). Rival-peak margin + Shazam sanity + energy_apply_min still guard false alarms.
+            "live_energy_lift_floor":  0.025, # v1.1.49: relaxed peak-lift bar for LIVE/concert arrangements — re-sung-over-crowd audio is noisy, so a CORRECT constant offset (V.W.P 共鳴 LIVE MV sat 2-3s off all song) read as a weak peak and never locked
+            "live_energy_peak_margin": 0.035, # v1.1.49: relaxed rival-peak margin for live (small-shift penalty + Shazam ±4s check still guard chorus-repetition false jumps)
             "energy_max_offset":    60.0,   # |new_off| < this for sanity
             "energy_shift_penalty":  0.012, # per-second penalty for large offset changes (small-shift prior)
             "energy_peak_margin":    0.06,  # reject if a distant rival peak is within this of the best
@@ -2651,6 +2680,9 @@ class Overlay:
             "scroll_fill_skip":        2.0, # scroll-mode only: heavy work runs every Nth frame (fills are sliver-cheap)
             "scroll_motion_catchup":   4.0, # scroll-mode only: extra seconds-per-second the belt may catch up after a stall / sync nudge
             "scroll_motion_seek_snap_s": 4.0, # scroll-mode only: large jump = real seek / track change, cut through instead of gliding
+            "scroll_motion_back_snap_s": 2.0, # v1.1.49: backward jump > this cuts cleanly (bounds max belt FREEZE at ~this many s)
+            "scroll_motion_back_cap":   0.0, # v1.1.49: backward slew multiplier — 0.0 = no reverse (belt pauses instead of sliding back)
+            "scroll_motion_pull_per_sec": 6.0, # v1.1.49: overlay-side exponential-glide stiffness for forward catch-up
             # PERF-102 — scroll bitmap-area controls (the dominant scroll cost):
             "scroll_max_lanes":      3,     # stacked scrolling lines (capped to what fits on screen)
             "scroll_v_stagger":    250,     # VERTICAL scroll: horizontal stagger (px@scale1) between
@@ -3994,6 +4026,18 @@ class Overlay:
 
     def _start_fetch(self, artist, title, duration=None, cover=False, strict=False,
                      swap_token=None):
+        # v1.1.49 — in a LIVE/CONCERT stream the SMTC "duration" is the whole
+        # video (e.g. 3110s / 51.8 min), NOT the per-song length, and every by-ear
+        # fetch here is handed self._cur_duration. Passing a container length
+        # poisons the providers: lrclib /api/get needs an exact match, _pick_lrclib
+        # penalises a >25s delta, and verify_lrc rejects any body whose LAST
+        # timestamp is < duration*0.35 — so a correct 4-min song (last ts ~240s)
+        # is thrown away even when the provider returned the RIGHT lyrics. Drop an
+        # implausible container duration in live mode so the fetch matches on
+        # title/artist instead. Tunable ceiling (default 15 min).
+        if (getattr(self, "_live_mode", False) and duration
+                and duration > float(self._tune.get("live_song_max_s", 900.0))):
+            duration = None
         key = (artist, title)
         # TICKET-113: snapshot the blacklist at queue time so the worker thread
         # never reads the live set (a second /wrong mid-fetch would otherwise
@@ -4399,11 +4443,17 @@ class Overlay:
         confidently names a song we have, switch the overlay to that song's lyrics.
         Runs only in live/concert mode. Best-effort: any failure is ignored and the
         sound-driven detection stands. See concert_ocr.py / docs/CONCERT_DETECTION.md."""
+        if getattr(self, "_non_music_page", False):
+            return                       # v1.1.49 — no OCR song-ID on a social feed
         try:
             import concert_ocr
             if not concert_ocr.available():
                 return
-            lines = concert_ocr.read_banner_lines()
+            # v1.1.49 — read the MEDIA window's own pixels, not the whole desktop,
+            # so the banner reader can't OCR an unrelated top-left window (it was
+            # reading VS Code). Falls back to a desktop grab inside read_banner_lines
+            # when the hwnd is unknown.
+            lines = concert_ocr.read_banner_lines(hwnd=self._source_window_hwnd())
             cands = [e.get("title") for e in self.index.entries if e.get("title")]
             m = concert_ocr.match_song(lines, cands) if cands else None
             uncached = concert_ocr.plausible_title(lines)
@@ -6210,7 +6260,16 @@ class Overlay:
         # Scrolling Instagram/TikTok/etc. Reels: the tab reports the SITE NAME as
         # the title (no artist). That's not a song — keep the overlay OFF so it
         # doesn't match a same-named song and slap lyrics over the clip.
-        if is_non_music_source(state["title"], state.get("artist", "")):
+        # v1.1.49 — a reel/short with BACKGROUND MUSIC gives SMTC a real song
+        # title+artist, so is_non_music_source can't see it; the URL host can.
+        # `_non_music_page` is a STICKY flag (not just a one-shot clear): the
+        # by-ear / boundary / decision / OCR loops all consult it and STOP, so
+        # they can't keep re-identifying the reel's backing track and re-slapping
+        # lyrics over the feed (the logged "clearing overlay" → immediately
+        # "re-identifying by sound" → me_me_me leak).
+        if (is_non_music_source(state["title"], state.get("artist", ""))
+                or _is_social_url(getattr(self, "_now_url", None))):
+            self._non_music_page = True
             if self._track is not None or self.lines:
                 self._track = None
                 self.lines, self.idx, self._kara = [], -1, []
@@ -6220,6 +6279,7 @@ class Overlay:
                 self._hint("")        # nothing — don't cover the reel
             self.root.after(200, self._tick)
             return
+        self._non_music_page = False
 
         # clean_title() runs several regexes; the raw title rarely changes, so
         # only recompute it when it does (this loop runs every frame).
@@ -7764,10 +7824,22 @@ class Overlay:
         if abs(target - prev) > seek_snap:
             self._scroll_motion_out = target
             return self._scroll_motion_out
+        # v1.1.49 — NO-REVERSE belt (user: "slide forward or pausing, but not back
+        # and forth"). Any backward jump larger than `back_snap` cuts cleanly so
+        # the belt never freezes longer than ~back_snap seconds; smaller backward
+        # deltas HOLD (default back_cap multiplier 0.0), so the belt pauses
+        # instead of visibly reversing during a downward sync correction. Both
+        # thresholds are live-tunable; setting `scroll_motion_back_cap` > 0 will
+        # re-enable a bounded backward slew.
+        back_snap = float(self._tune.get("scroll_motion_back_snap_s", 2.0))
+        if back_snap > 0.0 and (target - prev) < -back_snap:
+            self._scroll_motion_out = target
+            return self._scroll_motion_out
         nominal_dt = max(0.008, float(self._fps) / 1000.0)
         catchup = float(self._tune.get("scroll_motion_catchup", 4.0))
         fwd_cap = nominal_dt * (1.0 + catchup)
-        back_cap = nominal_dt * min(catchup, 1.5)
+        back_mult = float(self._tune.get("scroll_motion_back_cap", 0.0))
+        back_cap = nominal_dt * min(catchup, 1.5) * back_mult
         delta = max(-back_cap, min(fwd_cap, target - prev))
         self._scroll_motion_out = prev + delta
         return self._scroll_motion_out
@@ -10466,7 +10538,30 @@ class Overlay:
         video's own lyrics → ground truth, never a source mismatch."""
         if getattr(self, "_is_cover", False):
             return "OK"
+        # v1.1.49 — in a LIVE/CONCERT stream the SMTC title is the EVENT name
+        # (e.g. "…生誕祭2025… Sincerely,Towa 3DLIVE"), never a per-song title, so
+        # title agreement is meaningless. Scoring the ear-heard song against the
+        # concert banner returned BAD on every tick and snowballed the decision
+        # engine into SWITCH/REGEN across the whole 51-min video — tearing down
+        # CORRECT lyrics and blacklisting good providers. A concert never has a
+        # trustworthy SMTC title to agree with, so this dim must abstain.
+        if getattr(self, "_live_mode", False):
+            return "OK"
         src = (self.meta.get("source") or "") if isinstance(self.meta, dict) else ""
+        # Cross-language identification is NOT a source disagreement. Shazam returns
+        # the ENGLISH/translated title ("Return to White") while the library + SMTC
+        # hold the native 「そして白に還る」; a pure character comparison can never
+        # match them. Once the AUDIO itself has corroborated the loaded body, the
+        # spelling of Shazam's title is irrelevant — a string mismatch is not a
+        # wrong song. (Without this, every kana/kanji song a Western Shazam names
+        # in English scores BAD forever.) EXCLUDES generated bodies: AI-generated
+        # lyrics are a transcript OF the audio, so they "corroborate" by
+        # construction — trusting that would strand WRONG generated lyrics (the
+        # kamone→ReGLOSS "won't correct off the generated song" case). Generated
+        # bodies must stay re-checkable via this dim.
+        if (getattr(self, "_body_corroborated", False)
+                and src not in ("generated", "generated-deep", "ai-gen")):
+            return "OK"
         if src == "youtube-captions":
             return "OK"
         st = self.media.get() or {}
@@ -10569,6 +10664,11 @@ class Overlay:
 
     def _decision_engine_tick(self):
         if not int(self._tune.get("decision_engine_on", 1)):
+            return
+        # v1.1.49 — don't run the wrong-lyric/SWITCH/REGEN machinery while parked
+        # on a social feed (Instagram/TikTok): there is no real song to score, and
+        # it would blacklist/AI-generate off a reel's backing track.
+        if getattr(self, "_non_music_page", False):
             return
         now = time.time()
         if now - self._decision_last_t < float(
@@ -10706,6 +10806,13 @@ class Overlay:
             "scroll_speed": round(v_eff, 2),
             "motion_catchup": round(float(self._tune.get("scroll_motion_catchup", 4.0)), 3),
             "motion_seek_snap_s": round(float(self._tune.get("scroll_motion_seek_snap_s", 4.0)), 3),
+            # v1.1.49 — the overlay's belt-motion clock (smoothMotionPos in app.js)
+            # honors these three knobs so the "no reverse, pause instead" + smoother
+            # forward glide behaviour lives in ONE place (the tune dict) and stays in
+            # lockstep with the engine-side _scroll_motion_pos above.
+            "motion_back_snap_s": round(float(self._tune.get("scroll_motion_back_snap_s", 2.0)), 3),
+            "motion_back_cap": round(float(self._tune.get("scroll_motion_back_cap", 0.0)), 3),
+            "motion_pull_per_sec": round(float(self._tune.get("scroll_motion_pull_per_sec", 6.0)), 3),
             "font_scale": round(float(getattr(self, "font_scale", 1.0))
                                  * float(getattr(self, "_auto_scale", 1.0)), 4),
             "opacity": round(float(getattr(self, "opacity", 1.0)), 3),
@@ -10745,6 +10852,15 @@ class Overlay:
             "playing": playing,
             "position": round(pos, 3),
             "motion_position": round(motion_pos, 3),
+            # v1.1.49 — SONG-IDENTITY signal for the overlay. _track_seq bumps ONLY
+            # on a real track change (_on_track_change) or an SMTC-paused takeover
+            # — NOT on sync-offset corrections and NOT on same-song SMTC re-reports
+            # — so a change in this value is the correct "clean-cut" trigger for
+            # the belt's motionOut clock. The overlay resets its motion clock on
+            # seq change (see poll() in overlay/src/app.js), killing the visible
+            # "slide back and forth between songs" that came from the belt easing
+            # between the old song's residual clock and the new song's initial one.
+            "seq": int(getattr(self, "_track_seq", 0)),
             "idx": idx,
             "line_count": n,
             "line": _ln(idx),
@@ -11171,6 +11287,11 @@ class Overlay:
         (TICKET-079)."""
         if track_seq != self._track_seq or self._deciding or self._aligning:
             return
+        # v1.1.49 — never identify-by-ear on a social feed: a reel's backing track
+        # would get matched to a library song and slapped over the clip. The
+        # sticky _non_music_page flag (set in _check_monitors) keeps it off.
+        if getattr(self, "_non_music_page", False):
+            return
         # TICKET-090: a Shazam-VERIFIED + title-LOCKED song is ground truth — the
         # decide loop can only hurt (a noisy/hallucinated transcript ranks the
         # wrong song and overrides good lyrics). Skip it unless the tune knob
@@ -11229,7 +11350,14 @@ class Overlay:
         # (a pool of just the loaded song is fine — a clearly-wrong loaded song is
         # then identified against the WHOLE library below.)
         self._deciding = True
-        lang = self.meta.get("lang", "ja")
+        # v1.1.49 — in a concert the loaded meta is stale/empty (the container
+        # title was discarded on live-mode entry) and consecutive songs may be in
+        # different languages, so DON'T force Whisper to Japanese — auto-detect per
+        # song (lang=None), exactly like the display-generation path. Force-pinning
+        # 'ja' on a non-JP or mixed live section is a top cause of the garbled,
+        # hallucinated transcripts that then self-confirm the wrong song. Outside
+        # live mode, keep the loaded song's language as a helpful prior.
+        lang = None if getattr(self, "_live_mode", False) else self.meta.get("lang", "ja")
         secs = float(self._tune.get("decide_listen_s", 12.0))
         wrong_floor = float(self._tune.get("decide_wrong_floor", 32.0))
         lib_paths = [str(e["path"]) for e in self.index.entries][:600]
@@ -11379,6 +11507,7 @@ class Overlay:
         # MIN/MARGIN compare — a transcript-only switch should hesitate when the
         # candidate is by the wrong artist. Skipped for covers (a cover's original
         # artist is DIFFERENT by design).
+        block_cross_artist = False
         if expanded and best_key not in ("loaded", loaded_key) and not getattr(self, "_is_cover", False):
             smtc_artist_n = _norm_title(getattr(self, "_clean_artist_cache", "") or "")
             best_artist_n = ""
@@ -11391,9 +11520,25 @@ class Overlay:
                 pass
             if smtc_artist_n and best_artist_n and smtc_artist_n != best_artist_n:
                 if not (smtc_artist_n in best_artist_n or best_artist_n in smtc_artist_n):
-                    log.info("decide-by-ear: best candidate's artist %r ≠ SMTC artist %r "
-                             "— penalizing best_score by 8", best_artist_n, smtc_artist_n)
                     best_score -= 8.0
+                    # v1.1.49 — a by-ear read must NOT switch a TITLE-LOCKED song to a
+                    # DIFFERENT ARTIST's library track. A confident title match is strong
+                    # ground truth; a transcript that fuzzy-matches some other artist's
+                    # song is almost always a hallucination on a quiet section. This is
+                    # the kamone case: 「かもね」/Kizuna AI was title-locked at 112 then
+                    # switched to feelingradation/ReGLOSS (hololivedevisregloss) at 90 on
+                    # a "me me me" transcript. The old -8 penalty was far too weak. When
+                    # the loaded song is title-locked, BLOCK the cross-artist switch
+                    # outright (defense-in-depth behind the transcript degeneracy filter).
+                    if getattr(self, "_title_locked", False):
+                        block_cross_artist = True
+                        log.info("decide-by-ear: BLOCKING cross-artist switch to %r "
+                                 "(≠ SMTC artist %r) off a TITLE-LOCKED song — "
+                                 "transcript-only match to the wrong artist",
+                                 best_artist_n, smtc_artist_n)
+                    else:
+                        log.info("decide-by-ear: best candidate's artist %r ≠ SMTC artist %r "
+                                 "— penalizing best_score by 8", best_artist_n, smtc_artist_n)
         # GUARD: a title-LOCKED song came from a confident title match — strong ground
         # truth. Require an OVERWHELMING library match before a by-ear read may override
         # it, so one noisy/short clip can't switch away from the right song (the Suisei
@@ -11722,7 +11867,19 @@ class Overlay:
         rival_i = int(np.argmax(masked))
         rival_score = float(masked[rival_i])
         rival_shift = float(shifts_s[rival_i]) if rival_score >= 0 else None
-        margin = self._tune.get("energy_peak_margin", 0.06)
+        # v1.1.49 — LIVE/concert arrangements (re-sung over crowd + band) produce a
+        # noisier vocal mask, so a CORRECT constant offset reads as a weak/ambiguous
+        # peak and never applies (V.W.P 共鳴 LIVE MV sat ~2-3s off the entire song).
+        # Relax the acceptance bars for live only; the small-shift penalty and the
+        # Shazam ±4s sanity check below still guard against chorus-repetition jumps.
+        live_sync = bool(getattr(self, "_live_arrangement", False)
+                         or getattr(self, "_live_mode", False))
+        margin = self._tune.get(
+            "live_energy_peak_margin" if live_sync else "energy_peak_margin",
+            0.035 if live_sync else 0.06)
+        lift_floor = float(self._tune.get(
+            "live_energy_lift_floor" if live_sync else "energy_lift_floor",
+            0.025 if live_sync else 0.045))
         ambiguous = rival_score >= 0 and (best_score - rival_score) < margin
         self._last_energy = {
             "best_shift": round(best_shift, 2), "best_score": round(best_score, 3),
@@ -11734,7 +11891,7 @@ class Overlay:
             "reason": getattr(self, "_energy_reason", "?"),
             "t": time.time(),
         }
-        if peak_lift < self._tune["energy_lift_floor"]:
+        if peak_lift < lift_floor:
             log.info("energy-align: weak peak (best %.3f, median %.3f, lift %.3f) — no change",
                      best_score, median, peak_lift)
             verdict("inconclusive")
@@ -11786,7 +11943,11 @@ class Overlay:
         # alpha=1.0 when lift≥0.30, falls linearly to 0.3 at the energy_lift_floor.
         # Anchored at the LIVE floor (not a hardcoded 0.10) so lowering the floor
         # for weak-but-clear peaks like kamone keeps the confidence gradient intact.
-        _floor = float(self._tune.get("energy_lift_floor", 0.045))
+        _live = bool(getattr(self, "_live_arrangement", False)
+                     or getattr(self, "_live_mode", False))
+        _floor = float(self._tune.get(
+            "live_energy_lift_floor" if _live else "energy_lift_floor",
+            0.025 if _live else 0.045))
         alpha = max(0.3, min(1.0, (lift - _floor) / 0.20 + 0.3))
         prev = self.offset
         blended = round((1.0 - alpha) * prev + alpha * new_off, 2)
@@ -12789,12 +12950,23 @@ def _is_only_instance():
     process does), so an instance never blocks its own stub→child pair."""
     global _SINGLE_INSTANCE_MUTEX
     try:
-        k32 = ctypes.windll.kernel32
+        # v1.1.49 — RELIABLE last-error capture. The old code called
+        # kernel32.GetLastError() as a SEPARATE ctypes call after CreateMutexW;
+        # ctypes' own machinery (and the intervening Python) can reset the
+        # thread's last error, so ERROR_ALREADY_EXISTS (183) was frequently
+        # missed → the second launch thought it was alone → duplicate instances
+        # fighting over port 8765 (the "port competition"). Use a
+        # use_last_error=True handle and read ctypes.get_last_error() IMMEDIATELY
+        # after the call, which snapshots errno at the call boundary.
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
         h = k32.CreateMutexW(None, False, "Local\\DesktopKaraoke.SingleInstance")
+        err = ctypes.get_last_error()
         if not h:
             return True
         _SINGLE_INSTANCE_MUTEX = h         # keep alive for the run (releases on exit)
-        return k32.GetLastError() != 183   # 183 = ERROR_ALREADY_EXISTS
+        return err != 183                  # 183 = ERROR_ALREADY_EXISTS → NOT the only instance
     except Exception:
         return True
 
