@@ -2625,7 +2625,7 @@ class Overlay:
             # below. User-visible via tray hint + /diag.decision_engine.
             "decision_engine_on":           1,
             "decision_caution_strikes":     3,
-            "decision_switch_strikes":      5,
+            "decision_switch_strikes":      4,   # v1.1.50: 5→4 — catch a genuinely wrong (non-cover) song ~2s sooner (user: "wrong the entire song"). Covers already floor lower via -2*cov. Concert live-mode source_agree guard prevents thrash.
             "decision_regen_strikes":       8,
             "decision_score_window":       12,
             "decision_tick_interval_s":   2.0,
@@ -2664,6 +2664,8 @@ class Overlay:
             "energy_lift_floor":     0.045, # min peak-vs-median lift to accept (was 0.10; kamone's correct shift had lift≈0.049 and was being rejected, so the cache loaded right but sync never locked). Rival-peak margin + Shazam sanity + energy_apply_min still guard false alarms.
             "live_energy_lift_floor":  0.025, # v1.1.49: relaxed peak-lift bar for LIVE/concert arrangements — re-sung-over-crowd audio is noisy, so a CORRECT constant offset (V.W.P 共鳴 LIVE MV sat 2-3s off all song) read as a weak peak and never locked
             "live_energy_peak_margin": 0.035, # v1.1.49: relaxed rival-peak margin for live (small-shift penalty + Shazam ±4s check still guard chorus-repetition false jumps)
+            "sync_match_min":          0.72, # min transcript↔LRC match ratio to trust a LARGE sync offset (guards chorus-repetition mis-matches on studio songs)
+            "live_sync_match_min":     0.62, # v1.1.50: LOWER bar for LIVE/cover arrangements — a re-sung version matches the STUDIO LRC less exactly (0.64-0.68), so at 0.72 the correct big offset was rejected every time and the song stayed off the whole time. Two-point confirmation still guards.
             "energy_max_offset":    60.0,   # |new_off| < this for sanity
             "energy_shift_penalty":  0.012, # per-second penalty for large offset changes (small-shift prior)
             "energy_peak_margin":    0.06,  # reject if a distant rival peak is within this of the best
@@ -10500,6 +10502,20 @@ class Overlay:
                  "OK" if ok else "miss", self._live_sync_streak, self._live_resync_gap,
                  60.0 / max(0.1, self._live_resync_gap + listen))
 
+    def _sync_match_floor(self):
+        """Minimum transcript↔LRC match ratio required to TRUST a large sync offset.
+        v1.1.50 — LIVE / cover arrangements re-sing the lyrics (ad-libs, tempo
+        shifts, extended live intros) so their transcript matches the STUDIO LRC
+        less exactly (~0.64-0.68). At the studio bar (0.72) every large live offset
+        was rejected, so a correct-but-shifted live song stayed off the WHOLE song
+        (the "wrong the entire time" report). Accept a lower bar for live; the
+        two-point hold-and-confirm still guards against chorus-repetition jumps.
+        Studio songs keep the strict bar."""
+        live = bool(getattr(self, "_live_arrangement", False)
+                    or getattr(self, "_live_mode", False))
+        return float(self._tune.get("live_sync_match_min", 0.62) if live
+                     else self._tune.get("sync_match_min", 0.72))
+
     # ── SMART song decision by ear (Whisper 'small' + rapidfuzz) ──────────────
     #
     # The robust answer to "what song should we show lyrics to?" when the usual
@@ -11681,7 +11697,12 @@ class Overlay:
                 return
             if not self._ocr_gpu_safe():          # TICKET-125: don't hitch a running game
                 return
-            if (self._live_mode or not self.lines
+            # Burned-in on-screen lyrics are the GROUND TRUTH for timing, so OCR-sync
+            # is now allowed in LIVE/CONCERT mode (was blocked) — that is exactly where
+            # the studio LRC timing is wrong and the video carries the real per-
+            # performance timing. Tunable via ocr_sync_in_live (default on).
+            if ((self._live_mode and not int(self._tune.get("ocr_sync_in_live", 1)))
+                    or not self.lines
                     or (self.meta.get("source") or "").startswith("generated")
                     or not any(h in (self._last_src or "") for h in BROWSER_HINTS)):
                 return
@@ -11712,7 +11733,15 @@ class Overlay:
                         else difflib.SequenceMatcher(None, no, nl).ratio()
                     if best is None or r > best[0]:
                         best = (r, i)
-            if not best or best[0] < 0.66:
+            # Live arrangements re-sing lyrics with small ad-lib differences from the
+            # studio LRC, so accept a slightly looser OCR↔LRC match for them (the
+            # match still has to clear the offset-range + deadband guards below).
+            _live_ocr = bool(getattr(self, "_live_arrangement", False)
+                             or getattr(self, "_live_mode", False))
+            ocr_min = float(self._tune.get(
+                "ocr_sync_min_live" if _live_ocr else "ocr_sync_min",
+                0.58 if _live_ocr else 0.66))
+            if not best or best[0] < ocr_min:
                 log.info("ocr-sync(%s): no confident LRC match (best %.2f)",
                          reason, best[0] if best else 0.0)
                 self._last_ocr_sync = {"matched": False, "ratio": round(best[0], 2) if best else 0.0,
@@ -12137,7 +12166,7 @@ class Overlay:
                 self._note_sync_verdict("insync")
                 return
             # a modest drift is low-risk → apply on this single read
-            if abs(drift) <= 2.0 and not (abs(offset) > 6.0 and ratio < 0.72):
+            if abs(drift) <= 2.0 and not (abs(offset) > 6.0 and ratio < self._sync_match_floor()):
                 self._tier_commit(offset, ratio, "drift %+.2fs" % drift)
                 return
             # a big jump → HOLD and confirm with a 2nd listen (two-point). The
@@ -12154,7 +12183,7 @@ class Overlay:
             self._note_sync_verdict("inconclusive")
             return
         measured = 0.5 * (first + offset)
-        if abs(measured) > 6.0 and ratio < 0.72:
+        if abs(measured) > 6.0 and ratio < self._sync_match_floor():
             self._note_sync_verdict("inconclusive")
             return
         self._tier_commit(measured, ratio, "two reads agree %.2f≈%.2f" % (first, offset))
@@ -12451,7 +12480,7 @@ class Overlay:
         # the user's observed fix is "reset to 0". So only trust a large offset when
         # the match is strong; otherwise snap back to 0 (the player position), which
         # is right far more often than a low-confidence big jump.
-        if abs(offset) > 6.0 and ratio < 0.72:
+        if abs(offset) > 6.0 and ratio < self._sync_match_floor():
             if not silent:
                 self.offset = 0.0
                 log.info("align: large offset %.1fs at low match %.2f → reset to 0",
