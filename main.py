@@ -2843,7 +2843,45 @@ class Overlay:
             # session's source_app.
             "prefer_audible_session":       1,    # 1 = use Core Audio peak as a tiebreaker, 0 = pre-118 sticky-only
             "prefer_audible_threshold":     0.005,  # peak below this is 'silent' (~-46 dBFS)
+            # ── v1.1.53: previously inline-only knobs, now REGISTERED so every
+            # weight / TPVR / OCR-sync / decision setting is live-adjustable via
+            # POST /tune with no rebuild. set_tune() only accepts registered keys
+            # (typo guard), so anything read via self._tune.get(...) must live here
+            # to be tunable. Defaults match the former inline values (no behavior
+            # change). The dead _hi_pos clock's hi_* knobs are intentionally omitted.
+            "belt_reseed_s":                0.5,
+            "decide_titlelock_bump":       15.0,  # extra library points a title-locked song demands before a by-ear switch
+            "decide_titlelock_margin":     28.0,
+            "drift_monotonic_reads_n":        3,
+            "drift_recovery_cooldown":      5.0,
+            "fast_lock_max_s":              6.0,
+            "lyrics_blacklist_max":           8,
+            "ocr_sync_in_live":               1,  # OCR-assisted sync allowed in live/concert mode
+            "ocr_sync_min":                0.66,  # OCR↔LRC match bar (studio)
+            "ocr_sync_min_live":           0.58,  # looser OCR↔LRC bar for live arrangements
+            "offset_defer_cap_s":           3.0,
+            "overlay_heartbeat_stale_s":    6.0,
+            "pos_stale_thresh_s":           1.5,
+            "swap_fetch_hard_cap_s":       30.0,
+            "sync_event_buffer_size":       200,
+            "sync_event_enabled":             1,
+            "unconfirmed_backoff_after_s": 25.0,
+            "wrong_streak_force_ai_gen_threshold": 2,
+            "wrong_streak_window_s":       60.0,
         }
+        # v1.1.53 — PERSISTED live-tune overrides. POST /tune?persist=1 writes the
+        # changed key into settings.json under "tune_overrides"; re-apply them here at
+        # startup (same type coercion + registered-key guard as set_tune) so a dialed-in
+        # weights/TPVR setup survives a restart. Unknown/typo'd keys are skipped.
+        try:
+            for _k, _v in (s.get("tune_overrides") or {}).items():
+                if _k in self._tune:
+                    try:
+                        self._tune[_k] = type(self._tune[_k])(_v)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # TICKET-104 A1: apply measure_text cache size ONCE at startup. The
         # cache is module-level (shared across Overlay/Mirror), so we set the
         # cap here rather than per-call (which would re-introduce the
@@ -8779,10 +8817,12 @@ class Overlay:
         "fill_interval":    "scroll_fill_interval",
     }
 
-    def set_tune(self, key, value):
+    def set_tune(self, key, value, persist=False):
         """Set one live-tunable sync parameter. Returns (ok, message). Coerces
         the value to the existing type. Only known keys accepted — silent reject
-        of unknowns is a footgun for tuning."""
+        of unknowns is a footgun for tuning. With persist=True (POST /tune?persist=1)
+        the change is also written to settings.json under 'tune_overrides' so it
+        survives a restart."""
         # Back-compat: old (pre-rename) keys redirect to the new scroll_* name.
         alias = self._TUNE_LEGACY_ALIASES.get(key)
         if alias is not None and alias in self._tune:
@@ -8824,6 +8864,17 @@ class Overlay:
                 self._apply_gpu_renderer_toggle(bool(new))
             except Exception as e:
                 log.info("gpu_renderer toggle failed: %s", e)
+        # v1.1.53 — optional persistence: remember this override in settings.json so
+        # it's re-applied at startup (see the tune_overrides loop in __init__).
+        if persist:
+            try:
+                _s = _load_settings()
+                _ov = dict(_s.get("tune_overrides") or {})
+                _ov[key] = new
+                _s["tune_overrides"] = _ov
+                _save_settings(_s)
+            except Exception as e:
+                log.info("tune persist failed for %s: %s", key, e)
         return True, f"{key}: {old} → {new}"
 
     # ── appearance (persisted) ──
