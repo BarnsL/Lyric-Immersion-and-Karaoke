@@ -468,6 +468,28 @@ def split_artists(artist: str) -> list[str]:
     return out
 
 
+def _joined_artist_variants(artist: str) -> list[str]:
+    """Provider-friendly no-space variants for stylized unit names.
+
+    Some catalogs index acts like 'Re GLOSS' under the branded single token
+    'ReGLOSS'. Keep the heuristic narrow so ordinary names ('Taylor Swift')
+    don't double the query fan-out for no benefit.
+    """
+    a = re.sub(r"\s+", " ", (artist or "").strip())
+    if " " not in a:
+        return []
+    toks = a.split()
+    if not (2 <= len(toks) <= 4):
+        return []
+    if not all(re.fullmatch(r"[A-Za-z0-9]+", tok) for tok in toks):
+        return []
+    stylized = any(tok.isupper() for tok in toks) or any(len(tok) <= 2 for tok in toks)
+    if not stylized:
+        return []
+    joined = "".join(toks)
+    return [joined] if joined.lower() != a.lower() else []
+
+
 # Agency / label PREFIXES that wrap the real performing UNIT. Lyric providers
 # index the UNIT name ("ReGLOSS", "FLOW GLOW") — NOT the full agency credit
 # ("hololive DEV_IS ReGLOSS") that SMTC delivers — so a fetch with the raw
@@ -503,6 +525,36 @@ def agency_unit_names(artist: str) -> list[str]:
                 return [rest]
             break
     return []
+
+
+def _artist_query_candidates(artist: str) -> list[str]:
+    """Prioritized artist variants for provider lookups.
+
+    Lead with the compact / unit form providers are most likely to index under,
+    then fall back to the original credit. Example: 'Re GLOSS' →
+    ['ReGLOSS', 'Re GLOSS']; 'hololive DEV_IS ReGLOSS' →
+    ['ReGLOSS', 'hololive DEV_IS ReGLOSS'].
+    """
+    a = re.sub(r"\s+", " ", (artist or "").strip())
+    out, seen = [], set()
+
+    def add(name: str):
+        name = re.sub(r"\s+", " ", (name or "").strip())
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            out.append(name)
+
+    def add_preferred(name: str):
+        for v in _joined_artist_variants(name):
+            add(v)
+        add(name)
+
+    for unit in agency_unit_names(a):
+        add_preferred(unit)
+    for part in split_artists(a):
+        add_preferred(part)
+    add_preferred(a)
+    return out
 
 
 # ── Romanization ─────────────────────────────────────────────────────
@@ -1215,14 +1267,10 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     + duration guards stay in charge of picking the winner. With them empty
     or None the behavior is identical to v1.0.93."""
     t, a = title.strip(), artist.strip()
-    arts = split_artists(a)
-    # Agency-prefix unit extraction (verified Flashpoint fix). A credit like
-    # 'hololive DEV_IS ReGLOSS' must ALSO try the unit-only 'ReGLOSS' that
-    # providers index — injected at the FRONT so the high-hit form is queried
-    # FIRST instead of after a 44s full-credit miss that eats the whole song.
-    for _unit in agency_unit_names(a):
-        if _unit and _unit.lower() not in {x.lower() for x in arts}:
-            arts.insert(0, _unit)
+    # Query artists in provider-friendly priority order: compact stylized-unit
+    # forms first ('ReGLOSS'), then the original credit ('Re GLOSS' / full
+    # agency channel). This keeps the fast hit in front of the slow miss.
+    arts = _artist_query_candidates(a)
     # TICKET-112: prepend YT-description vocalists / original-artist /
     # composer / lyricist as additional artist candidates. Vocals come first
     # (most likely to BE the recording artist), then original_artist (for
@@ -1235,10 +1283,11 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     for _src in (extra_artists or []):
         if not _src:
             continue
-        _key = _src.strip().lower()
-        if _key and _key not in _extras_seen:
-            arts.append(_src.strip())
-            _extras_seen.add(_key)
+        for _cand in (_artist_query_candidates(_src) or [_src.strip()]):
+            _key = _cand.strip().lower()
+            if _key and _key not in _extras_seen:
+                arts.append(_cand.strip())
+                _extras_seen.add(_key)
     romaji_fallback = [None]   # (lrc, meta) — used only if nothing original-script
     # A CJK-script artist's song is in a CJK language (or, for a cover, English) —
     # never German/Spanish/Russian. So a European-language hit on a Latin title is a
@@ -1332,7 +1381,7 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
         return lrc, meta
 
     # 1. LRCLIB duration-exact, trying the full credit then each artist
-    for ca in ([a] + arts if a else []):
+    for ca in (arts if arts else ([a] if a else [])):
         hit = _lrclib_get(t, ca, duration)
         if hit and verify_lrc(hit["lrc"], t, duration):
             r = take(hit["lrc"], {"source": "lrclib/get", "artist": hit["artist"],
@@ -1408,7 +1457,6 @@ def fetch_lrc(title: str, artist: str = "", duration: float | None = None,
     hi_q, seen = [], set()
     for tt in (_title_variants(t) or [t]):
         if arts:
-            hi_q.append(f"{tt} {a}")
             for ar in arts:
                 hi_q += [f"{tt} {ar}", f"{ar} {tt}"]
         elif a:

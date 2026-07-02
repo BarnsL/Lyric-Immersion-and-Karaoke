@@ -59,6 +59,7 @@ models/
 # Build artifacts
 build/
 dist/
+dist-live/
 *.exe
 *.msix
 *.msixupload

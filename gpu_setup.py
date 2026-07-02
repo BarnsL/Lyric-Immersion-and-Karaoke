@@ -201,8 +201,9 @@ def pick_inference_device(avoid_when_gaming: bool = True,
     GPU use on a single-GPU machine when they want the speed.
 
     Picks the LEAST-utilized CUDA GPU instead of assuming the game is always on
-    GPU 0 (TICKET-080 — on this rig the the external GPU is cuda:1 and gets the game,
-    so the old 'skip 0' rule put Whisper right on the game's card). When a
+    GPU 0 (TICKET-080 — on some dual-GPU layouts the busy gaming card is not
+    cuda:0, so the old 'skip 0' rule could put Whisper right on the game's card).
+    When a
     fullscreen game is active, any GPU at >=30% util is treated as the game's
     and skipped; if everything is busy we fall to CPU so the transcribe can't
     hitch the game. When not gaming, prefers the idlest GPU but stays on cuda:0
