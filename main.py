@@ -1646,6 +1646,30 @@ def _body_is_translation(lines) -> bool:
     return same >= 0.6 * len(nonempty)
 
 
+def _body_is_english(lines) -> bool:
+    """True when a loaded body is ENGLISH text where a Japanese song's 日本語 belongs:
+    no CJK anywhere in the 'jp' rows AND it does NOT read as romaji (romanized
+    Japanese). This is the 理芽/RIM concert case — fluent English lines shown over a
+    Japanese performance ('my first time crossing this door' instead of the 日本語 +
+    furigana + romaji). Distinct from _body_is_translation (jp == en); here the body
+    is simply the wrong language. Romanized-Japanese bodies (jp = 'kanbi na muhou')
+    are Japanese and must NOT trip this, so they're excluded via _looks_romaji."""
+    nonempty = [(getattr(ln, "jp", "") or "").strip() for ln in lines
+                if (getattr(ln, "jp", "") or "").strip()]
+    if len(nonempty) < 4:
+        return False
+    body = " ".join(nonempty)
+    if _CJK_TEXT_RE.search(body):
+        return False                          # has kana/kanji → real Japanese, fine
+    try:
+        from fetch_lyrics import _looks_romaji
+        if _looks_romaji(body):
+            return False                      # romanized Japanese is still Japanese
+    except Exception:
+        pass
+    return True                               # Latin, not romaji → an English body
+
+
 def split_furigana(text):
     """Parse 'kanji(かな)' furigana markup into [(base, reading), …] segments;
     plain runs come back as (text, '')."""
@@ -5774,6 +5798,37 @@ class Overlay:
             self.lines, self.meta, self._lyrics_path = [], {"source": ""}, None
             self.root.after(50, self._begin_generation)
             return
+        # v1.1.51 — ENGLISH-ONLY body over a JAPANESE performance (理芽/RIM
+        # "NEUROMANCE" concert: fluent English lines, no 日本語 anywhere). A
+        # Japanese act's song must show the Japanese original + furigana + romaji,
+        # never an English-only body. Fires when the content is clearly Japanese —
+        # the raw video/title carries CJK (true for a 神椿 concert title) OR the act
+        # is a known JP v-agency — and the loaded body is English (not romaji).
+        # Reject once/track: in a LIVE concert there's no per-song title to re-query,
+        # so transcribe the actual sung Japanese; otherwise re-fetch the native
+        # lyrics. Trusted sources (generated/bundled/captions/ocr) are exempt.
+        if (self.lines and not _xsrc.startswith(("generated", "bundled"))
+                and _xsrc not in ("youtube-captions", "ocr")
+                and self._track_seq != getattr(self, "_enonly_rejected_seq", None)
+                and _body_is_english(self.lines)):
+            _jp_content = _has_cjk(getattr(self, "_last_raw_title", "") or "")
+            if not _jp_content:
+                try:
+                    from fetch_lyrics import is_jp_vagency
+                    _ptitle = (self.media.get() or {}).get("title") or ""
+                    _jp_content = is_jp_vagency(self.meta.get("title", ""),
+                                                self.meta.get("artist", ""),
+                                                extras=[_ptitle])
+                except Exception:
+                    _jp_content = False
+            if _jp_content:
+                _live = bool(getattr(self, "_live_mode", False))
+                log.info("load: ENGLISH-only body for a Japanese act (src=%s) → %s",
+                         _xsrc, "generating by ear" if _live else "re-fetching native")
+                self._enonly_rejected_seq = self._track_seq
+                self.lines, self.meta, self._lyrics_path = [], {"source": ""}, None
+                self.root.after(50, self._begin_generation if _live else self.report_wrong)
+                return
         # Fast-switch language sanity check: a cached body's lang is incompatible
         # with the artist's known language (Kanade / 音乃瀬奏 cover of 怪獣の花唄
         # loaded a Spanish body with lang=es; without this the decision engine
