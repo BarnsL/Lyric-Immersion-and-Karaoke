@@ -2496,6 +2496,11 @@ class Overlay:
             # same offset and falsely "agree" ("All The Things She Said" symptom).
             "sync_confirm_hold_ms": 2600,   # hesitation before the confirming listen
             "sync_confirm_listen_s": 5.0,   # confirming-listen capture length
+            # ── two-point-verify (TPVR) chorus differentiation (v1.1.52) ──
+            "tpvr_gap_s":            2.5,   # studio: seconds between the 1st (held) and 2nd (confirming) tier read
+            "live_tpvr_gap_s":       4.0,   # LIVE/cover: longer gap so a repeated chorus can't be read at the same wrong offset twice and falsely "agree" (幸祜/KOKO chorus-lock)
+            "single_shot_max_s":     2.0,   # studio: a drift ≤ this applies on ONE read (low-risk)
+            "live_single_shot_max_s": 0.0,  # LIVE: 0 = NEVER single-shot — every live correction must be two-point verified (chorus repeats make a single read untrustworthy)
             "applause_min_s":        2.5,   # loud-non-vocal seconds = a concert applause gap
             "live_resync_s":         6.0,   # (legacy) LIVE/concert lyric-match RESYNC cadence (TICKET-106: 12.0 → 6.0)
             # Concert/live ARRANGEMENTS resync on a rolling, aggressive de-escalation:
@@ -12230,15 +12235,29 @@ class Overlay:
                 self._sync_fail_streak = 0     # a real anchor → the lyrics DO match this song
                 self._note_sync_verdict("insync")
                 return
-            # a modest drift is low-risk → apply on this single read
-            if abs(drift) <= 2.0 and not (abs(offset) > 6.0 and ratio < self._sync_match_floor()):
+            # v1.1.52 — CHORUS DIFFERENTIATION. A modest drift is low-risk to apply
+            # on a SINGLE read for a studio song, but on a LIVE arrangement chorus
+            # repeats mean a "modest" match can be the WRONG occurrence — it looks
+            # right for a moment then turns into wrong lyrics (幸祜/KOKO "the last
+            # bullet" locked onto a repeated chorus). So a live sync is NEVER
+            # single-shot: it must be TWO-POINT verified with a 2nd confirming read
+            # ~4s later (long enough to cross a chorus phrase) before it moves sync.
+            live = bool(getattr(self, "_live_arrangement", False)
+                        or getattr(self, "_live_mode", False))
+            single_shot_max = float(self._tune.get(
+                "live_single_shot_max_s" if live else "single_shot_max_s",
+                0.0 if live else 2.0))
+            if (abs(drift) <= single_shot_max
+                    and not (abs(offset) > 6.0 and ratio < self._sync_match_floor())):
                 self._tier_commit(offset, ratio, "drift %+.2fs" % drift)
                 return
-            # a big jump → HOLD and confirm with a 2nd listen (two-point). The
-            # window must outlast the 2.5 s gap + the next capture (~6 s) + margin.
-            self._tier_tpvr, self._tier_tpvr_until = offset, now + 14.0
-            log.info("sync-tier: holding %+.2fs — confirming with a 2nd listen", offset)
-            self.root.after(2500, self._tier_listen_now)
+            # HOLD and confirm with a 2nd listen (two-point). Longer gap on live for
+            # chorus differentiation; the window outlasts the gap + a ~6s capture + margin.
+            gap = float(self._tune.get("live_tpvr_gap_s", 4.0) if live
+                        else self._tune.get("tpvr_gap_s", 2.5))
+            self._tier_tpvr, self._tier_tpvr_until = offset, now + gap + 11.5
+            log.info("sync-tier: holding %+.2fs — confirming with a 2nd listen in %.1fs", offset, gap)
+            self.root.after(int(gap * 1000), self._tier_listen_now)
             return
         # confirming (second) read of a held big jump
         first = self._tier_tpvr
@@ -12526,8 +12545,14 @@ class Overlay:
             offset = res[0]
             if self._align_tpvr is None:
                 self._align_tpvr = offset
-                log.info("applause resync: holding %+.2fs — confirming with a 2nd listen", offset)
-                self.root.after(2500, lambda: self.align_by_listening(silent=True))
+                # v1.1.52 — longer confirm gap on live arrangements for chorus
+                # differentiation (an applause resync happens ONLY in live/concert).
+                _live = bool(getattr(self, "_live_arrangement", False)
+                             or getattr(self, "_live_mode", False))
+                _agap = float(self._tune.get("live_tpvr_gap_s", 4.0) if _live
+                              else self._tune.get("tpvr_gap_s", 2.5))
+                log.info("applause resync: holding %+.2fs — confirming with a 2nd listen in %.1fs", offset, _agap)
+                self.root.after(int(_agap * 1000), lambda: self.align_by_listening(silent=True))
                 return
             first = self._align_tpvr
             self._align_tpvr, self._align_tpvr_active = None, False
