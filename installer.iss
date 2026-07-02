@@ -1,9 +1,9 @@
-; Inno Setup script — builds a one-click "DesktopKaraoke-Setup.exe".
+; Inno Setup script — builds a one-click "Lyric-Immersion-and-Karaoke-Setup.exe".
 ; Install Inno Setup (free), then run:  iscc installer.iss
 ; (build.bat does this automatically if iscc is on PATH.)
 
 #define AppName "Lyric Immersion and Karaoke"
-#define AppVer  "1.1.46"
+#define AppVer  "1.1.48"
 #define AppExe  "Lyric-Immersion-and-Karaoke.exe"
 
 [Setup]

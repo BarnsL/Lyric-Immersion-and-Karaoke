@@ -58,7 +58,8 @@ An updater downloads and runs code, so it is hardened to fail **closed**:
   it and **a mismatch aborts the update**. The download is size-capped.
 * **Safe extraction.** The archive is unpacked with **path-traversal ("zip-slip")
   protection** (no member may escape the staging folder) and must contain
-  `DesktopKaraoke.exe`, or it's rejected.
+  `Lyric-Immersion-and-Karaoke.exe` (or the legacy `DesktopKaraoke.exe`), or
+  it's rejected.
 * **Never silent / never destructive.** Updates are **opt-in** — the app only
   *notifies*; the swap runs after you click **Install update**. The helper copies
   files in without purging, so your lyric cache and settings survive, and on **any**
@@ -77,7 +78,7 @@ An updater downloads and runs code, so it is hardened to fail **closed**:
   * `yt-dlp` (playlist tools) — list-form arguments.
   * the **update helper** (`cmd /c apply_update.cmd`) runs windowless/detached and
     only **after** a download has passed the HTTPS, host, checksum, and zip-slip
-    checks above; its source folder is validated to contain `DesktopKaraoke.exe`.
+    checks above; its source folder is validated to contain the app exe.
 * No `eval`, `exec`, `os.system`, or dynamic code loading.
 
 ## Files

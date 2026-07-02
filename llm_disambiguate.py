@@ -1,7 +1,7 @@
 """
 Optional LLM song disambiguation — gated on an Anthropic API key.
 
-When a key is present, this asks the newest Claude model to decide which
+When a key is present, this asks the configured Anthropic model to decide which
 candidate song the LIVE VOCALS actually are, by matching a Whisper
 transcription of the singing against candidate lyric bodies. It is far more
 robust than char-level fuzzy matching on a short / noisy / ASR-mangled
@@ -18,7 +18,7 @@ Key resolution order (first non-empty wins):
   2. the file named by ANTHROPIC_API_KEY_FILE, if that env var is set
   3. <data_dir>/anthropic-api-key.txt     (portable: next to the exe / settings)
 
-Model: newest Claude by default; override with LYRIC_LLM_MODEL.
+Model: the default Anthropic model below; override with LYRIC_LLM_MODEL.
 
 Implementation note: raw HTTPS via urllib — no SDK dependency to bundle, and the
 call runs on the decide-by-ear WORKER thread, never the render thread.
@@ -134,7 +134,7 @@ def _parse(text, candidates):
 
 
 def pick_best_match(heard, candidates, timeout=8.0, max_tokens=200):
-    """Ask Claude which candidate the vocals are.
+    """Ask the configured LLM which candidate the vocals are.
 
     heard:      Whisper transcription of the live vocals (str)
     candidates: list of {"key", "title", "artist", "body"}
