@@ -56,7 +56,7 @@ _ROUTES = {
         "/status": "now-playing + matched song + sync + current line",
         "/logs": "recent log lines (?n=200) — the matching decisions",
         "/lyrics": "the full loaded lyric lines",
-        "/tune": "live sync-tuning parameters (drift_fastpath, agree, spread_reset, …)",
+        "/tune": "GET: all live-tunable knobs + current values (weights, TPVR, decision strikes, energy/sync thresholds, display, …)",
         "/diag": "deep diagnostics: full sync state machine, last energy-correlation, FPS/frame-timing, pending-swap (TICKET-111)",
         "/metrics": "per-release success/wobbler/fail telemetry counter (TICKET-121)",
         "/sync": "current offset lock state: offset, last energy-align, last OCR-assisted align, verify cadence (TICKET-123)",
@@ -79,7 +79,7 @@ _ROUTES = {
         "/decide": "smart song decision — transcribe vocals + pick which candidate's lyrics they match",
         "/captions": "pull THIS video's caption track (accurate text+timing); ?url=<exact video> beats a title search",
         "/nowplaying": "browser pushes the exact current video URL (?url=...) so auto-captions hit the right upload",
-        "/tune": "set sync param: ?key=drift_fastpath&value=3.0 (one per call); or POST JSON {k:v,...}",
+        "/tune": "set any knob live (no rebuild): ?key=live_tpvr_gap_s&value=4.0  OR  POST JSON {k:v,...}. Add ?persist=1 to keep it across restarts (settings.json tune_overrides).",
         "/reindex": "rescan the local library",
         "/import/csv": "start a playlist CSV import: ?path=C:\\path\\to\\file.csv [&translate=1] [&force=1]",
         "/retranslate": "TICKET-115: force a translation backfill of the currently loaded track (de/fr/it/pt/ru/es/ja-romaji + CJK)",
@@ -427,9 +427,10 @@ def make_handler(app, log_file, token):
                     # Apply on the Tk thread (writing to the tune dict is fine
                     # without a lock — only the main loop reads it during the
                     # next sync tick).
+                    persist = q.get("persist", ["0"])[0].lower() in ("1", "true", "yes")
                     results = []
                     for k, v in updates.items():
-                        ok, msg = app.set_tune(k, v)
+                        ok, msg = app.set_tune(k, v, persist=persist)
                         results.append({"key": k, "ok": ok, "msg": msg})
                     self._send(200, {"ok": all(r["ok"] for r in results),
                                      "results": results, "tune": app.get_tune()})
