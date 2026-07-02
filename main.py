@@ -2461,6 +2461,9 @@ class Overlay:
             "agree_live":            4.0,   # live-arrangement agreement window
             "live_max_jump_s":      45.0,   # reject a live-follow correction that jumps >this from a STABLE offset (a chorus-repeat mismatch, e.g. -170s on a 4-min song) — not real tempo drift
             "live_song_max_s":     900.0,   # v1.1.49: in live/concert mode, a SMTC "duration" above this (the 51-min video container) is not a per-song length → dropped before fetch so verify_lrc/lrclib don't reject correct short-song lyrics
+            # ── multi-monitor / display selector ──
+            "display_lost_grace_s":  10.0,  # how long a lost selected screen holds before the LEGACY fallback (only used when display_stick_to_selected=0)
+            "display_stick_to_selected": 1, # v1.1.50: 1 = the overlay STAYS on the user-selected screen through a blink / GPU reload / app hang and NEVER auto-falls to the primary/main; snaps back when the screen returns. 0 = old grace→closest→primary fallback.
             # ── two-point sound-verification timing (TICKET-056) ──
             # hold a candidate offset, hesitate this long, then take a confirming
             # listen; the 2nd read must land within "agree" of the 1st to commit.
@@ -2661,6 +2664,7 @@ class Overlay:
                                             # (so it can't lock inside ONE repeating chorus pass)
             "force_sync_top_n":        6,   # candidate offsets ranked per read (try best→next on failure)
             "energy_apply_min":      0.4,   # min |new-old| to apply correlation
+            "live_energy_apply_min": 0.25,  # v1.1.50: FINER auto-sync for live/cover arrangements (apply smaller corrections; studio keeps 0.4 to avoid micro-jitter)
             "energy_lift_floor":     0.045, # min peak-vs-median lift to accept (was 0.10; kamone's correct shift had lift≈0.049 and was being rejected, so the cache loaded right but sync never locked). Rival-peak margin + Shazam sanity + energy_apply_min still guard false alarms.
             "live_energy_lift_floor":  0.025, # v1.1.49: relaxed peak-lift bar for LIVE/concert arrangements — re-sung-over-crowd audio is noisy, so a CORRECT constant offset (V.W.P 共鳴 LIVE MV sat 2-3s off all song) read as a weak peak and never locked
             "live_energy_peak_margin": 0.035, # v1.1.49: relaxed rival-peak margin for live (small-shift penalty + Shazam ±4s check still guard chorus-repetition false jumps)
@@ -9512,6 +9516,7 @@ class Overlay:
             if mon_id:
                 hit = next((m for m in mons if m["id"] == mon_id), None)
                 if hit:
+                    self._display_lost_t = 0.0       # found by STABLE device id (survives re-coordinate)
                     return hit
                 _log("saved monitor id %s not found; trying geometry", mon_id)
             fp = getattr(self, "_display_fp", None)
@@ -9520,23 +9525,31 @@ class Overlay:
                 if hit:
                     self._display_lost_t = 0.0   # found — reset grace timer
                     return hit
-                # Fingerprint not found — possibly a DisplayLink blink. Hold
-                # position for a grace period before falling back.
-                now = time.time()
-                grace = float(self._tune.get("display_lost_grace_s", 10.0))
-                if self._display_lost_t == 0.0:
-                    self._display_lost_t = now
-                    _log("display fp %s lost — starting %.0fs grace period", fp, grace)
-                if (now - self._display_lost_t) < grace:
-                    return None                   # still in grace — don't move
-                # Grace expired — the monitor is really gone. Try the closest
-                # remaining monitor by geometry before index / primary.
+            # The SELECTED screen is not present right now: a DisplayLink blink, a
+            # GPU driver reload, an app hang, or a genuine unplug. Track a timer
+            # (for logging) and DON'T rush a fallback.
+            now = time.time()
+            grace = float(self._tune.get("display_lost_grace_s", 10.0))
+            if self._display_lost_t == 0.0:
+                self._display_lost_t = now
+                _log("selected display %s lost — holding position", self.display)
+            # v1.1.50 — STICK TO THE SELECTED SCREEN (default on). A user who picked
+            # a specific display does NOT want the overlay to jump to the primary/
+            # main screen when that display blinks off, the GPU reloads, or the app
+            # hangs. Hold on it indefinitely (return None = keep current placement);
+            # it snaps back the instant the display reappears (matched by the stable
+            # device id / fingerprint above). Re-pick from the tray Display menu —
+            # which lists the live monitors — if the screen is gone for good. Set
+            # display_stick_to_selected=0 to restore the old grace→closest→primary.
+            if int(self._tune.get("display_stick_to_selected", 1)):
+                return None
+            if (now - self._display_lost_t) < grace:
+                return None                      # still in grace — don't move
+            if fp:
                 near = _closest_monitor_for_fp(mons, fp)
                 if near is not None:
-                    _log("display fp %s lost for %.1fs > grace; using closest monitor %s",
-                         fp, now - self._display_lost_t, near["fp"])
+                    _log("display fp %s lost > grace; using closest monitor %s", fp, near["fp"])
                     return near
-                _log("display fp %s lost for %.1fs > grace; trying index", fp, now - self._display_lost_t)
             try:
                 idx = int(self.display[4:])
             except ValueError:
@@ -9544,15 +9557,7 @@ class Overlay:
             if 0 <= idx < len(mons):
                 self._display_lost_t = 0.0
                 return mons[idx]
-            # Index also out of range — hold through the grace period too.
-            now = time.time()
-            grace = float(self._tune.get("display_lost_grace_s", 10.0))
-            if self._display_lost_t == 0.0:
-                self._display_lost_t = now
-            if (now - self._display_lost_t) < grace:
-                return None
-            _log("monitor index %s out of range (%d connected) for %.1fs; falling back to primary",
-                 idx, len(mons), now - self._display_lost_t)
+            _log("monitor %s gone > grace; falling back to primary", self.display)
         self._display_lost_t = 0.0
         return next((m for m in mons if m["primary"]), mons[0])
 
@@ -11942,7 +11947,12 @@ class Overlay:
             log.info("energy-align: candidate offset %+.1fs out of range — skipped", new_off)
             verdict("inconclusive")
             return
-        if abs(new_off - self.offset) < self._tune["energy_apply_min"]:
+        # v1.1.50 — FINER sync on live arrangements: apply smaller offset
+        # corrections (studio songs keep the coarser floor to avoid micro-jitter).
+        _apply_min = float(self._tune.get(
+            "live_energy_apply_min" if live_sync else "energy_apply_min",
+            0.25 if live_sync else 0.4))
+        if abs(new_off - self.offset) < _apply_min:
             log.info("energy-align: drift %+.2fs within tolerance — no change",
                      new_off - self.offset)
             verdict("insync")          # a clear peak AT the current offset = confirmed in sync
@@ -13517,12 +13527,16 @@ def main():
     sync_menu = pystray.Menu(
         pystray.MenuItem("⏪  Lyrics earlier  +5.0s", _nudge(+5.0)),
         pystray.MenuItem("⏪  Lyrics earlier  +2.0s", _nudge(+2.0)),
+        pystray.MenuItem("⏪  Lyrics earlier  +1.0s", _nudge(+1.0)),
         pystray.MenuItem("⏪  Lyrics earlier  +0.5s", _nudge(+0.5)),
+        pystray.MenuItem("⏪  Lyrics earlier  +0.2s  (fine)", _nudge(+0.2)),
+        pystray.MenuItem("⏩  Lyrics later  −0.2s  (fine)", _nudge(-0.2)),
         pystray.MenuItem("⏩  Lyrics later  −0.5s", _nudge(-0.5)),
+        pystray.MenuItem("⏩  Lyrics later  −1.0s", _nudge(-1.0)),
         pystray.MenuItem("⏩  Lyrics later  −2.0s", _nudge(-2.0)),
         pystray.MenuItem("⏩  Lyrics later  −5.0s", _nudge(-5.0)),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(lambda i: f"Reset  (now {ov.offset:+.1f}s)", _reset),
+        pystray.MenuItem(lambda i: f"Reset  (now {ov.offset:+.2f}s)", _reset),
     )
 
     # ── Updates ──────────────────────────────────────────────────────
