@@ -106,6 +106,32 @@ def available() -> bool:
         return False
 
 
+def model_ready(size=_GEN_MODEL) -> bool:
+    """True when the Whisper weights for `size` are already ON DISK, i.e. no
+    first-run download is needed. On a NEW INSTALL the library is bundled but the
+    MODEL is not — the first WhisperModel() call silently downloads ~200 MB from
+    HuggingFace, which on a slow/blocked network hangs or fails for minutes and
+    looked like 'stuck generating lyrics'. The caller uses this to show a
+    '⬇ downloading' hint and pick a longer stall deadline."""
+    try:
+        from pathlib import Path
+        md = _data_models_dir()
+        if not md:
+            return True          # no managed dir → default HF cache; just try
+        p = Path(md)
+        # huggingface_hub snapshot layout: models--Systran--faster-whisper-small/
+        # snapshots/<rev>/model.bin (weights may also be *.safetensors)
+        for d in p.glob(f"models--*{size}*"):
+            if next(d.rglob("model.bin"), None) or next(d.rglob("*.safetensors"), None):
+                return True
+        d2 = p / size            # bare converted-model dir is also accepted
+        if d2.is_dir() and next(d2.glob("model.bin"), None):
+            return True
+        return False
+    except Exception:
+        return True              # never block generation on the probe itself
+
+
 def _plain(jp: str) -> str:
     """A cached line's bare text for matching: drop furigana readings and
     punctuation/spacing so it compares cleanly to an ASR transcript."""
@@ -349,7 +375,13 @@ def transcribe_vocals(lang="ja", seconds=12, size=_GEN_MODEL):
     against several candidate pools (title-similar first, the whole library if
     needed)."""
     _ensure_deps_path()
-    audio = _capture(seconds)
+    try:
+        # capture can RAISE (not just return None) on unusual audio devices —
+        # soundcard throws COM errors when the default speaker is mid-switch or
+        # loopback is unavailable. Never let that kill the caller's thread.
+        audio = _capture(seconds)
+    except Exception:
+        return None
     if audio is None:
         return None
     import numpy as np
@@ -420,7 +452,12 @@ def transcribe_for_generation(pos_cap, lang=None, seconds=16, size=_GEN_MODEL):
     lang = {"ja-romaji": "ja"}.get(lang, lang)
     hint = lang if lang in ("ja", "ko", "zh", "es", "de", "ru", "en",
                             "fr", "it", "pt") else None   # None → Whisper auto-detects
-    audio = _capture(seconds)
+    try:
+        # capture can RAISE on unusual audio devices (soundcard COM errors on a
+        # fresh machine / device switch) — the generation loop must survive it.
+        audio = _capture(seconds)
+    except Exception:
+        return []
     if audio is None:
         return []
     import numpy as np

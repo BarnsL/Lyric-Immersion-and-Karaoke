@@ -2276,6 +2276,7 @@ class Overlay:
         self._last_ocr_t = 0.0        # throttle the concert OCR check
         self._ocr_song = None         # last song the banner OCR confidently read
         self._generating = False      # Whisper lyric-generation in progress
+        self._gen_stall_refetch_seq = None  # track that already used its stall re-fetch
         self._gen_token = 0           # bumped on track change / real-lyric load to stop generation
         self._track_seq = 0           # bumped per track change (gates the generation deadline)
         # per-release success/wobbler/fail telemetry (TICKET-121); GET /metrics
@@ -2918,6 +2919,9 @@ class Overlay:
             # non-Latin script → romanization row (see _maybe_translate)
             "translate_recheck_s":         30.0,  # coverage re-check cadence in the tick
             "translate_max_tries":            6,  # backfill kicks per loaded file
+            # generation stall watchdog (new-install 'stuck generating' fix)
+            "gen_stall_timeout_s":         75.0,  # abandon a zero-output generation
+            "gen_model_dl_timeout_s":     240.0,  # longer grace while the model downloads (first run)
         }
         # v1.1.53 — PERSISTED live-tune overrides. POST /tune?persist=1 writes the
         # changed key into settings.json under "tune_overrides"; re-apply them here at
@@ -5474,15 +5478,68 @@ class Overlay:
         self.meta = {"title": self._gen_title, "artist": self._gen_artist,
                      "lang": (getattr(self, "_cover_lang", None) or "ja"),
                      "duration": self._cur_duration, "source": "generated"}
-        self._hint("✨ Generating lyrics by ear… (AI — marked ***)")
+        # FRESH-INSTALL: the faster-whisper LIBRARY ships in the build, but the
+        # MODEL WEIGHTS do not — the first generation triggers a ~200 MB
+        # HuggingFace download. Say so (instead of a silent '✨ Generating…'
+        # that looks hung) and give the stall watchdog a longer deadline.
+        model_missing = False
+        try:
+            model_missing = not align.model_ready()
+        except Exception:
+            pass
+        if model_missing:
+            self._hint("⬇ First run — downloading the AI voice model…")
+            log.info("generation: whisper weights not on disk yet — first-run download")
+        else:
+            self._hint("✨ Generating lyrics by ear… (AI — marked ***)")
         log.info("generating lyrics by Whisper for %r", self._gen_title)
         threading.Thread(target=self._generate_loop,
                          args=(self._gen_token,), daemon=True).start()
+        # STALL WATCHDOG (fresh-install fix): if generation produces NOTHING
+        # within its grace window (hung model download, broken loopback capture,
+        # every chunk silent/errored), abandon it and retry the PROVIDER fetch —
+        # on a new install the first fetch often failed only because the network
+        # was still cold. Without this the app sat on '✨ Generating…' forever.
+        grace = float(self._tune.get("gen_model_dl_timeout_s", 240.0) if model_missing
+                      else self._tune.get("gen_stall_timeout_s", 75.0))
+        try:
+            self.root.after(int(grace * 1000),
+                            lambda t=self._gen_token: self._check_gen_stall(t))
+        except Exception:
+            pass
         # Tier 2 (deep): in the BACKGROUND, download the source audio + transcribe
         # the WHOLE file with the large model, then replace this rough best-effort
         # cache with a clean, complete one. Runs once per song. See
         # deep_transcribe.py / docs/GENERATION.md.
         self._begin_deep_generation(self._deep_token, self._gen_title, self._gen_artist)
+
+    def _check_gen_stall(self, token):
+        """Generation stall fallback (the new-install 'stuck generating lyrics').
+        Fires from the watchdog timer in _begin_generation AND from a zero-output
+        _generate_loop exit. If this generation attempt is still current and has
+        produced nothing — and no fetch is in flight — abandon it, then retry the
+        provider fetch ONCE per track (the first fetch on a fresh install often
+        failed only on a cold network); a second stall settles on an honest
+        'No lyrics found' instead of an eternal '✨ Generating…'."""
+        if token != self._gen_token:
+            return                          # a newer attempt / track superseded this one
+        if self.lines or self._gen_lines or self._fetching:
+            return                          # something is showing / still in flight
+        self._gen_token += 1                # cancel the (possibly hung) loop thread
+        self._generating = False
+        artist, title = (self._track or ("", ""))
+        seq = self._track_seq
+        if title and getattr(self, "_gen_stall_refetch_seq", None) != seq:
+            self._gen_stall_refetch_seq = seq
+            self._fetch_key = None
+            log.info("generation stalled with no output → abandoned; "
+                     "retrying the provider fetch for %r", title)
+            self._hint(f"♪ {title} — retrying lyric search…")
+            self._start_fetch(artist, title, self._cur_duration,
+                              cover=getattr(self, "_is_cover", False))
+        else:
+            log.info("generation stalled with no output → abandoned (retry already used)")
+            self._hint("No lyrics found for this song")
 
     def _whisper_lang_lock(self, lang):
         """TICKET-089: decide which language to pin Whisper to for deep
@@ -5617,50 +5674,76 @@ class Overlay:
 
     def _generate_loop(self, token):
         """Capture the song in chunks, transcribe each, annotate, accumulate.
-        Cancels the moment the track changes (token bump)."""
+        Cancels the moment the track changes (token bump).
+
+        FRESH-INSTALL hardening: any exception here used to KILL the thread with
+        `_generating` stuck True — the '✨ Generating…' hint froze forever and
+        every retry path (deadline re-generate, provider re-fetch) was blocked.
+        Per-chunk failures now count toward a bail-out, the flag is cleared in a
+        `finally`, and a zero-output exit reports to _check_gen_stall so the app
+        falls back to the providers instead of sitting silent."""
         import align
         from fetch_lyrics import annotate
-        CHUNK, last_end, idle, first = 16, 0.0, 0, True
-        while token == self._gen_token:
-            st = self.media.get()
-            if not (st and st.get("status") == PLAYING):
-                time.sleep(1.0)
-                idle += 1
-                if idle > 25:
-                    break                                # gave up (paused/stopped)
-                continue
-            idle = 0
-            pos = float(st.get("position") or 0.0)
-            secs = 8 if first else CHUNK      # short FIRST chunk → lyrics appear sooner
-            first = False
-            # Auto-detect the sung language on EVERY chunk (lang=None). Pinning the
-            # first chunk's guess mis-fired when the intro was instrumental/ambiguous
-            # and locked e.g. an English cover into Japanese gibberish; per-chunk
-            # detection self-corrects and even handles bilingual songs.
-            chunk = align.transcribe_for_generation(pos, lang=None, seconds=secs)
-            self._gen_lang = getattr(align, "_last_gen_lang", None) or self._gen_lang
-            if token != self._gen_token:
-                return
-            new = [d for d in chunk if d["t"][0] >= last_end - 1.0 and d["jp"].strip()]
-            if new:
+        CHUNK, last_end, idle, first, fails = 16, 0.0, 0, True, 0
+        try:
+            while token == self._gen_token:
+                st = self.media.get()
+                if not (st and st.get("status") == PLAYING):
+                    time.sleep(1.0)
+                    idle += 1
+                    if idle > 25:
+                        break                            # gave up (paused/stopped)
+                    continue
+                idle = 0
+                pos = float(st.get("position") or 0.0)
+                secs = 8 if first else CHUNK  # short FIRST chunk → lyrics appear sooner
+                first = False
+                # Auto-detect the sung language on EVERY chunk (lang=None). Pinning the
+                # first chunk's guess mis-fired when the intro was instrumental/ambiguous
+                # and locked e.g. an English cover into Japanese gibberish; per-chunk
+                # detection self-corrects and even handles bilingual songs.
                 try:
-                    annotate(new, self._gen_lang or "ja", translate=False)   # furigana/romaji NOW
-                except Exception:
-                    pass
-                for d in new:
-                    last_end = max(last_end, d["t"][1])
-                self._gen_lines += new
-                self.root.after(0, lambda t=token: self._apply_generated(t))
-                # Translate OFF the capture loop: the network round-trip used to
-                # block here (delaying the lyrics AND making the next capture miss
-                # several seconds of audio). JP+romaji now show immediately; the
-                # *** English fills in a moment later.
-                threading.Thread(target=self._translate_generated,
-                                 args=(token, list(new)), daemon=True).start()
-            if self._cur_duration and pos >= self._cur_duration - CHUNK:
-                break
-        if token == self._gen_token:
-            self._generating = False        # loop finished — clear the in-progress flag
+                    chunk = align.transcribe_for_generation(pos, lang=None, seconds=secs)
+                    if chunk:
+                        fails = 0
+                except Exception as e:
+                    log.info("generation chunk failed: %s", e)
+                    fails += 1
+                    if fails >= 3:
+                        break                            # persistent failure → bail out
+                    time.sleep(2.0)
+                    continue
+                self._gen_lang = getattr(align, "_last_gen_lang", None) or self._gen_lang
+                if token != self._gen_token:
+                    return
+                new = [d for d in chunk if d["t"][0] >= last_end - 1.0 and d["jp"].strip()]
+                if new:
+                    try:
+                        annotate(new, self._gen_lang or "ja", translate=False)   # furigana/romaji NOW
+                    except Exception:
+                        pass
+                    for d in new:
+                        last_end = max(last_end, d["t"][1])
+                    self._gen_lines += new
+                    self.root.after(0, lambda t=token: self._apply_generated(t))
+                    # Translate OFF the capture loop: the network round-trip used to
+                    # block here (delaying the lyrics AND making the next capture miss
+                    # several seconds of audio). JP+romaji now show immediately; the
+                    # *** English fills in a moment later.
+                    threading.Thread(target=self._translate_generated,
+                                     args=(token, list(new)), daemon=True).start()
+                if self._cur_duration and pos >= self._cur_duration - CHUNK:
+                    break
+        finally:
+            if token == self._gen_token:
+                self._generating = False    # NEVER leave the flag wedged (thread death)
+        if token == self._gen_token and not self._gen_lines:
+            # produced NOTHING (model download failed, capture broken, all chunks
+            # errored/silent) → fall back to the providers instead of staying blank
+            try:
+                self.root.after(0, lambda t=token: self._check_gen_stall(t))
+            except Exception:
+                pass
 
     def _translate_generated(self, token, lines):
         """Fill the English (marked ***) for generated lines, off the capture loop.
