@@ -128,6 +128,10 @@ exe = EXE(
     console=False,            # no console window — clean GUI app
     disable_windowed_traceback=False,
     icon="icon.ico",
+    # Embed real Windows file metadata (company / product / version). An exe with
+    # NO version resource is a strong Defender/SmartScreen false-positive signal on
+    # clean machines. version_info.txt keeps its four numbers in sync with version.py.
+    version="version_info.txt" if os.path.isfile("version_info.txt") else None,
 )
 coll = COLLECT(
     exe,

@@ -1142,6 +1142,35 @@ def _strip_title_credits(t):
     return t
 
 
+# ── Native-title aliases (cross-language title miss — the #1 "why did it generate?") ──
+# A Japanese song often "generates" instead of finding real lyrics because the
+# YouTube/SMTC title is the ROMAJI/English form while the providers index the
+# SYNCED LRC under the NATIVE (katakana/kanji) title. Confirmed live for
+# feelingradation (ReGLOSS): the app's own fetch chain returns ONLY unsynced plain
+# lyrics for "feelingradation" (→ rejected → AI-gen) but the real 59-line SYNCED
+# body for フィーリングラデーション. There's no reliable generic romaji→katakana
+# converter for English-loanword titles (フィーリング+グラデーション is a portmanteau),
+# so this is a hand-seeded map — trivial to extend one "romaji": "native" pair at a
+# time (same spirit as gairaigo.py). Keys match on a normalized form.
+_NATIVE_TITLE_ALIASES_RAW = {
+    "feelingradation": "フィーリングラデーション",   # hololive DEV_IS ReGLOSS
+}
+
+
+def _norm_alias_key(s):
+    return re.sub(r"[^0-9a-z぀-ヿ一-鿿]", "", (s or "").lower())
+
+
+_NATIVE_TITLE_ALIASES = {_norm_alias_key(k): v
+                         for k, v in _NATIVE_TITLE_ALIASES_RAW.items()}
+
+
+def native_title_alias(title):
+    """Map a known romaji/English title whose SYNCED lyrics are only indexed under
+    the NATIVE (katakana/kanji) title to that native title; else return unchanged."""
+    return _NATIVE_TITLE_ALIASES.get(_norm_alias_key(title), title)
+
+
 def clean_title(title, source="", artist=""):
     """Reduce a media title to the actual SONG NAME so it matches lyric metadata.
 
@@ -1298,7 +1327,11 @@ def clean_title(title, source="", artist=""):
     # (┃│｜／・‖): a truncated "Song | Cover by X" arrives as "Song┃", and that
     # stray bar made the search match a different-language song (Blue Bird┃ → a
     # Spanish track instead of the Japanese original).
-    return t.strip(" -–—|/　┃│｜／・‖").strip()
+    # Cross-language native-title alias LAST: after all the credit/decoration
+    # stripping has reduced the title to the bare song name, swap a known
+    # romaji/English title for the native (katakana/kanji) form the providers
+    # actually index the synced LRC under (feelingradation → フィーリングラデーション).
+    return native_title_alias(t.strip(" -–—|/　┃│｜／・‖").strip())
 
 
 # Titles that name an EVENT (a whole concert / festival / medley), not a song.
@@ -2183,6 +2216,12 @@ class Overlay:
         self.tauri_overlay_on = bool(s.get("tauri_overlay_on", False))
         self._tauri_child = None
         self._tauri_bounds = None
+        # Show / Hide (tray). One authoritative flag for BOTH renderers: the Tk
+        # window is withdrawn AND get_overlay_state sends hidden:true so the GPU
+        # (Tauri) overlay — a separate process — blanks too. Without this the tray
+        # toggle only touched Tk, so Show/Hide did nothing while the GPU overlay
+        # (the usual renderer) kept drawing.
+        self._hidden = False
         # TICKET-100: opt-in Discord Rich Presence reader; default OFF (mirrors
         # generate_on — both are "extra effort" features users opt into). Persists
         # under settings key 'discord_rpc'. Tray toggle and tune knob both write
@@ -2868,6 +2907,11 @@ class Overlay:
             "unconfirmed_backoff_after_s": 25.0,
             "wrong_streak_force_ai_gen_threshold": 2,
             "wrong_streak_window_s":       60.0,
+            # anti-teardown: a correctly-ID'd song that only DRIFTED must re-sync,
+            # not get blacklisted / re-fetched / re-generated (dropped-translations
+            # + wrong-song-cascade + spurious feelingradation regen fixes).
+            "switch_needs_identity_evidence": 1,  # SWITCH/REGEN needs a non-sync dim bad
+            "corroborated_lock_immunity":     1,  # title-locked + corroborated LRC is immune
         }
         # v1.1.53 — PERSISTED live-tune overrides. POST /tune?persist=1 writes the
         # changed key into settings.json under "tune_overrides"; re-apply them here at
@@ -3401,6 +3445,14 @@ class Overlay:
                     self._start_fetch(fetch_artist, title, duration,
                                       cover=(self._is_cover or romaji_only),
                                       strict=(self._clean_source() and not romaji_only))
+                    # A GENERATED stub has no provider upgrade for songs the providers
+                    # simply don't carry (feelingradation/ReGLOSS — every provider
+                    # misses). Try THIS video's own captions (and, for a browser
+                    # source, the burned-in text) so the accurate official lyrics
+                    # supersede the AI guess instead of the stub sticking forever.
+                    if gen:
+                        self._escalate_to_captions()
+                        self._maybe_escalate_ocr()
             else:
                 self.lines, self._lyrics_path, self.idx = [], None, -1
                 self._kara = []
@@ -6748,23 +6800,46 @@ class Overlay:
                         w = measure_text(self.cv, ch, jpf)
                         if w <= 0:
                             continue
-                        fid = draw_text(self.cv, cx + w / 2, cur_y, ch, jpf, WHITE)
+                        fid = draw_text(self.cv, cx + w / 2, cur_y, ch, jpf, WHITE,
+                                        tags=("cur", "rowjp"))
                         chars.append({"fill": fid, "last": WHITE})
                         cx += w
                     if reading:
                         draw_text(self.cv, (seg_start + cx) / 2,
                                   cur_y - jp_h / 2 - furi_h / 2 - 2,
-                                  reading, self.FURI_FONT, FURI_C)
+                                  reading, self.FURI_FONT, FURI_C,
+                                  tags=("cur", "rowjp"))
                     cx += 6
                 self._kara.append({"chars": chars, "base": WHITE, "sung": SUNG})
                 cur_y += jp_h / 2 + 14
 
             if ln.rm:
-                chars, cur_y = self._wrap_row(ln.rm, cur_y, self.ROMAJI_FONT, ROMAJI_C, pad, max_w)
+                chars, cur_y = self._wrap_row(ln.rm, cur_y, self.ROMAJI_FONT, ROMAJI_C,
+                                              pad, max_w, tags=("cur", "rowrm"))
                 self._kara.append({"chars": chars, "base": ROMAJI_C, "sung": SUNG})
             if ln.en:
-                chars, cur_y = self._wrap_row(ln.en, cur_y, self.EN_FONT, EN_C, pad, max_w)
+                chars, cur_y = self._wrap_row(ln.en, cur_y, self.EN_FONT, EN_C,
+                                              pad, max_w, tags=("cur", "rowen"))
                 self._kara.append({"chars": chars, "base": EN_C, "sung": SUNG})
+
+            # HORIZONTAL orientation of the stacked rows (jp / romaji / english):
+            # align each row within the block per pos_x so the line renderer matches
+            # the belt + GPU overlay (left = left-flush, center = centred under the
+            # widest row, right = right-flush). Rows are drawn left-flush above;
+            # shift the narrower ones within the block's horizontal extent. The
+            # widest row has delta 0, so the block extent is unchanged and the
+            # whole-block anchor below still uses the same bbox.
+            if self.pos_x != "left":
+                blk = self.cv.bbox("cur")
+                if blk:
+                    for _tag in ("rowjp", "rowrm", "rowen"):
+                        rb = self.cv.bbox(_tag)
+                        if not rb:
+                            continue
+                        rdx = (blk[2] - rb[2]) if self.pos_x == "right" \
+                              else round(((blk[0] + blk[2]) - (rb[0] + rb[2])) / 2)
+                        if rdx:
+                            self.cv.move(_tag, rdx, 0)
 
             # Anchor the whole block within the FIXED window. VERTICAL: top edge,
             # bottom band, or centred (center/left/right all sit vertically centred).
@@ -6794,9 +6869,10 @@ class Overlay:
                 except Exception:
                     pass
 
-    def _wrap_row(self, text, y, font, color, pad, max_w):
+    def _wrap_row(self, text, y, font, color, pad, max_w, tags="cur"):
         """Draw a text row, wrapping overflow onto lines underneath.
-        Returns (chars, next_y)."""
+        Returns (chars, next_y). `tags` lets the caller stamp a per-row tag so the
+        block can be re-aligned horizontally per pos_x after layout."""
         h = self._text_h(font)
         line_h = h + 12
         sp = measure_text(self.cv, " ", font) or h * 0.3
@@ -6810,7 +6886,7 @@ class Overlay:
                 w = measure_text(self.cv, ch, font)
                 if w <= 0:
                     continue
-                fid = draw_text(self.cv, cx + w / 2, cy, ch, font, color)
+                fid = draw_text(self.cv, cx + w / 2, cy, ch, font, color, tags=tags)
                 chars.append({"fill": fid, "last": color})
                 cx += w
             if latin:
@@ -6904,7 +6980,8 @@ class Overlay:
                 if reading:
                     furi.append((reading, (seg + cx) / 2))
                 cx += 6 * s
-            rows.append({"chars": chars, "y": self.b_main, "font": fj, "base": WHITE})
+            rows.append({"chars": chars, "y": self.b_main, "font": fj, "base": WHITE,
+                         "rx": cx})
             right = max(right, cx)
         if ln.rm:
             # if a romaji/translation row contains CJK (a mixed-language line),
@@ -6912,14 +6989,30 @@ class Overlay:
             frow = (self._pil_font(_script_of(ln.rm, self.meta.get("lang")),
                                    max(8, round(23 * s))) if _has_cjk(ln.rm) else fr)
             rc, rx = self._img_row(ln.rm, frow, x0)
-            rows.append({"chars": rc, "y": self.b_rom, "font": frow, "base": ROMAJI_C})
+            rows.append({"chars": rc, "y": self.b_rom, "font": frow, "base": ROMAJI_C,
+                         "rx": rx})
             right = max(right, rx)
         if ln.en:
             erow = (self._pil_font(_script_of(ln.en, self.meta.get("lang")),
                                    max(8, round(21 * s))) if _has_cjk(ln.en) else fe)
             ec, ex = self._img_row(ln.en, erow, x0)
-            rows.append({"chars": ec, "y": self.b_en, "font": erow, "base": EN_C})
+            rows.append({"chars": ec, "y": self.b_en, "font": erow, "base": EN_C,
+                         "rx": ex})
             right = max(right, ex)
+        # HORIZONTAL orientation of the stacked rows — follow pos_x so the belt
+        # matches the GPU overlay + the line renderer: left = left-flush,
+        # center = centred under the widest row, right = right-flush. Rows are
+        # laid out left-flush above (x0); shift the narrower ones within [x0, right].
+        f = 0.0 if self.pos_x == "left" else (1.0 if self.pos_x == "right" else 0.5)
+        if f and rows:
+            for r in rows:
+                dxr = (right - r["rx"]) * f
+                if dxr:
+                    r["chars"] = [(ch, cxr + dxr) for (ch, cxr) in r["chars"]]
+            if furi and ln.jp:
+                dxr = (right - rows[0]["rx"]) * f   # rows[0] is the jp row when ln.jp
+                if dxr:
+                    furi = [(t, cxf + dxr) for (t, cxf) in furi]
         return {"rows": rows, "furi": furi, "furi_font": ff, "furi_y": self.b_furi,
                 "w": int(right) + 8, "h": self._block_h}
 
@@ -9926,13 +10019,29 @@ class Overlay:
         self._persist()
 
     def toggle(self):
-        if self.root.winfo_viewable():
-            self.root.withdraw()
-        else:
-            self.root.deiconify()
-            self.root.overrideredirect(True)   # re-assert borderless...
-            self.root.attributes("-topmost", True)
-            self._click_through()              # ...and click-through after re-showing
+        """Show / Hide (tray). Flip the authoritative flag and apply it to BOTH
+        renderers. The old code toggled `winfo_viewable()` on the Tk window only,
+        so while the GPU (Tauri) overlay was the renderer (Tk already withdrawn)
+        the toggle was a no-op on what the user actually saw — and could even
+        deiconify Tk ON TOP of the GPU overlay. Now the GPU overlay hides via the
+        `hidden` flag in get_overlay_state and Tk is shown only when it is the
+        live renderer and we are not hidden."""
+        self._hidden = not getattr(self, "_hidden", False)
+        self._apply_hidden()
+
+    def _apply_hidden(self):
+        hidden = getattr(self, "_hidden", False)
+        gpu = getattr(self, "_gpu_rendering", False)
+        try:
+            if hidden or gpu:
+                self.root.withdraw()
+            else:
+                self.root.deiconify()
+                self.root.overrideredirect(True)   # re-assert borderless...
+                self.root.attributes("-topmost", True)
+                self._click_through()              # ...and click-through after re-showing
+        except Exception:
+            pass
 
     def refetch(self):
         self._fetch_key = None
@@ -10785,7 +10894,13 @@ class Overlay:
         # generation. The user wants a bad COVER abandoned QUICKER, so trim the
         # escalation thresholds when the current track is an explicit cover. Non-covers
         # keep the conservative thresholds (cov=0). Floors keep it from over-firing.
-        cov = 1 if getattr(self, "_is_cover", False) else 0
+        # Fast-abandon is for a cover that landed on the WRONG song (a title-only
+        # search collided). Once the audio has CORROBORATED the body, the cover is
+        # confirmed-correct — drop the penalty so a confirmed live/cover isn't torn
+        # down as quickly as a mystery one (that teardown dropped translations and
+        # re-generated correct songs).
+        cov = 1 if (getattr(self, "_is_cover", False)
+                    and not getattr(self, "_body_corroborated", False)) else 0
         regen   = max(4, int(self._tune.get("decision_regen_strikes",   8)) - 3 * cov)
         switch  = max(3, int(self._tune.get("decision_switch_strikes",  5)) - 2 * cov)
         caution = max(2, int(self._tune.get("decision_caution_strikes", 3)) - 1 * cov)
@@ -10993,6 +11108,8 @@ class Overlay:
             # "slide back and forth between songs" that came from the belt easing
             # between the old song's residual clock and the new song's initial one.
             "seq": int(getattr(self, "_track_seq", 0)),
+            # Show / Hide — the GPU overlay blanks itself when this is true (app.js).
+            "hidden": bool(getattr(self, "_hidden", False)),
             "idx": idx,
             "line_count": n,
             "line": _ln(idx),
@@ -11019,6 +11136,30 @@ class Overlay:
             except Exception:
                 pass
             return
+        # DRIFT IS NOT A WRONG SONG. A correctly-identified track that merely fell
+        # out of sync is a TIMING problem — re-sync it, don't blacklist + re-fetch
+        # (which drops the translation and can cascade into wrong songs) or
+        # AI-regenerate a correct song. A SWITCH/REGEN asserts "this is the wrong
+        # song", so require an IDENTITY dimension (source_agree / ear_corrob /
+        # lyric_quality) to also be bad; when ONLY sync_stable is bad, hold at
+        # CAUTION and kick a re-sync instead. This is the exact failure the logs
+        # showed: syncedlyrics MAKE IT BREAK IT and generated feelingradation were
+        # both torn down on {sync_stable:BAD, everything else OK}. Tunable off.
+        if state in ("SWITCH", "REGEN") and int(
+                self._tune.get("switch_needs_identity_evidence", 1)):
+            identity_bad = any(dims.get(k, "OK") != "OK"
+                               for k in ("source_agree", "ear_corrob", "lyric_quality"))
+            if not identity_bad:
+                log.info("decision: %s suppressed — only sync_stable is bad "
+                         "(drift, not wrong song) → hold + re-sync", state)
+                self._decision_strikes = max(0, self._decision_strikes - 2)
+                self._decision_state = "CAUTION" if self._decision_strikes >= int(
+                    self._tune.get("decision_caution_strikes", 3)) else "TRUST"
+                try:
+                    self._maybe_auto_align(reason="decision-drift-resync")
+                except Exception:
+                    pass
+                return
         # GROUND-TRUTH IMMUNITY (TICKET-122) — TWO-TIER BARRIER:
         #   • Tier 1 — a hand-curated BUNDLE is authoritative UNCONDITIONALLY (we verified
         #     it; trustworthy even before hearing the audio). An instrumental OUTRO makes
@@ -11032,7 +11173,16 @@ class Overlay:
         _gsrc = (self.meta.get("source") or "") if isinstance(self.meta, dict) else ""
         _authoritative = (_gsrc.startswith("bundled")
                           or (_gsrc in ("youtube-captions", "ocr")
-                              and getattr(self, "_body_corroborated", False)))
+                              and getattr(self, "_body_corroborated", False))
+                          # A provider LRC that is BOTH exact-title-locked AND
+                          # audio-corroborated has PROVEN it's the right song — sync
+                          # drift must not tear it down. Excludes generated bodies
+                          # (they "corroborate" by construction, so they stay
+                          # re-checkable). Tunable off.
+                          or (getattr(self, "_title_locked", False)
+                              and getattr(self, "_body_corroborated", False)
+                              and _gsrc not in ("generated", "generated-deep", "ai-gen")
+                              and int(self._tune.get("corroborated_lock_immunity", 1))))
         # Closed captions are the video's OWN lyrics — a SWITCH (blacklist + re-fetch)
         # is futile (the same video returns the same captions) and would blacklist the
         # only ground-truth source for this concert. Suppress SWITCH on captions; a
@@ -13028,7 +13178,8 @@ class Overlay:
                 self._tauri_wd_armed = False
                 log.info("tauri overlay: process gone — back to the Tk (CPU) overlay")
                 try:
-                    self.root.deiconify()
+                    if not getattr(self, "_hidden", False):
+                        self.root.deiconify()   # honor Show/Hide across a GPU death
                 except Exception:
                     pass
                 try:
@@ -13048,7 +13199,8 @@ class Overlay:
             elif not confirmed and getattr(self, "_gpu_rendering", False):
                 self._gpu_rendering = False      # GPU stopped → CPU overlay back
                 try:
-                    self.root.deiconify()
+                    if not getattr(self, "_hidden", False):
+                        self.root.deiconify()   # honor Show/Hide across a GPU stall
                 except Exception:
                     pass
                 log.info("tauri overlay: not rendering — Tk (CPU) overlay restored")
