@@ -9,7 +9,16 @@
 [Setup]
 AppName={#AppName}
 AppVersion={#AppVer}
-AppPublisher=Lyric Immersion and Karaoke
+AppPublisher=Purple Industries
+AppPublisherURL=https://github.com/BarnsL/Lyric-Immersion-and-Karaoke
+; Real metadata on the Setup.exe itself — an installer with no version resource is
+; a Defender/SmartScreen heuristic signal, same as the app exe. (Does not replace
+; code-signing; lowers the false-positive rate on clean machines.)
+VersionInfoVersion={#AppVer}
+VersionInfoCompany=Purple Industries
+VersionInfoProductName={#AppName}
+VersionInfoProductVersion={#AppVer}
+VersionInfoDescription={#AppName} Setup
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
