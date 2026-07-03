@@ -3337,6 +3337,12 @@ class Overlay:
         self._last_audio_off_t = 0.0
         self._sound_title_alias = None  # clear cross-language alias for new song
         self._drift_integral = 0.0      # fresh drift accumulation for new song
+        # Stale-drift fix: _last_drift is a MEASUREMENT of the PREVIOUS song —
+        # carrying it across the track change kept _score_sync_stable DEGRADED
+        # for the new song (no fresh read yet), which re-armed the decision
+        # engine's drift thrash loop on every following track. None = "no
+        # measurement yet" → sync_stable scores OK until a real read lands.
+        self._last_drift = None
         # New song → start in fast-verify (3×/min) and re-judge from scratch.
         self._sync_tier_interval = self._tune.get("sync_tier_fast_s", 20.0)
         self._sync_good_streak = self._sync_miss_streak = self._energy_blind = 0
@@ -11047,6 +11053,12 @@ class Overlay:
         self._decision_last_t = now
         if not self.lines and not getattr(self, "_track", None):
             return
+        # Nothing is actually PLAYING → nothing to score. A paused tab (or a
+        # non-song video with a leftover _track) kept the tick striking on a
+        # STALE drift reading, feeding the thrash loop below.
+        st_dec = self.media.get() or {}
+        if st_dec.get("status") != PLAYING:
+            return
         dims = {
             "source_agree":  self._score_source_agree(),
             "sync_stable":   self._score_sync_stable(),
@@ -11058,6 +11070,15 @@ class Overlay:
             self._decision_dim_history[k].append(v)
         delta = sum(2 if v == "BAD" else 1 if v == "DEGRADED" else 0
                     for v in dims.values())
+        # DRIFT-HOLD: after a drift-only SWITCH/REGEN was suppressed (see
+        # _fire_decision_action), sync_stable ALONE must not re-strike until the
+        # hold expires. Without this the strikes rebuilt every 2 ticks and the
+        # engine thrashed CAUTION→SWITCH→suppress every ~4s, hundreds of times
+        # per song (92% of the log), because the suppression path returns before
+        # the action-cooldown gate ever engages.
+        if (delta and now < getattr(self, "_drift_hold_until", 0.0)
+                and all(v == "OK" for k, v in dims.items() if k != "sync_stable")):
+            delta = 0
         if delta == 0:
             self._decision_strikes = max(0, self._decision_strikes - 2)
         else:
@@ -11274,7 +11295,14 @@ class Overlay:
                                for k in ("source_agree", "ear_corrob", "lyric_quality"))
             if not identity_bad:
                 log.info("decision: %s suppressed — only sync_stable is bad "
-                         "(drift, not wrong song) → hold + re-sync", state)
+                         "(drift, not wrong song) → hold + re-sync "
+                         "(next drift re-check in %.0fs)", state,
+                         float(self._tune.get("decision_action_cooldown_s", 30.0)))
+                # Arm the DRIFT-HOLD: sync-only strikes pause for the cooldown
+                # window (see _decision_engine_tick) so this branch fires at most
+                # once per window instead of every ~4s.
+                self._drift_hold_until = now + float(
+                    self._tune.get("decision_action_cooldown_s", 30.0))
                 self._decision_strikes = max(0, self._decision_strikes - 2)
                 self._decision_state = "CAUTION" if self._decision_strikes >= int(
                     self._tune.get("decision_caution_strikes", 3)) else "TRUST"
@@ -13951,17 +13979,36 @@ def main():
     _upd = {"info": None}
 
     def _upd_label(i=None):
+        # HONEST labeling: only promise "Install" when stage_update can actually
+        # self-install (a .zip asset exists + portable build). Otherwise the old
+        # label said "Install update", toasted "Updating…", then just opened a
+        # browser with no explanation.
         info = _upd["info"]
-        return f"⬆  Install update v{info['version']}" if info else "Check for updates"
+        if not info:
+            return "Check for updates"
+        if info.get("installable"):
+            return f"⬆  Install update v{info['version']}"
+        return f"⬆  Download update v{info['version']}…"
 
     def _on_updates(icon_, *_):
         info = _upd["info"]
         if info:                                   # an update is known → apply it
-            try: icon_.notify(f"Updating to v{info['version']}…", "Lyric Immersion and Karaoke")
+            installable = bool(info.get("installable"))
+            try: icon_.notify(
+                f"Updating to v{info['version']}…" if installable
+                else f"Opening the v{info['version']} download page…",
+                "Lyric Immersion and Karaoke")
             except Exception: pass
             def _do():
                 if updater.stage_update(info, log=log.info):
                     ov.root.after(0, lambda: _quit(icon_))   # exit so the helper swaps + relaunches
+                elif installable:
+                    # promised an install but staging failed (download/checksum/
+                    # extract) — say so; the Releases page was opened as fallback.
+                    try: icon_.notify(
+                        "Couldn't auto-install — opened the download page instead.",
+                        "Lyric Immersion and Karaoke")
+                    except Exception: pass
             threading.Thread(target=_do, daemon=True).start()
             return
         try: icon_.notify("Checking for updates…", "Lyric Immersion and Karaoke")    # manual check
@@ -13972,7 +14019,8 @@ def main():
             try: icon_.update_menu()
             except Exception: pass
             try: icon_.notify(
-                f"Update v{got['version']} available — open the tray menu to install." if got
+                (f"Update v{got['version']} available — open the tray menu to "
+                 + ("install." if got.get("installable") else "download.")) if got
                 else f"You're up to date (v{updater.current_version()}).", "Lyric Immersion and Karaoke")
             except Exception: pass
         threading.Thread(target=_check, daemon=True).start()
