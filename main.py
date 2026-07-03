@@ -2448,6 +2448,8 @@ class Overlay:
         self._gen_defers = 0          # times generation waited on the in-flight fetch
         self._translate_result = None
         self._translating = None
+        self._translate_tries = {}    # path → backfill kicks (translate_max_tries cap)
+        self._last_tr_check_t = 0.0   # last periodic coverage re-check (translate_recheck_s)
         self._cur_duration = None
         # TICKET-099: split verification into TENTATIVE (duration/title check at
         # load time — _verified_meta) and CONFIRMED (sound has corroborated the
@@ -2912,6 +2914,10 @@ class Overlay:
             # + wrong-song-cascade + spurious feelingradation regen fixes).
             "switch_needs_identity_evidence": 1,  # SWITCH/REGEN needs a non-sync dim bad
             "corroborated_lock_immunity":     1,  # title-locked + corroborated LRC is immune
+            # translation/romanization guarantee: non-English → English row,
+            # non-Latin script → romanization row (see _maybe_translate)
+            "translate_recheck_s":         30.0,  # coverage re-check cadence in the tick
+            "translate_max_tries":            6,  # backfill kicks per loaded file
         }
         # v1.1.53 — PERSISTED live-tune overrides. POST /tune?persist=1 writes the
         # changed key into settings.json under "tune_overrides"; re-apply them here at
@@ -3237,6 +3243,7 @@ class Overlay:
         self._verified = False
         self._body_corroborated = False    # new song → BODY not yet corroborated; re-earn per song
         self._body_probe_retried = False
+        self._translate_tries = {}         # fresh song → fresh translation-backfill budget
         # TICKET batch4: a real SMTC track change must wipe lyrics immediately
         # (the render-side gate is for transient mid-track demotions only).
         # Clear the gate timestamp so /diag and any downstream gate check
@@ -4126,27 +4133,49 @@ class Overlay:
                      best.name, heard_title)
         return best
 
+    # Scripts the pipeline can romanize: kana + han (ja/zh), hangul (ko),
+    # cyrillic (ru), greek (el). Any lyric line containing one of these must
+    # carry a romanization row.
+    _RM_SCRIPT_RE = re.compile(
+        "[぀-ヿ㐀-䶿一-鿿"
+        "가-힯ᄀ-ᇿ㄰-㆏"
+        "Ѐ-ӿͰ-Ͽἀ-῿]")
+
     def _maybe_translate(self):
-        # Self-heal a loaded song in the background: add romaji to any
-        # Japanese/CJK line missing it, and translate any line that should have
-        # English but doesn't — whatever the song's overall detected language.
-        # So a song that came out as bare Japanese (e.g. mixed-language, or a
-        # mis-detected song) gets furigana/romaji + English filled and re-saved.
+        # GUARANTEE (user directive): every NON-ENGLISH lyric shows an English
+        # translation, and every NON-LATIN-SCRIPT lyric shows a romanization as
+        # well. Kick-side check: whenever the loaded body misses either, run the
+        # backfill (fetch_lyrics.backfill_file adds romaji/translit + windowed
+        # context translation and re-saves). FULL coverage — the old 50%
+        # threshold left partially-translated songs stuck partial forever.
+        # Retries are capped per file (translate_max_tries): an unsatisfiable
+        # line (an English interjection inside a JP song whose "translation" is
+        # an echo, a "♪~" line) can't loop the backfill; the periodic re-check
+        # in the tick (translate_recheck_s) retries transient network failures
+        # until the cap. Keep the want-set in lockstep with
+        # fetch_lyrics._translate_lines.
         if not self.lines or not self._lyrics_path:
             return
-        cjk = [ln for ln in self.lines if ln.jp.strip() and _has_cjk(ln.jp)]
-        need_rm = any(not ln.rm.strip() for ln in cjk)
-        # TICKET-115: non-English Latin/Cyrillic songs (Spanish, German,
-        # French, Italian, Portuguese, Russian, and romanized-Japanese) should
-        # have every line translated; CJK songs only their CJK lines. Keep this
-        # set in sync with fetch_lyrics._translate_lines' _LANGS.
-        whole = self.meta.get("lang") in (
-            "es", "de", "fr", "it", "pt", "ru", "ja-romaji"
-        )
-        want_en = (self.lines if whole else cjk)
-        want_en = [ln for ln in want_en if ln.jp.strip()]
-        have_en = sum(1 for ln in want_en if ln.en.strip())
-        if need_rm or (want_en and have_en < len(want_en) * 0.5):
+        path = str(self._lyrics_path)
+        tries = self._translate_tries.get(path, 0)
+        if tries >= int(self._tune.get("translate_max_tries", 6)):
+            return
+        rows = [ln for ln in self.lines if ln.jp.strip()]
+        script = [ln for ln in rows if self._RM_SCRIPT_RE.search(ln.jp)]
+        # romanization: every romanizable non-Latin line must carry rm
+        need_rm = any(not ln.rm.strip() for ln in script)
+        # translation: a Latin-script non-English song (es/fr/de/pt/it/…) needs
+        # English on EVERY line; a script song (ja/ko/zh/ru/el) on every script
+        # line (its Latin lines are usually English interjections — leave them).
+        # _body_is_english guards the detect_lang="other" ambiguity: an English
+        # song must never be "translated" into itself.
+        lang = (self.meta.get("lang") or "")
+        whole = (bool(lang) and not lang.startswith("en") and not script
+                 and not _body_is_english(self.lines))
+        want_en = rows if whole else script
+        need_en = any(not ln.en.strip() for ln in want_en)
+        if need_rm or need_en:
+            self._translate_tries[path] = tries + 1
             self._start_translate(self._lyrics_path)
 
     def _start_fetch(self, artist, title, duration=None, cover=False, strict=False,
@@ -4759,6 +4788,17 @@ class Overlay:
             self._translate_result = None
             if ok and Path(path) == Path(self._lyrics_path or ""):
                 self.load(path, keep_idx=True)
+        # GUARANTEE top-up: re-check translation/romanization coverage on a
+        # cadence while a body is loaded, so a failed or partial backfill (the
+        # free translator rate-limits, a network blip) self-heals MID-SONG
+        # instead of leaving lines untranslated until the next track. Cheap
+        # string scans; _maybe_translate no-ops once coverage is full and is
+        # capped per file by translate_max_tries.
+        _now_tr = time.time()
+        if _now_tr - self._last_tr_check_t > float(
+                self._tune.get("translate_recheck_s", 30.0)):
+            self._last_tr_check_t = _now_tr
+            self._maybe_translate()
         if self._identify_result:
             _, res = self._identify_result
             self._identify_result = None

@@ -303,6 +303,7 @@ _HANGUL = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏]")
 _KANA   = re.compile(r"[぀-ゟ゠-ヿ]")
 _HAN    = re.compile(r"[一-鿿㐀-䶿々]")
 _CYRILLIC = re.compile(r"[а-яё]", re.I)
+_GREEK  = re.compile(r"[Ͱ-Ͽἀ-ῼ]")
 _KANJI  = r"[一-鿿㐀-䶿々]"
 _JP_RE  = re.compile(r"[ぁ-んァ-ヶー一-鿿々]")
 _CREDIT_RE = re.compile(
@@ -373,11 +374,14 @@ def _is_german(text: str) -> bool:
 
 def detect_lang(text: str) -> str:
     """Coarse language of a string/lyric by dominant script / markers →
-    ja|ko|zh|ru|es|de|other."""
+    ja|ko|zh|ru|el|es|de|other."""
     hang = len(_HANGUL.findall(text))
     kana = len(_KANA.findall(text))
     han = len(_HAN.findall(text))
     cyr = len(_CYRILLIC.findall(text))
+    grk = len(_GREEK.findall(text))
+    if grk and grk >= max(kana, han, hang, cyr):
+        return "el"
     if cyr and cyr >= max(kana, han, hang):
         return "ru"
     if hang and hang >= kana:
@@ -750,6 +754,33 @@ def _translit_ru(text: str) -> str:
     return "".join(out)
 
 
+# Greek → Latin (modern ELOT-ish) so Greek lyrics get a readable romanization,
+# same guarantee as ja/zh/ko/ru: any non-Latin script line carries an `rm` row.
+_EL_MAP = {
+    "α": "a", "β": "v", "γ": "g", "δ": "d", "ε": "e", "ζ": "z", "η": "i",
+    "θ": "th", "ι": "i", "κ": "k", "λ": "l", "μ": "m", "ν": "n", "ξ": "x",
+    "ο": "o", "π": "p", "ρ": "r", "σ": "s", "ς": "s", "τ": "t", "υ": "y",
+    "φ": "f", "χ": "ch", "ψ": "ps", "ω": "o",
+}
+
+
+def _translit_el(text: str) -> str:
+    import unicodedata
+    # strip accents/breathings first (ά→α, ῆ→η) so the letter map covers everything
+    text = "".join(c for c in unicodedata.normalize("NFD", text)
+                   if not unicodedata.combining(c))
+    text = text.replace("ου", "ou").replace("Ου", "Ou").replace("ΟΥ", "OU")
+    out = []
+    for ch in text:
+        low = ch.lower()
+        if low in _EL_MAP:
+            r = _EL_MAP[low]
+            out.append((r[0].upper() + r[1:]) if ch.isupper() and r else r)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 # Cache for zh pinyin results, keyed by line text. Capped to avoid unbounded
 # growth on long sessions; jieba.lcut + pypinyin per line is cheap but not free.
 _ZH_PINYIN_CACHE: dict[str, str] = {}
@@ -841,6 +872,8 @@ def romanize(text: str, lang: str) -> str:
     try:
         if lang == "ru":
             return _translit_ru(text)
+        if lang == "el":
+            return _translit_el(text)              # Greek → Latin reading
         if lang == "ja":
             if _jp_engine():
                 try:
@@ -1572,7 +1605,8 @@ def _song_lang(lines: list[dict]) -> str:
 # unchanged, which then got stored as the "translation" (the user's "no English
 # for Chinese songs", en==original). An explicit zh source translates it
 # correctly. Japanese/Korean auto-detect fine but explicit is harmless + safer.
-_SRC_LANG = {"zh": "zh-CN", "yue": "zh-CN", "ja": "ja", "ko": "ko", "ru": "ru"}
+_SRC_LANG = {"zh": "zh-CN", "yue": "zh-CN", "ja": "ja", "ko": "ko", "ru": "ru",
+             "el": "el"}
 
 
 def _make_translator(source_lang: str | None = None):
@@ -1593,6 +1627,14 @@ def _make_translator(source_lang: str | None = None):
             pass
     from deep_translator import GoogleTranslator
     return GoogleTranslator(source=src, target="en")
+
+
+def _norm_echo(s: str) -> str:
+    """Whitespace/case-normalized form for echo detection: the free translator
+    sometimes returns the SOURCE text back with only spacing/case mangled
+    ('какдела' for 'как дела'); a plain equality check missed those, so the
+    original text got stored as the 'English translation'."""
+    return re.sub(r"\s+", "", (s or "").strip().lower())
 
 
 def _translate_window(tr, idxs: list[int], raw_fn) -> dict:
@@ -1637,8 +1679,9 @@ def _translate_window(tr, idxs: list[int], raw_fn) -> dict:
             # REJECT a no-op "translation" that just echoes the source text (the
             # translator returned the input untranslated). Storing that produced
             # the "en shows the original Chinese" symptom. Leaving it unmapped
-            # keeps the line eligible for re-translation instead.
-            if eng == (raw_fn(idxs[k]).strip()):
+            # keeps the line eligible for re-translation instead. Normalized
+            # compare: the echo often comes back with mangled spacing/case.
+            if _norm_echo(eng) == _norm_echo(raw_fn(idxs[k])):
                 continue
             res[idxs[k]] = eng
     return res
@@ -1650,13 +1693,13 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
         tr = _make_translator(song_lang)
     except ImportError:
         return 0
-    # TICKET-115: full non-English whitelist. Whole-song fallback covers any
-    # Latin/Cyrillic source we identify at song level (German, French, Italian,
-    # Portuguese as well as Spanish + Russian); CJK + Japanese-romaji round out
-    # the per-line set. Keep both gates in lockstep with main.py's
-    # _maybe_translate "whole" set and with detect_lang()'s outputs.
-    _LANGS = ("ja", "ko", "zh", "es", "de", "ru", "fr", "pt", "it")
-    whole = song_lang in (*_LANGS, "ja-romaji")
+    # GUARANTEE (user directive): every non-English lyric carries an English
+    # translation. Per-line set = every language detect_lang() can name; the
+    # whole-song fallback now covers ANY non-English song language (French,
+    # Italian, Indonesian, … detect per-line as "other", so the song-level lang
+    # is what routes them). Keep in lockstep with main.py's _maybe_translate.
+    _LANGS = ("ja", "ko", "zh", "es", "de", "ru", "el", "fr", "pt", "it")
+    whole = bool(song_lang) and not str(song_lang).startswith("en")
 
     def want(ln):
         raw = re.sub(r"\(.*?\)", "", ln["jp"])
@@ -1665,9 +1708,10 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
         en = ln.get("en", "").strip()
         if only_missing and en:
             # Keep a REAL translation, but RE-translate a failed one where the
-            # "translation" is just the original text (the source='auto' CJK bug
-            # stored en==original). Treat that as missing so it self-heals.
-            if en != raw.strip():
+            # "translation" is just the original text (the translator echoed the
+            # source — compare whitespace/case-normalized so a space-mangled
+            # echo like 'какдела' for 'как дела' is also treated as missing).
+            if _norm_echo(en) != _norm_echo(raw):
                 return False
         ll = detect_lang(raw)
         if ll in _LANGS:
@@ -1681,45 +1725,72 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
     def raw(i):
         return re.sub(r"\(.*?\)", "", lines[i]["jp"])
 
+    # Group the wanted lines by their OWN language: with the translator source
+    # pinned to the SONG language, a line in a different script inside a
+    # mixed-language body (a Russian/Greek line in a Japanese song) came back
+    # ECHOED — the original text was stored as the "English". Script lines get
+    # a translator sourced from their own language; Latin/"other" lines ride
+    # the song-language translator.
+    groups: dict[str, set[int]] = {}
+    for i in want_set:
+        ll = detect_lang(raw(i))
+        key = ll if ll in ("ja", "ko", "zh", "ru", "el") else "_song"
+        groups.setdefault(key, set()).add(i)
+
     # Translate in windows that CARRY CONTEXT: each block of focus lines is sent
     # together with CTX neighbouring lines before and after (and the whole block is
     # numbered), so a line is read in the flow of the song (pronouns/subjects often
     # only make sense from the surrounding lines) instead of in isolation. Only the
     # focus lines' results are kept; the context lines just steer the translation.
     CTX, SIZE, n = 2, 24, len(lines)
-    done = pos = 0
-    while pos < n:
-        end = min(n, pos + SIZE)
-        focus = [i for i in range(pos, end) if i in want_set]
-        if not focus:
-            pos = end
-            continue
-        lo, hi = max(0, pos - CTX), min(n, end + CTX)
-        got = _translate_window(tr, list(range(lo, hi)), raw)
-        for i in focus:
-            if got.get(i):
-                lines[i]["en"] = got[i]
-                done += 1
+
+    def _run(tr_run, wset):
+        done = pos = 0
+        while pos < n:
+            end = min(n, pos + SIZE)
+            focus = [i for i in range(pos, end) if i in wset]
+            if not focus:
+                pos = end
                 continue
-            # The block translator merged/dropped this one. Retry it in a SMALL
-            # numbered window of just its ±CTX neighbours (still in context), and
-            # only fall to a bare single-line translation if even that fails.
-            sub = list(range(max(0, i - CTX), min(n, i + CTX + 1)))
-            g2 = _translate_window(tr, sub, raw)
-            if g2.get(i):
-                lines[i]["en"] = g2[i]
-                done += 1
-                continue
-            try:
-                t = raw(i)
-                eng = (tr.translate(t) or "").strip() if t.strip() else ""
-                if eng and eng != t.strip():        # reject a no-op echo of the source
-                    lines[i]["en"] = eng
+            lo, hi = max(0, pos - CTX), min(n, end + CTX)
+            got = _translate_window(tr_run, list(range(lo, hi)), raw)
+            for i in focus:
+                if got.get(i):
+                    lines[i]["en"] = got[i]
                     done += 1
+                    continue
+                # The block translator merged/dropped this one. Retry it in a SMALL
+                # numbered window of just its ±CTX neighbours (still in context), and
+                # only fall to a bare single-line translation if even that fails.
+                sub = list(range(max(0, i - CTX), min(n, i + CTX + 1)))
+                g2 = _translate_window(tr_run, sub, raw)
+                if g2.get(i):
+                    lines[i]["en"] = g2[i]
+                    done += 1
+                    continue
+                try:
+                    t = raw(i)
+                    eng = (tr_run.translate(t) or "").strip() if t.strip() else ""
+                    # reject a no-op echo of the source (normalized)
+                    if eng and _norm_echo(eng) != _norm_echo(t):
+                        lines[i]["en"] = eng
+                        done += 1
+                except Exception:
+                    pass
+            pos = end
+        return done
+
+    total = 0
+    for key, idx_set in groups.items():
+        if key == "_song" or key == (song_lang or ""):
+            tr_g = tr
+        else:
+            try:
+                tr_g = _make_translator(key)
             except Exception:
-                pass
-        pos = end
-    return done
+                tr_g = tr
+        total += _run(tr_g, idx_set)
+    return total
 
 
 def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict]:
@@ -1750,6 +1821,8 @@ def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict
                 ln["rm"] = romanize(raw, "ja")
         elif ll == "ru":
             ln["rm"] = romanize(raw, "ru")          # Cyrillic → Latin reading
+        elif ll == "el":
+            ln["rm"] = romanize(raw, "el")          # Greek → Latin reading
         else:
             # Latin-script source languages (Spanish, German, French, Italian,
             # Portuguese, English) — shown as-is; no romaji needed. Leaving 'rm'
@@ -1791,7 +1864,10 @@ def backfill_file(path) -> bool:
             ln["jp"] = to_furigana(raw)
             ln["rm"] = romanize(raw, "ja")
             changed = True
-        elif ll in ("zh", "ko"):
+        elif ll in ("zh", "ko", "ru", "el"):
+            # every non-Latin script self-heals its romanization, not just CJK —
+            # ru/el used to be annotate-only, so a body that arrived without rm
+            # never got its Latin reading backfilled.
             ln["rm"] = romanize(raw, zh_rom if ll == "zh" else ll)
             changed = True
     n = _translate_lines(lines, lang, only_missing=True)   # fills lines missing 'en'
