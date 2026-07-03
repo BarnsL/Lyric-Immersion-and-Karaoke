@@ -4,9 +4,11 @@ Three distribution channels, three behaviours:
 
   • Installed from the **Microsoft Store** (MSIX) → the Store delivers updates
     automatically, so this module does nothing (``check()`` returns ``None``).
-  • The **portable .exe** → checks GitHub Releases and, if a newer build is
-    published as a ``.zip`` of the onedir folder, downloads it and launches a
-    helper that swaps it in (keeping your lyric cache + settings) and relaunches.
+  • The **portable / Inno-installed .exe** → checks GitHub Releases and, if a
+    newer build is published as a ``.zip`` of the onedir folder (every release
+    ships the zip alongside the Setup.exe precisely for this), downloads it and
+    launches a helper that swaps it in (keeping your lyric cache + settings)
+    and relaunches.
   • Running **from source** → no self-update (use ``git pull``); ``check()`` still
     reports whether a newer release tag exists.
 
@@ -152,32 +154,61 @@ def check(timeout: float = 8.0):
                     and _is_github_https(a.get("browser_download_url", "")):
                 sha_url = a.get("browser_download_url")
                 break
-    m = re.search(r"\b[a-f0-9]{64}\b", (data.get("body") or "").lower())
+    # Notes-hash fallback: only trust a 64-hex digest from a line that mentions
+    # the ZIP. Release notes also print the Setup.exe hash; grabbing the first
+    # hex in the whole body made the zip verification fail-closed against the
+    # INSTALLER's digest (checksum trap). The `.sha256` asset above still takes
+    # precedence over this either way.
+    sha_body = None
+    for line in (data.get("body") or "").lower().splitlines():
+        if ".zip" in line:
+            m = re.search(r"\b[a-f0-9]{64}\b", line)
+            if m:
+                sha_body = m.group(0)
+                break
     return {
         "version": tag.lstrip("vV"),
         "url": data.get("html_url") or RELEASES_PAGE,
         "asset_url": (zip_asset or {}).get("browser_download_url"),
         "asset_name": (zip_asset or {}).get("name"),
         "sha_url": sha_url,
-        "sha_body": m.group(0) if m else None,
+        "sha_body": sha_body,
         "notes": (data.get("body") or "").strip()[:500],
+        # True when clicking "install" can actually self-update (a zip asset
+        # exists AND this is the portable frozen build). The tray uses this to
+        # say "Install" vs "Download" honestly instead of promising an install
+        # it can only answer with a browser window.
+        "installable": bool(zip_asset and can_self_update()),
     }
 
 
-def background_check(callback, delay: float = 15.0):
-    """Run check() off the UI thread after a short delay; call callback(info) if
-    a newer release exists. Daemon thread, never raises."""
+def background_check(callback, delay: float = 15.0, every: float = 24 * 3600.0):
+    """Run check() off the UI thread after a short delay, then RE-CHECK every
+    `every` seconds (default daily) — this app lives in the tray for days, and a
+    single at-launch check meant long-running installs never learned about new
+    releases until restarted. callback(info) fires at most once per discovered
+    version. Daemon thread, never raises. Pass every=0 for the old one-shot."""
     def _run():
-        try:
-            time.sleep(delay)
-        except Exception:
-            pass
-        info = check()
-        if info:
+        notified = None
+        wait = delay
+        while True:
             try:
-                callback(info)
+                time.sleep(wait)
             except Exception:
                 pass
+            wait = every
+            try:
+                info = check()
+            except Exception:
+                info = None
+            if info and info.get("version") != notified:
+                notified = info.get("version")
+                try:
+                    callback(info)
+                except Exception:
+                    pass
+            if not every or every <= 0:
+                break
     threading.Thread(target=_run, name="dk-update-check", daemon=True).start()
 
 

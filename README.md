@@ -6,7 +6,7 @@
 lyrics over whatever you're playing — built for learning Japanese (plus Chinese,
 Korean, Spanish, German, and Russian) by singing along.**
 
-> ### ⬇️ Just want to use it? [**Download the latest release**](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest) → unzip → double-click `Lyric-Immersion-and-Karaoke.exe`. No install, no Python, no account. That's it.
+> ### ⬇️ Just want to use it? [**Download the latest release**](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest) → run **`Lyric-Immersion-and-Karaoke-Setup.exe`** (no admin needed) → done. Prefer no installer? Grab the portable **`.zip`** from the same page, extract, and double-click `Lyric-Immersion-and-Karaoke.exe`. No Python, no account.
 
 Play a song in **Spotify, YouTube, or any app** that talks to Windows' media
 controls, and Lyric Immersion and Karaoke pulls the **real playback position** and streams
@@ -87,14 +87,19 @@ while it runs.
 
 
 
-### Portable build (no install, no Python — just download and run)
-
-The easy path for everyone:
+### One-click installer (recommended)
 
 1. Open the **[latest release](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest)**.
-2. Download **`LyricImmersion-portable-vX.Y.Z.zip`**.
-3. Right-click → **Extract All**.
-4. Double-click **`Lyric-Immersion-and-Karaoke.exe`** inside.
+2. Download **`Lyric-Immersion-and-Karaoke-Setup.exe`** and run it — no admin
+   rights needed. If Windows SmartScreen appears, click **More info → Run anyway**.
+3. The app starts in your system tray; right-click the tray icon for every setting.
+
+### Portable build (no install — download and run)
+
+1. From the same **[latest release](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest)**,
+   download **`Lyric-Immersion-and-Karaoke-<version>.zip`**.
+2. Right-click → **Extract All**.
+3. Double-click **`Lyric-Immersion-and-Karaoke.exe`** inside.
 
 That's it. The app starts in your **system tray** (the little purple microphone by
 the clock), and lyrics appear the moment you play a song. It's **fully portable** —
@@ -140,19 +145,12 @@ Every optional piece **degrades gracefully** — if it's missing, that one featu
 shows a hint and everything else keeps working. The lyric library and the small
 speech model build/download themselves the first time they're needed.
 
-### Microsoft Store — recommended
+### Microsoft Store — planned
 
-<!-- STORE LINK --> _Store listing pending — see [STORE_SUBMISSION.md](docs/STORE_SUBMISSION.md)._
-
-Open the **Microsoft Store**, search **Desktop Karaoke**, and click **Get**. It
-installs with no Python and **no security warnings** (the Store signs it), and
-keeps itself up to date. The app launches into your **system tray** (look for the
-purple microphone icon) and adds a **Desktop Karaoke** entry to your **Start
-menu**. Play any song and the lyrics appear automatically.
-
-> Why the Store? Windows **Smart App Control** blocks unsigned installers
-> outright, and SmartScreen warns on them. The Store ships a Microsoft-trusted
-> signature, so it just works — that's the true one-click path.
+_A signed Store listing is planned (see [STORE_SUBMISSION.md](docs/STORE_SUBMISSION.md))
+but is not live yet — until then, the **Setup.exe** above is the recommended
+install. A Store build would install with no SmartScreen warnings (Microsoft
+signs it) and keep itself up to date automatically._
 
 ### ⚙️ Where are the settings? — the tray icon
 
@@ -341,9 +339,9 @@ pythonw main.py                  # start the overlay (no console window)
 python  main.py --offset -1.5    # nudge sync earlier for an intro-heavy video
 ```
 
-> **?? Optional features:** Run **`install_extras.bat`** for a guided installer
+> **🧠 Optional features:** Run **`install_extras.bat`** for a guided installer
 > that offers faster-whisper (AI lyric generation + sync by listening), yt-dlp
-> (deep transcription), and GPU acceleration. Each is a Y/N choice � skip what
+> (deep transcription), and GPU acceleration. Each is a Y/N choice, so skip what
 > you don't want.
 
 **Build the one-click installer yourself** — see [BUILD.md](docs/BUILD.md):
@@ -538,9 +536,10 @@ drawn avatar, not any artist's actual model. Please support the artists. 💜
 
 ## 📄 License
 
-MIT for the code in this and prior releases (see [LICENSE](LICENSE)). Lyrics
-and any artwork belong to their respective owners.
+MIT for the code in this and prior releases (see [LICENSE](LICENSE)) — that
+includes every release through the current v1.1.x line. Lyrics and any artwork
+belong to their respective owners.
 
-> ⚠️ **Heads up — future releases will move to a proprietary
-> (all-rights-reserved) license.** If you need the open MIT terms, pin to the
-> **v1.0.93** tag or earlier. © 2026 BarnsL.
+> ⚠️ **Heads up — a future release may move to a proprietary
+> (all-rights-reserved) license.** Any such change applies only from the release
+> that makes it; every tag published before it stays MIT. © 2026 BarnsL.

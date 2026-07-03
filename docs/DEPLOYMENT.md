@@ -129,6 +129,28 @@ the runtime `lyrics/  models/  settings.json  *.log`). The deploy folder name st
   MSIX (optional)       packaging\build_msix.ps1  (calls scripts\make_assets.py)
 ```
 
+### Publishing a GitHub release (REQUIRED asset triplet)
+
+Every release MUST upload **three** assets, or deployed apps cannot auto-update
+(the in-app updater self-installs ONLY from the `.zip`; with just a Setup.exe it
+silently degrades to opening the Releases page in a browser):
+
+1. `Lyric-Immersion-and-Karaoke-Setup.exe` — first installs (laypeople).
+2. `Lyric-Immersion-and-Karaoke-<ver>.zip` — the onedir build zipped (exe at the
+   zip root); this is what `updater.py` downloads and swaps in.
+3. `Lyric-Immersion-and-Karaoke-<ver>.zip.sha256` — the zip's SHA-256 (bare hex);
+   the updater verifies against it fail-closed. build.bat step [4/5] produces both.
+
+```
+gh release create vX.Y.Z dist\Lyric-Immersion-and-Karaoke-Setup.exe ^
+    dist\Lyric-Immersion-and-Karaoke-X.Y.Z.zip ^
+    dist\Lyric-Immersion-and-Karaoke-X.Y.Z.zip.sha256
+```
+
+If a raw SHA-256 is printed in the release NOTES, put it on a line that names the
+file it belongs to — the updater only trusts a notes hash from a line mentioning
+`.zip` (a bare installer hash used to poison the zip verification).
+
 ### Gotchas (the ones that have bitten)
 - **Never build with `LEAN_BUILD=1`** for a deploy — it silently strips the bundled
   Whisper (AI lyric generation / sync-by-ear). See `BUILD.md`.
