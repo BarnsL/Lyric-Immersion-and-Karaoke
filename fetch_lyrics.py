@@ -304,6 +304,11 @@ _KANA   = re.compile(r"[぀-ゟ゠-ヿ]")
 _HAN    = re.compile(r"[一-鿿㐀-䶿々]")
 _CYRILLIC = re.compile(r"[а-яё]", re.I)
 _GREEK  = re.compile(r"[Ͱ-Ͽἀ-ῼ]")
+# Invisible characters providers embed in lyric text (zero-width space/joiners,
+# word-joiner, BOM, soft hyphen). The romanizer maps each to '?' — a line like
+# 'Alarm<ZWSP> <ZWSP><ZWSP>' reached the screen as 'Alarm ? ??' — and they have
+# no display value at all. Stripped at every text entry point.
+_INVIS_RE = re.compile("[​‌‍⁠﻿­]")
 _KANJI  = r"[一-鿿㐀-䶿々]"
 _JP_RE  = re.compile(r"[ぁ-んァ-ヶー一-鿿々]")
 _CREDIT_RE = re.compile(
@@ -869,22 +874,41 @@ def romanize(text: str, lang: str) -> str:
     cutlet, katakana English recovered as English), Chinese → pinyin, Korean →
     romaja, Russian → Latin transliteration. Returns '' on failure or an
     unsupported language (German/Spanish/English are already Latin)."""
+    text = _INVIS_RE.sub("", text or "")
     try:
         if lang == "ru":
             return _translit_ru(text)
         if lang == "el":
             return _translit_el(text)              # Greek → Latin reading
         if lang == "ja":
+            # Mixed-script lines: a Korean/Cyrillic/Greek run inside a JP line
+            # (サランヘヨ (사랑해요)) used to come out as '????' — romanize each
+            # foreign run with ITS OWN engine before the Japanese pass.
+            if _HANGUL.search(text):
+                text = re.sub(r"[가-힣]+",
+                              lambda m: _korean().translit(m.group(0)).replace("-", ""),
+                              text)
+            if _CYRILLIC.search(text):
+                text = re.sub(r"[Ѐ-ӿ]+", lambda m: _translit_ru(m.group(0)), text)
+            if _GREEK.search(text):
+                text = re.sub(r"[Ͱ-Ͽἀ-ῼ]+", lambda m: _translit_el(m.group(0)), text)
+            r = ""
             if _jp_engine():
                 try:
                     # split run-together katakana English first so the loanwords
                     # render as English (ベイビーアイラブユー → baby I love you)
-                    r = _jp_katsu.romaji(_segment_katakana(text)).strip()
-                    if r:
-                        return r[0].lower() + r[1:]   # match the lowercase style
+                    rr = _jp_katsu.romaji(_segment_katakana(text)).strip()
+                    if rr:
+                        r = rr[0].lower() + rr[1:]   # match the lowercase style
                 except Exception:
                     pass
-            return " ".join(it["hepburn"] for it in _kakasi().convert(text)).strip()
+            if not r:
+                r = " ".join(it["hepburn"] for it in _kakasi().convert(text)).strip()
+            # BACKSTOP: cutlet writes '?' for tokens it has no reading for. A '?'
+            # the source never contained must not reach the screen — drop it.
+            if "?" in r and "?" not in text and "？" not in text:
+                r = re.sub(r"\s*\?+", "", r).strip()
+            return r
         if lang == "yue":
             return _zh_jyutping(text)               # Cantonese → jyutping
         if lang == "zh":
@@ -907,6 +931,7 @@ def parse_lrc_text(lrc: str) -> list[dict]:
         # strip ALL [mm:ss] line tags and <mm:ss> word tags from the text
         text = re.sub(r"\[\d+:\d+(?:\.\d+)?\]", "", line)
         text = re.sub(r"<\d+:\d+(?:\.\d+)?>", "", text).strip()
+        text = _INVIS_RE.sub("", text)   # zero-width junk -> romanizer '?' garbage
         for mm, ss in tags:                       # a line may repeat at several times
             raw.append({"time": round(int(mm) * 60 + float(ss), 2), "text": text})
     raw.sort(key=lambda x: x["time"])
@@ -1805,7 +1830,9 @@ def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict
     if lang == "zh" and _is_cantonese(" ".join(l.get("jp", "") for l in lines)):
         zh_rom = "yue"
     for ln in lines:
-        raw = ln["jp"]
+        raw = _INVIS_RE.sub("", ln["jp"])
+        if raw != ln["jp"]:
+            ln["jp"] = raw           # store CLEAN text — invisibles have no value
         ll = detect_lang(raw)
         if ll == "ja":
             ln["jp"] = to_furigana(raw)
@@ -1856,8 +1883,16 @@ def backfill_file(path) -> bool:
         zh_rom = "yue"
     changed = False
     for ln in lines:
+        jp0 = ln.get("jp", "")
+        if _INVIS_RE.search(jp0):
+            ln["jp"] = _INVIS_RE.sub("", jp0)     # heal zero-width junk in place
+            changed = True
         raw = re.sub(r"[(（][ぁ-ゟ゛゜ー]+[)）]", "", ln.get("jp", ""))  # strip existing furigana
-        if not raw.strip() or ln.get("rm", "").strip():
+        rm0 = ln.get("rm", "")
+        # a '?' in rm that the source never contained = broken romanization
+        # (zero-width junk / mixed-script fallout) -> re-romanize it
+        rm_broken = "?" in rm0 and "?" not in raw and "？" not in raw
+        if not raw.strip() or (rm0.strip() and not rm_broken):
             continue
         ll = detect_lang(raw)
         if ll == "ja" or (ll == "zh" and lang != "zh"):

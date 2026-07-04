@@ -64,6 +64,7 @@ _ROUTES = {
         "/source": "video/music source view: raw SMTC data + what the app derived from it",
         "/audio": "audio listener: live loudness + vocal-band ratio + recent on/off pattern",
         "/lyricstate": "lyric current-state analyzer: current/prev/next lines, fill, structural checks",
+        "/display": "GET: current display mode + connected monitors + overlay bounds. POST: switch it — ?mode=primary|span|mirror|cycle or ?mode=monitor&index=1 (or &id=<stable device id>)",
         "/import/status": "current playlist import state: state, done, total, ok, skipped, failed_count",
         "/yt-meta": "TICKET-112: full parsed YouTube description metadata for the current track (credits, raw description, lyrics_block) — useful when debugging which disambiguators the fetch_lrc call did or didn't get",
     },
@@ -297,6 +298,13 @@ def make_handler(app, log_file, token):
                         self._send(200, {"ok": True, **app.get_sync_diag()})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/display":
+                    # live multi-monitor picture: mode, selected monitor identity,
+                    # overlay target bounds, every connected monitor
+                    try:
+                        self._send(200, {"ok": True, **app.display_state()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/metrics":
                     try:
                         self._send(200, {"ok": True, **app.get_metrics()})
@@ -363,7 +371,21 @@ def make_handler(app, log_file, token):
                     return self._err(401, "missing or bad X-API-Token")
                 path = urlparse(self.path).path.rstrip("/") or "/"
                 q = parse_qs(urlparse(self.path).query)
-                if path == "/identify":
+                if path == "/display":
+                    # switch display mode / target monitor (same as the tray menu)
+                    mode = (q.get("mode", [""])[0] or "").strip().lower()
+                    mon_id = (q.get("id", [""])[0] or "").strip() or None
+                    idx = q.get("index", [None])[0]
+                    try:
+                        idx = int(idx) if idx is not None else None
+                    except Exception:
+                        return self._err(400, "index must be an integer")
+                    try:
+                        res = app.set_display_api(mode, monitor_id=mon_id, index=idx)
+                    except Exception as e:
+                        return self._err(500, f"{type(e).__name__}: {e}")
+                    self._send(200 if res.get("ok") else 400, res)
+                elif path == "/identify":
                     self._run(lambda: app._start_identify(seconds=6, attempts=2))
                     self._send(200, {"ok": True, "action": "identifying by sound"})
                 elif path == "/wrong":

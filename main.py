@@ -4172,8 +4172,13 @@ class Overlay:
             return
         rows = [ln for ln in self.lines if ln.jp.strip()]
         script = [ln for ln in rows if self._RM_SCRIPT_RE.search(ln.jp)]
-        # romanization: every romanizable non-Latin line must carry rm
-        need_rm = any(not ln.rm.strip() for ln in script)
+        # romanization: every romanizable non-Latin line must carry rm — and a
+        # BROKEN rm counts as missing: a '?' the source never contained is the
+        # zero-width-junk / mixed-script romanizer fallout ('Alarm ? ??'), which
+        # backfill_file now re-romanizes.
+        need_rm = any((not ln.rm.strip())
+                      or ("?" in ln.rm and "?" not in ln.jp and "？" not in ln.jp)
+                      for ln in script)
         # translation: a Latin-script non-English song (es/fr/de/pt/it/…) needs
         # English on EVERY line; a script song (ja/ko/zh/ru/el) on every script
         # line (its Latin lines are usually English interjections — leave them).
@@ -9971,6 +9976,49 @@ class Overlay:
                 self._restart_tauri_overlay(reason="display-change")
             except Exception as e:
                 log.info("tauri overlay restart after display change failed: %s", e)
+
+    def display_state(self):
+        """GET /display — the live multi-monitor picture: current mode, the
+        monitor the overlay believes it is on (stable id + fingerprint), the
+        overlay's actual target bounds, and every connected monitor. Read-only;
+        safe off the Tk thread."""
+        mons = _monitors()
+        return {
+            "display": self.display,
+            "display_id": getattr(self, "_display_id", None),
+            "display_fp": getattr(self, "_display_fp", None),
+            "tauri_bounds": (list(self._tauri_bounds)
+                             if getattr(self, "_tauri_bounds", None) else None),
+            "work": {"left": self.work_left, "top": getattr(self, "work_top", 0),
+                     "w": self.W, "h": getattr(self, "work_h", None)},
+            "stick_to_selected": int(self._tune.get("display_stick_to_selected", 1)),
+            "monitors": [{"index": i, "id": m.get("id"), "name": m.get("device", ""),
+                          "primary": bool(m.get("primary")),
+                          "x": m["x"], "y": m["y"], "w": m["w"], "h": m["h"]}
+                         for i, m in enumerate(mons)],
+        }
+
+    def set_display_api(self, mode, monitor_id=None, index=None):
+        """POST /display — the tray Display menu, API-addressable (and testable):
+        mode = primary | span | mirror | cycle | monitor (with ?id= stable device
+        id or ?index= position in the /display monitors list)."""
+        mons = _monitors()
+        if mode in ("span", "mirror", "cycle", "primary"):
+            self.root.after(0, lambda: self.set_display(mode))
+            return {"ok": True, "display": mode}
+        if mode != "monitor":
+            return {"ok": False, "error": f"unknown mode {mode!r} (primary|span|mirror|cycle|monitor)"}
+        mon = None
+        if monitor_id:
+            mon = next((m for m in mons if m.get("id") == monitor_id), None)
+        if mon is None and index is not None and 0 <= int(index) < len(mons):
+            mon = mons[int(index)]
+        if mon is None:
+            return {"ok": False,
+                    "error": f"monitor not found (id={monitor_id!r}, index={index})"}
+        key = f"mon:{mons.index(mon)}"
+        self.root.after(0, lambda k=key, m=mon: self.set_display(k, monitor=m))
+        return {"ok": True, "display": key, "id": mon.get("id")}
 
     def set_display(self, d, monitor=None):
         """Tray 'Display' submenu → move the overlay to a monitor, or span all."""
