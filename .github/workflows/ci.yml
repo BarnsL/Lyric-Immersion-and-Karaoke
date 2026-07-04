@@ -22,17 +22,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Linux system libraries (libpulse for soundcard import, dbus for the MPRIS test)
+      - name: Linux system libraries (libpulse for soundcard import, dbus for the MPRIS test, xvfb for pystray)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpulse0 dbus
+          sudo apt-get install -y libpulse0 dbus xvfb
       - name: Install requirements
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Import gate
+        if: runner.os != 'Linux'
         run: python scripts/ci_import_gate.py
+      - name: Import gate (Linux, virtual display)
+        # pystray's X backend connects to $DISPLAY at import; the real app always
+        # has a display (it IS a GUI overlay), so give headless CI a virtual one.
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python scripts/ci_import_gate.py
       - name: MPRIS provider live test (mock player, private session bus)
         if: runner.os == 'Linux'
         run: dbus-run-session -- python scripts/test_mpris_provider.py
