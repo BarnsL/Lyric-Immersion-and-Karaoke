@@ -3,7 +3,7 @@
 ; (build.bat does this automatically if iscc is on PATH.)
 
 #define AppName "Lyric Immersion and Karaoke"
-#define AppVer  "1.1.55"
+#define AppVer  "1.1.56"
 #define AppExe  "Lyric-Immersion-and-Karaoke.exe"
 
 [Setup]

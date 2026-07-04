@@ -428,6 +428,12 @@ def extract_video_metadata(url_or_id: str,
             "language": _detect_language(desc),
             "tags": tags,
             "upload_date": info.get("upload_date") or None,
+            # Category + true duration (SMTC often reports None) — used by the
+            # concert-setlist category gate and available to any caller.
+            "categories": [str(c)[:40] for c in (info.get("categories") or [])
+                           if c][:8],
+            "duration": (float(info.get("duration"))
+                         if info.get("duration") else None),
             "fetched_at": time.time(),
             "from_cache": False,
         }

@@ -1826,12 +1826,17 @@ def _translate_lines(lines: list[dict], song_lang: str | None = None,
     return total
 
 
-def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict]:
+def annotate(lines: list[dict], lang: str, translate: bool = False,
+             romanize_rows: bool = True) -> list[dict]:
     """Add furigana + romaji to each line by ITS OWN script — not the song's
     overall language. This way a Japanese line inside a mostly-English song (or
     one whose language was mis-detected) still gets furigana/romaji instead of
     coming out as bare kanji. `lang` only disambiguates kanji-only lines
-    (Japanese vs Chinese)."""
+    (Japanese vs Chinese).
+
+    `romanize_rows=False` (subtitles mode with the romaji layer hidden) skips
+    the romanization work entirely — a hidden layer must not COST anything.
+    Furigana still runs (it decorates the native layer, not the rm row)."""
     # Decide the Chinese romanization ONCE per song: jyutping for Cantonese,
     # else Mandarin pinyin (only relevant when the song lang is zh).
     zh_rom = "zh"
@@ -1842,6 +1847,11 @@ def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict
         if raw != ln["jp"]:
             ln["jp"] = raw           # store CLEAN text — invisibles have no value
         ll = detect_lang(raw)
+        if not romanize_rows:
+            if ll == "ja" or (ll == "zh" and lang != "zh"):
+                ln["jp"] = to_furigana(raw)
+            ln.setdefault("rm", "")
+            continue
         if ll == "ja":
             ln["jp"] = to_furigana(raw)
             ln["rm"] = romanize(raw, "ja")
@@ -1870,11 +1880,16 @@ def annotate(lines: list[dict], lang: str, translate: bool = False) -> list[dict
     return lines
 
 
-def backfill_file(path) -> bool:
+def backfill_file(path, romanize_rows: bool = True,
+                  translate_rows: bool = True) -> bool:
     """Self-heal a cached file: add furigana/romaji to any Japanese/CJK line
     that's missing it, and translate any non-English line with no English yet.
     Returns True if anything changed. Used at runtime so a song that came out as
-    bare Japanese gets fixed in place the first time it plays."""
+    bare Japanese gets fixed in place the first time it plays.
+
+    `romanize_rows` / `translate_rows` = False skip that layer's WORK
+    (subtitles mode with the layer hidden); re-enabling the layer lets the
+    next backfill pass heal it."""
     path = Path(path)
     try:
         data = json.loads(path.read_text("utf-8"))
@@ -1902,6 +1917,8 @@ def backfill_file(path) -> bool:
         rm_broken = "?" in rm0 and "?" not in raw and "？" not in raw
         if not raw.strip() or (rm0.strip() and not rm_broken):
             continue
+        if not romanize_rows:
+            continue                # hidden romaji layer: skip the work
         ll = detect_lang(raw)
         if ll == "ja" or (ll == "zh" and lang != "zh"):
             ln["jp"] = to_furigana(raw)
@@ -1913,9 +1930,10 @@ def backfill_file(path) -> bool:
             # never got its Latin reading backfilled.
             ln["rm"] = romanize(raw, zh_rom if ll == "zh" else ll)
             changed = True
-    n = _translate_lines(lines, lang, only_missing=True)   # fills lines missing 'en'
-    if n:
-        changed = True
+    if translate_rows:
+        n = _translate_lines(lines, lang, only_missing=True)   # fills lines missing 'en'
+        if n:
+            changed = True
     if changed:
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")

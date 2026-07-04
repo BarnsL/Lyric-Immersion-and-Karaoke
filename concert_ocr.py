@@ -104,7 +104,12 @@ def read_banner_lines(hwnd=None) -> list:
             im = ImageGrab.grab()                   # COM grab OUTSIDE the asyncio loop
         # The song banner sits TOP-LEFT; the hashtag is top-right and the chat panel
         # is far right — so OCR only the top-LEFT region to skip that UI noise.
-        strip = im.crop((0, 0, int(im.width * 0.60), int(im.height * _TOP_FRAC)))
+        # v1.1.56: when capturing a BROWSER window, start BELOW the chrome — the
+        # crop used to begin at y=0 and included the TAB STRIP, so another tab's
+        # title ('Sustainable AI Chat…') was read as a "song banner" repeatedly.
+        y0 = int(im.height * 0.10) if hwnd else 0
+        strip = im.crop((0, y0, int(im.width * 0.60),
+                         y0 + int(im.height * _TOP_FRAC)))
         fd, path = tempfile.mkstemp(prefix="dk_ocr_", suffix=".png")
         os.close(fd)
         strip.save(path)

@@ -107,13 +107,17 @@ def available() -> bool:
         return False
 
 
-def _download_audio(query: str, dest: Path) -> tuple[Path | None, str | None]:
+def _download_audio(query: str, dest: Path,
+                    max_dur: int | None = None) -> tuple[Path | None, str | None]:
     """ytsearch the query and download the top hit's AUDIO-ONLY stream into
     ``dest``. Returns (downloaded file path, the hit's CANONICAL title), or
     (None, None) on any failure / an over-long match (a concert or "1 hour loop"
     is not the song we want). The canonical title is the video's REAL name — often
     the Japanese original even when the player reported an English/translated one —
-    so the caller can look up real lyrics before transcribing by ear."""
+    so the caller can look up real lyrics before transcribing by ear.
+
+    `max_dur` overrides the song-sized duration cap — SUBTITLES mode transcribes
+    whole EPISODES (20-40 min), which the default would reject."""
     import shutil as _sh
     import yt_dlp
     out = str(dest / "src.%(ext)s")
@@ -123,7 +127,8 @@ def _download_audio(query: str, dest: Path) -> tuple[Path | None, str | None]:
         "format": "bestaudio/best",          # audio-only ⇒ no ffmpeg merge needed
         "outtmpl": out, "retries": 3, "socket_timeout": 30,
         # reject an over-long top hit (concert / compilation / hour-long loop)
-        "match_filter": yt_dlp.utils.match_filter_func(f"duration < {_MAX_DUR}"),
+        "match_filter": yt_dlp.utils.match_filter_func(
+            f"duration < {int(max_dur or _MAX_DUR)}"),
         # Also grab the MANUAL caption track (NOT auto-captions): on an official MV
         # this is the EXACT official lyrics WITH the video's own timing — strictly
         # better than a provider LRC (correct words AND perfect sync).
@@ -283,12 +288,17 @@ def _parse_vtt(path: Path) -> list[dict]:
     return ded
 
 
-def _captions_from_dir(dest: Path, lang: str | None):
+def _captions_from_dir(dest: Path, lang: str | None, any_lang: bool = False):
     """Find + parse the best MANUAL caption track matching the song's ORIGINAL
     language → (lines, lang) or None. A Japanese song's 'ja' track is its lyrics; a
-    'zh-TW'/'en' track is a TRANSLATION we must never show as the lyrics."""
+    'zh-TW'/'en' track is a TRANSLATION we must never show as the lyrics.
+
+    ``any_lang=True`` (SUBTITLES mode): a show's own captions are useful in
+    whatever language they exist — accept the best remaining track (e.g. 'en')
+    instead of rejecting non-CJK outright."""
     order = ([lang] if lang in ("ja", "zh", "ko") else []) + \
-            ["ja", "zh-Hans", "zh", "zh-Hant", "ko"]
+            ["ja", "zh-Hans", "zh", "zh-Hant", "ko"] + \
+            (["en"] if any_lang else [])
     files = glob.glob(str(dest / "*.vtt"))
     if not files:
         return None
@@ -303,13 +313,16 @@ def _captions_from_dir(dest: Path, lang: str | None):
     files.sort(key=lambda f: rank(f)[0])
     r, w = rank(files[0])
     if r == 99:
-        return None                      # only translation tracks → don't use
+        if not any_lang:
+            return None                  # only translation tracks → don't use
+        w = None                         # subtitles: take whatever track exists
     try:
         lines = _parse_vtt(Path(files[0]))
     except Exception:
         return None
     clang = ("zh" if w and w.startswith("zh") else
-             "ko" if w == "ko" else "ja")
+             "ko" if w == "ko" else
+             "en" if w == "en" or (w is None and any_lang) else "ja")
     return (lines, clang) if len(lines) >= 6 else None
 
 
@@ -334,7 +347,8 @@ def _normalize_youtube_url(q):
     return q
 
 
-def fetch_captions_only(query: str, lang: str | None = None):
+def fetch_captions_only(query: str, lang: str | None = None,
+                        max_dur: int | None = None, any_lang: bool = False):
     """FAST path: download ONLY the caption track (no audio, no Whisper) for the
     top YouTube hit for `query`, parse it to timed lines → (lines, lang) or None.
 
@@ -360,7 +374,10 @@ def fetch_captions_only(query: str, lang: str | None = None):
         # all CJK langs at once fired 5× the sub requests → YouTube 429s, and one
         # lang's error aborted the whole fetch. ignoreerrors keeps a single
         # rate-limited lang from killing the others.
-        if lang in ("ja", "ko"):
+        if any_lang:
+            # SUBTITLES mode: a show's manual captions help in ANY language.
+            langs = ["ja", "en", "ko", "zh-Hans", "zh-Hant", "zh"]
+        elif lang in ("ja", "ko"):
             langs = [lang]
         elif lang == "zh":
             langs = ["zh-Hans", "zh-Hant", "zh"]
@@ -374,7 +391,10 @@ def fetch_captions_only(query: str, lang: str | None = None):
             # and cap extractor work so a slow/blocked fetch can't burn CPU for
             # long (a pile-up of these stuttered the audio).
             "outtmpl": str(tmp / "c.%(ext)s"), "retries": 1, "socket_timeout": 15,
-            "match_filter": yt_dlp.utils.match_filter_func(f"duration < {_MAX_DUR}"),
+            # SUBTITLES mode passes max_dur so full-length EPISODES (20-40 min)
+            # aren't rejected by the song-sized cap.
+            "match_filter": yt_dlp.utils.match_filter_func(
+                f"duration < {int(max_dur or _MAX_DUR)}"),
             # MANUAL subs ONLY — the v1.0.25 behaviour. YouTube AUTO-captions (ASR)
             # are close-but-WRONG (鉄後/ラッキラ mis-hearings), carry [音楽]/[Music]
             # sound tags, and ROLL (each word repeats across overlapping cues), which
@@ -421,39 +441,51 @@ def fetch_captions_only(query: str, lang: str | None = None):
 
 
 def deep_transcribe(title: str, artist: str = "", lang: str | None = None,
-                    size: str = _DEEP_SIZE):
+                    size: str = _DEEP_SIZE, url: str | None = None,
+                    max_dur: int | None = None, romanize_rows: bool = True,
+                    translate_rows: bool = True, prefer_transcript: bool = False):
     """Full pipeline: search + download the source audio, then FIRST try REAL
     provider lyrics via the video's canonical (yt-dlp) title, and only transcribe
     by ear if that fails. DELETE the audio. Returns ``(lines, lang, meta)`` where
     ``meta`` is a provider dict for REAL lyrics or ``None`` for a by-ear
-    transcription; ``None`` on total failure. The audio is ALWAYS removed."""
+    transcription; ``None`` on total failure. The audio is ALWAYS removed.
+
+    SUBTITLES mode (v1.1.56): pass ``url`` for the EXACT playing video (a title
+    search could land on a different upload), ``max_dur`` to allow full-length
+    episodes past the song-sized cap, and romanize_rows/translate_rows=False to
+    skip a hidden layer's annotation work."""
     if not available():
         return None
-    query = f"{title} {artist}".strip()
+    query = url or f"{title} {artist}".strip()
     if not query:
         return None
     tmp = Path(tempfile.mkdtemp(prefix="dk_deep_"))
     try:
-        audio, canon = _download_audio(query, tmp)
+        audio, canon = _download_audio(query, tmp, max_dur=max_dur)
         if not audio:
             return None
         # 1) The video's OWN manual caption track — exact official lyrics WITH the
         #    video's exact timing (perfect sync, no offset). Strictly best.
-        caps = _captions_from_dir(tmp, lang)
+        caps = _captions_from_dir(tmp, lang, any_lang=prefer_transcript)
         if caps:
             clines, clang = caps
             try:
                 import fetch_lyrics as F
-                F.annotate(clines, clang, translate=True)
+                F.annotate(clines, clang, translate=translate_rows,
+                           romanize_rows=romanize_rows)
             except Exception:
                 pass
             log.info("deep: using OFFICIAL caption track — %d %s lines (exact video timing)",
                      len(clines), clang)
             return clines, clang, {"source": "youtube-captions"}
-        # 2) REAL provider lyrics reachable via the canonical title.
-        real = _real_from_canonical(canon, artist)
-        if real:
-            return real
+        # 2) REAL provider lyrics reachable via the canonical title. SKIPPED in
+        #    subtitles mode (prefer_transcript): an EPISODE title fuzzy-matching
+        #    any provider LRC would return a random SONG body as "real lyrics"
+        #    instead of the episode transcript.
+        if not prefer_transcript:
+            real = _real_from_canonical(canon, artist)
+            if real:
+                return real
         log.info("deep: transcribing %s (%d KB) with %s",
                  audio.name, audio.stat().st_size // 1024, size)
         lines, detected = transcribe_file(audio, lang=lang, size=size)
