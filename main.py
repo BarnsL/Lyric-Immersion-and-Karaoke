@@ -10414,6 +10414,8 @@ class Overlay:
     def _apply_hidden(self):
         hidden = getattr(self, "_hidden", False)
         gpu = getattr(self, "_gpu_rendering", False)
+        # Main Tk root: withdrawn on hide, and also while the GPU (Tauri) overlay is
+        # the live renderer (Tk is the fallback path).
         try:
             if hidden or gpu:
                 self.root.withdraw()
@@ -10424,6 +10426,31 @@ class Overlay:
                 self._click_through()              # ...and click-through after re-showing
         except Exception:
             pass
+        # The dancing character lives in its OWN Toplevel — root.withdraw() doesn't
+        # touch it, so Show/Hide used to leave the sprite dancing on top of every
+        # other window. Track _hidden directly (character is Tk-only, independent
+        # of the GPU-vs-CPU render choice); restore only when the user has it on.
+        char = getattr(self, "character", None)
+        if char is not None:
+            try:
+                if hidden:
+                    char.win.withdraw()
+                elif getattr(char, "enabled", False):
+                    char.win.deiconify()
+                    char.win.attributes("-topmost", True)
+            except Exception:
+                pass
+        # Mirror-mode clone windows (one Toplevel per secondary monitor, created by
+        # _create_mirrors) are separate from root too — same fix. They're display
+        # clones, not GPU-managed, so gpu state doesn't gate them.
+        for w in getattr(self, "_mirrors", None) or ():
+            try:
+                if hidden:
+                    w.withdraw()
+                else:
+                    w.deiconify()
+            except Exception:
+                pass
 
     def refetch(self):
         self._fetch_key = None
