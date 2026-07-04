@@ -3355,7 +3355,15 @@ class Overlay:
         # studio reset-to-0 strategy strands the lyrics 30-90 s out of sync
         # for the whole song (the 名前のない怪物 / 快晴 by 音乃瀬奏 cases).
         # Treat covers like live-arrangements: FOLLOW the measured offset.
+        # v1.1.56 (後悔史 fix): evaluate the live marker on the RAW player title
+        # too — clean_title strips a trailing " - LIVE at 日本武道館" as a dash-
+        # version subtitle BEFORE this check ever saw it, so an official single-
+        # song live video ran in studio/MV-intro mode: one fixed offset pinned a
+        # 244s studio LRC to a 433s live arrangement, and correct lyrics surfaced
+        # at wildly wrong moments (read as "wrong lyrics").
         self._live_arrangement = (is_live_arrangement(title)
+                                  or is_live_arrangement(
+                                      getattr(self, "_last_raw_title", "") or "")
                                   or bool(getattr(self, "_is_cover", False)))
         self._sync_event("mode_change", title=title, cover=getattr(self, "_is_cover", False),
                          live_arrangement=self._live_arrangement,
@@ -6196,6 +6204,23 @@ class Overlay:
             return
         self._last_mon_check = now
         self._apply_dynamic_priority()        # TICKET-127: yield harder to a running game
+        # Mirror-window hygiene (v1.1.56): (a) SELF-HEAL — a mirror Toplevel must
+        # never outlive mirror mode (a leaked one froze stale lyrics on the other
+        # screen); (b) FRESHNESS — while the GPU overlay renders, the Tk _render
+        # path that used to repaint mirrors doesn't run, so refresh them here on
+        # line change (and clear them between lines / in belt mode).
+        if self._mirrors and self.display != "mirror":
+            self._destroy_mirrors()
+        elif self._mirrors:
+            key = (self._track_seq, self.idx)
+            if key != getattr(self, "_mirror_key", None):
+                self._mirror_key = key
+                try:
+                    cur_ln = (self.lines[self.idx]
+                              if (self.lines and 0 <= self.idx < len(self.lines)) else None)
+                    self._update_mirrors(cur_ln)
+                except Exception:
+                    pass
         mons = _monitors()
         cur = _mon_snapshot_key(mons)
         if cur == self._mon_snapshot:
@@ -9965,17 +9990,27 @@ class Overlay:
         self._apply_scale()          # re-font + re-layout for the new width/height
         self._place_window()
         self.root.update_idletasks()
+        # Restart the GPU overlay window whenever its REAL bounds must change.
+        # v1.1.56 FIX (live-caught: span → mirror → primary left the belt painted
+        # across BOTH displays): 'mirror' used to be excluded from restarts while
+        # _tauri_bounds was recorded anyway — so the recorded bounds said
+        # "primary" while the actual window still covered everything, and the
+        # next switch compared equal and skipped the restart too. Rules now:
+        # 'cycle' never restarts (a per-line restart storm) and never records;
+        # every other mode restarts when the target differs from the bounds the
+        # window ACTUALLY has, and records only what it applies.
         restart_tauri = (
-            self.display not in ("mirror", "cycle")
+            self.display != "cycle"
             and tauri_bounds is not None
             and tauri_bounds != getattr(self, "_tauri_bounds", None)
         )
-        self._tauri_bounds = tauri_bounds
-        if restart_tauri and getattr(self, "tauri_overlay_on", False):
-            try:
-                self._restart_tauri_overlay(reason="display-change")
-            except Exception as e:
-                log.info("tauri overlay restart after display change failed: %s", e)
+        if restart_tauri:
+            self._tauri_bounds = tauri_bounds
+            if getattr(self, "tauri_overlay_on", False):
+                try:
+                    self._restart_tauri_overlay(reason="display-change")
+                except Exception as e:
+                    log.info("tauri overlay restart after display change failed: %s", e)
 
     def display_state(self):
         """GET /display — the live multi-monitor picture: current mode, the
@@ -13288,6 +13323,25 @@ class Overlay:
             return False
         return True
 
+    def _overlay_real_rect(self):
+        """The Tauri overlay window's ACTUAL screen rect [x, y, w, h] via Win32,
+        or None. Ground truth for the watchdog's bounds verification — the
+        recorded _tauri_bounds is only what we ASKED for (a lesson learned: the
+        two diverged and the belt kept painting across every display)."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            hwnd = u.FindWindowW(None, "Lyric Overlay")
+            if not hwnd:
+                return None
+            r = wintypes.RECT()
+            if not u.GetWindowRect(hwnd, ctypes.byref(r)):
+                return None
+            return [r.left, r.top, r.right - r.left, r.bottom - r.top]
+        except Exception:
+            return None
+
     def _overlay_window_visible(self):
         """True iff the Tauri overlay child has a VISIBLE top-level 'Lyric
         Overlay' window right now. This is the ground-truth render check the
@@ -13388,6 +13442,29 @@ class Overlay:
                 return
             fresh = (time.time() - getattr(self, "_overlay_ping_t", 0)) < stale_s
             confirmed = fresh and self._overlay_window_visible()
+            # BOUNDS VERIFY + SELF-HEAL (v1.1.56, live-caught): under rapid display
+            # switches the overlay occasionally comes up at its config-default rect
+            # instead of the env bounds (Rust applies them late or not at all).
+            # Compare the REAL window rect to what we launched it with; two
+            # consecutive mismatches (~3s) → one corrective restart (30s cooldown
+            # so a genuinely unsettable rect can't restart-loop).
+            if confirmed and self.display != "cycle":
+                want = getattr(self, "_tauri_bounds", None)
+                real = self._overlay_real_rect()
+                if want and real and list(real) != list(want):
+                    self._wd_rect_miss = getattr(self, "_wd_rect_miss", 0) + 1
+                    if (self._wd_rect_miss >= 2
+                            and time.time() - getattr(self, "_wd_rect_fix_t", 0) > 30.0):
+                        self._wd_rect_miss = 0
+                        self._wd_rect_fix_t = time.time()
+                        log.info("tauri overlay at %s but should cover %s — "
+                                 "corrective restart", real, want)
+                        try:
+                            self._restart_tauri_overlay(reason="bounds-mismatch")
+                        except Exception:
+                            pass
+                else:
+                    self._wd_rect_miss = 0
             if confirmed and not getattr(self, "_gpu_rendering", False):
                 self._gpu_rendering = True       # GPU proven → it takes over
                 try:
