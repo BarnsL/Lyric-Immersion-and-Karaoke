@@ -2281,6 +2281,8 @@ class Overlay:
         self._music_source_last_t = time.time()
         self._last_ocr_t = 0.0        # throttle the concert OCR check
         self._ocr_song = None         # last song the banner OCR confidently read
+        self._concert_setlist = None  # live video's chapter setlist [(start,title)…]
+        self._setlist_idx = None      # chapter index currently showing
         self._generating = False      # Whisper lyric-generation in progress
         self._gen_stall_refetch_seq = None  # track that already used its stall re-fetch
         self._gen_token = 0           # bumped on track change / real-lyric load to stop generation
@@ -2928,6 +2930,9 @@ class Overlay:
             # generation stall watchdog (new-install 'stuck generating' fix)
             "gen_stall_timeout_s":         75.0,  # abandon a zero-output generation
             "gen_model_dl_timeout_s":     240.0,  # longer grace while the model downloads (first run)
+            # concert setlist: use the live video's YouTube CHAPTERS as the
+            # per-song source of truth (titles + boundaries); OCR/by-ear fall back
+            "concert_setlist_on":             1,
         }
         # v1.1.53 — PERSISTED live-tune overrides. POST /tune?persist=1 writes the
         # changed key into settings.json under "tune_overrides"; re-apply them here at
@@ -3443,6 +3448,19 @@ class Overlay:
             self._body_corroborated = False       # kamone fix: BODY re-earns corroboration per song
             self._body_probe_retried = False
             self._verified_gate_t = 0.0           # TICKET batch4: real track change, no gate
+            # v1.1.56: the event title is worthless — a lock must NEVER survive
+            # into a concert (a stale/speculative lock gagged Shazam's correct
+            # per-song IDs for 10 strikes each).
+            self._title_locked = False
+            # SETLIST (v1.1.56): most 3D-live uploads carry YouTube CHAPTERS with
+            # per-song titles + exact start times — deterministic recognition.
+            # Fetch them in the background; _concert_setlist_tick drives per-song
+            # fetches at each boundary and OCR/by-ear stay as fallbacks.
+            self._concert_setlist = None
+            self._setlist_idx = None
+            if int(self._tune.get("concert_setlist_on", 1)):
+                threading.Thread(target=self._load_concert_setlist,
+                                 args=(self._track_seq,), daemon=True).start()
             self._hint("🎤 Live set — listening for each song…")
         else:
             # Provisional: show the title/artist match instantly (so there's no
@@ -4557,7 +4575,16 @@ class Overlay:
             # screen — read it (a high-confidence hint that Shazam can't beat on a
             # live arrangement) and switch to the right lyrics. Throttled, on a
             # background thread. See concert_ocr.py / docs/CONCERT_DETECTION.md.
+            # SETLIST first (v1.1.56): when the video ships CHAPTERS, per-song
+            # titles + boundaries are deterministic — check every pass (cheap
+            # bisect); OCR stays the fallback for chapterless concerts.
+            if st and st.get("status") == PLAYING and self._live_mode:
+                try:
+                    self._concert_setlist_tick(float(st.get("position") or 0.0))
+                except Exception:
+                    pass
             if (st and st.get("status") == PLAYING and self._live_mode
+                    and not getattr(self, "_concert_setlist", None)
                     and self.concert_ocr and time.time() - self._last_ocr_t > 6.0):
                 self._last_ocr_t = time.time()
                 threading.Thread(target=self._concert_ocr_check, daemon=True).start()
@@ -4654,6 +4681,15 @@ class Overlay:
             return
         # 2) a plausible banner title we DON'T have yet → fetch it ('Departures', …),
         #    so the concert detection isn't limited to pre-cached songs.
+        # v1.1.56 GARBAGE GUARD: the capture can land on the WRONG window and
+        # "read" another window's title bar / tab text (live-caught: the EcoGPT
+        # tab 'Sustainable AI Chat That…' was fetched as a song, repeatedly).
+        # Any OCR text that fuzzy-matches an OPEN top-level window title is
+        # window chrome, not a lyric banner — discard it.
+        if uncached and self._text_matches_window_title(uncached):
+            log.info("concert OCR read %r matches an open WINDOW title — "
+                     "chrome, not a banner; discarded", uncached)
+            return
         if (uncached and not self._titles_match(cur, uncached)
                 and uncached != self._ocr_song):
             self._ocr_song = uncached
@@ -4693,11 +4729,135 @@ class Overlay:
         """(Tk thread) the concert banner named a song we DON'T have cached — fetch its
         lyrics COVER-style (the banner gives the SONG; the concert group isn't its
         artist, so a title-first lookup finds the original — e.g. 'Departures'). The
-        loaded result shows the moment the fetch resolves (_consume_async)."""
+        loaded result shows the moment the fetch resolves (_consume_async).
+
+        v1.1.56: NO title-lock here. Locking on a SPECULATIVE read (nothing loaded
+        yet) armed the lock against an EMPTY title — live-caught: a wrong-window
+        OCR read ('Sustainable AI Chat…', a browser tab) locked the app, and
+        Shazam's CORRECT per-song concert IDs ('Melt', 'Ashura-chan') were then
+        'ignoring sound — title-locked to ""' for 10 strikes per song. The lock is
+        earned in _apply_ocr_song, where a real body actually loads."""
         log.info("concert OCR read uncached %r → fetching (cover-style)", title)
-        self._title_locked = True               # OCR is authoritative in a concert
         self._hint(f"🎤 {title} — fetching…")
         self._start_fetch("", title, None, cover=True)
+
+    def _text_matches_window_title(self, text):
+        """True when OCR'd text is really an open WINDOW's title (chrome, not a
+        lyric banner) — the capture can land on the wrong window and read its
+        title bar / tab text (live-caught: a browser tab 'Sustainable AI Chat…'
+        was fetched as a concert song, repeatedly)."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            from rapidfuzz import fuzz
+            u = ctypes.windll.user32
+            probe = (text or "").strip().lower()
+            if len(probe) < 6:
+                return False
+            titles = []
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            def _cb(hwnd, _l):
+                if u.IsWindowVisible(hwnd):
+                    n = u.GetWindowTextLengthW(hwnd)
+                    if n > 5:
+                        buf = ctypes.create_unicode_buffer(n + 1)
+                        u.GetWindowTextW(hwnd, buf, n + 1)
+                        titles.append(buf.value.lower())
+                return True
+
+            u.EnumWindows(_cb, 0)
+            return any(fuzz.partial_ratio(probe, t) >= 82 for t in titles if t)
+        except Exception:
+            return False
+
+    # ── Concert SETLIST (YouTube chapters) — deterministic per-song titles ──
+    def _load_concert_setlist(self, seq):
+        """(background thread) Pull the live video's CHAPTERS — most 3D-live
+        uploads carry per-song titles with exact start times, which beats every
+        by-ear signal. Resolved by the exact URL when the browser pushed one,
+        else a yt-dlp title search. Best-effort; on failure OCR/by-ear stand."""
+        try:
+            import yt_dlp
+        except Exception:
+            return
+        query = (getattr(self, "_now_url", None)
+                 or f"ytsearch1:{(getattr(self, '_last_raw_title', '') or '').strip()}")
+        if query == "ytsearch1:":
+            return
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
+                                   "skip_download": True, "noplaylist": True,
+                                   "extract_flat": False}) as y:
+                info = y.extract_info(query, download=False)
+            if info and "entries" in info:
+                info = (info.get("entries") or [None])[0] or {}
+            ch = [{"start": float(c.get("start_time") or 0.0),
+                   "title": str(c.get("title") or "").strip()}
+                  for c in (info.get("chapters") or []) if isinstance(c, dict)]
+        except Exception as e:
+            log.info("setlist: chapter fetch failed (%s) — OCR/by-ear stand", e)
+            return
+        if seq != self._track_seq:
+            return                          # video changed while we fetched
+        if len(ch) >= 2:
+            self._concert_setlist = ch
+            self._setlist_idx = None
+            log.info("setlist: %d chapters → deterministic per-song recognition: %s",
+                     len(ch), " | ".join(f"{int(c['start'])}s {c['title'][:24]}" for c in ch[:12]))
+        else:
+            log.info("setlist: no usable chapters on this video — OCR/by-ear stand")
+
+    # Chapter names that mark NON-SONG segments (talk blocks, intros) — exact,
+    # case-insensitive. 'After Talk'/アフタートーク is the standard VTuber
+    # concert talk segment.
+    _SETLIST_SKIP = {"intro", "outro", "mc", "talk", "after talk", "アフタートーク",
+                     "opening", "ending", "encore", "start", "end", "intermission"}
+
+    def _concert_setlist_tick(self, pos):
+        """(Tk thread, every recal pass) Map the live position onto the chapter
+        setlist; on entering a new SONG chapter, fetch that song by title —
+        the deterministic replacement for banner OCR + by-ear identification."""
+        sl = getattr(self, "_concert_setlist", None)
+        if not sl:
+            return
+        idx = 0
+        for i, c in enumerate(sl):
+            if pos >= c["start"] - 1.0:
+                idx = i
+        if idx == self._setlist_idx:
+            return
+        self._setlist_idx = idx
+        title = sl[idx]["title"]
+        if not title or title.strip().lower() in self._SETLIST_SKIP:
+            log.info("setlist: chapter %d %r @%.0fs is a non-song segment — waiting",
+                     idx, title, pos)
+            return
+        log.info("setlist: chapter %d/%d %r @%.0fs → per-song fetch",
+                 idx + 1, len(sl), title, pos)
+        # fresh song state (mirrors the banner-OCR flow, minus the lock — Shazam
+        # remains free to corroborate or veto once the body loads)
+        self._title_locked = False
+        self._sound_fail_streak = 0
+        self._last_heard_contra = None
+        self._ocr_song = title              # keep OCR from double-fetching it
+        artist = (self._track or ("", ""))[0]
+        cached = (self.index.match(artist, title, None)
+                  or self.index.match("", title, None))
+        if cached and self._file_valid(cached, None):
+            if cached != self._lyrics_path:
+                log.info("setlist: cached %s", cached.name)
+                self.load(cached)
+                self._maybe_translate()
+                self._verified_meta = True
+                self._set_verified(True, reason="concert-setlist")
+                self.offset = 0.0
+                self._fast_calib = max(self._fast_calib, 2)
+                self._arm_recal(5)
+                self._start_identify(seconds=6, attempts=2)   # lock timing by sound
+        else:
+            self._hint(f"🎤 {title} — fetching…")
+            self._start_fetch("", title, None, cover=True)
 
     def _viewport_watchdog(self):
         """Light keeper for the FIXED full-work-area window. The window never
@@ -5243,7 +5403,11 @@ class Overlay:
                     log.info("smtc-paused-takeover: heard %r ≠ loaded %r (SMTC paused) "
                              "— awaiting 2nd agreeing read",
                              f_title, self.meta.get("title", ""))
-                elif self._title_locked:
+                elif self._title_locked and (self.meta.get("title") or "").strip():
+                    # v1.1.56: the gate requires a LOADED title — a lock with an
+                    # empty meta title (speculative OCR fetch armed it before any
+                    # body landed) blocked Shazam's correct concert IDs against
+                    # nothing at all ('ignoring sound — title-locked to ""').
                     # The lyrics came from a confident EXACT match on a clean
                     # official title, but Shazam heard a DIFFERENT song — usually a
                     # mis-ID of another track by the SAME artist (feelingradation

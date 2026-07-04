@@ -409,6 +409,13 @@ def extract_video_metadata(url_or_id: str,
         result: dict[str, Any] = {
             "video_id": vid,
             "title_raw": info.get("title") or None,
+            # Concert setlist: YouTube CHAPTERS carry per-song titles + exact
+            # start times on most 3D-live uploads — deterministic recognition
+            # (main.py _concert_setlist_tick consumes these in live mode).
+            "chapters": [{"start": float(c.get("start_time") or 0.0),
+                          "title": str(c.get("title") or "")[:120]}
+                         for c in (info.get("chapters") or [])
+                         if isinstance(c, dict)],
             "channel": info.get("channel") or None,
             "uploader": info.get("uploader") or None,
             "description": desc or None,
