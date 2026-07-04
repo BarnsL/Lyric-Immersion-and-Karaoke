@@ -1154,6 +1154,12 @@ def _strip_title_credits(t):
 # time (same spirit as gairaigo.py). Keys match on a normalized form.
 _NATIVE_TITLE_ALIASES_RAW = {
     "feelingradation": "フィーリングラデーション",   # hololive DEV_IS ReGLOSS
+    # RADWIMPS (君の名は。) — YouTube titles these in romaji; providers index the
+    # NATIVE-script synced bodies under the Japanese titles, and the romaji-titled
+    # uploads are bare transliterations. ('sparkle' is NOT aliased: too generic —
+    # many unrelated songs share that English title.)
+    "zenzenzense": "前前前世",
+    "nandemonaiya": "なんでもないや",
 }
 
 

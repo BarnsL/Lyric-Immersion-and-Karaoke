@@ -447,8 +447,15 @@ def _looks_romaji(text: str) -> bool:
     original kanji/kana version. False for English / Spanish / German / actual CJK.
     Needs BOTH a high fraction of mora-shaped words AND a couple of unmistakably
     Japanese tokens, so vowel-rich Romance text isn't misread as romaji."""
-    if detect_lang(text) != "other":
-        return False                              # real CJK/Cyrillic/Spanish/German
+    ll = detect_lang(text)
+    if ll in ("ja", "ko", "zh", "ru", "el"):
+        return False                              # real non-Latin script present
+    # DO NOT trust an 'es'/'de' verdict here: romaji is FULL of Spanish-lookalike
+    # function words (no/me/de/te/se/mi/…), so detect_lang misreads a LONG romaji
+    # body as Spanish — a full 42-line Zenzenzense transliteration classified
+    # 'es', skipped the romaji tagging, and shipped bare romaji with no native
+    # upgrade and no translation. For Latin text let the structural test decide,
+    # with MORE unmistakable-Japanese markers required when es/de was suspected.
     words = [w for w in re.findall(r"[a-z']+", text.lower()) if len(w) > 1]
     if len(words) < 6:
         return False
@@ -457,7 +464,8 @@ def _looks_romaji(text: str) -> bool:
         return False                              # mostly English → it's English
     structural = sum(1 for w in words if _romaji_word(w))
     marks = sum(1 for w in set(words) if w in _ROMAJI_MARK)
-    return structural >= len(words) * 0.6 and marks >= 2
+    need_marks = 3 if ll in ("es", "de") else 2
+    return structural >= len(words) * 0.6 and marks >= need_marks
 
 
 def slugify(title: str) -> str:
