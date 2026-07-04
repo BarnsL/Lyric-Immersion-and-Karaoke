@@ -7,6 +7,8 @@ lyrics over whatever you're playing — built for learning Japanese (plus Chines
 Korean, Spanish, German, and Russian) by singing along.**
 
 > ### ⬇️ Just want to use it? [**Download the latest release**](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest) → run **`Lyric-Immersion-and-Karaoke-Setup.exe`** (no admin needed) → done. Prefer no installer? Grab the portable **`.zip`** from the same page, extract, and double-click `Lyric-Immersion-and-Karaoke.exe`. No Python, no account.
+>
+> **Windows today.** Linux and macOS ports are planned — the full engineering plan lives in [docs/PORTING.md](docs/PORTING.md) (Linux first: it can reach near-parity; macOS will launch with per-player support).
 
 Play a song in **Spotify, YouTube, or any app** that talks to Windows' media
 controls, and Lyric Immersion and Karaoke pulls the **real playback position** and streams

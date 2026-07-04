@@ -26,3 +26,9 @@ HOW TO USE IT
    automatically across your screen - with furigana, romaji, and an English
    translation. The overlay never steals focus, so you can keep working,
    watching, or gaming while it runs.
+
+FIRST RUN
+   The very first time a song needs AI lyric generation, the app downloads its
+   voice model (about 200 MB) and says so on screen - that happens once. Updates
+   are automatic: when a new version ships, the tray menu offers a one-click
+   "Install update".
