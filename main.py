@@ -3058,6 +3058,14 @@ class Overlay:
             # per-song source of truth (titles + boundaries); OCR/by-ear fall back
             "concert_setlist_on":             1,
             "setlist_gen_deadline_s":      45.0,  # chapter w/o lyrics → generate by ear
+            # v1.1.57 OFFLINE CONCERT AUDIO ANALYSIS (concert_audio.py) — download
+            # the concert once, find each song's true vocal onset + fingerprint it.
+            "concert_audio_on":               1,  # master switch for the offline pass
+            "concert_audio_identify":         1,  # fingerprint each segment (offline Shazam)
+            "concert_audio_max_dur_s":     4800,  # >80 min ⇒ not a single concert upload
+            "concert_audio_min_song_s":    45.0,  # min sustained song length (energy mode)
+            "concert_audio_floor_frac":    0.40,  # vocal floor as a fraction of the loud level
+            "concert_audio_id_slice_s":    12.0,  # seconds fingerprinted per segment
         }
         # v1.1.53 — PERSISTED live-tune overrides. POST /tune?persist=1 writes the
         # changed key into settings.json under "tune_overrides"; re-apply them here at
@@ -3570,6 +3578,14 @@ class Overlay:
                      _live_dur or 0.0, (_live_dur or 0.0) / 60.0, title)
         # TICKET-109: new track => decision engine forgets the prior song's strikes
         self._reset_decision_engine()
+        # v1.1.57 — always drop the previous concert's state so a concert
+        # followed by a regular song can't carry stale plan/setlist forward.
+        # The live-mode block below re-arms them for a NEW concert.
+        self._concert_setlist = None
+        self._setlist_idx = None
+        self._concert_plan = None
+        self._concert_plan_seq = -1
+        self._live_video_nonmusic = False
         # STALE-URL guard (v1.1.56): _now_url belongs to a VIDEO, not a session.
         # On a track change, a URL pushed for the PREVIOUS video must not feed
         # this track's caption fetch / episode download (transcribing the wrong
@@ -3617,9 +3633,7 @@ class Overlay:
             # per-song titles + exact start times — deterministic recognition.
             # Fetch them in the background; _concert_setlist_tick drives per-song
             # fetches at each boundary and OCR/by-ear stay as fallbacks.
-            self._concert_setlist = None
-            self._setlist_idx = None
-            self._live_video_nonmusic = False   # re-decided per video (category gate)
+            # (concert/plan/nonmusic state already cleared above, per track)
             if int(self._tune.get("concert_setlist_on", 1)):
                 threading.Thread(target=self._load_concert_setlist,
                                  args=(self._track_seq,), daemon=True).start()
@@ -5089,16 +5103,36 @@ class Overlay:
                 # video is MUSIC. YouTube's own category is authoritative when
                 # present; long sentence-like chapter names are the fallback tell.
                 cats = [str(c).lower() for c in (info.get("categories") or [])]
-                if cats and "music" not in cats:
+                # POSITIVE MUSIC-CONCERT signal overrides YouTube's category.
+                # VTuber 3D lives (Phase Connect / hololive Offkai concerts) are
+                # routinely tagged Entertainment / Film & Animation, NOT Music,
+                # yet they ARE multi-song concerts — the blanket "category ≠
+                # Music → off" kill was disabling the whole concert pipeline for
+                # exactly the videos it exists to serve.
+                # The signal MUST be a real concert cue: _LIVE_RE matches
+                # 'concert/live/setlist/medley/ワンマン/3D LIVE…' etc. A language
+                # classifier (is_jp_vagency) would fire on any JP documentary
+                # title, re-opening the Tartaria class — so it is used ONLY in
+                # combination with a live cue, never on its own. The
+                # sentence-like-chapter documentary tell below is a second
+                # backstop that runs even when the signal keeps chapters.
+                vid_title = str(info.get("title") or "")
+                raw_title = (getattr(self, "_last_raw_title", "") or "")
+                music_signal = bool(_LIVE_RE.search(vid_title)
+                                    or _LIVE_RE.search(raw_title))
+                if cats and "music" not in cats and not music_signal:
                     # This long video is NOT music (documentary, essay, VOD…):
                     # no setlist, and ALSO no concert banner-OCR — on these
                     # videos OCR only ever finds junk (tab text, video titles)
                     # and burns fetches on it. By-ear/Shazam stay available.
                     self._live_video_nonmusic = True
-                    log.info("setlist: video category %s ≠ Music — chapters are "
-                             "sections, not songs; setlist + concert-OCR off "
-                             "for this video", cats)
+                    log.info("setlist: video category %s ≠ Music (no concert/"
+                             "vagency signal) — chapters are sections, not songs; "
+                             "setlist + concert-OCR off for this video", cats)
                     ch = []
+                elif cats and "music" not in cats:
+                    log.info("setlist: category %s ≠ Music but title/artist signal "
+                             "a MUSIC concert — keeping the concert pipeline on", cats)
             except Exception as e:
                 log.info("setlist: chapter fetch failed (%s) — OCR/by-ear stand", e)
                 return
@@ -5122,6 +5156,78 @@ class Overlay:
                      len(ch), " | ".join(f"{int(c['start'])}s {c['title'][:24]}" for c in ch[:12]))
         else:
             log.info("setlist: no usable chapters on this video — OCR/by-ear stand")
+        # v1.1.57 — OFFLINE CONCERT AUDIO ANALYSIS: with the whole concert
+        # downloaded once, refine each song's ONSET (skip applause/intro) and
+        # CONFIRM its identity by fingerprinting a slice — far more reliable than
+        # live Shazam on a live arrangement (which returned -748s offsets), and
+        # jank-free (pure background numpy, no WASAPI capture). When the video
+        # had no chapters this BUILDS the setlist from the energy envelope.
+        # Gated off for a non-music video and behind a tune knob. See
+        # docs/CONCERT_AUDIO_SYNC.md and concert_audio.py.
+        if (int(self._tune.get("concert_audio_on", 1))
+                and not getattr(self, "_live_video_nonmusic", False)
+                and getattr(self, "_now_url", None)):
+            threading.Thread(target=self._analyze_concert_audio,
+                             args=(seq, self._now_url, list(ch)), daemon=True).start()
+
+    def _analyze_concert_audio(self, seq, url, chapters):
+        """(background thread) Download + analyse the concert audio offline and
+        install the resulting per-song PLAN (onsets + Shazam ids). Best-effort:
+        any failure leaves the chapter/OCR/by-ear path untouched."""
+        try:
+            import concert_audio
+        except Exception:
+            return
+        if seq != self._track_seq:
+            return
+        plan = concert_audio.analyze(
+            url, chapters=chapters,
+            max_dur=int(self._tune.get("concert_audio_max_dur_s", 4800)),
+            want_ids=bool(int(self._tune.get("concert_audio_identify", 1))),
+            tune=self._tune,
+            is_seq_current=lambda: seq == self._track_seq)
+        if not plan or seq != self._track_seq:
+            return
+        try:
+            self.root.after(0, lambda: self._apply_concert_plan(seq, plan))
+        except Exception:
+            pass
+
+    def _apply_concert_plan(self, seq, plan):
+        """(Tk thread) store the offline plan and, when the video had no usable
+        chapters, SYNTHESISE the setlist from it so the existing per-song tick
+        drives lyric loading. The plan also feeds precise onset anchors + a
+        Shazam-confirmed title into _concert_setlist_tick."""
+        if seq != self._track_seq:
+            return
+        self._concert_plan = plan
+        self._concert_plan_seq = seq
+        # No chapters → the plan IS the setlist, but ONLY for segments the
+        # offline fingerprint actually NAMED. A segment with no id gets NO
+        # synthesized title (never a blind 'Song N' fetch of garbage) — its
+        # onset anchor still applies via _plan_for_pos, and the existing live
+        # by-ear/boundary path handles it. Most concerts DO have chapters (the
+        # refinement path); this branch is the chapterless fallback.
+        if not getattr(self, "_concert_setlist", None):
+            sl = [{"start": float(s["start"]), "title": s["title"].strip()}
+                  for s in plan
+                  if (s.get("title") or "").strip()
+                  and s.get("id_conf", 0.0) >= 0.70
+                  and s.get("end", 0) - s.get("start", 0) >= 8.0]
+            if len(sl) >= 2:
+                self._concert_setlist = sl
+                self._setlist_idx = None
+                log.info("concert-audio: built a %d-song setlist from the energy "
+                         "envelope + fingerprints (no chapters on this video)", len(sl))
+        log.info("concert-audio: plan installed (%d segments) — per-song onsets "
+                 "and ids now drive setlist sync", len(plan))
+
+    def _plan_for_pos(self, pos):
+        """The offline plan segment covering VIDEO-second ``pos`` (or None)."""
+        for seg in getattr(self, "_concert_plan", None) or ():
+            if seg["start"] - 1.0 <= pos < seg.get("end", 1e18):
+                return seg
+        return None
 
     # Chapter names that mark NON-SONG segments (talk blocks, intros) — exact,
     # case-insensitive. 'After Talk'/アフタートーク is the standard VTuber
@@ -5169,16 +5275,48 @@ class Overlay:
         chapter_start = float(sl[idx]["start"])
         chapter_dur = (float(sl[idx + 1]["start"]) - chapter_start
                        if idx + 1 < len(sl) else None)
+        # v1.1.57 — OFFLINE PLAN refinement. The energy analysis found where the
+        # singing actually STARTS (past the applause/intro), and fingerprinted a
+        # slice to CONFIRM the song. Anchor to the vocal ONSET (so the first line
+        # lands on the first sung word, not during the crowd noise), and let a
+        # confident offline id override a generic/wrong chapter label ('La La La'
+        # was really a Melt cover).
+        plan_seg = self._plan_for_pos(pos) if getattr(self, "_concert_plan", None) else None
+        anchor = chapter_start
+        if plan_seg and plan_seg.get("onset") is not None:
+            anchor = float(plan_seg["onset"])
         log.info("setlist: chapter %d/%d %r @%.0fs → per-song fetch "
-                 "(anchor %.0fs, ~%.0fs long)",
-                 idx + 1, len(sl), title, pos, chapter_start, chapter_dur or -1)
+                 "(anchor %.0fs%s, ~%.0fs long)",
+                 idx + 1, len(sl), title, pos, anchor,
+                 " [audio-onset]" if anchor != chapter_start else "", chapter_dur or -1)
         # fresh song state (mirrors the banner-OCR flow, minus the lock — Shazam
         # remains free to corroborate or veto once the body loads)
         self._title_locked = False
         self._sound_fail_streak = 0
         self._last_heard_contra = None
-        self._ocr_song = title              # keep OCR from double-fetching it
         artist = (self._track or ("", ""))[0]
+        # OFFLINE ID vs CHAPTER LABEL: the fingerprint is most valuable when the
+        # chapter title is GENERIC/unhelpful ('La La La' was really a Melt cover;
+        # 'Song 3' from energy mode has no label at all). But a DISTINCTIVE,
+        # human-authored chapter title ('Face It') outranks a stray slice mis-ID
+        # ('Vaporwave City Tokyo') — keep it and let by-ear correct if truly
+        # wrong. Either way the audio ONSET anchor above still applies.
+        if (plan_seg and plan_seg.get("title") and plan_seg.get("id_conf", 0.0) >= 0.70
+                and plan_seg["title"].strip().lower() not in self._SETLIST_SKIP):
+            pid = plan_seg["title"].strip()
+            ch_distinct = (confidence.title_distinctiveness(title) >= 0.40
+                           and not _is_generic_title(title))
+            shares = bool(title) and self._titles_share_content(pid, title)
+            if not ch_distinct or shares:
+                if _norm_title(pid) and _norm_title(pid) != _norm_title(title):
+                    log.info("setlist: offline audio id %r outranks generic chapter "
+                             "label %r", pid, title)
+                title = pid
+                artist = plan_seg.get("artist") or artist
+            else:
+                log.info("setlist: chapter %r is distinctive — keeping it over "
+                         "offline id %r (onset anchor still applied)", title, pid)
+        self._ocr_song = title              # keep OCR from double-fetching it
         cached = (self.index.match(artist, title, None)
                   or self.index.match("", title, None))
         # A chapter title is a HINT, not truth — 'La La La' was really a Melt
@@ -5188,6 +5326,12 @@ class Overlay:
         # generation deadline below catches unfetchable originals either way.
         distinctive = (confidence.title_distinctiveness(title) >= 0.40
                        and not _is_generic_title(title))
+        # v1.1.57 — a synthesized 'Song N' placeholder (from an energy-derived
+        # segment with no Shazam id) must NEVER count as distinctive — a blind
+        # provider fetch of 'Song 1' returns garbage. Held for Shazam +
+        # generation backstop.
+        if re.match(r"^\s*song\s+\d+\s*$", title, re.I):
+            distinctive = False
         if cached and self._file_valid(cached, chapter_dur):
             if cached != self._lyrics_path:
                 log.info("setlist: cached %s", cached.name)
@@ -5195,16 +5339,17 @@ class Overlay:
                 self._maybe_translate()
                 self._verified_meta = True
                 self._set_verified(True, reason="concert-setlist")
-                # CHAPTER ANCHOR: the chapter's start time IS the song's t=0 —
-                # a fresh body without it ran on the RAW video clock (1811s into
-                # a 3-min LRC = blank screen). Live resync refines from here.
-                self.offset = -chapter_start
+                # ANCHOR: the song's t=0 in video time — the offline VOCAL
+                # ONSET when we have it (skips applause/intro), else the chapter
+                # start. Without it a fresh body ran on the RAW video clock
+                # (1811s into a 3-min LRC = blank screen). Live resync refines.
+                self.offset = -anchor
                 self._fast_calib = max(self._fast_calib, 2)
                 self._arm_recal(5)
                 self._start_identify(seconds=6, attempts=2)   # lock timing by sound
         elif distinctive:
             self._hint(f"🎤 {title} — fetching…")
-            self.offset = -chapter_start        # anchor for the body when it lands
+            self.offset = -anchor               # onset/chapter anchor for the body
             # chapter LENGTH as the expected duration: providers reject bodies
             # whose span can't be this song (the wrong same-title 'Remember You'
             # covered 8% of the chapter and would have been filtered)

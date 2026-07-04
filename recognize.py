@@ -74,6 +74,43 @@ async def _shazam(wav_bytes):
     return (title, artist, offset) if title else (None, None, None)
 
 
+def identify_pcm(pcm, sr=16000, attempts=2):
+    """Identify a numpy float32 PCM slice via Shazam — a slice of a DOWNLOADED
+    file, NOT live capture. Returns ``(title, artist, offset)`` (offset =
+    seconds into the matched song where this slice begins) or ``(None, None,
+    None)``.
+
+    This is the offline counterpart to ``recognize_playing``: the concert audio
+    analyzer (``concert_audio.py``) decodes a whole concert once, then calls this
+    on ~12s slices at each song's vocal onset to build a per-video setlist WITHOUT
+    the WASAPI loopback capture (no device enumeration, no GIL-heavy live record,
+    so it never janks the render loop). Shazam's fingerprinter accepts any WAV
+    bytes — the same code path ``recognize_playing`` feeds from the microphone."""
+    import numpy as np
+    try:
+        arr = np.asarray(pcm, dtype="float32")
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+        i16 = (np.clip(arr, -1.0, 1.0) * 32767).astype("<i2")
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(int(sr))
+            w.writeframes(i16.tobytes())
+        wav = buf.getvalue()
+    except Exception:
+        return (None, None, None)
+    for _ in range(max(1, attempts)):
+        try:
+            t, a, off = asyncio.run(_shazam(wav))
+            if t:
+                return (t, a, off)
+        except Exception:
+            pass
+    return (None, None, None)
+
+
 def recognize_playing(seconds=_DUR, attempts=2):
     """Identify the playing audio. Returns (title, artist, offset, t_cap):
       • offset = seconds into the song where the captured clip starts

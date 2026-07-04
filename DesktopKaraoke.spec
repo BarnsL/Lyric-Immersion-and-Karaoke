@@ -34,6 +34,9 @@ hiddenimports = [
     # pin so the frozen build includes it (stdlib urllib only, no new deps).
     "llm_disambiguate",
     "playlist_import", "playlist_import_gui", "concert_ocr", "ocr_lyrics", "deep_transcribe", "confidence",
+    # v1.1.57 offline concert audio analysis — lazy-imported in main.py's
+    # _analyze_concert_audio thread; pin so the frozen build includes it.
+    "concert_audio", "faster_whisper.audio",
     # TICKET-100: Discord IPC reader (lazy-imported in main.py only when the
     # tray toggle is ON, but pin it here so the frozen build includes it).
     "discord_rpc",
