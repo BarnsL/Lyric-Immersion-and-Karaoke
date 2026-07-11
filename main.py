@@ -19,6 +19,7 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -273,7 +274,7 @@ def _migrate_start_menu_shortcut():
                       f"$S.WorkingDirectory={_psq(workdir)};"
                       f"$S.IconLocation={_psq(target + ',0')};"
                       f"$S.Description='Transparent karaoke overlay with synced furigana, romaji, and English translation.';"
-                      f"$S.WindowStyle=7;"  # minimized, no-activate per CLAUDE.md app etiquette
+                      f"$S.WindowStyle=7;"  # minimized, no-activate for polite helper launch
                       f"$S.Save()")
             subprocess.run(["powershell", "-NoProfile", "-Command", ps_new],
                            capture_output=True, timeout=10,
@@ -303,6 +304,19 @@ PLAYING = 4  # GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing
 SCROLL_SPEED = 220.0  # px/sec — constant, comfortable scroll-through pace
 
 BROWSER_HINTS = ("youtube", "brave", "chrome", "msedge", "edge", "firefox", "opera", "mozilla")
+# v1.1.72 — dedicated MUSIC apps (SMTC source substrings): playback from these
+# is ALWAYS a song, so the Subtitles toggle must never hijack it. Deliberately
+# excludes generic video players (VLC, Films & TV) — those may play shows.
+_MUSIC_APP_HINTS = ("spotify", "itunes", "applemusic", "apple.music", "musicbee",
+                    "foobar", "winamp", "tidal", "deezer", "amazonmusic",
+                    "zunemusic", "music.ui")
+# v1.1.68 — anime streamer hostnames. Substring-matched against `_last_src`;
+# the hardsub-OCR fallback in `_subs_no_captions_fallback` only engages when
+# the source string carries one of these AND a browser hint.
+ANIME_HOSTS = (
+    "animepahe", "aniwave", "hianime", "9anime", "gogoanime",
+    "aniwatch", "zoro.to", "kickassanime", "animekai", "kaido",
+)
 # OCR burned-in-lyrics harvest tuning (TICKET-120): read the words off the VIDEO when no
 # provider/caption/bundle lyrics exist (niche Vocaloid etc.), BEFORE falling to AI gen.
 OCR_HARVEST_INTERVAL_S   = 1.6    # Tk-thread throttle between polls (encode hold lands on a frame)
@@ -320,6 +334,9 @@ _NON_MUSIC_TITLES = {
     "instagram", "tiktok", "facebook", "x", "twitter", "reddit", "snapchat",
     "threads", "tumblr", "linkedin", "pinterest", "discord", "whatsapp",
     "telegram", "messenger", "twitch", "vimeo", "dailymotion", "bilibili",
+    "netflix", "crunchyroll", "hidive", "funimation", "vrv", "disney+",
+    "disney plus", "hulu", "prime video", "amazon prime video", "9anime",
+    "animepahe", "aniwave", "hianime",
     "新しいタブ", "new tab",
 }
 
@@ -343,18 +360,27 @@ _SOCIAL_HOSTS = (
     "pinterest.com", "tumblr.com", "discord.com",
 )
 
-
-def _is_social_url(url):
-    """True if the browser-pushed URL is a social/short-video feed host."""
+def _url_host(url):
+    """Return a normalized hostname only; never expose the full URL in diag."""
     u = (url or "").strip()
     if not u:
-        return False
+        return ""
     try:
         from urllib.parse import urlparse
         host = (urlparse(u).hostname or "").lower()
+        return host[4:] if host.startswith("www.") else host
     except Exception:
-        return False
-    return bool(host) and any(host == h or host.endswith("." + h) for h in _SOCIAL_HOSTS)
+        return ""
+
+
+def _host_matches(host, hosts):
+    host = (host or "").lower()
+    return bool(host) and any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def _is_social_url(url):
+    """True if the browser-pushed URL is a social/short-video feed host."""
+    return _host_matches(_url_host(url), _SOCIAL_HOSTS)
 
 
 def _has_cjk(s):
@@ -1055,21 +1081,31 @@ def feat_artists_from_title(title):
     return out
 
 
-# Curated cover→original-artist hints for frequently-covered songs whose ORIGINAL
-# artist appears nowhere in the cover's title (so the title-only fallback can't
-# find them, and a bare-title search risks a same-title WRONG-LANGUAGE hit). This
-# is METADATA only — no lyrics — so it's compatible with the no-bundled-lyrics
+# Curated title→original-artist hints for frequently-covered / live-performed
+# songs whose ORIGINAL artist appears nowhere in the video title. This is
+# METADATA only — no lyrics — so it stays compatible with the no-bundled-lyrics
 # policy; the body still comes from providers/captions/OCR/by-ear. Keyed by the
 # cleaned, lowercased song title. The '!!!' in 'bang!!!' is load-bearing: it is
 # EGOIST's Japanese song, NOT the K-pop 'BANG' / IVE 'BANG BANG'. Extend as needed.
-_KNOWN_COVER_ORIGINALS = {
+_KNOWN_ORIGINAL_ARTISTS = {
     "bang!!!": "EGOIST",
+    "pop/stars": "K/DA",
+    "pop stars": "K/DA",
 }
 
+_KNOWN_ENGLISH_ORIGINALS = {
+    "pop/stars",
+    "pop stars",
+}
 
-def _known_cover_original(title: str):
+def _known_original_artist(title: str):
     """Original artist for a known frequently-covered song title, or None."""
-    return _KNOWN_COVER_ORIGINALS.get((title or "").strip().lower())
+    return _KNOWN_ORIGINAL_ARTISTS.get((title or "").strip().lower())
+
+
+def _known_english_original(title: str):
+    """True for known English/multilingual originals often sung by JP channels."""
+    return (title or "").strip().lower() in _KNOWN_ENGLISH_ORIGINALS
 
 
 def extract_cover_original(raw_title, cover_channel=""):
@@ -1229,6 +1265,11 @@ _NATIVE_TITLE_ALIASES_RAW = {
     # many unrelated songs share that English title.)
     "zenzenzense": "前前前世",
     "nandemonaiya": "なんでもないや",
+    # Seishun Buta Yarou ED — lyric videos title as "[不可思議のカルテ] Fukashigi no
+    # Carte FULL VER." and fan live-caps as "fukashigi no carte live 2024"; both
+    # reduce to the romaji after bracket/suffix stripping, but every synced-LRC
+    # provider indexes under the kanji title only.
+    "fukashigi no carte": "不可思議のカルテ",
 }
 
 
@@ -1351,6 +1392,57 @@ def clean_title(title, source="", artist=""):
     if not song:
         t = re.split(r"\s+[✦✧✩⭐★☆◆◇❖♪♫]\s+", t, 1)[0]
 
+    # Lyric-video uploads wrap the native title in square/lenticular brackets
+    # while the rest of the title is romaji + junk tags:
+    #   "[不可思議のカルテ] Fukashigi no Carte FULL VER. Lyrics"
+    # The blanket bracket strip below would DESTROY the only native-script form
+    # providers index under, so extract it as the song BEFORE that strip runs.
+    # Guarded by: CJK character class (Latin "[Official MV]" falls through),
+    # _is_generic_title (anime descriptors like "[TVアニメOPテーマ]" rejected),
+    # an event/hashtag guard (VTuber birthday/live tags like
+    # "【 #⁠音乃瀬奏生誕祭2025 】" are event markers, not song titles), and
+    # an OUTSIDE-LATIN guard (v1.1.62): when a Latin song title sits OUTSIDE
+    # the brackets — e.g. "【3DLIVE】Rise In Motion【轟はじめ】" (song =
+    # "Rise In Motion", artist = "轟はじめ") — the CJK bracket is metadata,
+    # not the song; extraction would grab the artist. The guard only fires
+    # if the string between/outside all brackets has a real Latin phrase
+    # (≥ 3 alphabetic characters), so pure-CJK titles with only a bracketed
+    # native form still get extracted.
+    if not song:
+        m_cjk_br = re.search(
+            r"[\[【]"
+            r"([^\]】]*[ぁ-ゖァ-ヶ一-鿿][^\]】]*)"
+            r"[\]】]", t)
+        # Compute what's OUTSIDE all bracketed segments.
+        _outside = re.sub(r"[\[【][^\]】]*[\]】]", " ", t).strip()
+        _has_outside_latin = bool(re.search(r"[A-Za-z]{3,}", _outside))
+        # v1.1.62 outside-Latin guard, revised. The bracketed CJK is only the
+        # real title when the outside content is either empty, or is the
+        # ROMANIZATION of that CJK title. We detect the romanization case by
+        # walking common romaji-substring aliases in _NATIVE_TITLE_ALIASES_RAW:
+        # if any outside Latin phrase maps (via alias) to the CJK bracket
+        # content, the outside IS the romanization → extract the CJK.
+        # Otherwise (independent Latin title like "Rise In Motion") the
+        # outside is the real song and the bracket is metadata (artist / tag).
+        _outside_maps_to_cjk = False
+        if _has_outside_latin and m_cjk_br:
+            _cjk_norm = _norm_alias_key(m_cjk_br.group(1))
+            _outside_norm = _norm_alias_key(_outside)
+            for _romaji, _native in _NATIVE_TITLE_ALIASES.items():
+                _n = _norm_alias_key(_native)
+                if _n and _n == _cjk_norm and _romaji and _romaji in _outside_norm:
+                    _outside_maps_to_cjk = True
+                    break
+        _outside_blocks = _has_outside_latin and not _outside_maps_to_cjk
+        if (m_cjk_br
+                and not _is_generic_title(m_cjk_br.group(1).strip())
+                and not re.search(
+                    r"#|生誕|誕生|ライブ|ワンマン|周年|記念",
+                    m_cjk_br.group(1))
+                and not _outside_blocks):
+            song = m_cjk_br.group(1).strip()
+            t = song
+
     t = re.sub(r"\s*[\[(（【「『][^\])）】」』]*[\])）】」』]", "", t)    # leftover (Official MV) / （cover） etc.
     # cover / "tried singing" credits → keep only the song title
     t = re.sub(r"\s*([/／]\s*)?\bcover(ed)?\s+by\b.*$", "", t, flags=re.I)
@@ -1374,6 +1466,10 @@ def clean_title(title, source="", artist=""):
         r"long\s*ver|self\s*cover|live)\b[^-–—]*[-–—]?\s*$",
         "", t, flags=re.I,
     )
+    # Fan concert uploads title as "song live 2024" without a dash delimiter, so
+    # the dash-gated pattern above misses them. \s+ before "live" guarantees
+    # preceding content exists (a title that IS just "Live" won't be blanked).
+    t = re.sub(r"\s+live(?:\s+\d{4})?\s*$", "", t, flags=re.I)
     # a trailing anime tie-in with no song info ('… - TVアニメOPテーマ')
     t = re.sub(r"\s*[-–—/／]\s*(?:tv\s*)?(?:アニメ|anime)\s*.*?"
                r"(?:op|ed|主題歌|テーマ|opening|ending|theme).*$", "", t, flags=re.I)
@@ -1422,6 +1518,15 @@ def clean_title(title, source="", artist=""):
     # (┃│｜／・‖): a truncated "Song | Cover by X" arrives as "Song┃", and that
     # stray bar made the search match a different-language song (Blue Bird┃ → a
     # Spanish track instead of the Japanese original).
+    # v1.1.62: strip trailing #hashtags — livestream / anniversary uploads
+    # append event hashtags to the title, e.g. "Rise In Motion #轟はじめ生誕祭2026"
+    # (Todoroki Hajime birthday-celebration 2026). Left in the title, the
+    # hashtag poisons LRCLIB search (returns no lyrics) and inflates
+    # title_distinctiveness so the bare "Rise In Motion" match is never
+    # attempted. Handles multiple trailing hashtags. CJK Unicode class covers
+    # the JP-only tag forms creators use.
+    t = re.sub(r"\s+#[\w\-一-鿿ぁ-ゖァ-ヶー]+(?:\s+#[\w\-一-鿿ぁ-ゖァ-ヶー]+)*\s*$",
+               "", t).strip()
     # Cross-language native-title alias LAST: after all the credit/decoration
     # stripping has reduced the title to the bare song name, swap a known
     # romaji/English title for the native (katakana/kanji) form the providers
@@ -2314,11 +2419,12 @@ class Overlay:
         self.concert_ocr = bool(s.get("concert_ocr", True)) # banner-text fallback song-ID during concerts
         # ── SUBTITLES MODE (v1.1.56) — for SHOWS / non-music videos ──────────
         # A USER TOGGLE (never auto-detected). When on, the overlay behaves
-        # like a subtitle display: STATIONARY, horizontally centered, bottom
-        # aligned, 70% opacity; native text on top, romaji under it, English
+        # like a subtitle display: stationary, horizontally centered, bottom
+        # aligned, 45% opacity; native text on top, romaji under it, English
         # under that; each layer can be toggled off in the Subtitles menu (and
-        # a hidden layer's generation work is skipped); scroll-through display
-        # only if the user picks it. subs_mode: 'on' | 'off'.
+        # a hidden layer's generation work is skipped). The toggle applies these
+        # visual defaults once; normal settings stay authoritative after.
+        # subs_mode: 'on' | 'off'.
         self.subs_mode = "on" if s.get("subs_mode") == "on" else "off"
         self.subs_display = s.get("subs_display", "stationary")  # 'stationary'|'scroll'
         self.subs_native = bool(s.get("subs_native", True))
@@ -2342,6 +2448,26 @@ class Overlay:
         self.tauri_overlay_on = bool(s.get("tauri_overlay_on", False))
         self._tauri_child = None
         self._tauri_bounds = None
+        # v1.1.62 AUTO GAME-FOCUS MODE — see tune knobs `auto_game_mode`,
+        # `auto_game_mode_arm_s`, `auto_game_mode_release_s`. The USER-facing
+        # toggle persists as `auto_game_mode`; the tune knob is the default.
+        # State machine (single-source-of-truth `_auto_game_swapped`):
+        #   IDLE  → _game_focus_since first non-None wall-time
+        #   ARM   → held ≥ arm_s → swap to gaming preset, remember prev preset
+        #   SWAP  → in gaming preset, watching for focus loss
+        #   COOL  → _game_focus_lost_since first non-None wall-time
+        #   RESTORE → held ≥ release_s → restore prev preset, back to IDLE
+        # v1.1.64: guard the _tune fallback — this reads BEFORE self._tune is
+        # initialised (~300 lines below), which raised on every fresh launch.
+        self.auto_game_mode_on = bool(s.get("auto_game_mode",
+                                            getattr(self, "_tune", {}).get(
+                                                "auto_game_mode", 1)))
+        self._auto_game_swapped = False        # currently in auto-applied gaming preset
+        self._auto_game_prev_preset = None     # what to restore ('karaoke'|'subtitles'|None)
+        self._game_focus_since = 0.0           # wall-clock when game first observed
+        self._game_focus_lost_since = 0.0      # wall-clock when game focus first lost
+        self._last_game_focus_check = 0.0      # throttle for _check_game_focus
+        self._last_gaming_hard_align_t = 0.0   # rate-limit the gaming hard-drift force-align
         # Show / Hide (tray). One authoritative flag for BOTH renderers: the Tk
         # window is withdrawn AND get_overlay_state sends hidden:true so the GPU
         # (Tauri) overlay — a separate process — blanks too. Without this the tray
@@ -2417,6 +2543,14 @@ class Overlay:
         self._ocr_empty_polls    = 0      # consecutive empty/filtered polls → giveup
         self._ocr_committed_seen = 0      # distinct committed lines so far (min-commits trust gate)
         self._ocr_title = self._ocr_artist = ""
+        # v1.1.68 anime hardsub-OCR (subtitles mode only). Mirrors the concert
+        # OCR state above but writes to overlay ONLY — never to disk, never to
+        # self.index. See `_apply_subs_ocr` for the firewall.
+        self._subs_ocr_seq          = None
+        self._subs_ocr_busy         = False
+        self._subs_ocr_harvester    = None
+        self._subs_ocr_empty_polls  = 0
+        self._subs_ocr_last_key     = ""
         self._gen_title = self._gen_artist = ""
         self._gen_lang = None         # language auto-detected for the current generation
         self._deep_token = 0          # bumped on track change → cancels in-flight deep transcription
@@ -2813,6 +2947,27 @@ class Overlay:
             "decide_wrong_floor":    32.0,  # loaded match below this = the lyrics are the wrong song → search the library
             "decide_listen_s":       12.0,  # seconds of vocals to transcribe for the decision
             "decide_at_s":           12.0,  # run the by-ear decision this many s into a new track (20→12: faster wrong-body detection on ambiguous covers)
+            # v1.1.64 P0 (docs/CONCERT_RESEARCH.md §4): scope by-ear song ID
+            # inside a concert wrapper to _concert_candidates (the description
+            # parsed pool from parse_song_candidates) instead of blind whole-
+            # library. 1 = on (prefetch on load + include in the decide pool
+            # + skip whole-library expansion when scoped pool has hits),
+            # 0 = pre-P0 behavior.
+            "concert_pool_scoped":   1,
+            "concert_pool_prefetch_max": 20,   # cap the prefetch fan-out
+            # v1.1.64 P2 (docs/CONCERT_RESEARCH.md §4): tunable offline-plan
+            # override threshold + opt-in no-song chapter rejection.
+            # `chapter_override_min_score` (was hardcoded 0.70) — lower to
+            # let a mid-confidence fingerprint override generic chapter
+            # labels (Phase Connect "La La La" / "Face It"); raise to
+            # protect distinctive human-authored labels.
+            # `chapter_no_song_reject` — when 1 AND a concert candidate pool
+            # exists, chapter titles matching neither the pool nor the local
+            # library are treated as non-song (Phase Connect "Fuura" case).
+            # Default 0 (opt-in) to avoid skipping legitimate lesser-known
+            # originals whose lyrics we haven't cached yet.
+            "chapter_override_min_score": 0.70,
+            "chapter_no_song_reject":     0,
             # TICKET-090: a Shazam-VERIFIED song whose loaded title also matches the
             # heard title is ground truth — the by-ear decide loop has nothing useful
             # to add and a noisy/hallucinated transcription can only POISON it by
@@ -2936,6 +3091,47 @@ class Overlay:
             # the non-game-card when gaming).
             "gpu_solo_override":            0,  # 1 = allow GPU on single-GPU machines, 0 = stay on CPU per policy
             "ocr_when_gaming":              0,  # TICKET-125: 1 = allow OCR (capture+WinRT-OCR, GPU-backed) even while a game uses the GPU; 0 = back off so it can't hitch the game
+            # ── v1.1.68 anime hardsub-OCR (Subtitles mode only) ──
+            # A stream on animepahe / aniwave / hianime / 9anime / gogoanime
+            # ships hardsubbed video and NO fetchable caption track. When the
+            # captions probe returns nothing AND the source is one of those
+            # sites AND Subtitles mode is on, poll the anime_sub band and feed
+            # the OCR'd lines to the overlay as meta.subtitle=True (ephemeral).
+            "subs_ocr_enable":               1,     # master switch (0 disables entirely)
+            "subs_ocr_interval_s":           0.40,  # poll cadence; anime lines ~1-2s each
+            "subs_ocr_hard_cap_s":           0.0,   # 0 = no cap (episodes run 20+ min)
+            "subs_ocr_stable_polls":         1,     # commit after 1 stable read (faster than concert's 2)
+            "subs_ocr_band":                 "anime_sub",  # named preset in ocr_lyrics._BAND_PRESETS
+            "subs_ocr_log_every":            20,     # log a raw-OCR sample every N polls until we commit
+            # ── v1.1.62 auto game-focus mode ──
+            # When a Direct3D EXCLUSIVE-FULLSCREEN game takes focus, temporarily
+            # swap to the Gaming preset (bottom-center, 45% opacity, fast perf)
+            # and restore the previous preset when the game exits focus.
+            # Primary signal: gpu_setup.game_active() (SHQueryUserNotificationState
+            # → QUNS_RUNNING_D3D_FULL_SCREEN). This is the same API Windows uses
+            # for Focus Assist / Game Mode — it deliberately does NOT fire for
+            # ordinary GPU apps (browsers, video players, our own overlay), so
+            # false-positives are near-zero at the OS level. We add a self-PID
+            # check as belt+suspenders in case the foreground window is ours.
+            # Debounced: game must hold focus for _arm_s before swap, and lose
+            # it for _release_s before restore — prevents flap on alt-tab.
+            "auto_game_mode":               1,      # 1 = enable auto-swap; 0 = off
+            "auto_game_mode_arm_s":         1.5,    # game must hold focus this long before swap
+            "auto_game_mode_release_s":     4.0,    # game must be gone this long before restore
+            # ── v1.1.62 gaming-mode TIGHT SYNC ──
+            # Gaming preset shows a single active line (plus dim context above/
+            # below). Multi-line scroll modes let the eye average timing across
+            # visible lines, hiding drift up to ~1s; a single-line display makes
+            # ANY misalignment stark — a 2 s drift means you're reading the wrong
+            # line. When the gaming visual state is active, tighten the resync
+            # engine so drift never exceeds ~2 s:
+            #   - _live_resync_loop never relaxes past the FAST tier (1.5 s gap)
+            #   - drift-integral watchdog fires 2× sooner (3.0 vs 6.0)
+            #   - hard drift watchdog: |drift| > this threshold → force
+            #     align_by_listening immediately, bypassing the tier cadence
+            "gaming_sync_tight":            1,      # 1 = engage tight-sync when gaming preset is active
+            "gaming_sync_hard_drift_s":     1.5,    # |drift| > this → force immediate align_by_listening
+            "gaming_sync_hard_min_gap_s":   3.0,    # min seconds between hard-drift force-aligns
             # ── TICKET-129 CPU policy ──
             # 1 (default) = "the last core drives the product": pin this process to
             # the LAST PHYSICAL core and run it ABOVE_NORMAL. Dedicating one core keeps
@@ -3262,6 +3458,9 @@ class Overlay:
         self._recal_after = None      # pending recalibrate timer id
         self._live_mode = False       # concert/compilation → sound-only, no title-match
         self._mv_mode = False         # MV/cinematic title → expect a dead-space intro
+        self._chapter_intro_hold = False  # concert chapter just fired → hold lyrics until vocals
+        self._chapter_intro_pos0 = 0.0    # video position when the chapter hold engaged (backstop)
+        self._chapter_intro_t0 = 0.0      # wall-clock when the chapter hold engaged (backstop)
         self._intro_anchored = True   # have we anchored past this track's intro yet?
         self._track_t0 = 0.0          # wall-clock when the current track started
 
@@ -3532,17 +3731,21 @@ class Overlay:
                  " [live-arrangement]" if self._live_arrangement else "",
                  " [cover]" if getattr(self, "_is_cover", False) else "")
 
-        # For covers, use the original artist (extracted from the title) for
-        # lyric search instead of the covering channel — "Coffee - Alka | Lumi"
-        # should search "Coffee" by "Alka", not by "Lumi".
+        # For covers / known live performances, use the original artist for
+        # lyric search instead of the uploader/channel — "Coffee - Alka | Lumi"
+        # should search "Coffee" by "Alka", not by "Lumi"; a concert segment
+        # named "POP/STARS" on a JP VTuber channel should search K/DA, not
+        # hololive. These are metadata hints only; providers/captions still
+        # supply the lyrics.
         fetch_artist = artist
+        self._known_original_artist = _known_original_artist(title)
         if self._is_cover:
             # Curated original-artist hint (e.g. 'BANG!!!' → EGOIST) when the title
             # didn't name the original. Routes the fetch to the ORIGINAL's lyrics
             # instead of a same-title wrong-language hit — 'BANG!!!' is EGOIST's JP
             # song, never the K-pop 'BANG'. Checked before the title-only fallback.
             if not self._cover_original_artist:
-                _hint = _known_cover_original(title)
+                _hint = self._known_original_artist
                 if _hint:
                     self._cover_original_artist = _hint
                     log.info("cover: curated original-artist hint %r for %r", _hint, title)
@@ -3558,6 +3761,10 @@ class Overlay:
                 fetch_artist = ""
                 log.info("cover: no original artist in title → title-only search "
                          "(ignoring cover channel %r)", artist)
+        elif self._live_arrangement and self._known_original_artist:
+            fetch_artist = self._known_original_artist
+            log.info("live arrangement: curated original-artist hint %r for %r "
+                     "(instead of channel %r)", fetch_artist, title, artist)
 
         # Live/concert DETECTION uses the RAW video length — a reliable concert
         # signal even on browser sources, where duration is NOT trusted for SYNC
@@ -3576,6 +3783,46 @@ class Overlay:
         if self._live_mode and not (duration and duration > 600):
             log.info("live/concert mode via VIDEO LENGTH %.0fs (%.1f min) — %r",
                      _live_dur or 0.0, (_live_dur or 0.0) / 60.0, title)
+        subtitle_requested = (self.subs_mode == "on")
+        subs_owns_long_video = False    # set by the long-video subtitles arm below
+        if subtitle_requested and self._music_app_source():
+            # v1.1.72 (live-caught): a dedicated music app (Spotify / YT-Music
+            # "- Topic") is ALWAYS playing a song — never a subtitles target.
+            # The subs toggle used to swallow a 3-min Spotify track into the
+            # captions pipeline (no library match, no providers → blank
+            # overlay). The toggle stays armed; it applies to browser videos.
+            # (NOT _clean_source(): VLC/Films & TV are clean but may play shows.)
+            log.info("subtitle toggle is ON but the source is a music app — "
+                     "lyrics pipeline (subtitles stay armed for videos)")
+            subtitle_requested = False
+        if subtitle_requested and self._live_mode:
+            # v1.1.71 — DIFFERENTIATE concerts from talk content. The subs
+            # toggle used to force EVERY long video into subtitles, which
+            # killed song-detection for a concert played while subs were left
+            # on. Two-stage split:
+            #   1) SYNC: a REAL concert cue in the SMTC title (one-man / 3D
+            #      LIVE / ライブ / setlist / medley … via is_live_or_compilation
+            #      with duration=None — a bare "LIVE:" stream prefix does NOT
+            #      match) → keep the concert pipeline right now.
+            #   2) ASYNC: no title cue → go subtitles immediately (captions
+            #      start loading), and a background YouTube-category probe
+            #      flips this track back to the concert pipeline if the video
+            #      turns out to be Music (concert uploads without a cue in the
+            #      title; VTuber lives tagged Entertainment mostly hit case 1).
+            if is_live_or_compilation(title, None):
+                log.info("subtitle toggle is ON but the title carries a MUSIC-"
+                         "CONCERT cue — keeping the concert pipeline (subtitles "
+                         "resume on the next non-music video)")
+                subtitle_requested = False
+            else:
+                log.info("subtitle toggle is ON — treating long video as "
+                         "subtitles, not a concert/song-detection target "
+                         "(background Music-category check may flip it back)")
+                self._live_mode = False
+                subs_owns_long_video = True     # applied after the per-track reset below
+                # (the category probe is spawned AFTER the stale-URL guard below
+                # — review finding: reading _now_url before the guard could
+                # categorize the PREVIOUS video and cache a wrong verdict)
         # TICKET-109: new track => decision engine forgets the prior song's strikes
         self._reset_decision_engine()
         # v1.1.57 — always drop the previous concert's state so a concert
@@ -3585,7 +3832,13 @@ class Overlay:
         self._setlist_idx = None
         self._concert_plan = None
         self._concert_plan_seq = -1
-        self._live_video_nonmusic = False
+        self._concert_candidates = []      # description-derived candidate songs pool
+        self._chapter_intro_hold = False   # cleared per track; re-armed by _concert_setlist_tick
+        # v1.1.72: the flag means "this LONG video is non-music" — set here for
+        # the subs long-video arm (via the local above) and later by the
+        # category probe. It used to be set for EVERY subs track (short videos
+        # included), which lied about what the name records.
+        self._live_video_nonmusic = subs_owns_long_video
         # STALE-URL guard (v1.1.56): _now_url belongs to a VIDEO, not a session.
         # On a track change, a URL pushed for the PREVIOUS video must not feed
         # this track's caption fetch / episode download (transcribing the wrong
@@ -3594,41 +3847,39 @@ class Overlay:
         if (getattr(self, "_now_url", None)
                 and time.time() - getattr(self, "_now_url_t", 0.0) > 3.0):
             self._now_url = None
+        if subs_owns_long_video:
+            threading.Thread(target=self._subs_music_category_check,
+                             args=(self._track_seq,), daemon=True).start()
         # SUBTITLES (v1.1.56): a USER TOGGLE, never auto-detected. When on, it
         # applies to every video until the user turns it off.
-        if self.subs_mode == "on":
+        if not subtitle_requested:
+            self._set_subtitle_active(False, "track-change")
+        if subtitle_requested:
+            # Explicit Subtitles mode: no title/provider lookup, no Shazam,
+            # no concert OCR. The user has said this is a show/video transcript;
+            # _set_subtitle_active loads captions or falls back to transcription.
             # Per-track bootstrap: force a fresh False→True transition so the
             # setter's side effects (relayout + caption fetch for THIS video)
             # run every track — a bare flag assignment skipped both, and the
             # normal caption path is live-gated for >10-min videos. Deferred a
             # beat so the new track's state (lines/meta) has settled.
+            log.info("subtitle toggle on → captions/transcript pipeline only")
             self._subtitle_active = False
             try:
                 self.root.after(1200, lambda seq=self._track_seq: (
                     seq == self._track_seq and self.subs_mode == "on"
                     and self._set_subtitle_active(True, "mode-on")))
             except Exception:
-                self._subtitle_active = True
-        else:
-            self._set_subtitle_active(False, "track-change")
-        if self._live_mode:
+                pass    # root.after fails only during teardown — nothing to bootstrap
+            self._clear_track_lyric_state()
+            self._hint("📺 Subtitles mode — loading captions/transcript…")
+        elif self._live_mode:
             # A concert / live / festival / compilation: the title is the EVENT,
             # not a song. Title-matching it is what made a whole concert show one
             # song's lyrics — so refuse the title entirely and let SOUND drive.
             # The song-change detector + the fast re-ID loop pick up each track.
             log.info("live/compilation title → ignoring title, identifying by sound")
-            self.lines, self._lyrics_path, self.idx = [], None, -1
-            self._kara = []
-            self._verified = False
-            self._verified_meta = False           # TICKET-099
-            self._sound_corroborated = False      # TICKET-099
-            self._body_corroborated = False       # kamone fix: BODY re-earns corroboration per song
-            self._body_probe_retried = False
-            self._verified_gate_t = 0.0           # TICKET batch4: real track change, no gate
-            # v1.1.56: the event title is worthless — a lock must NEVER survive
-            # into a concert (a stale/speculative lock gagged Shazam's correct
-            # per-song IDs for 10 strikes each).
-            self._title_locked = False
+            self._clear_track_lyric_state()
             # SETLIST (v1.1.56): most 3D-live uploads carry YouTube CHAPTERS with
             # per-song titles + exact start times — deterministic recognition.
             # Fetch them in the background; _concert_setlist_tick drives per-song
@@ -3679,13 +3930,7 @@ class Overlay:
                         self._escalate_to_captions()
                         self._maybe_escalate_ocr()
             else:
-                self.lines, self._lyrics_path, self.idx = [], None, -1
-                self._kara = []
-                self._verified = False
-                self._verified_meta = False           # TICKET-099
-                self._sound_corroborated = False      # TICKET-099
-                self._verified_gate_t = 0.0           # TICKET batch4: real track change, no gate
-                self._title_locked = False
+                self._clear_track_lyric_state()
                 self._hint(f"♪ {title} — identifying…")
                 self._start_fetch(fetch_artist, title, duration, cover=self._is_cover,
                                   strict=self._clean_source())
@@ -3709,17 +3954,20 @@ class Overlay:
             except Exception:
                 pass
 
-        # PRIMARY signal: identify by sound and let it decide the real song.
-        self._start_identify(seconds=6, attempts=2)
-        # Lock the timing fast: a short burst of quick re-checks right after the
-        # song starts, then the loop relaxes to the normal cadence.
-        self._fast_calib = 3
-        self._arm_recal(7)
+        if not subtitle_requested:
+            # PRIMARY signal: identify by sound and let it decide the real song.
+            self._start_identify(seconds=6, attempts=2)
+            # Lock the timing fast: a short burst of quick re-checks right after
+            # the song starts, then the loop relaxes to the normal cadence.
+            self._fast_calib = 3
+            self._arm_recal(7)
+        else:
+            self._fast_calib = 0
         # Bound the "deliberation": if no real lyrics have loaded within ~11 s
         # (title fetch + sound-ID have had their chance), start generating by ear
         # — instead of waiting out the whole title→sound→re-fetch chain (~30 s).
         # If real lyrics arrive late, `load()` cancels the generation.
-        if self.generate_on and not self._live_mode:
+        if self.generate_on and not self._live_mode and not subtitle_requested:
             self.root.after(11000,
                             lambda t=self._track_seq: self._maybe_generate(t))
         # Schedule an early auto-align ~25 s into the track — by then vocals
@@ -3727,7 +3975,7 @@ class Overlay:
         # and Shazam has had a couple of attempts. If Shazam locked it, the
         # auto-align silently no-ops; if not, this catches off-vocal /
         # karaoke / live cuts Shazam can't fingerprint.
-        if not self._live_mode:
+        if not self._live_mode and not subtitle_requested:
             self.root.after(25000,
                             lambda t=self._track_seq: self._track_start_auto_align(t))
             # SMART song decision: a few seconds in (vocals present), transcribe and
@@ -3769,6 +4017,9 @@ class Overlay:
         """Background: pull this YouTube video's caption track and prefer it over
         the provider LRC. Throttled (min gap between yt-dlp calls) and once per
         song, so a rapidly-advancing playlist can't rate-limit us."""
+        # v1.1.72: no whole-video caption fetch in ANY live/concert mode — the
+        # per-song machinery owns those tracks (previously subs ON leaked a
+        # full-concert caption body over the setlist's per-song lyrics).
         if track_seq != self._track_seq or self._live_mode:
             return
         if self._track == self._caption_song:
@@ -3961,6 +4212,37 @@ class Overlay:
         if any(h in src for h in BROWSER_HINTS):
             return rawa.strip().lower().endswith("- topic")
         return bool(src)
+
+    def _music_app_source(self):
+        """True when the SMTC source is a dedicated MUSIC app (Spotify, Apple
+        Music, …) or a YT-Music "- Topic" session — content that is ALWAYS a
+        song. Deliberately NARROWER than _clean_source(): a generic video app
+        (VLC, Films & TV) also has clean metadata but may be playing a show
+        the user wants subtitled (review finding v1.1.72)."""
+        src = (self._last_src or "").lower()
+        rawa = self._last_artist or ""
+        if any(h in src for h in BROWSER_HINTS):
+            return rawa.strip().lower().endswith("- topic")
+        return any(h in src for h in _MUSIC_APP_HINTS)
+
+    def _clear_track_lyric_state(self):
+        """Blank the lyric surface and every per-track verification flag — the
+        shared prologue of the SUBTITLES and CONCERT arms of a track change and
+        of the late subs→concert flip. One place, one truth:
+        • verified/meta/sound/body reset — TICKET-099 / kamone: each song
+          re-earns corroboration; nothing carries across a track boundary.
+        • _title_locked reset — v1.1.56: a stale/speculative lock must never
+          survive into a concert (it gagged Shazam's correct per-song IDs for
+          10 strikes each)."""
+        self.lines, self._lyrics_path, self.idx = [], None, -1
+        self._kara = []
+        self._verified = False
+        self._verified_meta = False
+        self._sound_corroborated = False
+        self._body_corroborated = False
+        self._body_probe_retried = False
+        self._verified_gate_t = 0.0
+        self._title_locked = False
 
     def _mark_verified(self, confirmed=False):
         """TICKET-099: split into TENTATIVE (meta — duration/title at load time)
@@ -4193,6 +4475,28 @@ class Overlay:
                     return False
             except Exception:
                 pass
+            # Curated original-artist cache guard. Some live/concert videos expose
+            # a known original title (for example K/DA "POP/STARS") but the
+            # uploader/channel as the artist. Older weak provider fallbacks could
+            # cache a same-title wrong body under that channel, then title-match it
+            # forever. Only distrust weak provider caches here; generated/captions/
+            # OCR bodies may legitimately be from the live performer.
+            known_artist = getattr(self, "_known_original_artist", None)
+            if known_artist:
+                try:
+                    meta = json.loads(Path(path).read_text("utf-8")).get("meta", {})
+                except Exception:
+                    meta = {}
+                src = meta.get("source") or ""
+                cached_artist = meta.get("artist") or ""
+                if (src in ("syncedlyrics/cover", "syncedlyrics/title")
+                        and cached_artist
+                        and not self._artists_corroborate(cached_artist, known_artist)):
+                    log.info("cache %s has weak source %r and artist %r, but %r "
+                             "is known-original artist for %r -> distrust, re-fetch",
+                             Path(path).name, src, cached_artist, known_artist,
+                             self._clean_title_cache or "")
+                    return False
             # PROVENANCE GUARD (wrong-song defense, TICKET-055). A cache produced
             # by a WEAK provider path — title-only or cover-fallback — is only
             # trustworthy for a song we'd still fetch that way. For a CLEAN source
@@ -4393,6 +4697,35 @@ class Overlay:
                     for i in range(len(ga) - 1):
                         if ga[i:i + 2] in gb:
                             return True
+        # Layer 3 (v1.1.72, live-caught): CROSS-SCRIPT same title. Shazam said
+        # "Sugar Rush" while the player said シュガーラッシュ — identical title,
+        # two scripts — and layers 1/2 can't see it (no ASCII substring, no CJK
+        # on the Shazam side). The wrong-song machinery then discarded the
+        # CORRECT player title and churned for the whole song. Romanize the CJK
+        # side (cutlet renders シュガーラッシュ → 'sugar rush' exactly) and
+        # compare in ASCII space; fuzzy backstops phonetic near-misses the
+        # segmenter can't render as real English.
+        if _has_cjk(a) != _has_cjk(b):
+            try:
+                from fetch_lyrics import romanize
+                ra = romanize(a, "ja") if _has_cjk(a) else (a or "")
+                rb = romanize(b, "ja") if _has_cjk(b) else (b or "")
+                fa = re.sub(r"[^a-z0-9]", "", ra.lower())
+                fb = re.sub(r"[^a-z0-9]", "", rb.lower())
+                if fa and fb:
+                    if fa == fb:
+                        return True
+                    # Containment needs a length floor (review finding): a 1-2
+                    # char CJK title romanizes to 2-3 letters ("ai", "uta")
+                    # contained in countless unrelated titles. Mirror layer 1's
+                    # ≥4-char requirement.
+                    if min(len(fa), len(fb)) >= 4 and (fa in fb or fb in fa):
+                        return True
+                    from rapidfuzz import fuzz
+                    if fuzz.ratio(fa, fb) >= 85:
+                        return True
+            except Exception:
+                pass
         return False
 
     def _prefer_cjk_cache(self, artist, heard_title, duration=None):
@@ -4695,9 +5028,9 @@ class Overlay:
         # v1.1.56 — SUBTITLE MODE is an explicit USER toggle: identification is
         # pointless (dialogue can't be Shazam'd) and any music-bed match would
         # only feed machinery that is suppressed anyway. Save the CPU. Keyed on
-        # the persistent toggle so the per-track bootstrap gap can't leak a
-        # wasted capture.
-        if self._subs_on():
+        # subtitles OWNING the track (v1.1.72) so a concert with subs left on
+        # still gets its per-song Shazam IDs.
+        if self._subs_suppresses_sound():
             return
         now = time.time()
         backoff_until = float(getattr(self, "_jank_backoff_until", 0.0) or 0.0)
@@ -4860,6 +5193,9 @@ class Overlay:
         nxt = max(4, self.recal_secs or 30)
         try:
             st = self.media.get()
+            if self._subs_suppresses_sound():
+                nxt = max(nxt, 30)
+                return
             # CONCERT banner OCR: a long live video shows the CURRENT song's name on
             # screen — read it (a high-confidence hint that Shazam can't beat on a
             # live arrangement) and switch to the right lyrics. Throttled, on a
@@ -4945,8 +5281,8 @@ class Overlay:
         sound-driven detection stands. See concert_ocr.py / docs/CONCERT_DETECTION.md."""
         if getattr(self, "_non_music_page", False):
             return                       # v1.1.49 — no OCR song-ID on a social feed
-        if getattr(self, "_subtitle_active", False):
-            return                       # v1.1.56 — a show has no song banner
+        if self._subs_suppresses_sound():
+            return                       # v1.1.56/72 — a show has no song banner; a concert does
         try:
             import concert_ocr
             if not concert_ocr.available():
@@ -5066,6 +5402,87 @@ class Overlay:
         except Exception:
             return False
 
+    # ── SUBTITLES-vs-CONCERT differentiation (v1.1.71) ───────────────────
+    def _subs_music_category_check(self, seq):
+        """(background thread) The subs toggle sent this long video down the
+        SUBTITLES path because its title carried no concert cue. Probe the
+        video's OWN YouTube category; if it says Music, this is a concert /
+        music compilation the user wants SONG DETECTION for — flip the track
+        back to the concert pipeline on the Tk thread. Non-music (News, People
+        & Blogs, Gaming, Education…) confirms subtitles and changes nothing.
+        Cached per query so SMTC flickers don't re-pay the yt-dlp round-trip."""
+        try:
+            import yt_dlp
+            query = (getattr(self, "_now_url", None)
+                     or f"ytsearch1:{(getattr(self, '_last_raw_title', '') or '').strip()}")
+            if query.strip() in ("ytsearch1:", ""):
+                return
+            cache = getattr(self, "_cats_query_cache", None)
+            if cache is None:
+                cache = self._cats_query_cache = {}
+            if query in cache:
+                cats, vid_title = cache[query]
+            else:
+                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
+                                       "skip_download": True,
+                                       "noplaylist": True}) as y:
+                    info = y.extract_info(query, download=False)
+                if info and "entries" in info:
+                    info = (info.get("entries") or [None])[0] or {}
+                cats = [str(c).lower() for c in ((info or {}).get("categories") or [])]
+                vid_title = str((info or {}).get("title") or "")
+                cache[query] = (cats, vid_title)
+            if seq != self._track_seq or self.subs_mode != "on":
+                return                      # track changed / subs turned off meanwhile
+            # Music category, or the video's CANONICAL title (often richer than
+            # the SMTC one) carries a real concert cue → concert pipeline.
+            music = ("music" in cats) or bool(vid_title
+                                              and is_live_or_compilation(vid_title, None))
+            if not music:
+                log.info("subtitles: category %s — non-music confirmed, "
+                         "captions stay", cats or ["<none>"])
+                return
+            log.info("subtitles: video category %s / title %r says MUSIC — "
+                     "flipping this video to the CONCERT pipeline (subtitles "
+                     "resume on the next non-music video)", cats, vid_title[:60])
+            self.root.after(0, lambda: self._flip_subs_to_concert(seq))
+        except Exception as e:
+            log.info("subtitles: music-category check failed (%s) — captions stay", e)
+
+    def _flip_subs_to_concert(self, seq):
+        """(Tk thread) Late flip: the category probe said this 'subtitles'
+        video is actually MUSIC. Re-arm the concert pipeline for the SAME
+        track — mirrors the `elif self._live_mode:` arm of the track-change
+        handler. Any caption lines already showing are the video's own text,
+        so they stand until the first by-ear/setlist song ID replaces them."""
+        if seq != self._track_seq:
+            return
+        self._live_mode = True
+        self._live_video_nonmusic = False
+        # Cancel in-flight SUBTITLE work (review finding): the bootstrap's
+        # whole-video caption fetch / episode Whisper would otherwise land
+        # AFTER this flip and paint the full-concert transcript over the
+        # per-song machinery (its "captions win" epilogue also nulls the
+        # setlist's queued fetches). Same bumps as set_subs_mode's off branch.
+        self._gen_token += 1
+        self._deep_token += 1
+        self._generating = False
+        try:
+            self._set_subtitle_active(False, "music-video")
+        except Exception:
+            pass
+        self._clear_track_lyric_state()
+        if int(self._tune.get("concert_setlist_on", 1)):
+            threading.Thread(target=self._load_concert_setlist,
+                             args=(seq,), daemon=True).start()
+        # Mirror the track-change concert arm's sound kicks (v1.1.72) — the
+        # flip lands mid-track, so without these the first per-song ID would
+        # wait for the next self-armed recal pass (up to 30s away).
+        self._start_identify(seconds=6, attempts=2)
+        self._fast_calib = 3
+        self._arm_recal(7)
+        self._hint("🎤 Music concert detected — listening for each song…")
+
     # ── Concert SETLIST (YouTube chapters) — deterministic per-song titles ──
     def _load_concert_setlist(self, seq):
         """(background thread) Pull the live video's CHAPTERS — most 3D-live
@@ -5086,7 +5503,16 @@ class Overlay:
         if cache is None:
             cache = self._setlist_query_cache = {}
         if query in cache:
-            ch = cache[query]
+            cached_entry = cache[query]
+            # Legacy cache entries were plain lists; new entries are
+            # (list, from_description) tuples so the sentence-gate can be
+            # skipped correctly on a cache-hit for description-parsed
+            # setlists too. Handle both shapes.
+            if isinstance(cached_entry, tuple):
+                ch, ch_from_description = cached_entry
+            else:
+                ch = cached_entry
+                ch_from_description = False
         else:
             try:
                 with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
@@ -5098,6 +5524,61 @@ class Overlay:
                 ch = [{"start": float(c.get("start_time") or 0.0),
                        "title": str(c.get("title") or "").strip()}
                       for c in (info.get("chapters") or []) if isinstance(c, dict)]
+                # DESCRIPTION-EMBEDDED SETLIST fallback: many concert uploads
+                # (indie / VTuber lives / self-produced EXPO shows like
+                # ZUTOMAYO's EXPO2025) don't set YouTube's native CHAPTERS
+                # metadata — they paste a "MM:SS Title" list into the
+                # description instead. Recover that so chapter-based
+                # recognition still fires. Runs only when native chapters
+                # returned nothing; the description parser has its own
+                # monotonic / header / length guards.
+                ch_from_description = False
+                if not ch:
+                    try:
+                        from yt_description import parse_setlist_timestamps
+                        ch_desc = parse_setlist_timestamps(info.get("description") or "")
+                        if ch_desc:
+                            ch = ch_desc
+                            ch_from_description = True
+                            log.info("setlist: %d entries parsed from DESCRIPTION "
+                                     "(no native chapters on this video) — sample: %s",
+                                     len(ch),
+                                     " | ".join(f"{int(c['start'])}s {c['title'][:20]}"
+                                                for c in ch[:6]))
+                    except Exception as e:
+                        log.info("setlist: description-fallback parse failed (%s)", e)
+                # v1.1.62 — CANDIDATE POOL from description credit sections.
+                # Livestreams (birthday shows, anniversary streams) rarely
+                # have chapters or timestamp setlists, but their descriptions
+                # almost always list the artist's originals + covers under
+                # canonical headers (オリジナル曲宣伝 / COVER曲宣伝 /
+                # Setlist). These are the songs actually performed —
+                # a scoped pool that downstream by-ear identification can
+                # match against instead of blind global Shazam. Stored on
+                # the Overlay instance for the concert-audio analyzer and
+                # future by-ear matching to consume.
+                try:
+                    from yt_description import parse_song_candidates
+                    cand = parse_song_candidates(info.get("description") or "")
+                    if cand:
+                        self._concert_candidates = cand
+                        log.info("setlist: %d description candidate songs — %s",
+                                 len(cand),
+                                 " | ".join(f"[{c['kind'][:3]}] {c['title'][:24]}"
+                                            for c in cand[:8]))
+                        # v1.1.64 P0: kick off background prefetch of each
+                        # candidate's lyrics so the pool is populated by the
+                        # time _decide_by_ear runs (or is populating live if
+                        # the boundary fires quickly).
+                        try:
+                            self._prefetch_concert_candidates()
+                        except Exception as _e:
+                            log.info("setlist: prefetch kickoff failed (%s)", _e)
+                    else:
+                        self._concert_candidates = []
+                except Exception as e:
+                    log.info("setlist: candidate parse failed (%s)", e)
+                    self._concert_candidates = []
                 # NOT-A-CONCERT gate (live-caught: a 17-chapter Tartaria DOCUMENTARY
                 # got 'per-song' fetches): chapters are only a setlist when the
                 # video is MUSIC. YouTube's own category is authoritative when
@@ -5136,12 +5617,56 @@ class Overlay:
             except Exception as e:
                 log.info("setlist: chapter fetch failed (%s) — OCR/by-ear stand", e)
                 return
-            cache[query] = ch
+            cache[query] = (ch, ch_from_description)
             if len(cache) > 12:
                 cache.pop(next(iter(cache)))
         # title-shape sanity (works for cached entries too): song names are short;
-        # documentary sections read like sentences
+        # documentary sections read like sentences.
+        # SKIP for description-parsed setlists — the parser already ran its
+        # own header / monotonic / length guards (title cap 80 chars), and
+        # concert-description setlists often include credits like
+        # "Song (feat. Artist)" or "Song - Album Version" that legitimately
+        # sit above 40 chars without being documentary sections.
+        # v1.1.62: DATE / DATE-RANGE / TIME-WINDOW chapter titles are almost
+        # always merch pre-order windows, upload announcements, or event
+        # schedules — never song titles. Todoroki Hajime's birthday livestream
+        # had chapter 2 = "2025年9月13日(土) 21:00 ～ 2025年9月28日(日" (merch
+        # window), and without this filter the concert-tick would display
+        # "2025年9月13日..." as the "current song" and fetch nothing. Match
+        # JP date forms (2025年9月13日), Western dates (2025/9/13, 9-13-2025),
+        # and time-window separators (～ / - / ~ / to). Drop before the
+        # sentence-length gate below so the chapter count stays accurate.
+        _DATE_CHAP_RE = re.compile(
+            r"^\s*"
+            r"(?:"
+            r"\d{2,4}\s*[年/\-.]\s*\d{1,2}\s*[月/\-.]\s*\d{1,2}"
+            r"|\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{2,4}"
+            r"|\d{1,2}\s*[月/\-.]\s*\d{1,2}\s*日?"
+            r")"
+            r".*$", re.U,
+        )
         if ch:
+            _dropped = [c for c in ch if _DATE_CHAP_RE.match(c["title"])]
+            if _dropped:
+                log.info("setlist: dropping %d date/time-window chapter(s) — %s",
+                         len(_dropped),
+                         " | ".join(f"{int(c['start'])}s {c['title'][:30]}"
+                                    for c in _dropped[:4]))
+                ch = [c for c in ch if not _DATE_CHAP_RE.match(c["title"])]
+        # Also drop untitled / "Chapter N" placeholder chapters — some
+        # uploads leave a single 0-second untitled marker plus one date
+        # chapter, giving 2 useless entries that would pass the count gate.
+        if ch:
+            _UNTITLED_RE = re.compile(
+                r"^\s*(?:<?untitled[^>]*>?|chapter\s*\d+|\(?no\s*title\)?|"
+                r"section\s*\d+|part\s*\d+)\s*$", re.I)
+            _dropped_u = [c for c in ch if _UNTITLED_RE.match(c["title"])
+                          or not c["title"].strip()]
+            if _dropped_u:
+                log.info("setlist: dropping %d untitled/placeholder chapter(s)",
+                         len(_dropped_u))
+                ch = [c for c in ch if c not in _dropped_u]
+        if ch and not ch_from_description:
             longish = sum(1 for c in ch if len(c["title"]) > 40)
             if longish * 3 > len(ch):
                 log.info("setlist: chapter titles read like SECTIONS, not songs "
@@ -5169,6 +5694,79 @@ class Overlay:
                 and getattr(self, "_now_url", None)):
             threading.Thread(target=self._analyze_concert_audio,
                              args=(seq, self._now_url, list(ch)), daemon=True).start()
+
+    def _prefetch_concert_candidates(self):
+        """v1.1.64 P0 (docs/CONCERT_RESEARCH.md §4).
+
+        Background-fetch each concert candidate's lyrics so `_decide_by_ear`
+        can score against them without waiting on a per-song network round
+        trip. Fire-and-forget; per-candidate failures are silent. Bounded by
+        `concert_pool_prefetch_max` and skipped when
+        `concert_pool_scoped=0`. Candidates whose lyrics are already in the
+        library index are skipped (no-op fast path). Aborts if the concert
+        track changes mid-fetch (guarded by `_track_seq`)."""
+        if not int(self._tune.get("concert_pool_scoped", 1)):
+            return
+        cands = list(getattr(self, "_concert_candidates", []) or [])
+        if not cands:
+            return
+        seq = self._track_seq
+        cap = int(self._tune.get("concert_pool_prefetch_max", 20) or 20)
+        fallback_artist = ""
+        if getattr(self, "_track", None):
+            try:
+                fallback_artist = (self._track[0] or "").strip()
+            except Exception:
+                fallback_artist = ""
+
+        def work():
+            try:
+                from fetch_lyrics import fetch_and_save
+                got, skipped, failed = 0, 0, 0
+                for c in cands[:cap]:
+                    if seq != self._track_seq:
+                        log.info("concert-candidates prefetch: track changed → abort")
+                        return
+                    title = ""
+                    artist = fallback_artist
+                    if isinstance(c, dict):
+                        title = (c.get("title") or "").strip()
+                        cand_artist = (c.get("artist") or "").strip()
+                        if cand_artist:
+                            artist = cand_artist
+                    if not title:
+                        continue
+                    # Cheap index probe — if we already cached lyrics for this
+                    # title, skip the network call entirely.
+                    try:
+                        hits = list(self.index.candidates(title, limit=1))
+                        if hits:
+                            skipped += 1
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        p = fetch_and_save(title, artist)
+                    except Exception:
+                        failed += 1
+                        continue
+                    if not p:
+                        failed += 1
+                        continue
+                    got += 1
+                    # Register the new file on the Tk thread so the index
+                    # add can't race the main tick.
+                    try:
+                        self.root.after(0, self.index.add, p)
+                    except Exception:
+                        pass
+                log.info("concert-candidates prefetch: cached +%d "
+                         "(skipped %d already-indexed, %d failed) of %d/%d",
+                         got, skipped, failed, min(len(cands), cap), len(cands))
+            except Exception as e:
+                log.info("concert-candidates prefetch worker failed: %s", e)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _analyze_concert_audio(self, seq, url, chapters):
         """(background thread) Download + analyse the concert audio offline and
@@ -5221,6 +5819,20 @@ class Overlay:
                          "envelope + fingerprints (no chapters on this video)", len(sl))
         log.info("concert-audio: plan installed (%d segments) — per-song onsets "
                  "and ids now drive setlist sync", len(plan))
+        # If a chapter tick already fired for the current position (setlist_idx
+        # is set) it computed its anchor from chapter_start because the plan
+        # wasn't installed yet — force a re-tick so the newly-arrived vocal
+        # onset can refine the anchor and clear a stale _chapter_intro_hold.
+        # Bump the recorded idx first so the tick doesn't early-return on
+        # equal-index.
+        if self._setlist_idx is not None:
+            try:
+                st = self.media.get() or {}
+                pos = float(st.get("position") or 0.0)
+                self._setlist_idx = None
+                self._concert_setlist_tick(pos)
+            except Exception:
+                pass
 
     def _plan_for_pos(self, pos):
         """The offline plan segment covering VIDEO-second ``pos`` (or None)."""
@@ -5232,8 +5844,20 @@ class Overlay:
     # Chapter names that mark NON-SONG segments (talk blocks, intros) — exact,
     # case-insensitive. 'After Talk'/アフタートーク is the standard VTuber
     # concert talk segment.
+    # v1.1.64 P2 (docs/CONCERT_RESEARCH.md §4): widened non-song chapter set.
+    # Adds greeting / dance / break / freetalk / bilingual JP-EN variants.
+    # Titles here are treated as _SETLIST_SKIP unconditionally; the tune knob
+    # `chapter_no_song_reject` extends the rejection to titles that are not
+    # in the candidate pool AND not in the library index (proper-noun /
+    # tribute-name chapters like Phase Connect's "Fuura").
     _SETLIST_SKIP = {"intro", "outro", "mc", "talk", "after talk", "アフタートーク",
-                     "opening", "ending", "encore", "start", "end", "intermission"}
+                     "opening", "ending", "encore", "start", "end", "intermission",
+                     "greeting", "greetings", "closing", "goodbye",
+                     "break", "interval", "dance break", "instrumental break",
+                     "freetalk", "free talk", "フリートーク",
+                     "挨拶", "自己紹介", "オープニング", "エンディング",
+                     "アンコール", "休憩", "幕間",
+                     "credits", "staff roll", "スタッフロール"}
 
     def _concert_setlist_tick(self, pos):
         """(Tk thread, every recal pass) Map the live position onto the chapter
@@ -5243,7 +5867,9 @@ class Overlay:
         # (segment names, not songs); applying them would title-lock a segment
         # name, anchor offset=-chapter_start (destroying the captions' absolute
         # timing), and fetch a random same-named provider song over them.
-        if getattr(self, "_subtitle_active", False):
+        # v1.1.72: suppress only when subtitles OWN the track — a CONCERT with
+        # subs left on must still tick its setlist.
+        if self._subs_suppresses_sound():
             return
         sl = getattr(self, "_concert_setlist", None)
         if not sl:
@@ -5260,6 +5886,38 @@ class Overlay:
             log.info("setlist: chapter %d %r @%.0fs is a non-song segment — waiting",
                      idx, title, pos)
             return
+        # v1.1.64 P2 (docs/CONCERT_RESEARCH.md §4): opt-in `chapter_no_song_reject`
+        # gate. When ON, and a candidate pool is populated (parse_song_candidates
+        # gave us the artist's real setlist scope), a chapter whose title
+        # matches NEITHER the candidate pool (loose case-fold contains) NOR the
+        # local library index is treated as a non-song segment. Off by default:
+        # a Phase original I don't have data for could otherwise be skipped.
+        # Rationale: "Fuura"-style tribute chapters (person, not song) currently
+        # thrash the fetch pipeline searching for a non-existent title.
+        if int(self._tune.get("chapter_no_song_reject", 0)):
+            cands = list(getattr(self, "_concert_candidates", []) or [])
+            if cands:
+                tnorm = re.sub(r"\s+", "", (title or "").lower())
+                in_pool = False
+                for c in cands:
+                    ct = (c.get("title") if isinstance(c, dict) else "") or ""
+                    if not ct:
+                        continue
+                    cn = re.sub(r"\s+", "", ct.lower())
+                    if tnorm and (tnorm in cn or cn in tnorm):
+                        in_pool = True
+                        break
+                if not in_pool:
+                    try:
+                        lib_hits = list(self.index.candidates(title, limit=1))
+                    except Exception:
+                        lib_hits = []
+                    if not lib_hits:
+                        log.info("setlist: chapter %d %r @%.0fs NOT in candidate "
+                                 "pool (%d) and NOT in library — treated as "
+                                 "non-song (P2 chapter_no_song_reject)",
+                                 idx, title, pos, len(cands))
+                        return
         # SHAZAM OUTRANKS THE CHAPTER (live-caught: the tick replaced a VERIFIED,
         # sound-confirmed 'Ashura-chan' cover with a wrong same-title 'Remember
         # You' 17s after it locked). A chapter title is a hint; a fingerprint
@@ -5294,6 +5952,32 @@ class Overlay:
         self._title_locked = False
         self._sound_fail_streak = 0
         self._last_heard_contra = None
+        # CHAPTER INTRO HOLD (v1.1.61): between labeled songs in a concert
+        # there's applause / MC / crowd noise. When the offline plan has
+        # NOT yet found this chapter's vocal onset (either analysis is
+        # still running, or the chapter/song boundary landed inside a
+        # gap), `chapter_start` sits inside that intermission and lyrics
+        # would scroll ahead of the singing. Re-engage the same
+        # intro-hold machinery used by MV / live-arrangement mode: freeze
+        # display until _vocals_active_now() fires, then _on_vocal_onset()
+        # recalibrates the negative offset to the true first-sung-word
+        # instant. When the plan DOES have an onset, we trust it and skip
+        # the hold (the onset was measured offline from the whole audio,
+        # much more accurate than a live band-energy poll). We also clear
+        # `_sound_song` because a Shazam id from the PREVIOUS chapter is
+        # stale for this one — leaving it non-None would gate off both
+        # the hold (line 7641) AND _on_vocal_onset's offset recompute
+        # (line 10609), which is exactly what stranded the sync at chapter
+        # boundaries when a plan hadn't landed yet.
+        _plan_has_onset = bool(plan_seg and plan_seg.get("onset") is not None)
+        if not _plan_has_onset:
+            self._chapter_intro_hold = True
+            self._chapter_intro_pos0 = float(chapter_start)
+            self._chapter_intro_t0 = time.time()
+            self._intro_anchored = False
+            self._sound_song = None
+        else:
+            self._chapter_intro_hold = False
         artist = (self._track or ("", ""))[0]
         # OFFLINE ID vs CHAPTER LABEL: the fingerprint is most valuable when the
         # chapter title is GENERIC/unhelpful ('La La La' was really a Melt cover;
@@ -5301,7 +5985,14 @@ class Overlay:
         # human-authored chapter title ('Face It') outranks a stray slice mis-ID
         # ('Vaporwave City Tokyo') — keep it and let by-ear correct if truly
         # wrong. Either way the audio ONSET anchor above still applies.
-        if (plan_seg and plan_seg.get("title") and plan_seg.get("id_conf", 0.0) >= 0.70
+        # v1.1.64 P2 (docs/CONCERT_RESEARCH.md §4): tunable corroboration
+        # threshold. Was hardcoded 0.70; making it a knob lets the harness
+        # calibrate against the concerts corpus (Phase Connect's "La La La"
+        # / "Face It" cases benefit from a lower bar; false-overrides on
+        # distinctive titles want a higher one).
+        _corrob_min = float(self._tune.get("chapter_override_min_score", 0.70))
+        if (plan_seg and plan_seg.get("title")
+                and plan_seg.get("id_conf", 0.0) >= _corrob_min
                 and plan_seg["title"].strip().lower() not in self._SETLIST_SKIP):
             pid = plan_seg["title"].strip()
             ch_distinct = (confidence.title_distinctiveness(title) >= 0.40
@@ -5350,6 +6041,14 @@ class Overlay:
         elif distinctive:
             self._hint(f"🎤 {title} — fetching…")
             self.offset = -anchor               # onset/chapter anchor for the body
+            # Clear the PREVIOUS chapter's lyrics so _on_vocal_onset can't
+            # compute a wildly wrong offset from stale first_start data
+            # while the new fetch is in flight (the "-275s offset" bug).
+            # The intro-hold display is already frozen (idx = -1) and shows
+            # the "Between songs — waiting for vocals…" hint until fetch
+            # completes and the swap machinery restores rendering.
+            self.lines, self.idx = [], -1
+            self._kara = []
             # chapter LENGTH as the expected duration: providers reject bodies
             # whose span can't be this song (the wrong same-title 'Remember You'
             # covered 8% of the chapter and would have been filtered)
@@ -5357,6 +6056,11 @@ class Overlay:
         else:
             log.info("setlist: %r is a GENERIC title — holding the fetch, "
                      "Shazam decides (generation backstops)", title)
+            # Same rationale as the distinctive-title branch: clear stale
+            # lyrics from the previous chapter so vocal-onset calibration
+            # doesn't fire against them while we wait for Shazam.
+            self.lines, self.idx = [], -1
+            self._kara = []
             self._start_identify(seconds=6, attempts=2)
         # PER-CHAPTER generation backstop: many concert originals exist on no
         # provider at all — if this chapter still has no lyrics when the
@@ -5431,10 +6135,12 @@ class Overlay:
         return False
 
     def _consume_async(self):
-        if self._fetch_result and self._subs_on():
+        if self._fetch_result and self._subs_suppresses_sound():
             # v1.1.56 — SUBTITLE MODE: a provider SONG body (a fuzzy hit on the
             # episode title, or a fetch already in flight when the user toggled
             # subtitles on) must never land over subtitles/transcripts.
+            # v1.1.72: unless a CONCERT owns the track — its setlist tick
+            # fetches per-song lyrics that arrive through this same slot.
             log.info("subtitles: dropping provider fetch result (not captions)")
             self._fetch_result = None
         if self._fetch_result:
@@ -5498,7 +6204,7 @@ class Overlay:
                                 self.git_backup()
                 elif self._identifying:
                     pass                       # sound-ID running → wait for it
-                elif self._sound_song is None and not getattr(self, "_subtitle_active", False):
+                elif self._sound_song is None and not self._subs_suppresses_sound():
                     # title/artist missed (e.g. name-variant) — Shazam returns
                     # the canonical name, which usually fetches fine. Try sound first.
                     # (Not in subtitle mode: the hint would promise an identify
@@ -5555,7 +6261,9 @@ class Overlay:
                 # v1.1.56 — SUBTITLE MODE: a result from a capture that was
                 # already in flight when the user toggled subtitles on must
                 # never run the wrong-song machinery over the captions.
-                if getattr(self, "_subtitle_active", False):
+                # v1.1.72: unless a CONCERT owns the track — its per-song IDs
+                # arrive through this exact path.
+                if self._subs_suppresses_sound():
                     return
                 # TICKET-099: fetch SMTC state once at the top so the disagreement
                 # branches below can route by source priority (paused-SMTC takeover
@@ -5925,9 +6633,20 @@ class Overlay:
                                 else:
                                     # decay quickly when drift drops back into the deadband
                                     self._drift_integral *= 0.5
-                                if self._drift_integral > self._tune["drift_align_trigger"]:
-                                    log.info("drift integral %.1f crossed threshold → auto-aligning by ear",
-                                             self._drift_integral)
+                                # v1.1.62: half the trigger threshold when the
+                                # gaming preset is active — a single-line
+                                # display needs auto-align to fire ~2× sooner
+                                # (|drift|=1.0 s held for 3 s ≈ 3.0 integral,
+                                # already worth correcting; the default 6.0
+                                # bar would let it grow to a 2 s drift on
+                                # screen before firing).
+                                _trigger = float(self._tune["drift_align_trigger"])
+                                if (bool(int(self._tune.get("gaming_sync_tight", 1)))
+                                        and self._is_gaming_active()):
+                                    _trigger = min(_trigger, 3.0)
+                                if self._drift_integral > _trigger:
+                                    log.info("drift integral %.1f crossed threshold %.1f → auto-aligning by ear",
+                                             self._drift_integral, _trigger)
                                     self._drift_integral = 0.0
                                     self._maybe_auto_align(reason="drift-integral")
                 elif (self.meta.get("source") or "").startswith("bundled") and self.lines:
@@ -6239,6 +6958,12 @@ class Overlay:
         self._m(self.metrics.note_generated)                     # TICKET-121: ended generated = fail
         self._gen_token += 1
         self._gen_title, self._gen_artist = (title or "song"), (artist or "")
+        # v1.1.72 (survey P1): capture the SUBTITLES flag at generation START —
+        # _save_generated_only used to re-read the live toggle at save time, so
+        # a mid-generation toggle-off saved episode DIALOGUE untagged and
+        # INDEXED (library poisoning), and a mid-generation toggle-on tagged a
+        # real song's lyrics subtitle=True (lost cache).
+        self._gen_subtitle = bool(self._subs_on())
         self._gen_lines = []
         # cross-language cover hint: seed the sung language from the title (e.g. an
         # English cover → 'en') so the first chunk's annotation isn't the 'ja' default;
@@ -6390,7 +7115,7 @@ class Overlay:
         # past the song-sized cap, and skip hidden layers' annotation work. The
         # downloaded audio is deleted by deep_transcribe's finally block either
         # way — only the transcript survives.
-        subs = bool(getattr(self, "_subtitle_active", False))
+        subs = bool(self._subs_on())
         deep_url = (getattr(self, "_now_url", None) if subs else None)
         deep_max = (int(self._tune.get("subs_deep_max_dur_s", 3600)) if subs else None)
         rm_ok = self._row_visible("rm")
@@ -6459,7 +7184,13 @@ class Overlay:
         if token != self._deep_token:
             return                      # track changed (or real lyrics loaded) → discard
         if subtitle is None:
-            subtitle = bool(getattr(self, "_subtitle_active", False))
+            subtitle = bool(self._subs_on())
+        # v1.1.72 (survey P0): same live ownership re-check as _apply_captions —
+        # a whole-episode Whisper that outlived a subs toggle-off (or a
+        # subs→concert flip) must not paint show dialogue over whatever the
+        # music/concert pipeline has since loaded.
+        if subtitle and not self._subs_suppresses_sound():
+            return
         # REAL lyrics may have arrived (a slow fetch finally resolved) while we
         # transcribed — they WIN. Don't save or show a generated-deep version over
         # them (that was the "some ended up generated too" overwrite). A canonical
@@ -6638,7 +7369,9 @@ class Overlay:
                                "en": d.get("en", "")} for d in merged]}
             # v1.1.56 — SUBTITLE MODE: generated dialogue is not a song; tag it
             # and keep it out of the library index (same rule as show captions).
-            if getattr(self, "_subtitle_active", False):
+            # v1.1.72: use the flag CAPTURED at generation start, not the live
+            # toggle — same race class _apply_captions/_apply_deep fixed.
+            if getattr(self, "_gen_subtitle", False):
                 data["meta"]["subtitle"] = True
             out.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
             if into_pending and self._pending_swap is not None:
@@ -6832,6 +7565,139 @@ class Overlay:
         except Exception as e:
             log.info("OCR save failed: %s", e)
 
+    # ── v1.1.68 anime hardsub OCR (Subtitles mode) ────────────────────────
+    def _begin_subs_ocr_harvest(self, track_seq) -> bool:
+        """Kick off a subtitle-mode OCR harvest for hardsubbed anime.
+
+        Reuses ocr_lyrics.LyricOcrHarvester + read_lyric_lines but with the
+        anime_sub band preset. Ephemeral by design: `_apply_subs_ocr` writes
+        to the overlay ONLY — never to disk, never to self.index. Returns
+        True if a worker thread was started."""
+        if self._subs_ocr_busy:
+            return False
+        if not self._ocr_gpu_safe():
+            return False
+        try:
+            import ocr_lyrics
+        except Exception:
+            return False
+        if not ocr_lyrics.available():
+            return False
+        hwnd = self._source_window_hwnd()
+        # self._track is a (artist, title) tuple — mirror _begin_ocr_harvest's
+        # unpack (main.py:7240) so a None self._track doesn't crash.
+        artist, title = (self._track or ("", ""))
+        sp = max(1, int(self._tune.get("subs_ocr_stable_polls", 1)))
+        self._subs_ocr_harvester = ocr_lyrics.LyricOcrHarvester(stable_polls=sp)
+        self._subs_ocr_empty_polls = 0
+        self._subs_ocr_last_key = ""
+        self._subs_ocr_busy = True
+        self._hint("👁️ Reading subtitles from the video…")
+        log.info("subs-ocr: starting anime hardsub harvest for %r (band=%s, interval=%.2fs)",
+                 title, self._tune.get("subs_ocr_band", "anime_sub"),
+                 float(self._tune.get("subs_ocr_interval_s", 0.40)))
+        threading.Thread(target=self._subs_ocr_loop,
+                         args=(track_seq, hwnd, title or "", artist or ""),
+                         daemon=True).start()
+        return True
+
+    def _subs_ocr_loop(self, seq, hwnd, title, artist):
+        """Poll loop for anime hardsub OCR. Self-cancels on track change or
+        subs-mode toggle-off; sleeps subs_ocr_interval_s between reads."""
+        import ocr_lyrics
+        band = str(self._tune.get("subs_ocr_band", "anime_sub"))
+        interval = max(0.15, float(self._tune.get("subs_ocr_interval_s", 0.40)))
+        hard_cap = float(self._tune.get("subs_ocr_hard_cap_s", 0.0))
+        t0 = time.time()
+        poll_n = 0
+        # v1.1.69 — sample what OCR is actually reading every _log_every polls
+        # so a bad band geometry is visible in the log without pattern-matching
+        # against random screen text. Off after the first commit (so a working
+        # OCR doesn't spam the log).
+        log_every = max(1, int(self._tune.get("subs_ocr_log_every", 20)))
+        try:
+            while seq == self._track_seq and self._subs_on():
+                if hard_cap > 0 and (time.time() - t0) > hard_cap:
+                    log.info("subs-ocr: hard cap %.0fs reached — stopping", hard_cap)
+                    break
+                st = self.media.get() or {}
+                if st.get("status") != PLAYING:
+                    time.sleep(0.5)
+                    continue
+                pos = float(st.get("position") or 0.0)
+                try:
+                    lines = ocr_lyrics.read_lyric_lines(
+                        hwnd=hwnd, track_title=title, track_artist=artist,
+                        allow_fallback=True, band=band)
+                except TypeError:
+                    # Guard against an older ocr_lyrics (no band= kwarg).
+                    lines = ocr_lyrics.read_lyric_lines(
+                        hwnd=hwnd, track_title=title, track_artist=artist,
+                        allow_fallback=True)
+                except Exception as e:
+                    log.info("subs-ocr: read error: %s", e)
+                    lines = []
+                poll_n += 1
+                if (self._subs_ocr_last_key == ""       # not committed yet
+                        and (poll_n % log_every == 0 or poll_n == 1)):
+                    sample = (lines or [])[:3]
+                    log.info("subs-ocr: poll #%d hwnd=%s band=%s pos=%.1fs raw=%r",
+                             poll_n, hwnd, band, pos, sample)
+                if seq != self._track_seq:
+                    break
+                self.root.after(0, lambda p=pos, ls=lines: self._apply_subs_ocr(seq, p, ls))
+                time.sleep(interval)
+        finally:
+            self._subs_ocr_busy = False
+
+    def _apply_subs_ocr(self, seq, pos, lines):
+        """(Tk thread) receiver for a subs-OCR poll. Writes the overlay ONLY.
+
+        Never saves to disk, never touches self.index. meta.subtitle=True and
+        source='subs-ocr' so downstream code treats this body as ephemeral —
+        the LyricsIndex.refresh guard already skips meta.subtitle bodies."""
+        if seq != self._track_seq or not self._subs_on():
+            return
+        if self._subs_ocr_harvester is None:
+            return
+        committed = self._subs_ocr_harvester.observe(pos, lines)
+        if committed is None:
+            return
+        rows = self._subs_ocr_harvester.lines()          # list[(t_s, text)]
+        if not rows:
+            return
+        # Cheap dup guard: if the last 3 lines' text hasn't changed, skip the
+        # annotate+relayout round-trip (would burn CPU on every poll).
+        key = "|".join(str(t)[:6] + ":" + txt for (t, txt) in rows[-3:])
+        if key == self._subs_ocr_last_key:
+            return
+        self._subs_ocr_last_key = key
+        new = []
+        for i, (t_s, text) in enumerate(rows):
+            end = rows[i + 1][0] if i + 1 < len(rows) else t_s + 4.0
+            new.append({"t": [t_s, end], "jp": text, "rm": "", "en": ""})
+        try:
+            from fetch_lyrics import annotate
+            annotate(new, "ja", translate=True)
+        except Exception:
+            pass
+        artist, title = (self._track or ("", ""))
+        self.lines = [Line(start=d["t"][0], end=d["t"][1], jp=d["jp"],
+                           rm=d.get("rm", ""), en=d.get("en", "")) for d in new]
+        self.meta = {"title": title, "artist": artist, "lang": "ja",
+                     "duration": self._cur_duration,
+                     "source": "subs-ocr",   # distinct from 'ocr' — never disk-saved
+                     "subtitle": True}       # firewall vs LyricsIndex.refresh
+        self._gen_token += 1
+        self._deep_token += 1
+        self._generating = False
+        self.idx = -1
+        try:
+            self._subs_relayout()
+        except Exception:
+            pass
+        # NOTE: NO index.add, NO json write. Body is ephemeral by design.
+
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
         # Guard (アイドル → idol.json): a provider LRC whose 'original' text EQUALS its
@@ -6876,6 +7742,19 @@ class Overlay:
                                                 extras=[_ptitle])
                 except Exception:
                     _jp_content = False
+            # A JP channel can be the performer/uploader for an English or
+            # multilingual original (K/DA "POP/STARS" at a concert is the
+            # canonical case). If the title is in our original-artist hint table,
+            # do not reject the correct English body merely because the player
+            # title/channel contains hololive/ReGLOSS/etc.
+            try:
+                _mtitle = self.meta.get("title", "")
+                _ctitle = (self._track or ("", ""))[1]
+                if (_known_english_original(_mtitle)
+                        or _known_english_original(_ctitle)):
+                    _jp_content = False
+            except Exception:
+                pass
             if _jp_content:
                 _live = bool(getattr(self, "_live_mode", False))
                 log.info("load: ENGLISH-only body for a Japanese act (src=%s) → %s",
@@ -7205,6 +8084,19 @@ class Overlay:
                 self._check_applause_gap(now)
             except Exception:
                 pass
+        # v1.1.62 AUTO GAME-FOCUS SWAP: cheap poll (self-throttled to ~0.7 s
+        # inside the method). Runs BEFORE monitor topology check so an
+        # alt-tab to a game responds quickly rather than on the 3 s cadence.
+        try:
+            self._check_game_focus(now)
+        except Exception as e:
+            log.info("auto-game-mode tick: %s", e)
+        # v1.1.62 GAMING TIGHT-SYNC hard drift watchdog: rate-limited by the
+        # method itself, so calling every tick is cheap when not gaming.
+        try:
+            self._check_gaming_hard_drift(now)
+        except Exception as e:
+            log.info("gaming-tight tick: %s", e)
         self._check_monitors(now)
         state = self.media.get()
         # TICKET-099: edge-detect SMTC PLAYING/not-PLAYING transitions for the
@@ -7504,24 +8396,66 @@ class Overlay:
         # quiet stretch), (3) Shazam aligning (sets _sound_song). The tunable
         # `mv_intro_timeout` (default 75 s) is a last-ditch backstop for a very long
         # or oddly-mastered intro where none fire — Grimes "Genesis" has a ~70 s intro.
-        if (self._mv_mode and not self._intro_anchored
-                and self._sound_song is None):
-            # RELEASE the moment singing actually starts. The one-shot vocal-onset
-            # EVENT (_fire_vocal_event) can silently fail to fire, which left the
-            # lyrics stuck on the intro card for the WHOLE song (the "lyrics never
-            # started" bug). Poll the always-on vocal-band buffer here too — a
-            # robust second path reusing the live energy the sync already tracks.
+        # LIVE ARRANGEMENT intro hold: a concert clip like YOASOBI「アイドル」from
+        # 『… DOME LIVE 2024』opens with applause, MC, crowd noise. The studio LRC
+        # starts at lyric time 0 = the first sung word, but the video's time 0 is
+        # the intro. Without a hold, the lyrics scroll through the entire intro
+        # while no one is singing, arriving mid-song by the time vocals start.
+        # Same release paths as MV mode: vocals detected, Shazam calibrates, or
+        # timeout. Once released, _on_vocal_onset calibrates the negative offset
+        # and the live resync loop keeps it tight going forward.
+        _hold_intro = ((self._mv_mode or self._live_arrangement
+                        or self._chapter_intro_hold)
+                       and not self._intro_anchored
+                       and self._sound_song is None)
+        if _hold_intro:
             if self._vocals_active_now():
-                self._on_vocal_onset()           # calibrate the offset if applicable
-                self._intro_anchored = True      # vocals are here → stop holding
+                # _on_vocal_onset early-returns without setting
+                # _intro_anchored when self.lines is empty (fetch in flight)
+                # or when Shazam already calibrated. For the CHAPTER hold
+                # that matters: releasing while lines are empty would let
+                # a stale chapter_start anchor render nothing, and once the
+                # new fetch lands it would play from the wrong offset.
+                # We snapshot _intro_anchored: if it went True inside
+                # _on_vocal_onset, calibration landed and the hold is
+                # legitimately satisfied. Otherwise the CHAPTER hold stays
+                # engaged (the vocal-active poll runs every 90 ms — cheap
+                # to retry). MV / live-arrangement holds keep their
+                # historical "release regardless" semantics — those flows
+                # don't have the mid-track lyric-swap race.
+                self._on_vocal_onset()
+                if self._intro_anchored:
+                    self._chapter_intro_hold = False   # calibration landed
+                elif not self._chapter_intro_hold:
+                    # MV / live-arrangement: release even when calibration
+                    # was skipped (matches pre-chapter-hold behavior).
+                    self._intro_anchored = True
             mv_to = float(self._tune.get("mv_intro_timeout", 75.0))
             if not self._intro_anchored:
-                if state["position"] > mv_to or (time.time() - self._track_t0) > mv_to:
-                    self._intro_anchored = True   # backstop: very long / oddly-mastered intro
+                # Backstop timeout — release the hold if vocals never fire.
+                # For MV / live-arrangement mode the reference is the track
+                # start (video position or wall-clock since _track_t0). For
+                # CHAPTER mode inside a concert, the concert has already
+                # been playing for a long time when chapter N fires, so
+                # both track-start references would trip immediately. We
+                # measure elapsed since the CHAPTER hold engaged instead.
+                if self._chapter_intro_hold:
+                    ch_elapsed_pos = state["position"] - self._chapter_intro_pos0
+                    ch_elapsed_wall = time.time() - self._chapter_intro_t0
+                    timed_out = ch_elapsed_pos > mv_to or ch_elapsed_wall > mv_to
                 else:
-                    # MUSIC VIDEO ⇒ "Cinematic" (visual dead-space, often dialogue);
-                    # a plain audio instrumental lead-in keeps the "Instrumental" wording.
-                    self._hint("🎬 Cinematic intro — waiting for vocals…")
+                    timed_out = (state["position"] > mv_to
+                                 or (time.time() - self._track_t0) > mv_to)
+                if timed_out:
+                    self._intro_anchored = True   # backstop: very long / oddly-mastered intro
+                    self._chapter_intro_hold = False
+                else:
+                    if self._mv_mode:
+                        self._hint("🎬 Cinematic intro — waiting for vocals…")
+                    elif self._chapter_intro_hold:
+                        self._hint("🎤 Between songs — waiting for vocals…")
+                    else:
+                        self._hint("🎤 Live intro — waiting for vocals…")
                     self.idx = -1
                     self.root.after(90, self._tick)
                     return
@@ -8184,8 +9118,8 @@ class Overlay:
         bitmap too, so they must key the cache (a toggle otherwise kept serving
         blocks rendered with the old layer set for the rest of the song)."""
         return (round(self.font_scale, 3), round(self._auto_scale, 3), self._block_h,
-                self._subtitle_active and (self.subs_native, self.subs_romaji,
-                                           self.subs_english),
+                self._subs_on() and (self.subs_native, self.subs_romaji,
+                                     self.subs_english),
                 self._effective_pos_x())
 
     def _stroke_w(self):
@@ -9555,7 +10489,7 @@ class Overlay:
                 "recent_ms": hist,
                 "perf_mode": self.perf,
                 "scroll_dir": self.scroll_dir,
-                "subtitle_mode": bool(getattr(self, "_subtitle_active", False)),
+                "subtitle_mode": bool(self._subs_on()),
                 "subs_mode": getattr(self, "subs_mode", "off"),
                 # TICKET-104 A1: bounded LRU cache for measure_text widths.
                 # Steady-state target is >0.95 once the per-song char set is
@@ -9908,6 +10842,320 @@ class Overlay:
             "anomalies": anomalies,
         }
 
+    def _subtitle_line_payload(self, ln, i=None):
+        d = {
+            "t": [round(float(ln.start), 3), round(float(ln.end), 3)],
+            "start": round(float(ln.start), 3),
+            "end": round(float(ln.end), 3),
+            "jp": ln.jp,
+            "rm": ln.rm,
+            "en": ln.en,
+        }
+        if i is not None:
+            d["i"] = i
+        return d
+
+    def get_subtitles(self, start=0, count=None):
+        """Model-facing subtitle snapshot for GET /subtitles.
+
+        This intentionally exposes normal visual settings too: subtitle mode is a
+        preset + caption/transcript pipeline, not a separate rendering universe.
+        """
+        try:
+            start = max(0, int(start or 0))
+        except Exception:
+            start = 0
+        try:
+            count = None if count is None else max(0, int(count))
+        except Exception:
+            count = None
+        total = len(self.lines)
+        end = total if count is None else min(total, start + count)
+        st = self.media.get() or {}
+        pos = st.get("position")
+        eff = (pos + self.offset) if isinstance(pos, (int, float)) else None
+        cur = -1
+        if eff is not None:
+            for i, ln in enumerate(self.lines):
+                if ln.start <= eff < ln.end:
+                    cur = i
+                    break
+        return {
+            "mode": self.subs_mode,
+            "active": bool(self._subs_on()),
+            "subtitle_body": bool((self.meta or {}).get("subtitle")),
+            "settings": {
+                "opacity": round(float(self.opacity), 3),
+                "font_scale": round(float(self.font_scale), 3),
+                "position": {"x": self.pos_x, "y": self.pos_y},
+                "scroll": self.scroll_dir,
+                "scroll_speed": round(float(self.scroll_speed), 2),
+                "subtitle_display": self.subs_display,
+                "layers": {
+                    "native": bool(self.subs_native),
+                    "romaji": bool(self.subs_romaji),
+                    "english": bool(self.subs_english),
+                },
+                "performance": self.perf,
+                "display": self.display,
+            },
+            "meta": {k: (self.meta or {}).get(k)
+                     for k in ("title", "artist", "lang", "source", "duration", "subtitle")},
+            "path": str(self._lyrics_path) if self._lyrics_path else None,
+            "line_count": total,
+            "window": {"start": start, "end": end, "count": max(0, end - start)},
+            "current_index": cur,
+            "effective_time": round(eff, 3) if eff is not None else None,
+            "lines": [self._subtitle_line_payload(ln, i)
+                      for i, ln in enumerate(self.lines[start:end], start=start)],
+            "schema": {
+                "patch": [{"i": 0, "start": 1.23, "end": 4.56,
+                           "jp": "native/subtitle text", "rm": "romanization",
+                           "en": "English translation"}],
+                "replace": [{"t": [1.23, 4.56], "jp": "...", "rm": "", "en": ""}],
+                "shift": 0.25,
+                "settings": {"opacity": 0.45, "font_scale": 1.0,
+                             "scroll": "none|left|right|lr|rl|tb|bt",
+                             "position": {"x": "left|center|right",
+                                          "y": "top|center|bottom"},
+                             "subtitle_display": "stationary|scroll",
+                             "layers": {"native": True, "romaji": True,
+                                        "english": True}},
+            },
+        }
+
+    def _coerce_subtitle_line(self, src, existing=None):
+        if not isinstance(src, dict):
+            raise ValueError("line entries must be objects")
+        if "t" in src:
+            t = src.get("t") or []
+            if not isinstance(t, (list, tuple)) or len(t) != 2:
+                raise ValueError("line.t must be [start, end]")
+            start, end = float(t[0]), float(t[1])
+        else:
+            if existing is None and ("start" not in src or "end" not in src):
+                raise ValueError("new lines need t:[start,end] or start/end")
+            start = float(src.get("start", existing.start if existing else 0.0))
+            end = float(src.get("end", existing.end if existing else 0.0))
+        if not (math.isfinite(start) and math.isfinite(end)):
+            raise ValueError("line times must be finite numbers")
+        if start < 0 or end <= start:
+            raise ValueError("line times must satisfy 0 <= start < end")
+
+        def txt(key):
+            val = src.get(key, getattr(existing, key, "") if existing else "")
+            if val is None:
+                val = ""
+            val = _clean(str(val))
+            if len(val) > 4000:
+                raise ValueError(f"{key} is too long")
+            return val
+
+        return Line(start=start, end=end, jp=txt("jp"), rm=txt("rm"), en=txt("en"))
+
+    def _validate_subtitle_lines(self, lines):
+        prev_start = -1.0
+        for i, ln in enumerate(lines):
+            if not (math.isfinite(ln.start) and math.isfinite(ln.end)):
+                return f"line {i}: non-finite timing"
+            if ln.start < 0 or ln.end <= ln.start:
+                return f"line {i}: invalid timing"
+            if ln.start < prev_start:
+                return f"line {i}: starts before the previous line"
+            prev_start = ln.start
+        return None
+
+    def _save_subtitle_body(self, reason="api"):
+        from fetch_lyrics import slugify
+        LYRICS_DIR.mkdir(exist_ok=True)
+        meta = dict(self.meta or {})
+        artist, title = (self._track or ("", ""))
+        title = meta.get("title") or title or "api-subtitles"
+        artist = meta.get("artist") or artist or ""
+        meta.update({
+            "title": title,
+            "artist": artist,
+            "subtitle": True,
+            "api_edited_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "api_edit_reason": reason,
+        })
+        meta["source"] = meta.get("source") or "api-subtitles"
+        data = {
+            "meta": meta,
+            "lines": [{"t": [ln.start, ln.end], "jp": ln.jp,
+                       "rm": ln.rm, "en": ln.en} for ln in self.lines],
+        }
+        cur_path = Path(self._lyrics_path) if self._lyrics_path else None
+        existing_is_subtitle = False
+        if cur_path is not None and cur_path.suffix.lower() == ".json":
+            try:
+                old = json.loads(cur_path.read_text("utf-8"))
+                existing_is_subtitle = bool((old.get("meta") or {}).get("subtitle"))
+            except Exception:
+                existing_is_subtitle = cur_path.name.endswith(("-subtitles.json",
+                                                               "-api-subtitles.json"))
+        if cur_path is not None and cur_path.suffix.lower() == ".json" and existing_is_subtitle:
+            path = cur_path
+        else:
+            stem = slugify(title) or "api-subtitles"
+            path = LYRICS_DIR / f"{stem}-subtitles.json"
+            if path.exists():
+                try:
+                    old = json.loads(path.read_text("utf-8"))
+                    if not bool((old.get("meta") or {}).get("subtitle")):
+                        path = LYRICS_DIR / f"{stem}-api-subtitles.json"
+                except Exception:
+                    path = LYRICS_DIR / f"{stem}-api-subtitles.json"
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+        self.meta = meta
+        self._lyrics_path = path
+        try:
+            self.index.refresh()          # subtitle-tagged files must stay unindexed
+        except Exception:
+            pass
+        return path
+
+    def _apply_subtitle_settings_api(self, settings):
+        if not isinstance(settings, dict):
+            raise ValueError("settings must be an object")
+        if "opacity" in settings:
+            v = float(settings["opacity"])
+            if v > 1.0 and v <= 100.0:
+                v /= 100.0
+            self.set_opacity(v)
+        if "font_scale" in settings:
+            v = float(settings["font_scale"])
+            if v > 2.0 and v <= 200.0:
+                v /= 100.0
+            self.set_font_scale(v)
+        if "scroll_speed" in settings:
+            self.set_scroll_speed(float(settings["scroll_speed"]))
+        disp = settings.get("subtitle_display", settings.get("subtitle_layout"))
+        if disp:
+            self.set_subs_display(str(disp).strip().lower())
+        if "scroll" in settings:
+            d = str(settings["scroll"]).strip().lower()
+            if d not in ("none", "off", "stationary", "left", "right", "lr", "rl", "tb", "bt"):
+                raise ValueError("settings.scroll must be none|left|right|lr|rl|tb|bt")
+            self.set_scroll("none" if d in ("off", "stationary") else d)
+        pos = settings.get("position") if isinstance(settings.get("position"), dict) else {}
+        x = settings.get("pos_x", pos.get("x"))
+        y = settings.get("pos_y", pos.get("y"))
+        if x:
+            self.set_pos("x", str(x).strip().lower())
+        if y:
+            self.set_pos("y", str(y).strip().lower())
+        layers = settings.get("layers") if isinstance(settings.get("layers"), dict) else {}
+        layer_map = {"native": "subs_native", "romaji": "subs_romaji",
+                     "english": "subs_english"}
+        changed_layers = False
+        for key, attr in layer_map.items():
+            if key in settings:
+                setattr(self, attr, bool(settings[key]))
+                changed_layers = True
+            if key in layers:
+                setattr(self, attr, bool(layers[key]))
+                changed_layers = True
+        if changed_layers and self._subs_on():
+            self._subs_relayout()
+        if "performance" in settings:
+            mode = str(settings["performance"]).strip().lower()
+            if mode in ("smooth", "fast"):
+                self.set_quality(mode)
+
+    def apply_subtitle_api_update(self, payload):
+        """Apply a model/script subtitle update on the Tk thread.
+
+        Supported JSON keys:
+          mode, preset, settings, patch, replace, shift, persist.
+        Line edits require Subtitles mode on, either already or in this payload.
+        """
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "JSON body must be an object"}
+        actions = []
+        try:
+            if payload.get("preset"):
+                preset = str(payload.get("preset")).strip().lower()
+                if preset not in ("subtitles", "gaming", "karaoke"):
+                    return {"ok": False, "error": "preset must be subtitles|gaming|karaoke"}
+                self.apply_preset(preset)
+                actions.append(f"preset:{preset}")
+            if "mode" in payload:
+                self.set_subs_mode(payload.get("mode"))
+                actions.append(f"mode:{self.subs_mode}")
+            if "settings" in payload:
+                self._apply_subtitle_settings_api(payload.get("settings") or {})
+                actions.append("settings")
+
+            has_line_edit = any(k in payload for k in ("replace", "patch", "shift", "clear"))
+            if has_line_edit and not self._subs_on():
+                return {"ok": False,
+                        "error": "Subtitles mode is off; send {'mode':'on'} or apply the subtitles preset first"}
+
+            changed_lines = False
+            new_lines = list(self.lines)
+            if payload.get("clear"):
+                new_lines = []
+                changed_lines = True
+                actions.append("clear")
+            if "replace" in payload:
+                repl = payload.get("replace")
+                if not isinstance(repl, list):
+                    return {"ok": False, "error": "replace must be a list of line objects"}
+                new_lines = [self._coerce_subtitle_line(x) for x in repl]
+                changed_lines = True
+                actions.append(f"replace:{len(new_lines)}")
+            if "patch" in payload:
+                patch = payload.get("patch")
+                if not isinstance(patch, list):
+                    return {"ok": False, "error": "patch must be a list of line objects with i"}
+                for item in patch:
+                    if not isinstance(item, dict) or "i" not in item:
+                        return {"ok": False, "error": "each patch item needs an integer i"}
+                    i = int(item["i"])
+                    if i < 0 or i >= len(new_lines):
+                        return {"ok": False, "error": f"patch index out of range: {i}"}
+                    new_lines[i] = self._coerce_subtitle_line(item, existing=new_lines[i])
+                changed_lines = True
+                actions.append(f"patch:{len(patch)}")
+            if "shift" in payload:
+                delta = float(payload.get("shift") or 0.0)
+                if not math.isfinite(delta):
+                    return {"ok": False, "error": "shift must be a finite number of seconds"}
+                new_lines = [Line(max(0.0, ln.start + delta),
+                                  max(0.001, ln.end + delta),
+                                  ln.jp, ln.rm, ln.en) for ln in new_lines]
+                changed_lines = True
+                actions.append(f"shift:{delta:+.3f}s")
+
+            if changed_lines:
+                err = self._validate_subtitle_lines(new_lines)
+                if err:
+                    return {"ok": False, "error": err}
+                self.lines = new_lines
+                self.idx = -1
+                self._kara = []
+                try:
+                    self._block_cache.clear()
+                    self._prewarm_token += 1
+                    self._block_cache_max = max(32, min(72, len(self.lines) + 2))
+                except Exception:
+                    pass
+                self._subs_relayout()
+                if not isinstance(self.meta, dict):
+                    self.meta = {}
+                self.meta["subtitle"] = True
+                self.meta.setdefault("source", "api-subtitles")
+                persist = payload.get("persist", True)
+                path = self._save_subtitle_body(reason="api") if persist else None
+                if path:
+                    actions.append("persist")
+                self._hint("📺 Subtitles updated")
+
+            return {"ok": True, "actions": actions, **self.get_subtitles(start=0, count=20)}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
     # TICKET-106 / batch1: legacy → new key map for /tune back-compat. The scroll
     # perf knobs were renamed with a scroll_ prefix so future operators don't
     # confuse them with LINE-mode work (line mode is unbudgeted; see TICKET-104).
@@ -9993,14 +11241,75 @@ class Overlay:
         self._arm_recal(2 if self.recal_secs else 30)   # apply the new cadence now
         self._persist()
 
-    def apply_preset(self, name):
-        """One-click settings bundles for common use cases."""
+    def _apply_subtitle_visual_defaults(self):
+        """Visual defaults for the Subtitles preset/toggle.
+
+        This writes the same normal settings the tray already uses rather than
+        hiding overrides behind `_effective_*`. Turning Subtitles on gives a
+        readable starting point; any later tray/API setting change behaves just
+        like music mode.
+        """
+        self.opacity = 0.45
+        self.pos_y, self.pos_x = "bottom", "center"
+        self.scroll_dir = "none"
+        self.font_scale, self.perf, self.scroll_speed = 1.0, "smooth", 200.0
+        self.subs_display = "stationary"
+        self.subs_native = self.subs_romaji = self.subs_english = True
+
+    def apply_preset(self, name, _from_auto=False):
+        """One-click settings bundles for common use cases.
+
+        `_from_auto` is set by the AUTO game-focus swap path so we can tell
+        an internal preset change apart from a user's manual choice:
+          - MANUAL: stamp `_last_preset_t` (gates auto-mode for 3 s) AND
+            cancel any active auto-swap tracking (a user picking a preset
+            during an auto-swap signals "I want this instead" — the eventual
+            restore would otherwise overwrite it).
+          - AUTO: don't stamp, don't cancel (avoids self-gating our own tick
+            and preserves the prev-preset memory for the later restore).
+        """
+        if not _from_auto:
+            try:
+                self._last_preset_t = time.time()
+            except Exception:
+                pass
+            # User's manual choice cancels the auto-swap tracking so the
+            # later restore doesn't clobber it.
+            if getattr(self, "_auto_game_swapped", False):
+                log.info("auto-game-mode: user applied preset %r while swapped "
+                         "— cancelling auto-swap tracking", name)
+                self._auto_game_swapped = False
+                self._auto_game_prev_preset = None
+                self._game_focus_since = 0.0
+                self._game_focus_lost_since = 0.0
         if name == "gaming":          # learn a language while gaming — subtle
-            self.opacity, self.pos_y, self.pos_x, self.scroll_dir = 0.45, "top", "center", "left"
-            self.font_scale, self.perf = 1.0, "fast"
+            # BOTTOM-CENTER (v1.1.62): the top of the screen carries most game
+            # HUD (health, minimap, timer, killfeed); the bottom center is the
+            # least-contested strip in nearly every genre. Matches karaoke /
+            # subtitles orientation so a game-focus auto-swap feels consistent.
+            self.opacity, self.pos_y, self.pos_x, self.scroll_dir = 0.45, "bottom", "center", "left"
+            # 125% font (v1.1.62): single-line display with 45% opacity is
+            # already subtle for a game overlay; bumping the base scale to
+            # 1.25 keeps lyrics comfortably readable at typical viewing
+            # distance without crowding the game's UI up top.
+            self.font_scale, self.perf = 1.25, "fast"
+            self.subs_mode = "off"
+            self._set_subtitle_active(False, "preset-gaming")
         elif name == "karaoke":       # big, flowing lyrics for a room of people
             self.opacity, self.pos_y, self.pos_x, self.scroll_dir = 1.0, "bottom", "center", "rl"
-            self.font_scale, self.perf, self.scroll_speed = 1.5, "smooth", 200.0
+            # v1.1.67: 150% → 125%. The 150% default was chosen for a room-scale
+            # projection; on a normal desktop it wrapped multi-line entries and
+            # crowded the top of the belt. 125% still reads at karaoke distance
+            # and matches the Gaming preset's font_scale for a consistent switch.
+            self.font_scale, self.perf, self.scroll_speed = 1.25, "smooth", 200.0
+            self.subs_mode = "off"
+            self._set_subtitle_active(False, "preset-karaoke")
+        elif name == "subtitles":     # video/show subtitles — readable but not dominant
+            self._apply_subtitle_visual_defaults()
+            self.subs_mode = "on"
+            self._set_subtitle_active(True, "preset-subtitles")
+        else:
+            return
         self.root.attributes("-alpha", self._effective_opacity())
         self._apply_perf()
         self._apply_scale()
@@ -10010,7 +11319,230 @@ class Overlay:
         self._cancel_anim(); self._clear_stream(); self.cv.delete("all")
         self._kara, self.idx = [], -1
         self.root.update_idletasks()
+        if self._icon is not None:
+            self._icon.update_menu()
+        # v1.1.62: AUTO-swaps must NOT persist to settings.json — the user's
+        # original preset must stay on disk so a mid-game app restart brings
+        # it back (data-loss defect surfaced by adversarial verify). Only
+        # manual user preset changes persist. The restore path also uses
+        # _from_auto=True so its apply_preset call likewise skips persist,
+        # leaving the disk state untouched throughout the auto-swap cycle.
+        if not _from_auto:
+            self._persist()
+
+    def set_auto_game_mode(self, on):
+        """Tray toggle for the AUTO game-focus swap. Enabling activates the
+        detection loop; disabling both stops future auto-swaps AND immediately
+        restores the previous preset if we're currently in a swap. That's what
+        the user expects from an OFF-click — they want the pre-swap look back."""
+        was_on = self.auto_game_mode_on
+        self.auto_game_mode_on = bool(on)
+        if was_on and not self.auto_game_mode_on and self._auto_game_swapped:
+            # Disabling while swapped → restore now so the user immediately
+            # gets their prior preset back.
+            self._auto_game_restore(reason="auto-mode-disabled")
+        # Reset the debounce timers so a re-enable starts from a clean slate.
+        self._game_focus_since = 0.0
+        self._game_focus_lost_since = 0.0
         self._persist()
+
+    def _is_game_in_focus(self):
+        """True IFF a Direct3D EXCLUSIVE-FULLSCREEN game is currently the
+        focused window on the user's active monitor.
+
+        Layer 1 — is there a D3D fullscreen game running anywhere?
+          gpu_setup.game_active() → SHQueryUserNotificationState ==
+          QUNS_RUNNING_D3D_FULL_SCREEN. Same API Windows itself uses for
+          Focus Assist / Game Mode / auto-HDR. Deliberately excludes
+          browsers, video players, Discord, our own overlay, editors.
+
+        Layer 2 — is the foreground window OURS?
+          If GetForegroundWindow's PID matches our own, force False so we
+          never swap because Windows briefly told us the app looked at itself.
+
+        Layer 3 — is the foreground window FULLSCREEN on its monitor?
+          Multi-monitor guard: on a rig with a game on monitor 1 and a
+          browser being actively used on monitor 2, `game_active()` returns
+          True (a game IS running system-wide) and the foreground is the
+          browser (not us). Without this layer we would auto-swap — but
+          the user is clearly WORKING in the browser, not gaming. Requiring
+          the foreground window to cover its monitor rejects that case
+          (windowed browsers fail; the fullscreen game window on M1 passes
+          when it IS the foreground).
+
+        On any layer-2 or layer-3 introspection error, defer to layer 1 —
+        Windows itself already said a D3D fullscreen game is running, so a
+        transient ctypes hiccup shouldn't strand us out of an auto-swap."""
+        try:
+            import gpu_setup
+            if not gpu_setup.game_active():
+                return False
+        except Exception:
+            return False
+        # Layers 2 + 3.
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            k = ctypes.windll.kernel32
+            fg = u.GetForegroundWindow()
+            if not fg:
+                # Nothing focused (locked screen, transient state) → treat as
+                # "no game" so we don't swap into a state the user can't see.
+                return False
+            # Layer 2: own-window guard.
+            pid = wintypes.DWORD(0)
+            u.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+            if pid.value == k.GetCurrentProcessId():
+                return False
+            # Layer 3: foreground must be fullscreen on its monitor.
+            if not self._fg_window_is_fullscreen(fg):
+                return False
+        except Exception:
+            # Introspection failed after layer 1 said a game is running →
+            # trust Windows' primary signal rather than strand the swap.
+            pass
+        return True
+
+    @staticmethod
+    def _fg_window_is_fullscreen(hwnd):
+        """True when the given window's client rect covers its monitor's
+        FULL area (not the work-area — a taskbar-covering fullscreen game
+        crosses the work-area boundary). Compares GetWindowRect against
+        MONITORINFO.rcMonitor with a 4-pixel tolerance for borderless
+        windows that sit one row inside the edge on some drivers.
+
+        Not a game-vs-not-game check on its own (a fullscreen browser also
+        passes); used only as a MULTI-MONITOR guard downstream of
+        gpu_setup.game_active(), which already rejects browser fullscreen."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            # Get window rect.
+            wr = wintypes.RECT()
+            if not u.GetWindowRect(hwnd, ctypes.byref(wr)):
+                return False
+            # Get the monitor the window is on (nearest).
+            MONITOR_DEFAULTTONEAREST = 2
+            hmon = u.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            if not hmon:
+                return False
+            # MONITORINFO struct.
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD),
+                            ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT),
+                            ("dwFlags", wintypes.DWORD)]
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if not u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                return False
+            r = mi.rcMonitor
+            tol = 4  # allow a few pixels of edge-shim
+            return (abs(wr.left - r.left) <= tol
+                    and abs(wr.top - r.top) <= tol
+                    and abs(wr.right - r.right) <= tol
+                    and abs(wr.bottom - r.bottom) <= tol)
+        except Exception:
+            return False
+
+    def _auto_game_apply(self):
+        """Swap into the gaming preset, remembering what we came from so we
+        can restore it. Uses opacity as a lightweight fingerprint for the
+        prior preset — the exact prior preset name isn't tracked as a field
+        anywhere, so we infer from state and fall back to karaoke."""
+        # Infer prior preset from current visual state so the restore later
+        # looks like the user's own choice, not a guess.
+        if self._subs_on():
+            prev = "subtitles"
+        elif self.opacity >= 0.90 and self.scroll_dir == "rl":
+            prev = "karaoke"
+        else:
+            # Non-preset custom state — restore should not clobber it, so
+            # remember it as None and skip preset re-apply on restore.
+            prev = None
+        self._auto_game_prev_preset = prev
+        self._auto_game_swapped = True
+        log.info("auto-game-mode: game in focus → applying Gaming preset "
+                 "(will restore %s)", prev or "prior custom state")
+        try:
+            self.apply_preset("gaming", _from_auto=True)
+            self._hint("🎮 Auto-gaming — bottom-center")
+        except Exception as e:
+            # Never let a preset-apply exception leave the swap flag lit;
+            # otherwise we'd never restore later.
+            log.info("auto-game-mode: preset apply failed (%s) — reverting flag", e)
+            self._auto_game_swapped = False
+            self._auto_game_prev_preset = None
+
+    def _auto_game_restore(self, reason="game-exit"):
+        """Restore the pre-swap preset. Called on: game exits focus, user
+        disables auto-mode while swapped, or app teardown. Idempotent."""
+        if not self._auto_game_swapped:
+            return
+        prev = self._auto_game_prev_preset
+        self._auto_game_swapped = False
+        self._auto_game_prev_preset = None
+        log.info("auto-game-mode: %s → restoring %s", reason,
+                 prev or "prior custom state (no preset re-apply)")
+        if prev in ("karaoke", "subtitles"):
+            try:
+                self.apply_preset(prev, _from_auto=True)
+            except Exception as e:
+                log.info("auto-game-mode: restore preset %r failed (%s)", prev, e)
+        # If prev is None (custom state at swap time), we deliberately do
+        # nothing — user had a hand-tuned mix that the gaming preset
+        # overwrote. This is the safer default: never re-apply a preset the
+        # user didn't explicitly choose. The Gaming preset stays until the
+        # user manually applies a different one.
+
+    def _check_game_focus(self, now):
+        """(main tick) Debounced auto-swap into / out of gaming preset when
+        a Direct3D exclusive-fullscreen game takes / leaves focus.
+
+        Called from the main tick BEFORE _check_monitors so it runs on every
+        tick (not just the 3s monitor cadence). Own throttle: ~0.7 s — fast
+        enough to feel responsive on alt-tab, slow enough that the syscall +
+        two ctypes calls are negligible."""
+        if not self.auto_game_mode_on:
+            return
+        # Never swap while a manual preset apply just happened — user's most
+        # recent explicit choice always wins for at least a short window.
+        # Guarded on _last_preset_t > 0 so the sentinel initial value doesn't
+        # gate every startup tick until 3s of wall-clock have elapsed.
+        _lpt = float(getattr(self, "_last_preset_t", 0.0))
+        if _lpt > 0.0 and now - _lpt < 3.0:
+            return
+        if now - self._last_game_focus_check < 0.7:
+            return
+        self._last_game_focus_check = now
+        try:
+            in_game = self._is_game_in_focus()
+        except Exception as e:
+            log.info("auto-game-mode: focus check failed (%s) — skipping tick", e)
+            return
+        arm_s = float(self._tune.get("auto_game_mode_arm_s", 1.5))
+        release_s = float(self._tune.get("auto_game_mode_release_s", 4.0))
+        if in_game:
+            # Game is currently in focus.
+            self._game_focus_lost_since = 0.0
+            if self._game_focus_since == 0.0:
+                self._game_focus_since = now
+            if (not self._auto_game_swapped
+                    and (now - self._game_focus_since) >= arm_s):
+                self._auto_game_apply()
+        else:
+            # No game in focus.
+            self._game_focus_since = 0.0
+            if self._auto_game_swapped:
+                if self._game_focus_lost_since == 0.0:
+                    self._game_focus_lost_since = now
+                if (now - self._game_focus_lost_since) >= release_s:
+                    self._auto_game_restore(reason="game-exit")
+            else:
+                # Not swapped, no game — quietly clear the lost timer.
+                self._game_focus_lost_since = 0.0
 
     def set_git_sync(self, on):
         self.git_sync = bool(on)
@@ -10270,47 +11802,67 @@ class Overlay:
             # Commit ONLY the lyrics pathspec — `git commit -- lyrics` ignores
             # anything else that happens to be staged in the index, so a manual
             # `git add` of code can never be swept into an auto-backup commit.
-            for args in (["add", "--", "lyrics"],
-                         ["commit", "-m", "Update lyric library", "--", "lyrics"],
-                         ["push"]):
-                try:
-                    subprocess.run(["git", "-C", str(_DATA), *args],
+            try:
+                subprocess.run(["git", "-C", str(_DATA), "add", "--", "lyrics"],
+                               capture_output=True, timeout=90,
+                               creationflags=_NO_WINDOW)
+                r = subprocess.run(["git", "-C", str(_DATA), "commit",
+                                    "-m", "Update lyric library", "--", "lyrics"],
                                    capture_output=True, timeout=90,
                                    creationflags=_NO_WINDOW)
-                except Exception:
-                    return
+                # v1.1.72: push ONLY when the commit actually made one. The old
+                # unconditional push meant running from the SOURCE repo (where
+                # lyrics/ is gitignored → commit no-ops) could push unrelated
+                # unpushed CODE commits to origin as a side effect.
+                if r.returncode == 0:
+                    subprocess.run(["git", "-C", str(_DATA), "push"],
+                                   capture_output=True, timeout=90,
+                                   creationflags=_NO_WINDOW)
+            except Exception:
+                return
         threading.Thread(target=work, daemon=True).start()
 
     def _persist(self):
-        _save_settings({"opacity": self.opacity, "pos_y": self.pos_y, "pos_x": self.pos_x,
-                        "scroll": self.scroll_dir, "font_scale": self.font_scale,
-                        "scroll_speed": self.scroll_speed, "perf": self.perf,
-                        "recal_secs": self.recal_secs, "git_sync": self.git_sync,
-                        "character": self.character_on, "api": self.api_on,
-                        "boundary": self.boundary_on, "generate": self.generate_on,
-                        "captions": self.captions_on,
-                        "gpu_renderer": self.gpu_renderer_on,
-                        # NB: key MUST match the __init__ read s.get("tauri_overlay_on")
-                        # or the choice silently never persists.
-                        "tauri_overlay_on": getattr(self, "tauri_overlay_on", False),
-                        "discord_rpc": self.discord_rpc_on,
-                        "window_titles": self.window_titles_on,
-                        "window_titles_generic_browsers":
-                            self.window_titles_generic_browsers_on,
-                        # TICKET-117: SMTC session pin (Tab-A-muted / Tab-B-lyrics).
-                        # Two strings: the composite id (or '' for Auto) and the
-                        # source_app captured at pin time (auto-migrate guard).
-                        "pinned_session_id": self.pinned_session_id,
-                        "pinned_session_app": self.pinned_session_app,
-                        "concert_ocr": self.concert_ocr,
-                        "subs_mode": self.subs_mode,
-                        "subs_display": self.subs_display,
-                        "subs_native": self.subs_native,
-                        "subs_romaji": self.subs_romaji,
-                        "subs_english": self.subs_english,
-                        "display": self.display,
-                        "display_id": getattr(self, "_display_id", None),
-                        "display_fp": getattr(self, "_display_fp", None)})
+        s0 = _load_settings()
+        tune_overrides = dict(s0.get("tune_overrides") or {})
+        # v1.1.60: subtitles no longer have a hidden opacity override. The
+        # preset sets `opacity` to 45%, then the normal Opacity menu remains
+        # authoritative in both music and subtitle modes.
+        tune_overrides.pop("subs_opacity", None)
+        data = {"opacity": self.opacity, "pos_y": self.pos_y, "pos_x": self.pos_x,
+                "scroll": self.scroll_dir, "font_scale": self.font_scale,
+                "scroll_speed": self.scroll_speed, "perf": self.perf,
+                "recal_secs": self.recal_secs, "git_sync": self.git_sync,
+                "character": self.character_on, "api": self.api_on,
+                "boundary": self.boundary_on, "generate": self.generate_on,
+                "captions": self.captions_on,
+                "gpu_renderer": self.gpu_renderer_on,
+                # NB: key MUST match the __init__ read s.get("tauri_overlay_on")
+                # or the choice silently never persists.
+                "tauri_overlay_on": getattr(self, "tauri_overlay_on", False),
+                "discord_rpc": self.discord_rpc_on,
+                "window_titles": self.window_titles_on,
+                # v1.1.62: user toggle for AUTO game-focus swap.
+                "auto_game_mode": self.auto_game_mode_on,
+                "window_titles_generic_browsers":
+                    self.window_titles_generic_browsers_on,
+                # TICKET-117: SMTC session pin (Tab-A-muted / Tab-B-lyrics).
+                # Two strings: the composite id (or '' for Auto) and the
+                # source_app captured at pin time (auto-migrate guard).
+                "pinned_session_id": self.pinned_session_id,
+                "pinned_session_app": self.pinned_session_app,
+                "concert_ocr": self.concert_ocr,
+                "subs_mode": self.subs_mode,
+                "subs_display": self.subs_display,
+                "subs_native": self.subs_native,
+                "subs_romaji": self.subs_romaji,
+                "subs_english": self.subs_english,
+                "display": self.display,
+                "display_id": getattr(self, "_display_id", None),
+                "display_fp": getattr(self, "_display_fp", None)}
+        if tune_overrides:
+            data["tune_overrides"] = tune_overrides
+        _save_settings(data)
 
     def set_generate(self, on):
         """Toggle the last-resort Whisper lyric generation."""
@@ -10327,11 +11879,33 @@ class Overlay:
         """Subtitles are a USER TOGGLE: 'on' | 'off'. Never auto-detected —
         the user decides what is a show. Stays on across videos until turned
         off (a per-track bootstrap in _on_track_change re-runs the caption
-        fetch for each new video)."""
+        fetch for each new video).
+
+        Turning it on applies the Subtitles preset once. After that, Opacity,
+        Font size, Position, Scroll-in, Display, Performance, and GPU/CPU
+        rendering use the same normal settings paths as karaoke mode.
+        """
+        was_on = (self.subs_mode == "on")
         self.subs_mode = "on" if str(mode).lower() in ("on", "true", "1") else "off"
         if self.subs_mode == "on":
+            self._apply_subtitle_visual_defaults()
+            self._apply_perf()
+            self._apply_scale()
+            self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
             self._set_subtitle_active(True, "menu-on")
         else:
+            # v1.1.72 (survey P0): turning subs OFF must CANCEL in-flight
+            # subtitle work. The tier-1 by-ear loop and the tier-2 whole-
+            # episode Whisper are token-gated; without these bumps they kept
+            # running and painted show dialogue over the overlay minutes after
+            # the toggle (live-caught: menu-off 10:36:57, "generating from the
+            # episode audio" 10:37:31). Bump only on a REAL on→off transition
+            # (review finding): an idempotent {"mode":"off"} API call must not
+            # cancel an in-flight music/concert generation.
+            if was_on:
+                self._gen_token += 1
+                self._deep_token += 1
+                self._generating = False
             self._set_subtitle_active(False, "menu-off")
             # The setter early-returns when the flag was already False (e.g.
             # inside the per-track bootstrap gap) — restore the user's music
@@ -10346,9 +11920,22 @@ class Overlay:
         self._persist()
 
     def set_subs_display(self, disp):
-        """Subtitle presentation: 'stationary' (default) | 'scroll' (user opt-in)."""
+        """Subtitle presentation shortcut: stationary or scroll-through.
+
+        This is no longer a hidden renderer override. It updates the same normal
+        Scroll-in/Position settings that the rest of the app uses, so the regular
+        menus and API stay visibly in sync.
+        """
         self.subs_display = disp if disp in ("stationary", "scroll") else "stationary"
-        if self._subtitle_active:
+        if self.subs_display == "scroll":
+            if self.scroll_dir not in ("lr", "rl", "tb", "bt"):
+                self.scroll_dir = "rl"
+        else:
+            self.scroll_dir = "none"
+            self.pos_x, self.pos_y = "center", "bottom"
+        self._apply_scale()
+        self.root.geometry(f"{self.W}x{self.H}+{self.work_left}+{self._geom_y()}")
+        if self._subs_on():
             self._subs_relayout()            # full cleanup: this flips render MODE
         if self._icon is not None:
             self._icon.update_menu()
@@ -10405,6 +11992,16 @@ class Overlay:
 
     def _set_subtitle_active(self, on, reason=""):
         on = bool(on)
+        if on and self.subs_mode != "on":
+            log.info("subtitle mode ON ignored (%s) — Subtitles toggle is off",
+                     reason)
+            return
+        if on and self._music_app_source():
+            # v1.1.72: same music-app gate as the track-change path — toggling
+            # Subtitles on while Spotify plays must not hijack the current song.
+            log.info("subtitle mode ON deferred (%s) — music-app source is a "
+                     "song; subtitles engage on the next browser video", reason)
+            return
         if on == self._subtitle_active:
             return
         self._subtitle_active = on
@@ -10439,14 +12036,22 @@ class Overlay:
             try:
                 from fetch_lyrics import slugify
                 cur_t = (self._track or ("", ""))[1] or ""
-                p = LYRICS_DIR / f"{slugify(cur_t)}.json" if cur_t.strip() else None
-                if p and p.exists():
+                stem = slugify(cur_t) if cur_t.strip() else ""
+                candidates = [
+                    LYRICS_DIR / f"{stem}-subtitles.json",
+                    LYRICS_DIR / f"{stem}.json",
+                    LYRICS_DIR / f"{stem}-api-subtitles.json",
+                ] if stem else []
+                for p in candidates:
+                    if not p.exists():
+                        continue
                     m = json.loads(p.read_text("utf-8")).get("meta", {})
                     if m.get("subtitle"):
                         log.info("subtitles: reusing saved transcript %s", p.name)
                         self.load(p)
                         self.idx = -1
                         reused = True
+                        break
             except Exception:
                 pass
             # A show has no song to hunt — make sure caption lines exist:
@@ -10455,56 +12060,102 @@ class Overlay:
             # generator remains the fallback through the usual no-lyrics path.
             # Also re-fetch when the current body is NOT captions (e.g. a bogus
             # provider/title-match body loaded before the mode engaged).
-            if (not reused and self.captions_on
-                    and (self.meta.get("source") or "") != "youtube-captions"):
-                try:
-                    self.load_youtube_captions(silent=True)
-                except Exception:
-                    pass
+            #
+            # v1.1.65 — the CAPTIONS-ON music-mode toggle no longer gates this:
+            # the user explicitly turned SUBTITLES on, so we must engage the
+            # captions/generation pipeline regardless of the "Use YouTube
+            # captions for browser videos" setting (which is a music-mode
+            # preference, not a subtitles-mode gate). Symptom before this
+            # fix: user had captions_on=False (e.g. previously toggled it off
+            # for a fussy provider LRC), then turned Subtitles on and saw an
+            # empty overlay because captions never fetched. Also drop any
+            # provider/title-matched music body immediately so a stale LRC
+            # can't sit on screen until the fetch/generate result arrives.
+            if not reused:
+                src = (self.meta.get("source") or "")
+                if src and src != "youtube-captions" and not src.startswith(
+                        ("generated", "ocr")):
+                    self.lines, self._lyrics_path, self.idx = [], None, -1
+                    self._kara = []
+                    self._subs_relayout()
+                if src != "youtube-captions":
+                    try:
+                        self.load_youtube_captions(silent=True)
+                    except Exception:
+                        pass
+                    # If load_youtube_captions early-returns (no _track, no
+                    # yt-dlp) it schedules its own _subs_no_captions_fallback,
+                    # which routes into _maybe_generate. If we have no _track
+                    # yet (browser hasn't reported a title), the next
+                    # _on_track_change re-runs this block via the bootstrap.
 
     def _subs_on(self):
-        """Subtitle handling is ENGAGED: either the per-video flag is set or
-        the persistent toggle is on (covers the 1.2s per-track bootstrap gap,
-        where the flag briefly drops — the overlay must not flash back to
-        music styling and no wasted Shazam capture should launch)."""
-        return bool(self._subtitle_active or self.subs_mode == "on")
+        """Subtitle handling is engaged only by the user's Subtitles toggle.
+
+        `_subtitle_active` is a runtime fetch/render flag; it must never be an
+        alternate detector path that can force subtitle behavior on its own.
+        """
+        return self.subs_mode == "on"
+
+    def _subs_suppresses_sound(self):
+        """Should the Subtitles toggle suppress the SOUND machinery (Shazam,
+        recal loop, concert OCR/setlist ticks, provider fetch results)?
+
+        v1.1.72 (survey P0): the toggle stays ON across videos by design, and
+        the v1.1.71 differentiation deliberately routes MUSIC content to the
+        concert pipeline while subs remain on — but every sound-driven gate
+        used to check the persistent toggle alone, so a concert playing with
+        subs on armed a setlist that nothing ever ticked (zero per-song IDs).
+        Suppress only when subtitles OWN the track: toggle on AND not a
+        concert. In the subtitles arm _live_mode is forced False, so show
+        handling is unchanged; in a concert the sound machinery re-engages."""
+        return self._subs_on() and not self._live_mode
 
     def _effective_scroll(self):
-        """The scroll mode the renderers should USE this frame. In subtitle
-        mode 'stationary' pins the line-index display (no belt, no scroll-in);
-        'scroll' hands over to the user's scroll-through belt (or 'lr' if their
-        normal mode isn't a belt). Music playback is untouched."""
-        if not self._subs_on():
-            return self.scroll_dir
-        if self.subs_display == "scroll":
-            return self.scroll_dir if self.scroll_dir in ("lr", "rl", "tb", "bt") else "lr"
-        return "none"
+        """The scroll mode the renderers should use this frame.
+
+        Subtitles mode no longer masks this. The preset/toggle sets `scroll_dir`
+        to stationary once, and any later Scroll-in change is respected by both
+        CPU and GPU renderers.
+        """
+        return self.scroll_dir
 
     def _effective_pos_x(self):
-        """Subtitle mode is horizontally CENTERED by default."""
-        if self._subs_on() and self.subs_display != "scroll":
-            return "center"
+        """Horizontal position used by renderers."""
         return self.pos_x
 
     def _effective_pos_y(self):
-        """Subtitle mode sits at the BOTTOM by default (subtitle convention);
-        the user's music Position setting is untouched."""
-        if self._subs_on() and self.subs_display != "scroll":
-            return "bottom"
+        """Vertical position used by renderers."""
         return self.pos_y
 
     def _effective_opacity(self):
-        """Subtitle mode defaults to 70% opacity (subs_opacity knob); the
-        user's music opacity is untouched and restored on mode exit."""
-        if self._subs_on():
-            return max(0.15, min(1.0, float(self._tune.get("subs_opacity", 0.70))))
+        """The normal Opacity setting is authoritative for every mode.
+
+        The Subtitles preset initializes it to 45%, but changing Opacity after
+        that must immediately affect subtitle mode too.
+        """
         return self.opacity
 
     def _row_visible(self, row):
         """Per-layer visibility ('jp'|'rm'|'en'). Music playback always shows
-        every populated row; the toggles only govern SUBTITLE mode."""
+        every populated row; the toggles only govern SUBTITLE mode.
+
+        v1.1.65: for an ENGLISH body, hide the 'rm' (romaji — English needs
+        no romanization) and 'en' (English-translation — the source IS
+        English) rows. Do NOT hide 'jp' — the schema names 'jp' after
+        Japanese but it actually stores the SOURCE-LANGUAGE text of any
+        body; for an English caption / transcript, the English content
+        lives there. Hiding it (the earlier v1.1.64 attempt) left the
+        overlay silently blank for every English subtitle."""
         if not self._subs_on():
             return True
+        try:
+            body_lang = (self.meta.get("lang") or "").lower()
+        except Exception:
+            body_lang = ""
+        english_body = body_lang.startswith("en")
+        if english_body and row in ("rm", "en"):
+            return False
         return {"jp": self.subs_native, "rm": self.subs_romaji,
                 "en": self.subs_english}.get(row, True)
 
@@ -10736,7 +12387,8 @@ class Overlay:
             self._now_url = url
             self._now_url_t = time.time()
             self._caption_song = None        # re-fetch captions for the exact video
-            if (self.captions_on and self._track and not self._live_mode
+            if (self.captions_on and self._track
+                    and (not self._live_mode or self._subs_on())
                     and (self.meta.get("source") or "") != "youtube-captions"):
                 self.root.after(300,
                                 lambda t=self._track_seq: self._maybe_fetch_captions(t))
@@ -10815,9 +12467,8 @@ class Overlay:
 
     def set_opacity(self, v):
         self.opacity = max(0.15, min(1.0, v))
-        # v1.1.56: while SUBTITLE mode is active its own opacity stays
-        # authoritative on screen (both renderers read _effective_opacity);
-        # the user's music value is stored and restored on mode exit.
+        # Both CPU and GPU renderers read _effective_opacity(), so the tray
+        # Opacity setting stays live even while Subtitles mode is on.
         self.root.attributes("-alpha", self._effective_opacity())
         self._click_through()      # -alpha resets the exstyle → re-assert click-through
         self.root.update_idletasks()
@@ -10988,6 +12639,12 @@ class Overlay:
             m = mons[self._cycle_idx % len(mons)]
         else:
             m = self._resolve_monitor(mons, quiet=True)
+            if m is None:
+                # Selected monitor is temporarily missing and the display policy
+                # says to stick with it. Keep the current window bounds instead
+                # of crashing or falling back to the primary behind the user's
+                # back; _check_monitors will snap back when the monitor returns.
+                return self.work_left, self.work_top, self.W, self.H
         return m["x"], m["y"], m["w"], m["h"]
 
     def _apply_display(self):
@@ -11128,6 +12785,8 @@ class Overlay:
 
     def set_scroll(self, d):
         self.scroll_dir = d
+        if self._subs_on():
+            self.subs_display = "scroll" if d in ("lr", "rl", "tb", "bt") else "stationary"
         # Auto-orient pos_x for the per-line slide modes ONLY. The direction the
         # line slides FROM implies a natural horizontal anchor:
         #   left  -> anchor LEFT   (slides in from the left edge)
@@ -11338,6 +12997,67 @@ class Overlay:
         self._title_locked = False
         if self._track:
             self._on_track_change(self._track, self._cur_duration)
+
+    def mark_concert_boundary(self):
+        """v1.1.64 (docs/CONCERT_RESEARCH.md §5): append a concert-boundary
+        marker to `<data>/concert_marks.jsonl`. Captures wall-clock,
+        player position, current SMTC title/artist, video URL, live/mv
+        flags, and the currently-shown song title so the auto-tune harness
+        can back-fill `setlist[].start_s` and `mc_segments_s` from a real
+        run. Safe to call outside a concert wrapper (the file just grows).
+        Tray hint on success/failure."""
+        try:
+            import appdata
+            data = appdata.data_dir()
+        except Exception:
+            data = Path(_APP_DIR if "_APP_DIR" in globals() else ".")
+        try:
+            data.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        path = Path(data) / "concert_marks.jsonl"
+        st = self.media.get() or {}
+        loaded = ""
+        try:
+            if self.meta:
+                loaded = (self.meta.get("title") or "") or ""
+        except Exception:
+            pass
+        entry = {
+            "ts": time.time(),
+            "wall_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "smtc_title": st.get("title") or "",
+            "smtc_artist": st.get("artist") or "",
+            "player_pos_s": round(float(st.get("position") or 0.0), 2),
+            "duration_s": round(float(st.get("duration") or self._cur_duration or 0.0), 2),
+            "offset_s": round(float(self.offset), 2),
+            "video_url": getattr(self, "_now_url", "") or "",
+            "loaded_song_title": loaded,
+            "showing_idx": int(getattr(self, "idx", -1)),
+            "live_mode": bool(getattr(self, "_live_mode", False)),
+            "live_arrangement": bool(getattr(self, "_live_arrangement", False)),
+            "mv_mode": bool(getattr(self, "_mv_mode", False)),
+            "concert_candidates": [
+                (c.get("title") if isinstance(c, dict) else str(c))
+                for c in (getattr(self, "_concert_candidates", []) or [])[:12]
+            ],
+        }
+        line = json.dumps(entry, ensure_ascii=False)
+        try:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            log.info("concert boundary marked at %.1fs → %s",
+                     entry["player_pos_s"], path.name)
+            try:
+                self._hint(f"🔖 Boundary marked at {int(entry['player_pos_s'])}s")
+            except Exception:
+                pass
+        except Exception as e:
+            log.info("concert boundary write failed: %s", e)
+            try:
+                self._hint(f"Mark failed: {e}")
+            except Exception:
+                pass
 
     # ─────────────────────── TICKET-113 helpers ───────────────────
     def _blacklist_current_lyrics(self, reason: str) -> None:
@@ -11580,7 +13300,7 @@ class Overlay:
                     self._hint("YouTube captions need yt-dlp — see the README")
                 # SUBTITLES: no yt-dlp still must not dead-end the mode — the
                 # tier-1 by-ear generator works without it.
-                if getattr(self, "_subtitle_active", False):
+                if self._subs_on():
                     try:
                         self.root.after(0, lambda t=self._track_seq:
                                         self._subs_no_captions_fallback(t))
@@ -11590,6 +13310,16 @@ class Overlay:
         except Exception:
             return
         if not self._track:
+            return
+        # v1.1.72 (survey P1): captions ALREADY loaded for this track → done.
+        # The subs bootstrap (+1.2s) and _maybe_fetch_captions (+4s) both call
+        # here by design; without this guard the loser of the single-flight
+        # race re-armed its 3s retry chain and launched a COMPLETE second
+        # yt-dlp fetch of captions that were already showing (10-60s of wasted
+        # network/CPU and extra 429 exposure per subtitles track). SILENT
+        # callers only — the tray "Get captions now" click (silent=False) is an
+        # explicit re-fetch request and must always run.
+        if silent and url is None and (self.meta.get("source") or "") == "youtube-captions":
             return
         # SINGLE-FLIGHT: only ONE yt-dlp caption fetch at a time. A fast playlist
         # would otherwise spawn a new (heavy: network + node JS runtime) fetch
@@ -11601,12 +13331,12 @@ class Overlay:
             # SUBTITLES (v1.1.56): for an EPISODE this call is the ONLY caption/
             # generation trigger (live-gated deadlines don't fire) — a previous
             # track's in-flight fetch must not silently kill it. Retry shortly.
-            if getattr(self, "_subtitle_active", False):
+            if self._subs_on():
                 seq0 = self._track_seq
                 try:
                     self.root.after(3000, lambda: (
                         seq0 == self._track_seq
-                        and getattr(self, "_subtitle_active", False)
+                        and self._subs_on()
                         and self.load_youtube_captions(silent=True, url=url)))
                 except Exception:
                     pass
@@ -11627,7 +13357,7 @@ class Overlay:
 
         # SUBTITLES (v1.1.56): a full EPISODE is longer than the song-sized
         # duration cap — lift it, and gate hidden layers' annotation work.
-        subs = bool(getattr(self, "_subtitle_active", False))
+        subs = bool(self._subs_on())
         caps_max = (int(self._tune.get("subs_deep_max_dur_s", 3600)) if subs else None)
         rm_ok = self._row_visible("rm")
         en_ok = self._row_visible("en")
@@ -11649,7 +13379,10 @@ class Overlay:
                 # downloads the episode audio, Whisper-transcribes it into
                 # timed captions (then deletes the audio); the live by-ear
                 # tier shows lines meanwhile.
-                if subs and seq == self._track_seq:
+                # v1.1.72: re-read the LIVE toggle, not the value captured at
+                # kick time — the user turning Subtitles off mid-fetch used to
+                # still get a "generating from the episode audio" pass queued.
+                if subs and self._subs_on() and seq == self._track_seq:
                     log.info("subtitles: no caption track — generating from the episode audio")
                     try:
                         self.root.after(0, lambda: self._subs_no_captions_fallback(seq))
@@ -11687,15 +13420,34 @@ class Overlay:
         mode engaged is NOT subtitles — drop it (it also blocks the no-lyrics
         generation path), then route into the normal generation entry (tier-1
         live by-ear + tier-2 episode download/whisper)."""
-        if seq != self._track_seq or not getattr(self, "_subtitle_active", False):
+        if seq != self._track_seq or not self._subs_on():
             return
         src = (self.meta.get("source") or "") if isinstance(self.meta, dict) else ""
+        # v1.1.68 — 'subs-ocr' added to the keep-list so a mid-episode re-entry
+        # (e.g. captions probe firing again after a track_seq bump we missed)
+        # doesn't wipe an in-flight anime hardsub overlay.
         if self.lines and src not in ("youtube-captions", "generated",
-                                      "generated-deep", "ocr"):
+                                      "generated-deep", "ocr", "subs-ocr"):
             log.info("subtitles: dropping non-caption body (%s) so the episode "
                      "transcript can generate", src or "?")
             self.lines, self._lyrics_path, self.idx, self._kara = [], None, -1, []
             self._subs_relayout()
+        # v1.1.68 anime hardsub OCR: browser + anime host + subs mode + no
+        # captions. Runs INSTEAD of _maybe_generate when we detect a hardsub
+        # streamer; the harvest is provisional and never touches disk / index.
+        # If the host isn't anime (or the toggle is off), fall through to
+        # whisper generation exactly as before.
+        if int(self._tune.get("subs_ocr_enable", 1)):
+            src_hint = (self._last_src or "").lower()
+            title_hint = (self._last_raw_title or "").lower()
+            hay = src_hint + " " + title_hint
+            in_browser = any(h in src_hint for h in BROWSER_HINTS)
+            on_anime  = any(h in hay for h in ANIME_HOSTS)
+            if (in_browser and on_anime
+                    and self._track_seq != self._subs_ocr_seq):
+                self._subs_ocr_seq = self._track_seq
+                if self._begin_subs_ocr_harvest(seq):
+                    return
         self._maybe_generate(seq)
 
     def _apply_captions(self, seq, title, artist, lines, lang, subtitle=None):
@@ -11708,7 +13460,14 @@ class Overlay:
         if seq != self._track_seq or not lines:
             return
         if subtitle is None:
-            subtitle = bool(getattr(self, "_subtitle_active", False))
+            subtitle = bool(self._subs_on())
+        # v1.1.72 (survey P0): the captured flag protects the SAVE-TAGGING,
+        # but the APPLY must re-check LIVE OWNERSHIP — a mid-fetch toggle-off
+        # (or a subs→concert flip) used to still paint the show's dialogue over
+        # the music overlay (and its token bumps killed the music-mode work).
+        if subtitle and not self._subs_suppresses_sound():
+            log.info("captions: subtitles no longer own this track — not applying show dialogue")
+            return
         # JP-vagency language guard: a known JP act (ReGLOSS / hololive / Hajime /
         # Suisei / Kanade …) doesn't release Korean/Chinese/European-language
         # songs, so a ko/zh/es/de/ru/fr/it/pt captions track is a fan-translation
@@ -12072,27 +13831,100 @@ class Overlay:
             self._live_resync_after = self.root.after(int(max(1.0, gap) * 1000),
                                                       self._live_resync_loop)
 
+    def _is_gaming_active(self):
+        """True IFF the gaming preset's visual state is currently applied —
+        whether the user picked it manually or the auto game-focus swap
+        engaged it. Signal: subtle opacity + slide-in scroll_dir + fast
+        perf, the exact combination the gaming preset sets. Cheap boolean
+        read (no syscall) so it's fine to call every sync tick.
+
+        Used to tighten resync tolerances: a single-line display makes
+        sub-2 s drift unreadable, so the resync loop stays hot and a
+        hard-drift watchdog force-aligns when the reader can't be trusted."""
+        if getattr(self, "_auto_game_swapped", False):
+            return True
+        # Manual gaming preset detection — match the exact tuple set by
+        # apply_preset('gaming'). Being permissive (opacity ≤ 0.5 vs ==
+        # 0.45) lets a user manually adjust opacity a little without
+        # accidentally leaving tight-sync territory.
+        return (getattr(self, "opacity", 1.0) <= 0.5
+                and getattr(self, "scroll_dir", "") == "left"
+                and getattr(self, "perf", "smooth") == "fast")
+
     def _note_live_resync(self, ok):
         """Verdict from a live/concert resync → roll the cadence. ``live_resync_relax_n``
         (3) good reads in a row relax one step (8×/min → 5×/min → 3×/min); ANY miss
         resets the streak and snaps back to 8×/min, so a drifting concert is hammered
-        until it re-locks, then backs off once it's holding."""
+        until it re-locks, then backs off once it's holding.
+
+        v1.1.62: when GAMING PRESET is active, refuse to relax past the FAST
+        tier. Single-line display makes any ≥ 2 s drift painful to read; a
+        1.5 s cadence caps in-loop-window drift accumulation to well under
+        that ceiling. Tunable via ``gaming_sync_tight``."""
         fast = float(self._tune.get("live_resync_fast_gap_s", 1.5))
         mid  = float(self._tune.get("live_resync_mid_gap_s", 6.0))
         slow = float(self._tune.get("live_resync_slow_gap_s", 14.0))
         step = max(1, int(self._tune.get("live_resync_relax_n", 3)))
+        gaming_tight = (bool(int(self._tune.get("gaming_sync_tight", 1)))
+                        and self._is_gaming_active())
         if ok:
             self._live_sync_streak += 1
-            self._live_resync_gap = (slow if self._live_sync_streak >= 2 * step
-                                     else mid if self._live_sync_streak >= step
-                                     else fast)
+            if gaming_tight:
+                # Gaming mode: never let the cadence relax. A missed read
+                # would snap us back to FAST anyway; we just skip the
+                # intermediate MID/SLOW steps entirely.
+                self._live_resync_gap = fast
+            else:
+                self._live_resync_gap = (slow if self._live_sync_streak >= 2 * step
+                                         else mid if self._live_sync_streak >= step
+                                         else fast)
         else:
             self._live_sync_streak = 0
             self._live_resync_gap = fast
         listen = float(self._tune.get("live_resync_listen_s", 6.0))
-        log.info("live resync %s → good-streak %d, next gap %.1fs (~%.0f×/min)",
+        log.info("live resync %s → good-streak %d, next gap %.1fs (~%.0f×/min)%s",
                  "OK" if ok else "miss", self._live_sync_streak, self._live_resync_gap,
-                 60.0 / max(0.1, self._live_resync_gap + listen))
+                 60.0 / max(0.1, self._live_resync_gap + listen),
+                 " [gaming-tight]" if gaming_tight else "")
+
+    def _check_gaming_hard_drift(self, now):
+        """(main tick) Hard drift watchdog for GAMING preset. When the
+        gaming preset is active and the measured drift exceeds
+        ``gaming_sync_hard_drift_s`` (default 1.5 s — below the user's 2 s
+        ceiling), force an immediate ``align_by_listening`` regardless of
+        the resync loop's cooldown state. Rate-limited to at most once every
+        ``gaming_sync_hard_min_gap_s`` (3 s) so a genuine ~2 s slip doesn't
+        trigger a Whisper storm — one force-align, then let the normal
+        loop's tighter FAST cadence hold the line.
+
+        In multi-line scroll modes this is off — visible context lines mask
+        modest drift, so hammering Whisper wastes CPU with no visible gain."""
+        if not (bool(int(self._tune.get("gaming_sync_tight", 1)))
+                and self._is_gaming_active()):
+            return
+        drift = float(getattr(self, "_last_drift", 0.0) or 0.0)
+        threshold = float(self._tune.get("gaming_sync_hard_drift_s", 1.5))
+        if abs(drift) < threshold:
+            return
+        min_gap = float(self._tune.get("gaming_sync_hard_min_gap_s", 3.0))
+        if now - self._last_gaming_hard_align_t < min_gap:
+            return
+        # Only meaningful if lyrics are loaded, playback is going, and we
+        # aren't already mid-align (align_by_listening will refuse re-entry
+        # but the log noise is undesirable).
+        if not self.lines or getattr(self, "_aligning", False):
+            return
+        st = self.media.get()
+        if not (st and st.get("status") == PLAYING):
+            return
+        self._last_gaming_hard_align_t = now
+        listen = float(self._tune.get("live_resync_listen_s", 6.0))
+        log.info("gaming-tight: hard drift %+.2fs > %.1fs → force align_by_listening",
+                 drift, threshold)
+        try:
+            self.align_by_listening(silent=True, seconds=listen)
+        except Exception as e:
+            log.info("gaming-tight: force align failed (%s)", e)
 
     def _sync_match_floor(self):
         """Minimum transcript↔LRC match ratio required to TRUST a large sync offset.
@@ -12322,7 +14154,8 @@ class Overlay:
             return
         # v1.1.56 — a SHOW in subtitle mode has no song to be wrong about;
         # captions are the ground truth and must not be scored/blacklisted.
-        if getattr(self, "_subtitle_active", False):
+        # v1.1.72 — unless a CONCERT owns the track (subs merely armed).
+        if self._subs_suppresses_sound():
             return
         now = time.time()
         if now - self._decision_last_t < float(
@@ -12688,6 +14521,14 @@ class Overlay:
             self._stats_bump("switch")
         if state == "SWITCH" and track:
             artist, title = track
+            # The initial fetch used _cover_original_artist (e.g. "EGOIST" for a
+            # cover of BANG!!!), but track carries the COVERING channel. A re-fetch
+            # with the channel name loses the curated hint, falls through to
+            # title-only, and lands on a wrong same-title song (the cycling bug).
+            _orig = getattr(self, "_cover_original_artist", None) or \
+                    getattr(self, "_known_original_artist", None)
+            if _orig and getattr(self, "_is_cover", False):
+                artist = _orig
             hint = f"🔁 Switched to alternative lyric source for {title}…"
             # TICKET-113: capture before destroy — the unlink below would leave
             # nothing for the helper to hash.
@@ -12748,6 +14589,10 @@ class Overlay:
                 # in _begin_generation / _apply_generated) checks this flag and
                 # writes into pending['lines'] instead of self.lines.
                 artist, title = track
+                _orig = getattr(self, "_cover_original_artist", None) or \
+                        getattr(self, "_known_original_artist", None)
+                if _orig and getattr(self, "_is_cover", False):
+                    artist = _orig
                 self._queue_swap(
                     kind="regen", source_site="I",
                     artist=artist, title=title, cover=False,
@@ -13037,7 +14882,10 @@ class Overlay:
         if getattr(self, "_non_music_page", False):
             return
         # v1.1.56 — subtitle mode: dialogue is not singing; nothing to decide.
-        if getattr(self, "_subtitle_active", False):
+        # v1.1.72 — unless a CONCERT owns the track: _on_boundary schedules this
+        # exact call inside concerts (TICKET-079, Shazam can't fingerprint live
+        # arrangements) and the candidate-pool matching lives here.
+        if self._subs_suppresses_sound():
             return
         # TICKET-090: a Shazam-VERIFIED + title-LOCKED song is ground truth — the
         # decide loop can only hurt (a noisy/hallucinated transcript ranks the
@@ -13096,6 +14944,38 @@ class Overlay:
             pass
         # (a pool of just the loaded song is fine — a clearly-wrong loaded song is
         # then identified against the WHOLE library below.)
+        # v1.1.64 P0 (docs/CONCERT_RESEARCH.md §4) — CONCERT CANDIDATE POOL.
+        # Inside a concert wrapper (live_arrangement / live_mode / boundary),
+        # add each parse_song_candidates() entry's cached lyrics to the pool
+        # so the scoped-artist songs get a shot at the win before we fall
+        # through to whole-library expansion. Prefetched on load via
+        # _prefetch_concert_candidates; any candidate whose fetch hasn't
+        # landed yet is silently absent this pass.
+        pool_scoped = bool(
+            int(self._tune.get("concert_pool_scoped", 1))
+            and (self._live_arrangement or self._live_mode
+                 or reason == "boundary"))
+        cand_hits = 0
+        if pool_scoped:
+            for c in list(getattr(self, "_concert_candidates", []) or [])[:24]:
+                title = ((c.get("title") if isinstance(c, dict) else "") or "").strip()
+                if not title:
+                    continue
+                try:
+                    hits = list(self.index.candidates(title, limit=2))
+                except Exception:
+                    hits = []
+                for p in hits:
+                    k = str(p)
+                    if k in seen:
+                        continue
+                    try:
+                        d = json.loads(Path(p).read_text("utf-8"))
+                    except Exception:
+                        continue
+                    pool.append((k, self._lyric_text(d.get("lines"))))
+                    seen.add(k)
+                    cand_hits += 1
         self._deciding = True
         # v1.1.49 — in a concert the loaded meta is stale/empty (the container
         # title was discarded on live-mode entry) and consecutive songs may be in
@@ -13108,9 +14988,15 @@ class Overlay:
         secs = float(self._tune.get("decide_listen_s", 12.0))
         wrong_floor = float(self._tune.get("decide_wrong_floor", 32.0))
         lib_paths = [str(e["path"]) for e in self.index.entries][:600]
-        log.info("decide-by-ear (%s): listening among %d title candidates "
-                 "(whole library of %d ready if the loaded song is wrong)",
-                 reason, len(pool), len(lib_paths))
+        if cand_hits:
+            log.info("decide-by-ear (%s): listening among %d candidates "
+                     "(%d concert-scoped; whole library of %d held unless "
+                     "the pool underperforms)",
+                     reason, len(pool), cand_hits, len(lib_paths))
+        else:
+            log.info("decide-by-ear (%s): listening among %d title candidates "
+                     "(whole library of %d ready if the loaded song is wrong)",
+                     reason, len(pool), len(lib_paths))
 
         def work():
             res = None
@@ -13122,22 +15008,39 @@ class Overlay:
                     loaded_score = next((s for s, k in ranked if k == loaded_key), 0.0)
                     expanded = False
                     if loaded_score < wrong_floor:
-                        # The loaded lyrics DON'T match the singing → identify against
-                        # the WHOLE cached library (the model "trained on everything we
-                        # have"): score the SAME transcript against every cached song.
-                        libpool = []
-                        for k in lib_paths:
-                            if k == loaded_key:
-                                continue
-                            try:
-                                d = json.loads(Path(k).read_text("utf-8"))
-                            except Exception:
-                                continue
-                            libpool.append((k, self._lyric_text(d.get("lines"))))
-                        if libpool:
-                            ranked = sorted(align.score_candidates(heard, libpool)
-                                            + [(loaded_score, loaded_key)], reverse=True)
-                            expanded = True
+                        # v1.1.64 P0: inside a concert wrapper the description
+                        # candidate pool IS the artist's setlist scope. If the
+                        # scoped pool produced a candidate that convincingly
+                        # beats the wrong_floor, keep it — a whole-library
+                        # expansion at this point re-introduces the exact
+                        # generic-title collisions the pool exists to close
+                        # (BANZAI / Deep Dive / La La La class).
+                        best_pool_score = max((s for s, _k in ranked), default=0.0)
+                        if (cand_hits > 0
+                                and best_pool_score >= wrong_floor
+                                and best_pool_score >= loaded_score
+                                + float(self._tune.get("decide_margin", 12.0))):
+                            log.info("decide-by-ear: loaded weak (%.1f) but "
+                                     "concert pool hit strong (%.1f) — skipping "
+                                     "whole-library expansion",
+                                     loaded_score, best_pool_score)
+                        else:
+                            # The loaded lyrics DON'T match the singing → identify against
+                            # the WHOLE cached library (the model "trained on everything we
+                            # have"): score the SAME transcript against every cached song.
+                            libpool = []
+                            for k in lib_paths:
+                                if k == loaded_key:
+                                    continue
+                                try:
+                                    d = json.loads(Path(k).read_text("utf-8"))
+                                except Exception:
+                                    continue
+                                libpool.append((k, self._lyric_text(d.get("lines"))))
+                            if libpool:
+                                ranked = sorted(align.score_candidates(heard, libpool)
+                                                + [(loaded_score, loaded_key)], reverse=True)
+                                expanded = True
                     # OPTIONAL LLM disambiguation (gated on an Anthropic API key),
                     # on the HARD cases only — the loaded song looks wrong, the top
                     # fuzzy scores are close, or we expanded to the whole library.
@@ -13856,6 +15759,8 @@ class Overlay:
         thing that can judge sync."""
         try:
             mid = self._tune.get("sync_tier_mid_s", 40.0)
+            if self._subs_on():
+                return
             fast_tier = self._sync_tier_interval <= mid
             if self._force_sync_active:
                 pass                                # Force Sync owns the offset — don't fight it
@@ -14658,6 +16563,77 @@ class Overlay:
         except Exception:
             return False
 
+    # ── v1.1.66 dev-console launcher ─────────────────────────────────────
+    # A separate Tauri app (dev-console/) shows weights + params + AutoResearch
+    # + resources; it reads the local API. Not bundled with the release build;
+    # the tray item is here so a developer can jump into it from any session,
+    # and it gracefully hints if the exe hasn't been built yet.
+    def _dev_console_exe(self):
+        """Locate the built dev-console exe. Prefers release, then debug, then
+        the LYRIC_DEVCONSOLE_EXE env override. Returns Path or None."""
+        env = (os.environ.get("LYRIC_DEVCONSOLE_EXE") or "").strip()
+        if env and Path(env).is_file():
+            return Path(env)
+        # Two roots: the source tree (main.py's parent) and, in a frozen
+        # PyInstaller build, the exe's parent (which houses `_internal/` where
+        # datas land). The spec drops the built exe under
+        # `_internal/dev-console/`, so the release path is checked first — a
+        # deployed install NEVER has the src-tauri/target folder.
+        roots = []
+        try:
+            roots.append(Path(__file__).parent)
+        except Exception:
+            pass
+        try:
+            if getattr(sys, "frozen", False):
+                roots.append(Path(sys.executable).parent)
+        except Exception:
+            pass
+        for root in roots:
+            for rel in (
+                "_internal/dev-console/lyric-immersion-dev-console.exe",  # frozen bundle (see spec)
+                "dev-console/lyric-immersion-dev-console.exe",           # sibling install
+                "dev-console/src-tauri/target/release/lyric-immersion-dev-console.exe",
+                "dev-console/src-tauri/target/debug/lyric-immersion-dev-console.exe",
+            ):
+                p = root / rel
+                try:
+                    if p.is_file():
+                        return p
+                except Exception:
+                    pass
+        return None
+
+    def launch_dev_console(self):
+        """Spawn the dev-console child (windowless), or hint how to build it."""
+        # Reuse a live child instead of double-spawning — one dev console window
+        # is enough, and Tauri single-instance would flap.
+        if getattr(self, "_devconsole_child", None) is not None:
+            try:
+                if self._devconsole_child.poll() is None:
+                    log.info("dev-console: already running (pid %s)", self._devconsole_child.pid)
+                    self._hint("🛠 Dev Console already open")
+                    return
+            except Exception:
+                pass
+        exe = self._dev_console_exe()
+        if exe is None:
+            log.info("dev-console: build not found — cd dev-console && npm install && "
+                     "npm run tauri:build (portable exe lands at src-tauri\\target\\release\\).")
+            self._hint("🛠 Dev Console not built — see dev-console\\README.md")
+            return
+        try:
+            self._devconsole_child = subprocess.Popen(
+                [str(exe)], cwd=str(exe.parent),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, creationflags=_NO_WINDOW,
+            )
+            log.info("dev-console: launched %s (pid %s)", exe, self._devconsole_child.pid)
+            self._hint("🛠 Dev Console opened")
+        except Exception as e:
+            log.info("dev-console: launch failed: %s", e)
+            self._hint("🛠 Dev Console failed to launch")
+
     def _apply_tauri_overlay_toggle(self, on: bool):
         """Tray-menu hook. The GPU overlay BECOMES the renderer ONLY once it has
         PROVEN it is rendering (a visible window + a fresh /overlay heartbeat);
@@ -15097,6 +17073,7 @@ def main():
     opacity_menu = pystray.Menu(
         _op_item("100%  (solid)", 1.0), _op_item("85%", 0.85),
         _op_item("70%", 0.70), _op_item("55%", 0.55),
+        _op_item("45%  (subtle)", 0.45),
         _op_item("40%  (faint — for games)", 0.40), _op_item("25%", 0.25),
     )
     # Position is two INDEPENDENT axes now — pick a vertical AND a horizontal anchor.
@@ -15144,7 +17121,12 @@ def main():
             items.append(_disp_item("Mirror on ALL screens", "mirror"))
             items.append(_disp_item("Cycle through screens  (rotate per line)", "cycle"))
             items.append(_disp_item("Scroll across ALL screens  (one continuous band)", "span"))
-        return pystray.Menu(*items)
+        # Return the ITEMS (not a Menu). This is invoked as pystray's dynamic-
+        # submenu generator — pystray.Menu(<callable>) calls it EACH time the
+        # Display submenu opens, so the monitor list always reflects the live
+        # topology (a screen plugged in / woken after launch shows up without a
+        # restart). See the "Display" MenuItem below.
+        return items
     scroll_menu = pystray.Menu(
         _scr_item("Stationary (appear in place)", "none"),
         _scr_item("Slide in from left", "left"),
@@ -15180,9 +17162,20 @@ def main():
     def _subs_toggle(*_):
         ov.root.after(0, lambda: ov.set_subs_mode(
             "off" if ov.subs_mode == "on" else "on"))
+    # v1.1.65: Auto Game focus is a content-behavior toggle (it auto-swaps to
+    # the Gaming preset when a fullscreen game takes focus), so its home is
+    # now the Subtitles submenu alongside the other video/content controls,
+    # rather than crowding the top level. Defined ABOVE subs_menu so the menu
+    # item can reference it at construction time.
+    def _toggle_auto_game_mode(*_):
+        ov.root.after(0, lambda: ov.set_auto_game_mode(not ov.auto_game_mode_on))
     subs_menu = pystray.Menu(
-        pystray.MenuItem("Subtitles on  (treat videos as shows)", _subs_toggle,
-                         checked=lambda i: ov.subs_mode == "on"),
+        pystray.MenuItem(
+            lambda i: ("Subtitles  (on)"
+                       if getattr(ov, "subs_mode", "off") == "on"
+                       else "Subtitles on  (treat videos as shows)"),
+            _subs_toggle,
+            checked=lambda i: ov.subs_mode == "on"),
         pystray.Menu.SEPARATOR,
         _subs_disp_item("Stationary  (centered, bottom — default)", "stationary"),
         _subs_disp_item("Scroll through", "scroll"),
@@ -15190,6 +17183,14 @@ def main():
         _subs_layer_item("Native text", "native", "subs_native"),
         _subs_layer_item("Romaji / romanization", "romaji", "subs_romaji"),
         _subs_layer_item("English translation", "english", "subs_english"),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            lambda i: ("🎮  Auto game-focus  (swapped now)"
+                       if (getattr(ov, "auto_game_mode_on", False)
+                           and getattr(ov, "_auto_game_swapped", False))
+                       else "🎮  Auto game-focus"),
+            _toggle_auto_game_mode,
+            checked=lambda i: getattr(ov, "auto_game_mode_on", False)),
     )
 
     def _q_item(label, mode):
@@ -15214,6 +17215,7 @@ def main():
     preset_menu = pystray.Menu(
         pystray.MenuItem("🎮  Gaming  (subtle, learn while you play)", _preset("gaming")),
         pystray.MenuItem("🎤  Karaoke  (big, scrolling, for a room)", _preset("karaoke")),
+        pystray.MenuItem("📺  Subtitles  (45%, 100% font, centered)", _preset("subtitles")),
     )
     def _toggle_git(*_):   ov.root.after(0, lambda: ov.set_git_sync(not ov.git_sync))
     def _backup_now(*_):   ov.root.after(0, ov.git_backup)
@@ -15222,6 +17224,10 @@ def main():
     def _toggle_bound(*_): ov.root.after(0, lambda: ov.set_boundary(not ov.boundary_on))
     def _toggle_gen(*_):   ov.root.after(0, lambda: ov.set_generate(not ov.generate_on))
     def _toggle_caps(*_):  ov.root.after(0, lambda: ov.set_captions(not ov.captions_on))
+    def _open_dev_console(*_):
+        # v1.1.66: spawn the standalone dev-console child (windowless). Falls
+        # back to a hint if the exe hasn't been built yet.
+        ov.root.after(0, ov.launch_dev_console)
     def _toggle_tauri_overlay(*_):
         # Toggle the USER'S INTENT (tauri_overlay_on), not raw child liveness, so the
         # button is a clean A/B switch: ON → GPU (Tauri) renders + Tk hides once it's
@@ -15231,6 +17237,11 @@ def main():
     # TICKET-100: Discord Rich Presence reader toggle (default OFF, opt-in).
     def _toggle_discord_rpc(*_):
         ov.root.after(0, lambda: ov.set_discord_rpc(not ov.discord_rpc_on))
+    # v1.1.62 AUTO GAME-FOCUS MODE toggle: defined above subs_menu (v1.1.65
+    # moved the item into the Subtitles submenu, and the def had to move too
+    # so the MenuItem could reference it at construction time). When a D3D
+    # exclusive-fullscreen game takes focus, the app swaps to the Gaming
+    # preset (bottom-center, 45% opacity), then restores on game exit.
     # TICKET-102: window-title scraper toggles (HIGH default ON, LOW default OFF).
     def _toggle_window_titles(*_):
         ov.root.after(0, lambda: ov.set_window_titles(not ov.window_titles_on))
@@ -15238,6 +17249,11 @@ def main():
         ov.root.after(0, lambda: ov.set_window_titles_generic_browsers(
             not ov.window_titles_generic_browsers_on))
     def _get_caps(*_):     ov.root.after(0, ov.load_youtube_captions)
+    # v1.1.64 (docs/CONCERT_RESEARCH.md §5): boundary marker for concert
+    # ground-truth capture. Writes wall-clock + player position + current
+    # SMTC title + video URL to <data>/concert_marks.jsonl. Consumed later
+    # by the auto-tune harness to fill in setlist[].start_s + mc_segments_s.
+    def _mark_boundary(*_):  ov.root.after(0, ov.mark_concert_boundary)
 
     # ── TICKET-117: Source pin (which SMTC session feeds lyrics) ─────────
     # Two browser tabs both playing media (e.g. a muted visual + the actual
@@ -15478,6 +17494,13 @@ def main():
         pystray.MenuItem("🚀  Force Sync  (try ranked matches, skip chorus traps, until it locks)", _align),
         pystray.MenuItem("Re-fetch lyrics", _refetch),
         pystray.MenuItem("⬇  Get captions for this video now", _get_caps),
+        # v1.1.64 — concert boundary marker for ground-truth capture.
+        # Appends the current player position + SMTC title + URL to
+        # <data>/concert_marks.jsonl. Only visible while a concert wrapper
+        # (live_arrangement / live_mode) is active.
+        pystray.MenuItem("🔖 Mark song boundary (concert)", _mark_boundary,
+                         visible=lambda i: (getattr(ov, "_live_arrangement", False)
+                                            or getattr(ov, "_live_mode", False))),
         pystray.Menu.SEPARATOR,
         # 2. DETECTION / LYRIC SOURCES ────────────────────────────────────
         pystray.MenuItem("Fast song-change detect (compilations)", _toggle_bound,
@@ -15518,17 +17541,18 @@ def main():
         # 4. VISUAL / DISPLAY ─────────────────────────────────────────────
         pystray.MenuItem("Show / Hide", _toggle),
         pystray.MenuItem("Position", position_menu),
-        pystray.MenuItem("Display", _display_menu_items),
+        # BUGFIX (v1.1.70): the second arg MUST be a pystray.Menu for a submenu —
+        # passing the bare `_display_menu_items` function made pystray treat
+        # "Display" as a click ACTION (no submenu arrow, no monitor list), so
+        # there was no way to pick a screen. Wrapping the callable in
+        # pystray.Menu(...) makes it a proper DYNAMIC submenu (rebuilt each open).
+        pystray.MenuItem("Display", pystray.Menu(_display_menu_items)),
         pystray.MenuItem("Opacity", opacity_menu),
         pystray.MenuItem("Font size", font_menu),
         pystray.MenuItem("Scroll-in", scroll_menu),
         pystray.MenuItem("Scroll-through speed", speed_menu),
         pystray.MenuItem("Dancing character", _toggle_char,
                          checked=lambda i: ov.character_on),
-        pystray.MenuItem(
-            lambda i: ("Subtitles  (📺 active)" if getattr(ov, "_subtitle_active", False)
-                       else "Subtitles"),
-            subs_menu),
         pystray.Menu.SEPARATOR,
         # 5. PERFORMANCE ──────────────────────────────────────────────────
         pystray.MenuItem("Performance", perf_menu),
@@ -15547,10 +17571,22 @@ def main():
         pystray.Menu.SEPARATOR,
         # 6. LIBRARY / CONTENT ────────────────────────────────────────────
         pystray.MenuItem("Presets", preset_menu),
+        # v1.1.65: "Auto game-focus" moved INTO the Subtitles submenu — the
+        # top-level now just holds Subtitles, which itself groups the video/
+        # content behaviors (transcript on/off, layout, per-layer toggles,
+        # and auto-swap-to-Gaming).
+        pystray.MenuItem(
+            lambda i: ("Subtitles  (on)" if getattr(ov, "subs_mode", "off") == "on"
+                       else "Subtitles"),
+            subs_menu),
         pystray.MenuItem("📥  Import playlist (Spotify / YouTube)", _open_import),
         pystray.MenuItem("Library backup (Git)", git_menu),
         pystray.Menu.SEPARATOR,
         # 7. APP / SYSTEM ─────────────────────────────────────────────────
+        # v1.1.66: dev-console tray entry. The item is always visible; if the
+        # exe hasn't been built the launcher toasts a hint pointing at
+        # dev-console\README.md so the user knows exactly what to do.
+        pystray.MenuItem("🛠  Developer Console", _open_dev_console),
         pystray.MenuItem("Local API (agent control)", _toggle_api,
                          checked=lambda i: ov.api_on),
         pystray.MenuItem("Start with Windows", _toggle_startup,

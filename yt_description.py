@@ -150,10 +150,306 @@ _SUFFIX_NOSPLIT = {"append", "ver", "version", "mix", "edit", "remix", "cover",
 # token is >= 2 chars and not a known suffix word.
 _SOFT_SEPS = ("/", "／", "、", ",", "・", "&")
 
+# ── Description-embedded setlist parser ─────────────────────────────────
+# Many concert uploads (indie / VTuber lives / EXPO self-produced shows
+# like ZUTOMAYO's ずっと真夜中でいいのに。EXPO2025) don't set YouTube's
+# native CHAPTERS metadata — they paste a plain "MM:SS Title" list into
+# the description instead. The existing setlist path only reads
+# info["chapters"], so it misses these entirely. This parser recovers
+# that setlist so chapter-based recognition works on those videos too.
+#
+# Matched shapes (real-world YouTube conventions, all seen in the wild):
+#   00:00 Song A
+#   1:23:45 Song B                   ← HH:MM:SS
+#   [00:00] Song C                   ← bracketed timestamp
+#   (04:12) Song D                   ← parenthesized
+#   00:00｜Song E                    ← full-width bar
+#   00:00 - Song F  |  00:00 / Song G
+#   00:00 曲名                       ← CJK title, no separator
+#
+# We deliberately require a SPACE or explicit separator between the
+# timestamp and the title so a stray "at 04:12 today" prose line
+# doesn't parse as a chapter.
+_SETLIST_LINE_RE = re.compile(
+    r"^[ \t　]*"
+    r"[\[\(【（]?"                                   # optional open bracket
+    r"(?P<t>(?:\d{1,2}:)?\d{1,2}:\d{2})"           # HH:MM:SS or MM:SS
+    r"[\]\)】）]?"                                   # optional close bracket
+    r"[ \t　\|｜／/・．\.\-–—~〜]{1,4}"          # separator (space or punct)
+    r"(?P<title>[^\r\n]+?)"                         # title (non-greedy)
+    r"[ \t　]*$",
+    re.M,
+)
+
+
+def _hms_to_sec(hms: str) -> float:
+    """'MM:SS' or 'HH:MM:SS' → seconds. Returns 0.0 on any parse failure."""
+    try:
+        parts = [int(p) for p in hms.split(":")]
+    except ValueError:
+        return 0.0
+    if len(parts) == 2:
+        return parts[0] * 60.0 + parts[1]
+    if len(parts) == 3:
+        return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+    return 0.0
+
+
+# Titles that look like a timestamp entry but are really header/section
+# labels ("Setlist", "Tracklist", "セットリスト", "曲順") — reject so the
+# monotonic filter below doesn't get seeded with garbage.
+_SETLIST_HEADER_RE = re.compile(
+    r"^(setlist|tracklist|songs?|track\s*list|"
+    r"セットリスト|曲順|曲目|楽曲|プレイリスト)\s*[:：]?\s*$",
+    re.I,
+)
+
+
+def parse_setlist_timestamps(desc: str) -> list[dict]:
+    """Pull a per-song setlist out of a video's DESCRIPTION.
+
+    Returns a list of ``{"start": float, "title": str}`` compatible with
+    the yt-dlp ``chapters`` shape, so callers can plug it into the same
+    ``_concert_setlist_tick`` pipeline that consumes native chapters.
+
+    Guards against false positives:
+      - requires ≥2 entries (a single timestamp is just prose)
+      - strips trailing ``(feat. …)`` / ``[…]`` credit blocks so they
+        don't inflate the title-length check
+      - drops entries with empty or over-long (>80 char) titles
+      - rejects header lines ("Setlist" / "セットリスト") that happen
+        to sit next to a timestamp
+      - de-duplicates exact ``(start, title)`` repeats
+      - enforces monotonic increasing starts (drops any backwards entry —
+        common when a description lists times twice, or when the
+        description mentions "back at 00:00" prose lower down)
+
+    Returns ``[]`` on any failure or when the result would be shorter
+    than 2 entries after filtering.
+    """
+    if not desc:
+        return []
+    hits: list[dict] = []
+    for m in _SETLIST_LINE_RE.finditer(desc):
+        t = _hms_to_sec(m.group("t"))
+        title = (m.group("title") or "").strip()
+        # Strip trailing credit / annotation brackets so a line like
+        #  '00:00 Song A (music: kors k)' keeps just 'Song A'.
+        title = re.sub(r"\s*[\(\[【（].*?[\)\]】）]\s*$", "", title).strip()
+        # Strip a trailing separator artifact ('Song A -' / 'Song A |').
+        title = re.sub(r"[ \t\|｜／/・．\.\-–—~〜]+$", "", title).strip()
+        if not title or len(title) > 80:
+            continue
+        if _SETLIST_HEADER_RE.match(title):
+            continue
+        hits.append({"start": float(t), "title": title})
+    if len(hits) < 2:
+        return []
+    # De-dup exact repeats first (some descriptions list the setlist
+    # twice — once in JP, once in EN — with identical timestamps).
+    seen: set[tuple[float, str]] = set()
+    deduped: list[dict] = []
+    for h in hits:
+        key = (h["start"], h["title"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(h)
+    # Enforce monotonic increasing starts. Prose like "back at 04:12"
+    # lower in the description would otherwise re-anchor.
+    mono = [deduped[0]]
+    for h in deduped[1:]:
+        if h["start"] > mono[-1]["start"]:
+            mono.append(h)
+    return mono if len(mono) >= 2 else []
+
 
 def _strip_decoration(s: str) -> str:
     """Strip leading decorative chars (★☆♪・■▪︎▶◆◇♥♡✿◎) and whitespace."""
     return re.sub(r"^[\s★☆♪♫■□▪▶◆◇♥♡✿◎◯●→▼▽–—\-=*]+", "", s or "")
+
+
+# ── Description-song candidate extractor ─────────────────────────────────
+# Livestream concerts (VTuber birthday shows, anniversary streams) have NO
+# native chapters and NO description-timestamp setlist — YouTube's chapter
+# UI wasn't the right fit for a chatty 1-hour stream with songs interspersed.
+# But the description ALWAYS carries the artist's own song list, marked with
+# section headers like オリジナル曲宣伝 / カバー曲宣伝 / Original / Cover:
+#
+#   ✨オリジナル曲宣伝✨
+#   💜【Original】Dunk/轟はじめ💜
+#   💜【Original】BANZAI-轟はじめ💜
+#   ✨COVER曲宣伝✨
+#   BANDAGE-Ayumu Imazu /cover
+#   夜咄ディセイブ/歌ってみた【轟はじめ/ReGLOSS】
+#
+# These are the songs the artist ACTUALLY performs — a scoped candidate pool
+# far better than blind Shazam for the livestream case. Extract them so
+# downstream code can fetch each candidate's lyrics ahead of time, then
+# match live vocal transcripts against just this pool instead of against
+# all of LRCLIB.
+
+_CAND_SECTION_START_RE = re.compile(
+    r"(?:オリジナル曲|カバー曲|COVER曲|カバー|オリジナル|"
+    r"original\s*(?:song)?s?|cover\s*(?:song)?s?|"
+    r"performed\s*songs?|setlist|track\s*list|楽曲一覧|セットリスト)",
+    re.I,
+)
+# STRICT header — fullmatch a plain section header line (nothing after).
+# Header + optional decorative suffix (宣伝 = "promotion/showcase" is the
+# canonical VTuber convention), colon, or numbered marker.
+_CAND_SECTION_HEADER_STRICT_RE = re.compile(
+    r"^(?:オリジナル|カバー|COVER|Original|Cover)"
+    r"\s*(?:曲|songs?|list)?"
+    r"\s*(?:宣伝|一覧|selection|list)?"
+    r"\s*(?:section)?\s*[:：]?\s*$",
+    re.I,
+)
+# All emoji + decorative chars we want to STRIP from a candidate line before
+# splitting on separators. Broad Unicode ranges: pictographic emoji + symbols
+# + hearts + suits + decorative markers.
+_CAND_STRIP_RE = re.compile(
+    r"[\U0001F300-\U0001FAFF"
+    r"\U0001F600-\U0001F64F"
+    r"\U0001F680-\U0001F6FF"
+    r"\U00002600-\U000027BF"
+    r"★☆♪♫■□▪▶◆◇♥♡✿◎◯●→▼▽]+"
+)
+# Full-width punctuation we normalize to ASCII to keep the "NEW!!" prefix
+# strip simple.
+_CAND_FULLWIDTH_MAP = str.maketrans({"！": "!", "？": "?", "：": ":", "，": ","})
+# Inline section markers we strip before title matching: 【Original】,
+# 【Cover】, 【MV】, 【Official MV】, 【歌ってみた】, 【〜】 variants.
+_CAND_INLINE_MARKER_RE = re.compile(
+    r"【\s*(?:original|cover|カバー|オリジナル|mv|"
+    r"official\s*mv|歌ってみた|cover\s*ver|off\s*vocal|"
+    r"instrumental|acoustic)\s*】",
+    re.I,
+)
+# Noise prefixes that sit before the title: NEW!!, ★NEW★, 【NEW】.
+_CAND_PREFIX_NOISE_RE = re.compile(
+    r"^\s*(?:new\s*!*\s*|【\s*new\s*】\s*|【\s*完成\s*】\s*|"
+    r"latest\s*!*\s*|最新\s*)+",
+    re.I,
+)
+# Numbered-list prefix ("1. ", "01) ", "M1  ", "① ").
+_CAND_LIST_NUM_RE = re.compile(
+    r"^\s*(?:\d{1,2}[\.\)\-））]|\d{1,2}\s+|"
+    r"[①-⑳㈠-㈩]|M\d{1,2}\s+|"
+    r"[\-–—•・◆▶]\s+)\s*",
+    re.I,
+)
+# Titles that are obviously NOT songs (headers, boilerplate).
+_CAND_NOISE_RE = re.compile(
+    r"^(オリジナル曲宣伝|カバー曲宣伝|オリジナル曲|カバー曲|Original|Cover|"
+    r"Music|Songs?|Setlist|Tracklist|楽曲一覧|セットリスト|"
+    r"http|www\.|@|#|Special\s*Thanks|Credits?|"
+    r"[\s\|\-＿_=]*$)",
+    re.I,
+)
+
+
+def parse_song_candidates(desc: str, max_candidates: int = 24) -> list[dict]:
+    """Extract a candidate pool of songs the artist performs, from the
+    description's song-list sections.
+
+    Returns a list of ``{"title": str, "kind": "original"|"cover"|"unknown"}``
+    dicts, deduped, in order of first appearance. The ``kind`` field lets
+    downstream ranking prefer originals (uniquely identifying) over covers
+    (which collide with many other artists' recordings).
+
+    Runs a simple state machine: walk lines top-to-bottom, activate a
+    "collecting" mode when a section-header line is seen, then for each
+    subsequent non-empty non-URL line try to extract a title until we hit
+    a divider (======= / ______ / a new section header of a non-song kind).
+    """
+    if not desc:
+        return []
+    kind = None                       # 'original' | 'cover' | None
+    out: list[dict] = []
+    seen: set[str] = set()
+    for raw in desc.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # Section divider — reset kind.
+        if re.fullmatch(r"[\s\-_=￣ー\|\.·・]{4,}", line):
+            kind = None
+            continue
+        # Section header — activate collection mode. Only fire on a line
+        # that is JUST the header (after decoration strip) — e.g.
+        # "オリジナル曲宣伝" or "Cover:" or "Setlist". A line like
+        # "【Original】BANZAI-轟はじめ" starts with "Original" but has song
+        # content after it, so the STRICT fullmatch rejects it and the
+        # candidate branch below picks up the song.
+        _header_probe = _CAND_STRIP_RE.sub(" ", line).strip()
+        _header_probe = re.sub(r"\s+", " ", _header_probe).strip(" 　【】[]")
+        if _header_probe and _CAND_SECTION_HEADER_STRICT_RE.fullmatch(_header_probe):
+            low = _header_probe.lower()
+            if "cover" in low or "カバー" in _header_probe:
+                kind = "cover"
+            elif "オリジナル" in _header_probe or "original" in low:
+                kind = "original"
+            else:
+                kind = "unknown"
+            continue
+        # Broader header pattern for "Setlist" / "楽曲一覧" / "セットリスト".
+        if _header_probe and _CAND_SECTION_START_RE.fullmatch(_header_probe.rstrip(":： ")):
+            low = _header_probe.lower()
+            if "cover" in low or "カバー" in _header_probe:
+                kind = "cover"
+            else:
+                kind = "unknown"
+            continue
+        if kind is None:
+            continue
+        # Reject obvious noise / boilerplate.
+        if _CAND_NOISE_RE.match(line):
+            continue
+        if "http://" in line or "https://" in line or "www." in line:
+            continue
+        # Normalize:
+        #  1. Full-width punct → ASCII so 'NEW！！' becomes 'NEW!!'.
+        #  2. Strip all emoji / decorative glyphs anywhere in the line
+        #     (VTuber descriptions sandwich the title in 💜 / 🏀 pairs).
+        #  3. Strip inline section markers 【Original】 / 【Cover】 / 【MV】.
+        #  4. Strip 'NEW!!' / '【NEW】' prefixes.
+        norm = line.translate(_CAND_FULLWIDTH_MAP)
+        norm = _CAND_STRIP_RE.sub(" ", norm)
+        norm = _CAND_INLINE_MARKER_RE.sub(" ", norm)
+        norm = _CAND_PREFIX_NOISE_RE.sub("", norm)
+        norm = _CAND_LIST_NUM_RE.sub("", norm)
+        norm = norm.strip()
+        if not norm:
+            continue
+        # Now the title is the first non-empty segment before a
+        # separator that introduces artist / cover-ver / MV etc:
+        #   'Dunk/轟はじめ'   → 'Dunk'
+        #   'BANZAI-轟はじめ' → 'BANZAI'
+        #   '踊り子-Vaundy(Cover)/…' → '踊り子'
+        # Split on the first of: /, ／, -, –, —, 【, [, (, （
+        parts = re.split(r"[/／\-–—【\[\(（]", norm, maxsplit=1)
+        title = parts[0].strip()
+        # Some lines have artist-song reversed with '/' separator (rare in
+        # song-list sections, but handle 'ReGLOSS/FeelingRadation' shape by
+        # keeping the LEFT side — song-list sections nearly always put
+        # song first).
+        # Reject too-short / too-long titles or titles that are still
+        # obvious noise.
+        if len(title) < 2 or len(title) > 60:
+            continue
+        if _CAND_NOISE_RE.match(title):
+            continue
+        # Dedup on lowercased-normalized title so casing/spacing doesn't
+        # create duplicates.
+        key = re.sub(r"\s+", " ", title.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"title": title, "kind": kind})
+        if len(out) >= max_candidates:
+            break
+    return out
 
 
 def _split_names(val: str) -> list[str]:

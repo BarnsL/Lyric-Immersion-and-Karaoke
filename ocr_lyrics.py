@@ -59,6 +59,23 @@ _BAND_SIDE = 0.08
 _MIN_LEN = 2
 _OCR_DOWNSCALE_H = 240   # downscale the band to this height before PNG/OCR (GIL-hold cut)
 
+# v1.1.68 — named band presets. `read_lyric_lines(band="...")` picks one; the
+# default (None) is the "lyric" band above and matches the previous behavior
+# byte-for-byte so concert OCR is unchanged.
+#
+# "anime_sub" targets hardsubbed anime dialogue at the bottom of the VIDEO.
+# On a windowed anime-streamer page (animepahe / aniwave / hianime) the video
+# fills the middle ~55-80% of the browser window — a tab bar + address bar sit
+# above it and download / episode-list / comments sit below. So the anime_sub
+# band must target the LOWER-MIDDLE of the browser window, NOT the bottom of
+# it (the bottom is the site's download panel, not the video). v1.1.69 —
+# widened top from 0.80 to 0.55 and lowered bottom from 0.97 to 0.80 after
+# live-verified miss on animepahe's Magilumiere ep 1.
+_BAND_PRESETS = {
+    "lyric":     (_BAND_TOP,  _BAND_BOTTOM, _BAND_SIDE),
+    "anime_sub": (0.55,       0.80,         0.06),
+}
+
 PW_RENDERFULLCONTENT = 0x00000002
 
 
@@ -298,13 +315,24 @@ def _looks_black(img, thresh: int = 10, frac: float = 0.985) -> bool:
         return False
 
 
-def _crop_band(img):
-    """Crop the centred lower lyric band out of a full-window/screen image."""
+def _crop_band(img, band=None):
+    """Crop the centred lower band out of a full-window/screen image.
+
+    `band` picks one of ``_BAND_PRESETS`` by name (e.g. "anime_sub"), or takes
+    an explicit ``(top, bot, side)`` tuple of 0..1 fractions. ``None`` falls
+    back to the legacy lyric band so every existing caller is unaffected.
+    """
     w, h = img.size
-    top = int(h * _BAND_TOP)
-    bot = int(h * _BAND_BOTTOM)
-    left = int(w * _BAND_SIDE)
-    right = int(w * (1.0 - _BAND_SIDE))
+    if isinstance(band, tuple) and len(band) == 3:
+        t, b, s = band
+    elif isinstance(band, str) and band in _BAND_PRESETS:
+        t, b, s = _BAND_PRESETS[band]
+    else:
+        t, b, s = _BAND_TOP, _BAND_BOTTOM, _BAND_SIDE
+    top = int(h * t)
+    bot = int(h * b)
+    left = int(w * s)
+    right = int(w * (1.0 - s))
     if bot <= top or right <= left:
         return img
     return img.crop((left, top, right, bot))
@@ -446,7 +474,8 @@ def _matches_meta(raw_line: str, norm_line: str, meta_norm: str, meta_tokens: se
 
 def filter_lyric_lines(lines, overlay_text: Optional[str] = None,
                        track_title: Optional[str] = None,
-                       track_artist: Optional[str] = None) -> list:
+                       track_artist: Optional[str] = None,
+                       band: Optional[str] = None) -> list:
     """Keep only plausible burned-in LYRIC lines. Drops, in order:
       * UI chrome (player controls, view counts, 'Next:' up-next card, channel) — the
         spike showed these dominate the band on a non-fullscreen watch page;
@@ -454,11 +483,15 @@ def filter_lyric_lines(lines, overlay_text: Optional[str] = None,
         `track_title`/`track_artist`) — the single most effective discriminator;
       * (fallback path only) lines fuzzy-matching our OWN overlay text — self-read guard.
     CJK glyph-spacing from the OCR engine is collapsed first. `overlay_text` should be
-    None for PrintWindow captures (already overlay-free)."""
+    None for PrintWindow captures (already overlay-free).
+
+    v1.1.68 — ``band="anime_sub"`` disables the TITLE/ARTIST-bleed reject
+    (the SMTC title on animepahe reads "Let's Go Kaiki-gumi Ep. 1 :: animepahe";
+    dialogue like "Let's go" or the character name would be wrongly dropped)."""
     ov = _norm(overlay_text) if overlay_text else ""
     meta = " ".join(x for x in (track_title, track_artist) if x)
-    meta_norm = _norm(meta)
-    meta_tokens = _tokens(meta)
+    meta_norm = _norm(meta) if band != "anime_sub" else ""
+    meta_tokens = _tokens(meta) if band != "anime_sub" else set()
     out = []
     for ln in lines:
         ln = _collapse_cjk_spaces(_strip_tofu((ln or "").strip()))
@@ -481,7 +514,8 @@ def read_lyric_lines(hwnd: Optional[int] = None,
                      overlay_text: Optional[str] = None,
                      track_title: Optional[str] = None,
                      track_artist: Optional[str] = None,
-                     allow_fallback: bool = True) -> list:
+                     allow_fallback: bool = True,
+                     band=None) -> list:
     """Read the burned-in lyric line(s) currently on screen, self-read-safe.
 
     PRIMARY path (hwnd given): PrintWindow the source window → crop band → OCR. The
@@ -509,10 +543,11 @@ def read_lyric_lines(hwnd: Optional[int] = None,
             return []
     if img is None:
         return []
-    raw = _ocr_image(_crop_band(img))
+    raw = _ocr_image(_crop_band(img, band=band))
     # only apply the self-read guard on the fallback (composited) path
     return filter_lyric_lines(raw, overlay_text if used_fallback else None,
-                              track_title=track_title, track_artist=track_artist)
+                              track_title=track_title, track_artist=track_artist,
+                              band=band)
 
 
 # ── Timed harvester → LRC builder ────────────────────────────────────────────────

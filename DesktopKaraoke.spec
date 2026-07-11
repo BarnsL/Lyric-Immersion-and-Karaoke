@@ -16,6 +16,18 @@ datas = [("icon.ico", ".")]
 overlay_exe = os.path.join("overlay", "lyric-overlay.exe")
 if os.path.isfile(overlay_exe):
     datas.append((overlay_exe, "overlay"))
+# v1.1.66 dev-console: an optional Tauri companion (dev-console/) shown from
+# the tray's "🛠 Developer Console" item. It's bundled ONLY when the release
+# build has been produced (npm run tauri:build inside dev-console/). Without
+# the exe on disk the tray item toasts a hint pointing at dev-console\README.md,
+# so this branch never breaks a build — it just enables the tray launcher in
+# installed copies. Runtime resolver: main.py.Overlay._dev_console_exe.
+devconsole_exe = os.path.join(
+    "dev-console", "src-tauri", "target", "release",
+    "lyric-immersion-dev-console.exe",
+)
+if os.path.isfile(devconsole_exe):
+    datas.append((devconsole_exe, "dev-console"))
 # TICKET-124: NO bundled lyrics are shipped. This is a sellable product — every lyric
 # must be FOUND BY CODE at runtime (providers / YouTube captions / OCR / by-ear), never
 # copyrighted text baked into the build. (bundled_lyrics/ was removed from the repo.)
@@ -66,6 +78,26 @@ hiddenimports = [
     "pygame", "pygame.image", "pygame.display", "pygame.event", "pygame.time",
 ]
 
+# BUGFIX (v1.1.70): PyInstaller ALWAYS runs the pkg_resources runtime hook
+# (pyi_rth_pkgres) at startup; pkg_resources imports jaraco.text/.functools/
+# .context. setuptools 78 ships those ONLY vendored under setuptools/_vendor as a
+# PEP-420 namespace that collect_submodules can't walk, so the frozen build had no
+# jaraco and the WINDOWED bootloader HUNG on a modal "No module named 'jaraco'"
+# dialog (looks like a silent freeze; the pre-7/11 build predated this setuptools
+# layout). Fix: a real TOP-LEVEL `jaraco.text` is installed in the build env, and
+# setuptools' vendor importer (APPENDED to sys.meta_path) yields to it. Bundle the
+# concrete jaraco subpackages + their data (the namespace parent can't be walked).
+for _jp in ("jaraco.text", "jaraco.functools", "jaraco.context"):
+    try:
+        _jd, _jb, _jh = collect_all(_jp)
+        datas += _jd
+        binaries += _jb
+        hiddenimports += _jh
+    except Exception:
+        pass
+hiddenimports += ["jaraco", "jaraco.text", "jaraco.functools",
+                  "jaraco.context", "more_itertools"]
+
 # Packages that ship data files / dynamically-imported submodules.
 # NOTE: unidic_lite bundles the ~50 MB dictionary fugashi/cutlet need at runtime
 # — collect_all is what pulls those data files into the exe.
@@ -107,6 +139,11 @@ a = Analysis(
     runtime_hooks=[],
     # Trim heavy libraries the app never imports (they can get pulled in
     # transitively and bloat the build). Safe to drop — none are used.
+    # setuptools._vendor stays excluded (keeps the build lean): pkg_resources'
+    # startup import of jaraco.text now resolves to the TOP-LEVEL jaraco bundled
+    # above — setuptools' vendor importer is appended to sys.meta_path, so the real
+    # top-level package wins. (Excluding _vendor WITHOUT that top-level jaraco is
+    # what caused the "No module named 'jaraco'" startup hang.)
     excludes=["tkinter.test", "test", "pytest", "matplotlib", "scipy",
               "IPython", "notebook", "pandas", "PyQt5", "PyQt6", "PySide2",
               "PySide6", "wx", "sphinx", "setuptools._vendor", "wordninja"],

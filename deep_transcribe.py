@@ -85,15 +85,43 @@ def _resilient(opts: dict) -> dict:
 
 
 def _yt_variants(base: dict):
-    """yt-dlp opt sets to try IN ORDER until one works: resilient (yt-dlp's smart
-    default clients + UA + retries), then the same WITH browser cookies (authenticated
-    requests get blocked less). Both keep the default clients, so no DRM regression."""
+    """yt-dlp opt sets to try IN ORDER until one works.
+
+    v1.1.65 revision — 4-tier cascade:
+      1. RESILIENT default clients (yt-dlp picks; UA + retries): works for
+         the majority of songs / MV uploads.
+      2. + browser cookies (if DK_COOKIES_BROWSER is set): authenticated
+         requests get past the age gate and get less rate-limited.
+      3. FORCED ios/tv/mweb clients: yt-dlp's web player client now returns
+         a bare 'Video unavailable' without a PO token for many videos
+         (fan compilations, game clips, older uploads). Forcing the mobile
+         clients gets ASR captions when the web path was walled off.
+      4. + browser cookies with forced clients: last-resort combo.
+
+    The old note ("don't force player_client — mis-reported 'DRM protected'
+    on the KAF MV") was for DOWNLOADS. Caption-only extraction is
+    skip_download=True, so no DRM check runs — safe to force the mobile
+    clients as a fallback. Ordering (default first, forced last) preserves
+    the KAF-class videos: they succeed on the default before the forced
+    variant is ever tried."""
     variants = [_resilient(base)]
     b = _cookie_browser()
     if b:
         v = _resilient(base)
         v["cookiesfrombrowser"] = (b,)
         variants.append(v)
+    # Forced mobile-client variants — bypass the web PO-token wall.
+    forced = _resilient(base)
+    forced_ea = dict(forced.get("extractor_args") or {})
+    _yt_ea = dict(forced_ea.get("youtube") or {})
+    _yt_ea["player_client"] = ["ios", "tv", "mweb", "web"]
+    forced_ea["youtube"] = _yt_ea
+    forced["extractor_args"] = forced_ea
+    variants.append(forced)
+    if b:
+        vf = dict(forced)
+        vf["cookiesfrombrowser"] = (b,)
+        variants.append(vf)
     return variants
 
 
@@ -294,11 +322,29 @@ def _captions_from_dir(dest: Path, lang: str | None, any_lang: bool = False):
     'zh-TW'/'en' track is a TRANSLATION we must never show as the lyrics.
 
     ``any_lang=True`` (SUBTITLES mode): a show's own captions are useful in
-    whatever language they exist — accept the best remaining track (e.g. 'en')
-    instead of rejecting non-CJK outright."""
-    order = ([lang] if lang in ("ja", "zh", "ko") else []) + \
-            ["ja", "zh-Hans", "zh", "zh-Hant", "ko"] + \
-            (["en"] if any_lang else [])
+    whatever language they exist — accept whatever track this video has (any
+    of the many languages we support) and REPORT its actual language so the
+    annotate/translate pass reads the body correctly.
+    """
+    # Explicit language HINT beats the fallbacks for MUSIC mode; for
+    # SUBTITLES mode we still prefer the requested lang if it exists, but
+    # gracefully take whatever else is on offer.
+    preferred = [lang] if lang in ("ja", "zh", "ko") else []
+    # Ranked fallback: CJK first (music-mode: only CJK carries the song's own
+    # lyrics), then broadly for subtitles mode.
+    music_fallback = ["ja", "zh-Hans", "zh", "zh-Hant", "ko"]
+    # v1.1.65 — every language annotate/_translate_lines can handle (plus a
+    # few common variants like pt-BR / zh-TW). Order = "most common video
+    # caption languages worldwide" so a Japanese + English track picks JA
+    # first for a Japanese source, but a Spanish-only track is still taken
+    # instead of triggering Whisper generation.
+    subs_fallback = [
+        "ja", "en", "es", "pt", "pt-BR", "fr", "de", "it", "ru",
+        "ko", "zh-Hans", "zh", "zh-Hant", "zh-TW", "vi", "id", "th",
+        "tr", "pl", "uk", "ar", "hi", "el", "nl", "sv", "no", "da",
+        "fi", "cs", "hu", "ro", "he", "ms", "tl",
+    ]
+    order = preferred + (subs_fallback if any_lang else music_fallback)
     files = glob.glob(str(dest / "*.vtt"))
     if not files:
         return None
@@ -320,9 +366,30 @@ def _captions_from_dir(dest: Path, lang: str | None, any_lang: bool = False):
         lines = _parse_vtt(Path(files[0]))
     except Exception:
         return None
-    clang = ("zh" if w and w.startswith("zh") else
-             "ko" if w == "ko" else
-             "en" if w == "en" or (w is None and any_lang) else "ja")
+    # Report the file's ACTUAL language so annotate() / translate() route
+    # the body correctly. Filename form is "c.LANG.vtt" (e.g. c.es.vtt,
+    # c.pt-BR.vtt) — read it back if we don't already know from `w`.
+    if w is None:
+        stem = Path(files[0]).stem.lower()
+        parts = stem.split(".")
+        if len(parts) >= 2:
+            w = parts[-1]
+    # Fold regional variants back to the base tag the annotate pipeline uses.
+    lw = (w or "").lower()
+    if lw.startswith("zh"):
+        clang = "zh"
+    elif lw.startswith("pt"):
+        clang = "pt"
+    elif lw.startswith("en"):
+        clang = "en"
+    elif lw in ("ja", "ko", "es", "fr", "de", "it", "ru", "el", "vi", "id",
+                "th", "tr", "pl", "uk", "ar", "hi", "nl", "sv", "no", "da",
+                "fi", "cs", "hu", "ro", "he", "ms", "tl"):
+        clang = lw
+    elif w is None and any_lang:
+        clang = "en"                     # unknown label, subtitles: last resort
+    else:
+        clang = "ja"                     # music-mode CJK fallthrough
     return (lines, clang) if len(lines) >= 6 else None
 
 
@@ -375,8 +442,16 @@ def fetch_captions_only(query: str, lang: str | None = None,
         # lang's error aborted the whole fetch. ignoreerrors keeps a single
         # rate-limited lang from killing the others.
         if any_lang:
-            # SUBTITLES mode: a show's manual captions help in ANY language.
-            langs = ["ja", "en", "ko", "zh-Hans", "zh-Hant", "zh"]
+            # SUBTITLES mode (v1.1.69). MANUAL subs first — a short hot-list of
+            # what a video actually publishes as a manual caption track. The
+            # previous 34-language list triggered YouTube 429s (auto-cap fetch
+            # slots are aggressively rate-limited) which killed the whole
+            # batch. Auto-captions are handled in a SEPARATE retry below,
+            # requesting only "en" (YouTube's auto-caps for a non-English
+            # source are literally Google-Translated from the primary, so
+            # asking for many translations wastes rate-limit budget for no
+            # quality gain).
+            langs = ["en", "ja", "ko", "zh-Hans", "zh", "es", "pt", "fr", "de", "it", "ru"]
         elif lang in ("ja", "ko"):
             langs = [lang]
         elif lang == "zh":
@@ -391,19 +466,33 @@ def fetch_captions_only(query: str, lang: str | None = None,
             # and cap extractor work so a slow/blocked fetch can't burn CPU for
             # long (a pile-up of these stuttered the audio).
             "outtmpl": str(tmp / "c.%(ext)s"), "retries": 1, "socket_timeout": 15,
-            # SUBTITLES mode passes max_dur so full-length EPISODES (20-40 min)
-            # aren't rejected by the song-sized cap.
-            "match_filter": yt_dlp.utils.match_filter_func(
-                f"duration < {int(max_dur or _MAX_DUR)}"),
-            # MANUAL subs ONLY — the v1.0.25 behaviour. YouTube AUTO-captions (ASR)
-            # are close-but-WRONG (鉄後/ラッキラ mis-hearings), carry [音楽]/[Music]
-            # sound tags, and ROLL (each word repeats across overlapping cues), which
-            # parsed into duplicated "excess" lines. A song with no manual track now
-            # falls through to the provider LRC (cleaner) instead of bad ASR.
-            "writesubtitles": True, "writeautomaticsub": False,
+            # MANUAL subs first, ASR fallback in SUBTITLES mode (v1.1.64):
+            # ASR is close-but-wrong for MUSIC (misheard lyrics, [Music] tags,
+            # rolling cues that parse as dupes) — hence manual-only for the
+            # song path. But SUBTITLES mode covers general video (game clips,
+            # vlogs, fan compilations, tutorials) where 90%+ have ONLY ASR
+            # captions. Manual-only would return nothing for those. Toggle
+            # ASR on when the caller signals subtitles via `any_lang=True`;
+            # the song path (any_lang=False) keeps the strict manual-only
+            # behavior.
+            # v1.1.69 — MANUAL subs only on this pass. Auto-caps get a
+            # dedicated retry with a single language so YouTube's per-language
+            # rate limiter (~2 langs before HTTP 429) doesn't nuke the batch.
+            "writesubtitles": True,
+            "writeautomaticsub": False,
             "subtitleslangs": langs,
             "subtitlesformat": "vtt",
         }
+        # Duration gate: MUSIC mode only. There it protects a TITLE SEARCH from
+        # landing on a 2-hour compilation instead of the song. SUBTITLES mode
+        # (any_lang=True) targets the EXACT video the user is watching and a
+        # caption fetch downloads NO audio — so no length is too long. v1.1.71
+        # live-caught: the old unconditional filter silently rejected every
+        # >60-min video (subs_deep_max_dur_s=3600) — a 139-min talk show got
+        # "no caption track" while its 'en' auto-caps existed the whole time.
+        if not any_lang:
+            opts["match_filter"] = yt_dlp.utils.match_filter_func(
+                f"duration < {int(max_dur or _MAX_DUR)}")
         if _sh.which("node"):
             opts["js_runtimes"] = {"node": {}}
         # Anti-bot variants (alternate player clients + best-effort browser cookies)
@@ -424,12 +513,68 @@ def fetch_captions_only(query: str, lang: str | None = None,
             try:
                 with yt_dlp.YoutubeDL(vopts) as y:
                     y.extract_info(target, download=True)
-                if _captions_from_dir(tmp, lang):    # got a caption track → done
+                # v1.1.72: pass any_lang so a non-CJK manual track (en/es/fr —
+                # the common talk-show case) is RECOGNIZED as success here; the
+                # old check ranked it 99/reject and burned every remaining
+                # client variant on captions that were already on disk.
+                if _captions_from_dir(tmp, lang, any_lang=any_lang):
                     break
             except Exception as e:
                 last_err = e
                 continue
-        res = _captions_from_dir(tmp, lang)
+        res = _captions_from_dir(tmp, lang, any_lang=any_lang)
+        # v1.1.69 — SUBTITLES-MODE AUTO-CAPTIONS RETRY. Most YouTube shows /
+        # podcasts / lectures publish NO manual subs — only Google's ASR-
+        # generated auto-captions. The primary attempt above deliberately asks
+        # for manual only; if that comes up empty and the caller signalled
+        # subs mode via any_lang, spin a SECOND yt-dlp call for auto-caps in
+        # ONLY the primary language (usually "en"). Anything else (ja/ko/es…)
+        # would just be YouTube's on-the-fly Google-Translate of the same
+        # source, wasting a 429-prone request slot. `_captions_from_dir`
+        # accepts both because auto-caps VTT files land under the exact same
+        # `c.<lang>.vtt` filename as manual would.
+        if not res and any_lang:
+            # Clear leftover VTTs from the manual pass (review finding): a
+            # too-short manual track (e.g. a 4-line c.ja.vtt) would outrank the
+            # fresh c.en.vtt in _captions_from_dir's ja-first ordering and fail
+            # the ≥6-line floor — returning None despite good auto-caps on disk.
+            for _f in tmp.glob("*.vtt"):
+                try:
+                    _f.unlink()
+                except Exception:
+                    pass
+            asr_opts = dict(opts)
+            asr_opts["writesubtitles"] = False
+            asr_opts["writeautomaticsub"] = True
+            # v1.1.70 — SUBTITLES mode wants ENGLISH out ("translate non-English
+            # to English"). Request ONLY "en": YouTube offers an 'en' auto-caption
+            # for essentially EVERY video — it's the RAW ASR for English speech
+            # (and, unlike auto-TRANSLATED tracks, downloads without a JS runtime)
+            # and a server-side auto-translation for a foreign source. So one
+            # 'en' request yields English for every video in a SINGLE call — no
+            # 429-prone multi-language batch and no wrong-guess miss. (The old
+            # code inherited the app's VTuber-default lang='ja' and fetched a
+            # Japanese track for an English talking-head video → nothing usable.
+            # Requesting ['ja','en'] is WORSE: both land and _captions_from_dir's
+            # subs_fallback leads with 'ja', so it would pick the JA machine-
+            # translation and then double-translate it back to English.)
+            asr_opts["subtitleslangs"] = ["en"]
+            log.info("captions: no manual track — retrying with YouTube auto-captions %s",
+                     asr_opts["subtitleslangs"])
+            for vopts in _yt_variants(asr_opts):
+                try:
+                    with yt_dlp.YoutubeDL(vopts) as y:
+                        y.extract_info(target, download=True)
+                    if _captions_from_dir(tmp, "en", any_lang=any_lang):
+                        break
+                except Exception as e:
+                    last_err = e
+                    continue
+            res = _captions_from_dir(tmp, "en", any_lang=any_lang)
+            if res:
+                log.info("captions: %d %s lines from YouTube auto-captions for %r",
+                         len(res[0]), res[1], query)
+                return res
         if not res and last_err is not None:
             log.info("captions: fetch failed for %r: %s", target, str(last_err)[:140])
         if res:

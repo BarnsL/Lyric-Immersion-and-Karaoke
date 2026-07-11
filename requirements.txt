@@ -33,6 +33,15 @@ pycaw>=20240210; sys_platform == "win32"
 # shazamio) imports; this backport restores it. No-op on <=3.12.
 audioop-lts>=0.2; python_version >= "3.13"
 
+# BUILD DEP (PyInstaller freeze): setuptools 71+ vendors `jaraco` under
+# setuptools/_vendor as a PEP-420 namespace PyInstaller can't collect, yet the
+# frozen app's MANDATORY pkg_resources startup hook (pyi_rth_pkgres) imports
+# jaraco.text. Without a real TOP-LEVEL jaraco the built .exe hangs on an
+# (invisible) modal "No module named 'jaraco'" dialog at launch. Pin it so
+# build.bat's `pip install -r requirements.txt` always provides it. See
+# DesktopKaraoke.spec for the matching collect_all("jaraco.*") wiring.
+jaraco.text>=3.12
+
 # OPTIONAL — "Sync by listening": transcribes the live vocals and aligns the
 # cached lyrics to the heard audio (fixes timing when Shazam can't ID the exact
 # cut). Heavy, so it's NOT installed or bundled by default. Enable it with:

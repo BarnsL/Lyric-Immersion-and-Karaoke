@@ -9,7 +9,8 @@ WHERE THE SETTINGS ARE
    RIGHT-CLICK the tray icon to open the full menu. Everything is there - there
    is no separate settings window:
 
-       *  Presets (Gaming / Karaoke)
+       *  Presets (Gaming / Karaoke / Subtitles)
+       *  Subtitles (next to Presets)
        *  Opacity, Font size, Position, Display, Scroll style
        *  GPU overlay toggle for the smooth click-through renderer
        *  Sync timing - nudge the lyrics earlier / later

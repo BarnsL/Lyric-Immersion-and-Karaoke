@@ -22,12 +22,15 @@ if %errorlevel%==1 (
 echo.
 echo [2/5] Building Lyric-Immersion-and-Karaoke.exe ...
 python -m PyInstaller --noconfirm DesktopKaraoke.spec || goto :err
-echo     -> dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe
+REM v1.1.62 BUGFIX: '->' in cmd is `-` + `>` (redirect), which OVERWROTE the
+REM freshly-built exe with 7 bytes of "    -\r\n" — every build was silently
+REM broken. Escape the `>` with `^>` so it stays literal text in the echo.
+echo     -^> dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe
 
 echo [3/5] Building the installer (optional) ...
 where iscc >nul 2>nul
 if %errorlevel%==0 (
-    iscc installer.iss && echo     -> dist\Lyric-Immersion-and-Karaoke-Setup.exe
+    iscc installer.iss && echo     -^> dist\Lyric-Immersion-and-Karaoke-Setup.exe
 ) else (
     echo     Inno Setup ^(iscc^) not found - skipping installer.
     echo     dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe is portable: double-click to run.

@@ -46,7 +46,7 @@ PLAYING = 4
 # Active playlist import job (set when POST /import/csv is called).
 _import_job = None
 _import_lock = _threading.Lock()
-_MAX_BODY = 64 * 1024          # cap POST bodies — we don't need a payload anyway
+_MAX_BODY = 2 * 1024 * 1024    # cap POST bodies; /subtitles may replace a transcript
 _START = time.time()
 
 # {method: {path: description}} — returned by GET / so an agent can self-describe.
@@ -64,6 +64,7 @@ _ROUTES = {
         "/source": "video/music source view: raw SMTC data + what the app derived from it",
         "/audio": "audio listener: live loudness + vocal-band ratio + recent on/off pattern",
         "/lyricstate": "lyric current-state analyzer: current/prev/next lines, fill, structural checks",
+        "/subtitles": "subtitle mode + editable transcript state for local agents/models (?start=0&count=200)",
         "/display": "GET: current display mode + connected monitors + overlay bounds. POST: switch it — ?mode=primary|span|mirror|cycle or ?mode=monitor&index=1 (or &id=<stable device id>)",
         "/import/status": "current playlist import state: state, done, total, ok, skipped, failed_count",
         "/yt-meta": "TICKET-112: full parsed YouTube description metadata for the current track (credits, raw description, lyrics_block) — useful when debugging which disambiguators the fetch_lrc call did or didn't get",
@@ -84,6 +85,7 @@ _ROUTES = {
         "/reindex": "rescan the local library",
         "/import/csv": "start a playlist CSV import: ?path=C:\\path\\to\\file.csv [&translate=1] [&force=1]",
         "/retranslate": "TICKET-115: force a translation backfill of the currently loaded track (de/fr/it/pt/ru/es/ja-romaji + CJK)",
+        "/subtitles": "toggle/apply subtitle preset, adjust subtitle settings, or patch/replace subtitle lines with JSON",
     },
 }
 
@@ -335,6 +337,13 @@ def make_handler(app, log_file, token):
                         self._send(200, {"ok": True, **app.get_lyric_state()})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/subtitles":
+                    try:
+                        start = q.get("start", ["0"])[0]
+                        count = q.get("count", [None])[0]
+                        self._send(200, {"ok": True, **app.get_subtitles(start=start, count=count)})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/overlay":
                     # compact render state for an external overlay client (Tauri PoC)
                     try:
@@ -366,6 +375,9 @@ def make_handler(app, log_file, token):
                     n = 0
                 body = b""
                 if n > 0:
+                    if n > _MAX_BODY:
+                        self.rfile.read(_MAX_BODY)
+                        return self._err(413, f"body too large; max {_MAX_BODY} bytes")
                     body = self.rfile.read(min(n, _MAX_BODY))
                 if not self._authed():
                     return self._err(401, "missing or bad X-API-Token")
@@ -512,6 +524,29 @@ def make_handler(app, log_file, token):
 
                     self._run(_do)
                     # Bounded wait so a frozen UI thread can never hang the API.
+                    if not done_ev.wait(timeout=5.0):
+                        return self._err(503, "UI thread did not respond within 5s")
+                    self._send(200 if result_box.get("ok") else 409, result_box)
+                elif path == "/subtitles":
+                    if not body:
+                        return self._err(400, "JSON body required")
+                    try:
+                        payload = json.loads(body.decode("utf-8") or "{}")
+                    except Exception as e:
+                        return self._err(400, f"bad JSON body: {e}")
+                    result_box: dict = {}
+                    done_ev = threading.Event()
+
+                    def _do():
+                        try:
+                            result_box.update(app.apply_subtitle_api_update(payload) or {})
+                        except Exception as e:
+                            result_box.update({"ok": False,
+                                               "error": f"{type(e).__name__}: {e}"})
+                        finally:
+                            done_ev.set()
+
+                    self._run(_do)
                     if not done_ev.wait(timeout=5.0):
                         return self._err(503, "UI thread did not respond within 5s")
                     self._send(200 if result_box.get("ok") else 409, result_box)
