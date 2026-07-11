@@ -44,6 +44,10 @@ desktop.ini
 # Local UI preferences
 settings.json
 
+# Personal listening telemetry (metrics.py writes it to the repo root when
+# running from source) — titles + play outcomes, never commit.
+metrics.json
+
 # Icon-generation scratch / previews
 _icon_preview.png
 _preview_cur.png
@@ -55,6 +59,14 @@ _exe_icon.png
 .deps-ship/
 deps/
 models/
+
+# Local agent tooling (Claude Code skills/launch config) — machine-local, not product
+.claude/
+
+# Dev-console (Tauri) build outputs — sources ARE committed, artifacts are not
+dev-console/node_modules/
+dev-console/dist/
+dev-console/src-tauri/target/
 
 # Build artifacts
 build/

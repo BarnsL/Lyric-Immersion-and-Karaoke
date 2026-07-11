@@ -3,6 +3,26 @@
 This file tells an automated agent how to add songs and keep the lyric
 library correct. Humans can follow it too.
 
+## ⛔ HARD RULE — no copyrighted content, ever (commercial product)
+
+This is a COMMERCIAL, proprietary product (see LICENSE). The repo and every
+build made from it must contain ZERO copyrighted third-party content:
+
+- **Never commit lyric text** — no lyric bodies in code, docs, tests, fixtures,
+  commit messages, or example output. Song TITLES, artists, and setlists are
+  facts and are fine; lyric LINES are not, even one line "as an example"
+  (paraphrase or mark `(quote redacted)` instead).
+- **Never bundle lyrics into a build.** `lyrics/` and `bundled_lyrics/` are
+  git-ignored and must stay that way; the app fetches/caches at runtime on the
+  user's machine only.
+- **No copyrighted artwork, unlicensed fonts, or ripped assets** in the repo
+  or installer.
+- Before committing, review what you're staging (`git status` + read any new
+  file that could carry lyric text). When in doubt, leave it out.
+- History matters too: content deleted at HEAD is still retrievable by commit
+  SHA on a public remote. Anything that slips in requires a history purge and
+  repo re-publish — expensive. Don't let it in.
+
 ## What this project is
 
 A transparent karaoke overlay. `main.py` reads the real playback position
