@@ -149,13 +149,50 @@ class SongChangeDetector(threading.Thread):
                 if loop is None:
                     time.sleep(2.0)
                     continue
+                # TICKET-167: remember WHICH default speaker this recorder is
+                # bound to. WASAPI loopback keeps reading the ORIGINAL endpoint
+                # after the user switches the default output device — it then
+                # hears pure silence forever: no vocal mask (energy-align blind
+                # for whole songs), no boundaries, no vocal onsets (MV-intro
+                # anchor never fires). Live-caught on a YOASOBI live cut.
+                bound_name = getattr(loop, "name", "") or ""
+                try:
+                    _spk = sc.default_speaker()
+                    bound_default = bool(_spk and _spk.name and _spk.name in bound_name)
+                except Exception:
+                    bound_default = False
                 with loop.recorder(samplerate=self.sr, channels=1) as rec:
                     backoff = 1.0
                     self._reset()
                     n = max(1, int(self.sr * self.block))
+                    blocks = 0
+                    silence_run = 0.0
                     while not self._stop_evt.is_set() and self._enabled:
                         data = rec.record(numframes=n)
                         self._feed(np, data)
+                        blocks += 1
+                        # ── stale-device watchdog (TICKET-167) ──
+                        # 1) Every ~5 s: if the DEFAULT speaker changed away
+                        #    from the device we bound, reopen on the new one.
+                        #    (Only when we bound the default — the any-loopback
+                        #    fallback has no name relationship to check.)
+                        if bound_default and blocks % 25 == 0:
+                            try:
+                                _spk = sc.default_speaker()
+                                if _spk and _spk.name and _spk.name not in bound_name:
+                                    break            # → reopen on new default
+                            except Exception:
+                                pass
+                        # 2) 60 s of CONTINUOUS silence → reopen regardless.
+                        #    Covers same-name re-routes and endpoint invalidation
+                        #    the name check can't see. A genuinely paused system
+                        #    just re-opens the same device once a minute (cheap).
+                        if self._live_silent:
+                            silence_run += self.block
+                            if silence_run >= 60.0:
+                                break                # → reopen
+                        else:
+                            silence_run = 0.0
             except Exception:
                 # Device changed / busy / went away — back off and re-open.
                 self._reset()
@@ -200,6 +237,15 @@ class SongChangeDetector(threading.Thread):
             self._silent_for += dt
             self._music_for = 0.0
             self._onset_fired = False       # arm the next quiet→music onset
+            # TICKET-167: record EXPLICIT silence in the vocal mask. The
+            # energy correlator aligns vocal-ON vs line-active intervals — the
+            # OFF samples carry half the signal, and the ≥12 s history minimum
+            # must stay reachable through the quiet passages of live cuts.
+            self._live_vr = 0.0
+            with self._buf_lock:
+                self._vocal_buf.append((time.time(), 0.0))
+                if len(self._vocal_buf) > 300:
+                    del self._vocal_buf[: len(self._vocal_buf) - 300]
             # A qualifying gap = enough silence, and it followed real music.
             # `had_music` is latched while music played, so this still holds even
             # though music_for was just zeroed on the first silent block.

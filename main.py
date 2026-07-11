@@ -3025,6 +3025,7 @@ class Overlay:
             "sync_match_min":          0.72, # min transcript↔LRC match ratio to trust a LARGE sync offset (guards chorus-repetition mis-matches on studio songs)
             "live_sync_match_min":     0.62, # v1.1.50: LOWER bar for LIVE/cover arrangements — a re-sung version matches the STUDIO LRC less exactly (0.64-0.68), so at 0.72 the correct big offset was rejected every time and the song stayed off the whole time. Two-point confirmation still guards.
             "energy_max_offset":    60.0,   # |new_off| < this for sanity
+            "energy_max_offset_live": 120.0, # TICKET-167: live arrangements need bigger offsets (crowd intro + MC + tempo — YOASOBI live 祝福 = 247s video vs 181s studio LRC)
             "energy_shift_penalty":  0.012, # per-second penalty for large offset changes (small-shift prior)
             "energy_peak_margin":    0.06,  # reject if a distant rival peak is within this of the best
             "keep_last_line_gap_s":  0.6,   # CPU renderer: hold the previous line on-canvas during inter-line gaps shorter than this, to kill the disappear/reappear flicker (GPU renderer holds independently)
@@ -15405,9 +15406,11 @@ class Overlay:
                 return
             ratio, idx = best
             target = round(self.lines[idx].start - raw_pos, 2)
-            if abs(target) > float(self._tune.get("energy_max_offset", 30.0)):
-                log.info("ocr-sync(%s): line %d but offset %.1fs out of range — skip",
-                         reason, idx, target)
+            _off_cap = (float(self._tune.get("energy_max_offset_live", 120.0))
+                        if _live_ocr else float(self._tune.get("energy_max_offset", 30.0)))
+            if abs(target) > _off_cap:
+                log.info("ocr-sync(%s): line %d but offset %.1fs out of range (cap %.0fs) — skip",
+                         reason, idx, target, _off_cap)
                 return
             self._last_ocr_sync = {"matched": True, "line": idx, "ratio": round(ratio, 2),
                                    "offset": target, "was": round(self.offset, 2),
@@ -15441,7 +15444,20 @@ class Overlay:
         except Exception:
             return
         if len(history) < 60:    # need at least 12 s of buffer
-            log.info("auto-align: not enough vocal-mask history (%d blocks)", len(history))
+            # TICKET-167: say WHY the mask is empty. A dead/stale loopback
+            # capture (default audio device changed under the recorder) looks
+            # identical to "song just started" without this hint.
+            hint = ""
+            try:
+                la = self._boundary.live_audio() or {}
+                if not la.get("capturing"):
+                    hint = " — loopback NOT capturing (device changed?)"
+                elif la.get("is_silent") and (la.get("silent_for_s") or 0) > 30:
+                    hint = " — loopback hears only SILENCE while playing (device changed?)"
+            except Exception:
+                pass
+            log.info("auto-align: not enough vocal-mask history (%d blocks)%s",
+                     len(history), hint)
             return
 
         self._energy_reason = reason
@@ -15594,8 +15610,15 @@ class Overlay:
         # to the LRC. Since the displayed song-time = player_pos + self.offset,
         # the new offset becomes (current offset + best_shift).
         new_off = round(self.offset + best_shift, 2)
-        if abs(new_off) > self._tune["energy_max_offset"]:
-            log.info("energy-align: candidate offset %+.1fs out of range — skipped", new_off)
+        # TICKET-167: a LIVE arrangement legitimately needs a much larger
+        # offset than a studio cut (crowd intro + MC + slower tempo — the
+        # YOASOBI live 祝福 runs 247s against a 181s studio LRC). Use the
+        # live-specific cap there; studio songs keep the tight one.
+        _off_cap = (float(self._tune.get("energy_max_offset_live", 120.0))
+                    if live_sync else float(self._tune.get("energy_max_offset", 60.0)))
+        if abs(new_off) > _off_cap:
+            log.info("energy-align: candidate offset %+.1fs out of range (cap %.0fs) — skipped",
+                     new_off, _off_cap)
             verdict("inconclusive")
             return
         # v1.1.50 — FINER sync on live arrangements: apply smaller offset
