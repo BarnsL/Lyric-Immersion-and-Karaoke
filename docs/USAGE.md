@@ -5,7 +5,7 @@ instantly to `settings.json` (next to the app) and persist across restarts.
 
 ## Quick start
 
-1. Launch (the portable `DesktopKaraoke.exe`, or `pythonw main.py` from source).
+1. Launch the portable `Lyric-Immersion-and-Karaoke.exe`, or run `pythonw main.py` from source.
 2. Play a song anywhere — Spotify, YouTube in a browser, any media app.
 3. Lyrics appear over your screen. That's it.
 
@@ -18,14 +18,18 @@ keyboard pass straight through to the game/app underneath, so it never interfere
 |--------|---------------|--------------|
 | 🎮 **Gaming** | Passive language learning while playing | 45% opacity · top · slide-in left · 100% font · Performance |
 | 🎤 **Karaoke** | Big flowing lyrics for a room | 100% opacity · bottom · scroll-through ← · 150% font · Smooth · auto re-sync on |
+| 📺 **Subtitles** | Shows, interviews, long videos, and concerts | Subtitle mode on · 45% opacity · 100% font · stationary bottom-center · native/romaji/English layers on |
 
-Both are just starting points — tweak anything afterward.
+All three are just starting points — tweak anything afterward. Subtitles are an
+explicit toggle/preset, not site-name auto-detection; after applying it,
+**Opacity** and **Font size** still change subtitle mode live.
 
 ## Tray menu reference
 
 | Item | Does |
 |------|------|
-| **Presets** | One-click Gaming / Karaoke setups (above). |
+| **Presets** | One-click Gaming / Karaoke / Subtitles setups (above). |
+| **Subtitles** | Toggle subtitle mode, choose stationary vs scrolling subtitles, and show/hide native text, romanization, or English translation layers. This menu sits next to **Presets** because the Subtitles preset visibly changes these settings. |
 | **⚑ Wrong lyrics — fix this song** | Bin the current match and re-identify by sound. |
 | **🎧 Identify by sound** | Force an immediate Shazam listen. |
 | **Generate lyrics by ear when none found** | On/off (on by default). When **no** lyric provider has the song, transcribes the audio with Whisper into timed Japanese + furigana + romaji + a likely translation — **each line ends with `***`** to flag it's AI-generated, not official. Builds up over the song and saves it (a replay is instant + synced). First pass lags ~20 s and is imperfect; needs faster-whisper (bundled in the portable build). **Then, in the background, a *deep* pass downloads the source audio and re-transcribes the whole song with a larger model for a clean, complete result — replacing the rough version and deleting the audio. The deep pass also needs `yt-dlp` + a JS runtime (Node/Deno); see [docs/GENERATION.md](docs/GENERATION.md).** |
@@ -34,14 +38,14 @@ Both are just starting points — tweak anything afterward.
 | **Auto re-sync by sound** | Re-listen on an interval (Off / 20s / 30s / 60s) to keep timing locked and to catch a new song inside a concert/live video. |
 | **Library backup (Git)** | *Auto-push new songs* (opt-in) and *Back up now* — see below. |
 | **Sync timing** | Nudge the offset ±0.5s / ±2.0s; shows the current offset. |
-| **Opacity** | 25–100%. Low = unobtrusive over games (background stays transparent). |
+| **Opacity** | 25–100%. Low = unobtrusive over games or videos (background stays transparent). Also applies while Subtitles mode is on. |
 | **Font size** | 25–200% in 25% steps. Scales text, layout and window. |
 | **Position** | Top or bottom of the screen. |
 | **Scroll-in** | Stationary · Slide from left/right · **Scroll-through →/←** (continuous ticker). |
 | **Scroll-through speed** | Slow / Medium / Fast / Very fast (continuous mode only). |
 | **Performance** | *Smooth* (60fps, full outline) or *Performance* (30fps, light outline). |
 | **Dancing character** | On/off. A small companion themed to the current song's artist that dances while music plays. Drag to move it; click it to make it hop. Drop a `characters/<artist>.png` next to the app to use your own image for that artist. |
-| **Local API (agent control)** | On/off. A localhost-only HTTP server on `127.0.0.1:8765` so an agent or script can read what's playing and drive it (`/status`, `/logs`, `/identify`, `/wrong`). Never exposed to the network. See the README's *Automation* section. |
+| **Local API (agent control)** | On/off. A localhost-only HTTP server on `127.0.0.1:8765` so an agent or script can read what's playing and drive it (`/status`, `/logs`, `/identify`, `/wrong`, `/display`, `/subtitles`). Never exposed to the network. See the README's *Automation* section and [`SUBTITLES_MODEL_API.md`](SUBTITLES_MODEL_API.md). |
 | **Start with Windows** | Launch automatically at login. |
 | **Check for updates / ⬆ Install update vX** | The app quietly checks GitHub for a newer release on launch and shows **⬆ Install update** here when one exists (Microsoft Store installs update themselves). Clicking it downloads the new build over **verified HTTPS**, checks its **SHA-256**, and swaps it in — keeping your lyric library and settings. Nothing is downloaded or applied unless you click. |
 | **Show / Hide**, **Re-fetch lyrics**, **Quit** | Self-explanatory. |
@@ -89,7 +93,7 @@ doubt.
 ## Files (all in one folder — portable)
 
 ```
-DesktopKaraoke.exe   the app (or main.py from source)
+Lyric-Immersion-and-Karaoke.exe   the app (or main.py from source)
 lyrics/              cached, annotated, timed lyrics  (your growing library)
 settings.json        your tray preferences
 ```

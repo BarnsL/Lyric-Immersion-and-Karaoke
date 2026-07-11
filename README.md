@@ -18,12 +18,16 @@ the singing. There's no window and no panel: just clean, outlined text over your
 screen that never steals focus, so you can keep working, watching, or gaming
 while it runs.
 
-**Two one-click modes** (right-click the tray icon → **Presets**):
+**Three one-click modes** (right-click the tray icon → **Presets**):
 - 🎮 **Gaming** — a *faint, out-of-the-way* overlay at the **top** of the screen.
   Glance up between fights and you passively absorb furigana, readings, and meaning
   while you play — it never blocks clicks or steals focus from the game.
 - 🎤 **Karaoke** — *big, bold, flowing* lyrics across the **bottom** that a whole
   room can read and sing along to, scrolling in time with the music.
+- 📺 **Subtitles** — an explicit toggle/preset for a centered, bottom subtitle
+  view. The preset starts at **45% opacity** with **100% font**, and the normal
+  **Opacity** / **Font size** menus still work afterward so a video's captions
+  or transcript behave like subtitles rather than karaoke lyrics.
 
 ## ▶️ Demo
 
@@ -172,7 +176,7 @@ menu option explained.
 
 ---
 
-## 🎛️ Two presets to start from
+## 🎛️ Three presets to start from
 
 Right-click the tray icon → **Presets**:
 
@@ -186,7 +190,16 @@ Big, bold, flowing lyrics everyone can read and sing from across the room.
 > Opacity **100%** · bottom · scroll-through ← · font **150%** · Smooth 60 fps ·
 > auto re-sync by sound.
 
-Both are just starting points — mix your own from the tray menu.
+### 📺 Subtitles for videos and shows
+Centered, bottom subtitles for spoken videos, long concerts, livestreams, and
+anything where you want captions/transcripts instead of karaoke movement.
+> Subtitle mode **on** · opacity **45%** · stationary bottom-center · native text,
+> romanization, and English translation layers **on** · font **100%**.
+> Subtitles are never auto-detected from a site name; use the **Subtitles**
+> toggle/preset when you want this mode. After applying the preset, **Opacity**
+> and **Font size** still change subtitle mode live.
+
+All three are just starting points — mix your own from the tray menu.
 
 ---
 
@@ -352,6 +365,11 @@ python  main.py --offset -1.5    # nudge sync earlier for an intro-heavy video
 build.bat        # -> dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe (+ dist\Lyric-Immersion-and-Karaoke-Setup.exe if Inno Setup is installed)
 ```
 
+For a contributor map of the current runtime, data stores, and module ownership,
+start with [docs/REPO_ORGANIZATION.md](docs/REPO_ORGANIZATION.md). For subtitle
+mode and model-controlled transcript editing, see
+[docs/SUBTITLES_MODEL_API.md](docs/SUBTITLES_MODEL_API.md).
+
 ### Build a starter library
 ```bash
 python scripts/preload.py                  # fetch a curated ReGLOSS / hololive / J-pop set
@@ -414,7 +432,7 @@ your token / Client ID stay local (git-ignored).
 
 ## 🤖 Automation & local API
 
-Desktop Karaoke runs a tiny HTTP server on **`127.0.0.1:8765`** (localhost only —
+Lyric Immersion and Karaoke runs a tiny HTTP server on **`127.0.0.1:8765`** (localhost only —
 never the network; toggle it in the tray) so an agent or script can see what it's
 doing and drive it:
 
@@ -428,11 +446,15 @@ route schema — so it's safe and predictable to drive from an agent.
 | `GET /status` | now-playing, matched song, sync offset, current line, song-change detector state |
 | `GET /logs?n=200` | the last N log lines (every match/sound/swap decision) |
 | `GET /lyrics` | the full loaded, annotated lyric lines |
+| `GET /display` | current display mode, monitor list, selected monitor identity, and overlay bounds |
+| `GET /subtitles?start=0&count=200` | subtitle mode, normal visual settings, current transcript window, and editable schema for agents |
 | `POST /identify` | re-identify the song by **sound** now |
 | `POST /wrong` | mark the current lyrics wrong → re-identify + re-fetch |
 | `POST /nudge?s=2.5` | shift sync by *s* seconds (for songs Shazam can't hear) |
 | `POST /reset` | reset the sync offset to 0 |
 | `POST /align` | **sync by listening** — transcribe the live audio + match it to the lyrics (needs faster-whisper) |
+| `POST /display?mode=monitor&index=1` | move the overlay to a monitor, primary, span, mirror, or cycle mode |
+| `POST /subtitles` | toggle/apply the Subtitles preset, change subtitle settings, or patch/replace subtitle lines |
 | `POST /reindex` | rescan the local library |
 | `POST /import/csv?path=…` | start a background CSV import from an Exportify file at `path` |
 | `GET /import/status` | current import job state: `state`, `done`, `total`, `ok`, `skipped`, `failed_count` |
@@ -536,12 +558,38 @@ for personal study** and caches them locally — the cache is *not* committed or
 redistributed (see `.gitignore`). The optional dancing character is a simple
 drawn avatar, not any artist's actual model. Please support the artists. 💜
 
+## 🙏 Credits
+
+Lyric Immersion and Karaoke is possible because of a lot of excellent open-source
+work and public resources:
+
+- Lyrics, captions, and metadata: [`syncedlyrics`](https://github.com/moehmeni/syncedlyrics),
+  [LRCLIB](https://lrclib.net), Musixmatch / NetEase / Megalobiz / Genius via
+  provider integrations, [`yt-dlp`](https://github.com/yt-dlp/yt-dlp), and
+  YouTube caption tracks.
+- Audio identification and capture: [`shazamio`](https://github.com/shazamio/ShazamIO),
+  [`soundcard`](https://github.com/bastibe/SoundCard), [`pycaw`](https://github.com/AndreMiras/pycaw),
+  and Windows media-session APIs through [`winsdk`](https://github.com/pywinrt/python-winsdk).
+- Language tooling: [`fugashi`](https://github.com/polm/fugashi), UniDic /
+  [`unidic-lite`](https://github.com/polm/unidic-lite), [`cutlet`](https://github.com/polm/cutlet),
+  [`pypinyin`](https://github.com/mozillazg/python-pinyin), [`ToJyutping`](https://github.com/CanCLID/ToJyutping),
+  [`jieba`](https://github.com/fxsjy/jieba), [`hangul-romanize`](https://github.com/youknowone/hangul-romanize),
+  [`pykakasi`](https://github.com/miurahr/pykakasi), and [`deep-translator`](https://github.com/nidhaloff/deep-translator).
+- Optional AI transcription: [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)
+  and the Whisper model ecosystem.
+- App/runtime pieces: Python, Tkinter, [`pystray`](https://github.com/moses-palmer/pystray),
+  [`Pillow`](https://github.com/python-pillow/Pillow), [`spotipy`](https://github.com/spotipy-dev/spotipy),
+  [`pygame-ce`](https://github.com/pygame-community/pygame-ce), [`Tauri`](https://tauri.app),
+  WebView2, PyInstaller, and Inno Setup.
+- Playlist/import resources: [Exportify](https://exportify.net), Spotify Web API,
+  and YouTube Music metadata via `yt-dlp`.
+
 ## 📄 License
 
-MIT for the code in this and prior releases (see [LICENSE](LICENSE)) — that
-includes every release through the current v1.1.x line. Lyrics and any artwork
-belong to their respective owners.
-
-> ⚠️ **Heads up — a future release may move to a proprietary
-> (all-rights-reserved) license.** Any such change applies only from the release
-> that makes it; every tag published before it stays MIT. © 2026 BarnsL.
+**Proprietary — all rights reserved** from v1.1.72 onward (see
+[LICENSE](LICENSE)). The source is published for viewing only; no use, copying,
+modification, or redistribution is licensed without written permission.
+Releases tagged BEFORE this change were published under MIT and that grant
+stands for those historical versions only. Lyrics and any artwork belong to
+their respective owners — this software never bundles or redistributes them.
+© 2026 BarnsL / Purple Industries.

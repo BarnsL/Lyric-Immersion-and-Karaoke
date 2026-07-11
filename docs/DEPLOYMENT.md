@@ -2,7 +2,8 @@
 
 A one-stop orientation for a developer: **where everything lives, what each module
 does, and how source becomes a running app.** Pairs with
-[`ARCHITECTURE.md`](ARCHITECTURE.md) (runtime internals) and
+[`ARCHITECTURE.md`](ARCHITECTURE.md) (runtime internals),
+[`REPO_ORGANIZATION.md`](REPO_ORGANIZATION.md) (current runtime/data map), and
 [`BUILD.md`](BUILD.md) (build minutiae).
 
 ---
@@ -42,7 +43,7 @@ the runtime `lyrics/  models/  settings.json  *.log`). The deploy folder name st
 | `main.py` | The whole app: the `Overlay` Tk window, the `_tick` per-frame render + sync loop, the system-tray menu, settings load/save, and spawning/​feeding the GPU child. The ~11k-line core everything hangs off. |
 | `version.py` | Single source of the version string (read by `api.py`, `updater.py`, the build scripts). |
 | `appdata.py` | Resolves the data dir / paths (lyric cache, settings, logs). |
-| `api.py` | Local HTTP control API on `127.0.0.1:8765` (`/status /tune /nudge /resync /decide /scroll …`) — the "eyes and hands" for driving the app while it runs. |
+| `api.py` | Local HTTP control API on `127.0.0.1:8765` (`/status /tune /display /subtitles /nudge /resync /decide /scroll ...`) - the "eyes and hands" for driving the app while it runs. |
 | `updater.py` | In-app updater (checks GitHub releases, swaps the exe). |
 
 ### "What's playing?" — sources
@@ -80,8 +81,9 @@ the runtime `lyrics/  models/  settings.json  *.log`). The deploy folder name st
 | Module | Role |
 |--------|------|
 | `main.py` (Tk path) | The **CPU renderer** — transparent click-through Tk overlay, the scroll belt, the karaoke fill. The default, fully-featured renderer. |
-| `gpu_renderer.py` | The **GPU renderer** child process (Pygame-CE + moderngl). Color-key transparency, the scroll belt, fed live state over stdin NDJSON. Opt-in. |
-| `gpu_setup.py` | Picks the idlest GPU for AI / rendering work. |
+| `overlay/lyric-overlay.exe` | The current **Tauri GPU overlay**. It is bundled by `DesktopKaraoke.spec`, launched by `main.py`, and polls `GET /overlay`. Tk remains visible until this renderer proves it is alive and painting. |
+| `gpu_renderer.py` | Legacy retired pygame/moderngl child kept for reference/back-compat stubs. It is not the active GPU renderer. |
+| `gpu_setup.py` | Picks the idlest GPU for optional AI/OCR work and exposes GPU diagnostics. |
 | `character.py` | The optional on-screen "dancing character" sprite. |
 
 ### Library import
@@ -110,7 +112,7 @@ the runtime `lyrics/  models/  settings.json  *.log`). The deploy folder name st
                                                ▼
   OUTPUT                dist\DesktopKaraoke\
                           ├── Lyric-Immersion-and-Karaoke.exe
-                          └── _internal\   (deps, models, cuda libs, gpu_renderer, …)
+                          └── _internal\   (deps, models, cuda libs, overlay\lyric-overlay.exe, ...)
                                                │
                                                ▼
   DEPLOY (robocopy)     robocopy dist\DesktopKaraoke  <install-dir>  /E
@@ -121,8 +123,8 @@ the runtime `lyrics/  models/  settings.json  *.log`). The deploy folder name st
                                                ▼
   RUN                   <install-dir>\Lyric-Immersion-and-Karaoke.exe
    • tray app, transparent overlay, no normal window
-   • reads settings.json; if gpu_renderer=true, spawns the GPU child
-     (main.exe --gpu-renderer-child → gpu_renderer.run_ipc_child())
+   • reads settings.json; if tauri_overlay_on=true, starts overlay\lyric-overlay.exe
+     and hands off only after the Tauri window proves it is rendering
    • serves the control API on 127.0.0.1:8765
 
   INSTALLER (optional)  build.bat also runs Inno (installer.iss) → dist\…-Setup.exe
@@ -159,8 +161,9 @@ file it belongs to — the updater only trusts a notes hash from a line mentioni
   `BelowNormal` so they do not starve the live app.
 - **robocopy exit code 1-7 = success** (3 = "files copied + extra files present").
   A locked `__mypyc*.pyd` can show a benign non-zero; the exe still copies.
-- **GPU child is the same exe** re-entered with `--gpu-renderer-child`; transparency
-  is **DWM color-key** (`LWA_COLORKEY`), not blur-behind (which renders solid black).
+- **GPU renderer today is Tauri**, not the old pygame/moderngl child. If the Tauri
+  child fails, the watchdog restores the Tk CPU overlay instead of leaving a
+  blank screen.
 
 ---
 
@@ -196,12 +199,13 @@ flowchart TD
 
     SYNC --> CLOCK[main._hi_pos<br/>free-running highlight clock]
     CLOCK --> R{Renderer}
-    R -->|default| TK[main.py Tk<br/>CPU overlay + belt + fill]
-    R -->|opt-in| GPU[gpu_renderer child<br/>moderngl + color-key]
+    R -->|default/fallback| TK[main.py Tk<br/>CPU overlay + belt + fill]
+    R -->|opt-in| GPU[overlay/lyric-overlay.exe<br/>Tauri GPU overlay polling /overlay]
     TK --> SCREEN[(transparent<br/>click-through overlay)]
     GPU --> SCREEN
 
     API[api.py<br/>127.0.0.1:8765] -.controls.-> DE
     API -.controls.-> SYNC
     API -.controls.-> R
+    API -.feeds.-> GPU
 ```

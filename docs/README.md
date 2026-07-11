@@ -4,8 +4,9 @@ This folder breaks the app into its logical **parts**, one folder per subsystem.
 The confidence-bearing subsystems have a file per **method**, each explaining how
 that method produces a **confidence score** and what threshold gates it.
 
-Start with [`ARCHITECTURE.md`](ARCHITECTURE.md) for the one-page map, then
-drill in here.
+Start with [`ARCHITECTURE.md`](ARCHITECTURE.md) for the one-page map,
+[`REPO_ORGANIZATION.md`](REPO_ORGANIZATION.md) for the current runtime diagram
+and source/data inventory, then drill in here.
 
 | Folder | Question it answers | Methods (→ confidence) |
 |---|---|---|
@@ -17,6 +18,7 @@ drill in here.
 | [mv-concert-detection](mv-concert-detection/) | *MV intros, live sets* | intro hold · live/compilation · banner OCR |
 
 Rendering/performance lives in [`PERFORMANCE.md`](PERFORMANCE.md);
+subtitle/model control lives in [`SUBTITLES_MODEL_API.md`](SUBTITLES_MODEL_API.md);
 behaviour tickets in [`ISSUES.md`](ISSUES.md).
 
 **The one rule that ties it together:** the player's title is a *hint*; **sound is

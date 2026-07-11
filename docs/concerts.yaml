@@ -1,0 +1,397 @@
+# Concert test corpus — machine-readable mirror of docs/CONCERT_RESEARCH.md §2.
+#
+# Consumed by:
+#   - The auto-tune harness (D:\Lyric-Immersion-Auto\auto\concerts_corpus.py) for
+#     concert-specific scoring against known setlists.
+#   - main.py._load_concert_setlist as a MANUAL-OVERRIDE fallback when neither
+#     YouTube chapters, description-embedded timestamps, nor
+#     parse_song_candidates yields a usable setlist for a given URL.
+#
+# start_s values come from cross-verified sources (setlist.fm / Wikipedia /
+# official releases / YouTube chapter markers). Where a time is estimated,
+# `time_confidence: est` is set — treat as a soft anchor, not ground truth.
+#
+# See docs/CONCERT_RESEARCH.md §7 for open questions and the change log.
+
+version: 1
+schema:
+  entry:
+    key: string                  # filesystem-safe identifier
+    url: string                  # YouTube watch URL
+    video_id: string
+    title: string
+    artist: string
+    channel: string
+    duration_s: number | null
+    is_concert: bool
+    has_mc: bool
+    has_intermissions: bool
+    has_chapter_markers: bool
+    setlist_confidence: high | medium | low | unknown
+    vtuber: bool
+    language: string             # ISO 639-1 or "mixed"
+    weight: number               # per-concert score weight in the harness
+    setlist: [ { pos, title, artist?, type, start_s?, time_confidence?, notes? } ]
+    mc_segments_s: [ [start, end], ... ]   # measured / annotated MC intervals
+    known_pending_releases: [ string, ... ]
+    failure_modes: [ enum, ... ]
+    sources: [ url, ... ]
+
+concerts:
+
+  # ── C1 ── Todoroki Hajime birthday 3D live (2026-06-07) ───────────────
+  - key: rise_in_motion_hajime_2026
+    url: https://www.youtube.com/watch?v=Zcx1344XAmI
+    video_id: Zcx1344XAmI
+    title: "【3DLIVE】Rise In Motion【轟はじめ】 #轟はじめ生誕祭2026"
+    artist: "轟はじめ"
+    channel: "Hajime Ch. 轟はじめ ‐ ReGLOSS"
+    duration_s: null
+    is_concert: true
+    has_mc: true
+    has_intermissions: true
+    has_chapter_markers: false
+    setlist_confidence: low
+    vtuber: true
+    language: ja
+    weight: 3.0
+    setlist: []
+    mc_segments_s: []
+    known_pending_releases:
+      - "Deep Dive"
+    candidate_pool_hint:            # feed for parse_song_candidates comparison
+      originals:
+        - "Deep Dive"
+        - "BANCHO"
+        - "Countach"
+        - "BANZAI"
+        - "Dunk"
+    failure_modes:
+      - wrong_song_generic
+      - cross_lang_ko_zh
+      - cover_artist_misattribution
+      - mc_drift
+      - chorus_trap
+      - generic_chapter_labels
+      - brand_new_no_fingerprint
+    sources:
+      - https://hololive.hololivepro.com/en/talents/todoroki-hajime/
+      - https://ja.wikipedia.org/wiki/%E8%BD%9F%E3%81%AF%E3%81%98%E3%82%81
+      - https://coki.jp/article/column/83175/
+      - https://www.youtube.com/watch?v=coev0bBUn-c
+
+  # ── C2 ── ReGLOSS 3D Live "Reach the top!" (2024-09-28) ───────────────
+  - key: reach_the_top_regloss_2024
+    url: https://www.youtube.com/watch?v=wIYvks57cQA
+    video_id: wIYvks57cQA
+    title: "【#ReGLOSS3Dライブ】Reach the top！"
+    artist: "hololive DEV_IS ReGLOSS"
+    channel: "hololive DEV_IS ReGLOSS"
+    duration_s: 3840
+    is_concert: true
+    has_mc: true
+    has_intermissions: true
+    has_chapter_markers: false
+    setlist_confidence: medium
+    vtuber: true
+    language: ja
+    weight: 3.0
+    setlist:
+      - { pos: 1,  title: "瞬間ハートビート",         artist: "ReGLOSS",           type: original,  notes: "Debut single (group)" }
+      - { pos: 2,  title: "シンメトリー",             artist: "ReGLOSS",           type: original,  notes: "2nd single (group)" }
+      - { pos: 3,  title: "Shiny Smily Story",       artist: "hololive IDOL PROJECT", type: cover,  notes: "Hiodoshi Ao solo" }
+      - { pos: 4,  title: "未来のミュージアム",       artist: "Perfume",           type: cover,     notes: "Juufuutei Raden solo" }
+      - { pos: 5,  title: "SUPER DUPER",             artist: "ReGLOSS",           type: original,  notes: "Sub-unit (Ririka/Ao/Raden)" }
+      - { pos: 6,  title: "泡沫メイビー",             artist: "ReGLOSS",           type: original,  notes: "group" }
+      - { pos: 7,  title: "Departures ～あなたにおくるアイの歌～", artist: "EGOIST", type: cover,   notes: "Otonose Kanade solo. Distinct from globe's 1996 'Departures'." }
+      - { pos: 8,  title: "LAKI MODE",               artist: "ReGLOSS",           type: original,  notes: "Sub-unit (Kanade/Hajime)" }
+      - { pos: 9,  title: "BANDAGE",                 artist: "Ayumu Imazu",       type: cover,     notes: "Todoroki Hajime solo. Distinct from Lands/Kazuya Kamenashi 2010." }
+      - { pos: 10, title: "bvdiz",                   artist: "ReGLOSS",           type: original,  notes: "Read as 'buddies'; group song from 1st album" }
+      - { pos: 11, title: "フィーリングラデーション", artist: "ReGLOSS",           type: original,  notes: "feelingradation — katakana ↔ romaji cross-script fetch case" }
+    mc_segments_s: []
+    failure_modes:
+      - cross_lang_ko_zh
+      - native_title_vs_romaji
+      - cover_artist_misattribution
+      - wrong_song_generic
+      - chorus_trap
+      - mc_drift
+      - ocr_katakana_stylised
+    sources:
+      - https://minkara.carview.co.jp/userid/318124/blog/48000489/
+      - https://hololive.hololivepro.com/en/videos/13618/
+      - https://hololive.wiki/wiki/Hololive_DEV_IS_ReGLOSS
+      - https://music.apple.com/jp/song/bvdiz/1774207331
+
+  # ── C3 ── YOASOBI ARENA TOUR 2023 電光石火 @ Saitama Super Arena ──────
+  - key: yoasobi_denkosekka_saitama_2023
+    url: https://www.youtube.com/watch?v=LQiPO0bhB9o
+    video_id: LQiPO0bhB9o
+    title: "【全場中字】『YOASOBI ARENA TOUR 2023 電光石火』2023.6.4@さいたまスーパーアリーナ"
+    artist: "YOASOBI"
+    channel: "pureland"
+    duration_s: null                # ~110-130 min unverified
+    is_concert: true
+    has_mc: true
+    has_intermissions: true
+    has_chapter_markers: false
+    setlist_confidence: medium
+    vtuber: false
+    language: ja
+    weight: 2.5
+    setlist:
+      - { pos: 1,  title: "祝福",                    type: original,  notes: "Opener. Gundam: The Witch from Mercury OP1" }
+      - { pos: 2,  title: "夜に駆ける",              type: original,  notes: "Breakout hit" }
+      - { pos: 3,  title: "三原色",                  type: original }
+      - { pos: 4,  title: "セブンティーン",          type: original }
+      - { pos: 5,  title: "ミスター",                type: original }
+      - { pos: 6,  title: "海のまにまに",            type: original }
+      - { pos: 7,  title: "好きだ",                  type: original }
+      - { pos: 8,  title: "優しい彗星",              type: original,  notes: "BEASTARS S2 ED" }
+      - { pos: 9,  title: "もしも命が描けたら",      type: original }
+      - { pos: 10, title: "たぶん",                  type: original }
+      - { pos: 11, title: "ハルジオン",              type: original,  notes: "some EN sources mis-title as 'Halcyon'" }
+      - { pos: 12, title: "ハルカ",                  type: original }
+      - { pos: 13, title: "ツバメ",                  type: original,  notes: "NHK Minna no Uta; ミドリーズ collab exists" }
+      - { pos: 14, title: "怪物",                    type: original,  notes: "BEASTARS S2 OP" }
+      - { pos: 15, title: "群青",                    type: original,  notes: "Massive singalong" }
+      - { pos: 16, title: "アドベンチャー",          type: original,  notes: "Main-set closer" }
+      - { pos: 17, title: "アイドル",                type: original,  notes: "Encore. Oshi no Ko OP" }
+    mc_segments_s: []
+    failure_modes:
+      - wrong_song_generic
+      - cross_lang_ko_zh
+      - cover_artist_misattribution
+      - mc_drift
+      - wrong_song_strike_storm
+      - chorus_trap
+      - encore_dead_air
+      - hardcoded_subtitle_burnin
+      - no_chapters_offline_fingerprint_stress
+    sources:
+      - https://www.setlist.fm/setlist/yoasobi/2023/saitama-super-arena-saitama-japan-4ba6b38e.html
+      - https://en.wikipedia.org/wiki/Denk%C5%8Dsekka_Arena_Tour
+      - https://music-setlist.hatenablog.jp/entry/2023/06/04/170000
+      - https://www.yoasobi-music.jp/live/49695
+      - https://utaten.com/karaoke/yoasobi-setlist/
+
+  # ── C4 ── Phase OriginS "The OriginS of Stars" @ Offkai Expo Gen4 ─────
+  - key: phase_origins_of_stars_offkai_2025
+    url: https://www.youtube.com/watch?v=Gl9B6D3ru7M
+    video_id: Gl9B6D3ru7M
+    title: "The OriginS of Stars - Offkai Expo Gen4 3D Concert"
+    artist: "Phase OriginS"
+    channel: "Phase Connect"
+    duration_s: 2602
+    is_concert: true
+    has_mc: true
+    has_intermissions: true
+    has_chapter_markers: true
+    setlist_confidence: medium
+    vtuber: true
+    language: en                    # EN VTubers, JP covers likely present
+    weight: 2.5
+    setlist:
+      - { pos: 1,  title: "Intro",              type: other,        start_s: 0,    notes: "Overture / opening sequence (chapter 0:00-3:25)" }
+      - { pos: 2,  title: "Kton Boogie",        type: unknown,      start_s: 205,  notes: "Chapter title as-given; likely 混沌ブギ / Konton Boogie (jon-YAKITORY). Romaji↔native mismatch." }
+      - { pos: 3,  title: "Fly To The World",   type: unknown,      start_s: 428,  notes: "Not obviously indexed as a Phase original or well-known cover" }
+      - { pos: 4,  title: "La La La",           type: unknown,      start_s: 666,  notes: "Extreme title collision" }
+      - { pos: 5,  title: "Next to You",        type: unknown,      start_s: 941,  notes: "Extreme title collision" }
+      - { pos: 6,  title: "After Talk",         type: mc,           start_s: 1192, notes: "Explicit MC segment (19:52-22:38). _SETLIST_SKIP should catch by title." }
+      - { pos: 7,  title: "Face It",            type: unknown,      start_s: 1358, notes: "URL-hinted t=1575s lands here" }
+      - { pos: 8,  title: "Daddy Mama",         type: unknown,      start_s: 1585 }
+      - { pos: 9,  title: "Remember You",       type: unknown,      start_s: 1785 }
+      - { pos: 10, title: "Fuura",              type: unknown,      start_s: 2035, notes: "Almost certainly a tribute to former Phase member Fuura Yuri. NOT a song title. Chapter-trap test case." }
+      - { pos: 11, title: "The Future",         type: unknown,      start_s: 2306, notes: "Likely a Phase OriginS group original written for this concert" }
+    mc_segments_s:
+      - [1192, 1358]                # After Talk 19:52-22:38 per chapter markers
+    failure_modes:
+      - wrong_song_generic
+      - cross_lang_ko_zh
+      - cover_artist_misattribution
+      - mc_drift
+      - wrong_song_strike_storm
+      - chapter_trap_non_song
+      - generic_chapter_labels
+      - chorus_trap
+    sources:
+      - https://www.setlist.fm/setlists/phase-connect-be725da.html
+      - https://www.offkaiexpo.com/event/phase-connect-concert/
+      - https://musicbrainz.org/event/6e207a75-b820-4f53-9a0b-e7aebc3abc65
+      - https://virtualyoutuber.fandom.com/wiki/Kaneko_Lumi/Discography
+      - https://virtualyoutuber.fandom.com/wiki/Fujikura_Uruka/Discography
+      - https://projectsekai.fandom.com/wiki/Konton_Boogie
+
+  # ── C6 ── RIM 2nd ONE-MAN LIVE「NEUROMANCE Ⅱ」DIGEST (YMWE 8.0) ───────
+  # Digest cut (19:22 / 1162s) of the full ~90-min live originally held
+  # 2023-12-16 as SINKA LIVE SERIES EP.Ⅳ "NEUROMANCE Ⅱ -神椿市壱番街-".
+  # Live-verified failure mode: the current app finds NO lyrics for ANY
+  # song in this video because (a) NO chapter markers, (b) the description
+  # is release/promo copy with no timestamps, (c) NEUROMANCE II songs are
+  # niche KAMITSUBAKI releases many providers don't carry, and (d) at
+  # ~19 min the individual songs may be partial cuts that break Shazam
+  # confidence gates. Candidate-pool hint (full 24-song setlist) below
+  # lets _decide_by_ear at least score against the right pool.
+  - key: rim_neuromance_ii_digest_2024
+    url: https://www.youtube.com/watch?v=pnk4AlLu8MM
+    video_id: pnk4AlLu8MM
+    title: "理芽 - 2nd ONE-MAN LIVE「NEUROMANCE Ⅱ」【YouTube Music Weekend 8.0 Edition】"
+    artist: "理芽"
+    channel: "RIM"
+    duration_s: 1162
+    is_concert: true
+    is_digest: true                  # partial cuts of each song, not full-length
+    has_mc: true
+    has_intermissions: false
+    has_chapter_markers: false        # confirmed by yt-dlp: chapters=null
+    setlist_confidence: high          # full setlist verified from multiple JP sources
+    vtuber: true                      # KAMITSUBAKI STUDIO virtual artist
+    language: ja
+    weight: 3.0
+    original_event:
+      name: "SINKA LIVE SERIES EP.Ⅳ 理芽 2nd ONE-MAN LIVE「NEUROMANCE Ⅱ -神椿市壱番街-」"
+      date: "2023-12-16"
+      venue: "Virtual (Kamitsubaki City AREA 1)"
+    # FULL SETLIST — 24 songs. This is the parent-event setlist; the digest
+    # video probably includes a subset (unverified which, and start_s is
+    # unknown without chapters). Every song is loaded into
+    # candidate_pool_hint below so _decide_by_ear scores against the right
+    # pool even without per-song timestamps.
+    setlist:
+      - { pos: 1,  title: "ファンファーレ",                         type: original }
+      - { pos: 2,  title: "クライベイビー",                         type: original,  notes: "Cry Baby" }
+      - { pos: 3,  title: "胎児に月はキスをしない",                 type: original }
+      - { pos: 4,  title: "デイネイ",                               type: original }
+      - { pos: 5,  title: "ラヴソング",                             type: original }
+      - { pos: 6,  title: "どくどく",                               type: original }
+      - { pos: 7,  title: "ピロウトーク",                           type: original,  notes: "Pillow Talk" }
+      - { pos: 8,  title: "NEUROMANCE",                             type: original,  notes: "Title track" }
+      - { pos: 9,  title: "甘美な無法",                             type: original }
+      - { pos: 10, title: "RIM DISCOTHEQUE",                        type: original }
+      - { pos: 11, title: "インナアチャイルド",                     type: original,  notes: "Inner Child — katakana↔romaji cross-script" }
+      - { pos: 12, title: "ルフラン",                               type: original,  notes: "Refrain" }
+      - { pos: 13, title: "空っぽなら、踊ろうぜ",                   artist: "理芽 × Guiano", type: original,  notes: "w/ Guiano" }
+      - { pos: 14, title: "言っちゃいけないことばっか浮かぶよな",   artist: "理芽 × Guiano", type: original,  notes: "w/ Guiano; from imagine album" }
+      - { pos: 15, title: "食虫植物",                               type: original }
+      - { pos: 16, title: "生きているより楽しそう",                 type: original }
+      - { pos: 17, title: "えろいむ",                               type: original,  notes: "Eloim" }
+      - { pos: 18, title: "ピルグリム",                             type: original,  notes: "Pilgrim" }
+      - { pos: 19, title: "風",                                     artist: "理芽 × 裏命", type: original,  notes: "w/ 裏命 (RIME)" }
+      - { pos: 20, title: "わたしレプリカ",                         artist: "理芽 × 裏命", type: original,  notes: "w/ 裏命" }
+      - { pos: 21, title: "おしえてかみさま",                       type: original,  notes: "Tell Me God / Divine Delays — often bilingual titled" }
+      - { pos: 22, title: "フロム天国",                             type: original }
+      - { pos: 23, title: "百年",                                   type: original,  notes: "100 Years" }
+      - { pos: 24, title: "狂えない",                               type: original,  notes: "Encore closer" }
+    mc_segments_s: []                 # unmapped; digest is compressed
+    # ALL 24 SONG TITLES pre-seeded — a fingerprint hit on any of these
+    # inside the digest wins the concert-scoped pool over a whole-library
+    # search that could easily wander into a wrong ReGLOSS/花譜 song.
+    candidate_pool_hint:
+      originals:
+        - "ファンファーレ"
+        - "クライベイビー"
+        - "胎児に月はキスをしない"
+        - "デイネイ"
+        - "ラヴソング"
+        - "どくどく"
+        - "ピロウトーク"
+        - "NEUROMANCE"
+        - "甘美な無法"
+        - "RIM DISCOTHEQUE"
+        - "インナアチャイルド"
+        - "ルフラン"
+        - "空っぽなら、踊ろうぜ"
+        - "言っちゃいけないことばっか浮かぶよな"
+        - "食虫植物"
+        - "生きているより楽しそう"
+        - "えろいむ"
+        - "ピルグリム"
+        - "風"
+        - "わたしレプリカ"
+        - "おしえてかみさま"
+        - "フロム天国"
+        - "百年"
+        - "狂えない"
+    known_pending_releases: []
+    failure_modes:
+      - no_chapters
+      - no_setlist_in_description
+      - digest_partial_cuts
+      - kamitsubaki_niche_provider_gap    # NEW: KAMITSUBAKI releases sit outside lrclib/musixmatch coverage
+      - native_title_vs_romaji
+      - cross_lang_ko_zh
+      - wrong_song_generic
+      - mc_drift
+    hints:
+      # Runtime discoverability — every hint here is something the app
+      # could learn to look for AUTOMATICALLY for a concert we don't have
+      # a pre-seeded setlist for.
+      channel_is_official_artist: true
+      tags_include_live: ["live", "Vsinger", "Vtuber", "neuromance", "YouTube Music Weekend", "YMWE"]
+      studio_hint: "KAMITSUBAKI STUDIO"    # channel/description mention → pull artist's discography from Wikipedia
+      digest_signal: "短い + ライブ tag + Music category + duration < 30min = digest"
+      description_release_hint:           # NEW ROMANCER2 mentioned → fetch that album's tracklist as candidates
+        - "NEW ROMANCER2"
+        - "NEW ROMANCER"
+        - "imagine"
+        - "CHOCOLATE LIVE2"
+    sources:
+      - https://kamitsubaki.jp/news/2023/10/18/2715/
+      - https://www.zan-live.com/en/live/detail/10324
+      - https://findmestore.thinkr.jp/products/ktr-100-0167
+      - https://ja.wikipedia.org/wiki/%E7%90%86%E8%8A%BD
+      - https://en.wikipedia.org/wiki/Rim_(singer)
+      - https://realsound.jp/2023/10/post-1464304.html
+      - https://simkl.com/movies/2581637/rim-2nd-one-man-live%E3%80%8Cneuromance-ii%E3%80%8D
+
+  # ── C5 ── Nirvana LIVE @ The Paramount 1991-10-31 (4K reupload) ───────
+  - key: nirvana_paramount_1991
+    url: https://www.youtube.com/watch?v=Z53nb74H7Vc
+    video_id: Z53nb74H7Vc
+    title: "Nirvana LIVE @ The Paramount 1991 | Full Concert (4K Remastered)"
+    artist: "Nirvana"
+    channel: "fruzalv"
+    duration_s: null
+    is_concert: true
+    has_mc: true
+    has_intermissions: false
+    has_chapter_markers: false
+    setlist_confidence: high
+    vtuber: false
+    language: en
+    weight: 1.5                     # generalisation coverage — Western rock outlier
+    setlist:
+      - { pos: 1,  title: "Jesus Doesn't Want Me for a Sunbeam", artist: "The Vaselines", type: cover,    start_s: 30,   time_confidence: est, notes: "Kurt intro; ~5:48" }
+      - { pos: 2,  title: "Aneurysm",              type: original, start_s: 380,  time_confidence: est,  notes: "~5:05" }
+      - { pos: 3,  title: "Drain You",             type: original, start_s: 700,  time_confidence: est,  notes: "~5:16" }
+      - { pos: 4,  title: "School",                type: original, start_s: 1030, time_confidence: est,  notes: "~2:57" }
+      - { pos: 5,  title: "Floyd the Barber",      type: original, start_s: 1225, time_confidence: est,  notes: "~2:21" }
+      - { pos: 6,  title: "Smells Like Teen Spirit", type: original, start_s: 1400, time_confidence: est, notes: "~6:58 with jam intro" }
+      - { pos: 7,  title: "About a Girl",          type: original, start_s: 1830, time_confidence: est,  notes: "~3:02" }
+      - { pos: 8,  title: "Polly",                 type: original, start_s: 2030, time_confidence: est,  notes: "~3:04" }
+      - { pos: 9,  title: "Breed",                 type: original, start_s: 2230, time_confidence: est,  notes: "~2:54" }
+      - { pos: 10, title: "Sliver",                type: original, start_s: 2415, time_confidence: est,  notes: "~2:18" }
+      - { pos: 11, title: "Love Buzz",             artist: "Shocking Blue", type: cover, start_s: 2560, time_confidence: est, notes: "~4:01" }
+      - { pos: 12, title: "Lithium",               type: original, start_s: 2820, time_confidence: est,  notes: "~6:02" }
+      - { pos: 13, title: "Been a Son",            type: original, start_s: 3200, time_confidence: est,  notes: "~2:41" }
+      - { pos: 14, title: "Negative Creep",        type: original, start_s: 3375, time_confidence: est,  notes: "~3:00" }
+      - { pos: 15, title: "On a Plain",            type: original, start_s: 3570, time_confidence: est,  notes: "~4:09" }
+      - { pos: 16, title: "Blew",                  type: original, start_s: 3830, time_confidence: est,  notes: "~3:00; main-set close" }
+      - { pos: 17, title: "Encore break",          type: intermission, start_s: 4030, time_confidence: est, notes: "~1 min" }
+      - { pos: 18, title: "Rape Me",               type: original, start_s: 4090, time_confidence: est,  notes: "Early live version, ~3:04" }
+      - { pos: 19, title: "Territorial Pissings",  type: original, start_s: 4290, time_confidence: est,  notes: "~2:55" }
+      - { pos: 20, title: "Endless, Nameless",     type: original, start_s: 4480, time_confidence: est,  notes: "~7:39; noise-jam finale, 'secret song'" }
+    mc_segments_s: []
+    failure_modes:
+      - mc_drift
+      - wrong_song_generic
+      - cover_artist_misattribution
+      - endless_nameless_noise_tail
+      - chorus_trap
+      - encore_dead_air
+      - wrong_song_strike_storm
+    sources:
+      - https://www.setlist.fm/setlist/nirvana/1991/paramount-theatre-seattle-wa-53d67f05.html
+      - https://www.livenirvana.com/concerts/91/91-10-31.php
+      - https://en.wikipedia.org/wiki/Live_at_the_Paramount_(video)
+      - https://www.nirvana.com/releases-archive/live-at-the-paramount/

@@ -1,7 +1,8 @@
 # Porting Plan: Lyric Immersion and Karaoke on Linux and macOS
 
 Status: plan of record. Nothing in this document is started unless a phase says so.
-Source tree: `~/lyric-overlay` (referred to as repo root below). Overlay renderer: `D:\projects\lyric-overlay-tauri`.
+Source tree: this repository root. Overlay renderer: the companion Tauri project
+that produces `overlay/lyric-overlay.exe` for the frozen build.
 
 ## 1. Executive summary, honest version
 
@@ -57,7 +58,7 @@ Deliverable: AppImage that identifies Spotify/VLC/browser playback via MPRIS, sy
 - [ ] FontResolver via fontconfig, Noto Sans CJK in the CSS stacks.
 - [ ] Packaging: PyInstaller onedir + appimagetool, libpulse0 listed as external, single-instance via flock.
 
-Testable without hardware: MPRIS backend against a fake `dbus-next` service and against real players inside **WSL2/WSLg on the author's machine** (WSLg gives Wayland+XWayland, PulseAudio, and a session D-Bus, so MPRIS + monitor-source capture + X11 overlay can all be exercised there); headless X via Xvfb in CI for the ewmh scraper. Needs real hardware: PipeWire soak, Wayland compositor matrix, multi-monitor, GPU overlay smoothness.
+Testable without hardware: MPRIS backend against a fake `dbus-next` service and against real players inside **WSL2/WSLg** (WSLg gives Wayland+XWayland, PulseAudio, and a session D-Bus, so MPRIS + monitor-source capture + X11 overlay can all be exercised there); headless X via Xvfb in CI for the ewmh scraper. Needs real hardware: PipeWire soak, Wayland compositor matrix, multi-monitor, GPU overlay smoothness.
 
 ### Phase L2: Linux polish (small-medium)
 
@@ -92,6 +93,6 @@ Testable without a Mac: `macos-latest` CI runners cover import gate, AppleScript
 
 - **Now (Phase 0):** Actions matrix on ubuntu/macos/windows running the import gate and pure-logic tests every push. This locks in the "already imports green on Linux" property so it cannot regress.
 - **Phase L1 onward:** ubuntu job grows a smoke tier: Xvfb + a mock MPRIS player (`dbus-next` test service) asserting the provider fills the session dict and maps `'Playing'` correctly; a null-sink PulseAudio (`pulseaudio --start` or pipewire in the runner) asserting `all_microphones(include_loopback=True)` yields a monitor and a 1 s capture returns samples; container images (Ubuntu LTS, Fedora, Arch) for install-matrix checks of the AppImage.
-- **Author's daily bench:** WSL2 with WSLg on this machine is the standing Linux dev environment: session D-Bus for MPRIS and Discord sockets, PulseAudio server for monitor capture, XWayland for the ewmh scraper and overlay bring-up. Anything that passes there gets a final pass on one real bare-metal distro before release.
+- **Suggested Linux bench:** WSL2 with WSLg is a useful first-pass Linux dev environment: session D-Bus for MPRIS and Discord sockets, PulseAudio server for monitor capture, XWayland for the ewmh scraper and overlay bring-up. Anything that passes there should still get a final pass on one real bare-metal distro before release.
 - **macOS:** macos runners for import + adapter unit tests; a physical or MacStadium/Scaleway rented Mac is required once per M1 milestone for BlackHole, TCC, and notarization, and is the explicit gate on shipping M1.
 - **Release gate per platform:** the Phase 0 import matrix green, the platform smoke tier green, and one manual end-to-end on real hardware (play a JP track in Spotify, confirm ID, sync, and overlay).

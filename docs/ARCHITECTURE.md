@@ -7,11 +7,13 @@ app acts on it. This supersedes the old module-by-module listing and scattered
 notes; per-function detail lives in source docstrings.
 
 Doc map:
-- **ARCHITECTURE.md** (this file) — the parts, methods, confidence model.
-- **ISSUES.md** — numbered behaviour tickets (matching / sync / rendering).
-- **PERFORMANCE.md** — rendering / CPU / audio-stutter tickets (PERF-###).
-- **RESEARCH.md** — background research that informed the design.
-- **docs/** — deep dives (CONCERT_DETECTION.md, GENERATION.md).
+- **ARCHITECTURE.md** (this file) - the parts, methods, confidence model.
+- **REPO_ORGANIZATION.md** - current runtime diagram, source layout, data stores.
+- **SUBTITLES_MODEL_API.md** - subtitle preset/toggle behavior and model-facing API.
+- **ISSUES.md** - numbered behaviour tickets (matching / sync / rendering).
+- **PERFORMANCE.md** - rendering / CPU / audio-stutter tickets (PERF-###).
+- **RESEARCH.md** - background research that informed the design.
+- **docs/** - deep dives (CONCERT_DETECTION.md, GENERATION.md).
 
 The app is ONE process: a Tkinter transparent overlay (`main.py:Overlay`) plus
 background worker threads, with a local HTTP API (`api.py`) for inspection.
@@ -126,16 +128,18 @@ By failure mode:
 
 ## 7. Rendering & Performance
 **Modules:** `main.py` (`_tick`/`_ticker_update`, layer-composite fill),
-`character.py`; see **PERFORMANCE.md**. Tkinter canvas (CPU). Scroll = `canvas.move`
-of pre-rendered PIL blocks; karaoke fill = composite a sung layer over base via a
-full-glyph mask. Open: PERF-101 single-strip, PERF-100 moderngl GPU overlay.
+`character.py`, bundled `overlay/lyric-overlay.exe`; see **PERFORMANCE.md**.
+Tkinter canvas is the guaranteed CPU fallback. The current GPU path is the Tauri
+overlay polling `/overlay`; Python remains the timing/settings source of truth.
+Scroll = `canvas.move` or Tauri belt positioning of pre-rendered/current line
+state; karaoke fill uses the raw song clock while line position eases toward sync.
 
 ---
 
 ## 8. Diagnostics API (`api.py`, 127.0.0.1:8765)
 `/status` `/diag` (sync state machine + FPS) `/source` `/audio` `/lyricstate`
-`/tune` (live sync constants) `/captions` `/align` `/identify` `/wrong` `/nudge`
-`/reset` `/logs`.
+`/tune` (live sync constants) `/display` `/subtitles` `/captions` `/align`
+`/identify` `/wrong` `/nudge` `/reset` `/logs` `/overlay`.
 
 ---
 
