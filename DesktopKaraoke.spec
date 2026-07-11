@@ -46,6 +46,9 @@ hiddenimports = [
     # pin so the frozen build includes it (stdlib urllib only, no new deps).
     "llm_disambiguate",
     "playlist_import", "playlist_import_gui", "concert_ocr", "ocr_lyrics", "deep_transcribe", "confidence",
+    # TICKET-169: movie-site subtitle fetcher — lazy-imported in the captions
+    # worker; pin so the frozen build includes it (stdlib-only module).
+    "movie_subs",
     # v1.1.57 offline concert audio analysis — lazy-imported in main.py's
     # _analyze_concert_audio thread; pin so the frozen build includes it.
     "concert_audio", "faster_whisper.audio",
@@ -146,7 +149,17 @@ a = Analysis(
     # what caused the "No module named 'jaraco'" startup hang.)
     excludes=["tkinter.test", "test", "pytest", "matplotlib", "scipy",
               "IPython", "notebook", "pandas", "PyQt5", "PyQt6", "PySide2",
-              "PySide6", "wx", "sphinx", "setuptools._vendor", "wordninja"],
+              "PySide6", "wx", "sphinx", "setuptools._vendor", "wordninja",
+              # BUNDLE DIET (v1.1.74, live-caught): OTHER projects' pip installs
+              # leaked into the frozen build through transitive import probes —
+              # torch alone added 3.6 GB and pushed the release zip past
+              # GitHub's 2 GiB asset limit. NONE of these are app imports
+              # (verified by grep); faster-whisper runs on ctranslate2, which
+              # stays. tokenizers stays too (faster-whisper needs it).
+              "torch", "torchvision", "torchaudio", "triton",
+              "paddle", "paddleocr", "cv2", "spacy", "thinc",
+              "transformers", "datasets", "sklearn", "numba", "llvmlite",
+              "sympy", "networkx", "jax", "tensorflow", "keras"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

@@ -93,6 +93,7 @@ class SongChangeDetector(threading.Thread):
         # isn't bundled (the karaoke .exe is lean by default).
         self._vocal_buf = []       # list of (t_wall, ratio) — last ~60 s
         self._buf_lock = threading.Lock()
+        self.active_device = None  # TICKET-168: loopback we're bound to (name)
         # latest per-block values, for the live audio-listener diagnostic
         self._live_rms = 0.0
         self._live_vr = None
@@ -140,12 +141,20 @@ class SongChangeDetector(threading.Thread):
             return
 
         backoff = 1.0
+        probe_next = False        # TICKET-168: next open should HUNT for signal
         while not self._stop_evt.is_set():
             if not self._enabled:
                 time.sleep(0.3)
                 continue
             try:
-                loop = self._find_loopback(sc)
+                loop = None
+                if probe_next:
+                    # The last binding produced junk (silence or a flat mask):
+                    # the default speaker is NOT where the music renders. Probe
+                    # every loopback and bind the one actually carrying audio.
+                    loop = self._probe_best_loopback(sc, np)
+                    probe_next = False
+                loop = loop or self._find_loopback(sc)
                 if loop is None:
                     time.sleep(2.0)
                     continue
@@ -156,6 +165,7 @@ class SongChangeDetector(threading.Thread):
                 # for whole songs), no boundaries, no vocal onsets (MV-intro
                 # anchor never fires). Live-caught on a YOASOBI live cut.
                 bound_name = getattr(loop, "name", "") or ""
+                self.active_device = bound_name    # for /diag + recognize child
                 try:
                     _spk = sc.default_speaker()
                     bound_default = bool(_spk and _spk.name and _spk.name in bound_name)
@@ -183,14 +193,27 @@ class SongChangeDetector(threading.Thread):
                                     break            # → reopen on new default
                             except Exception:
                                 pass
-                        # 2) 60 s of CONTINUOUS silence → reopen regardless.
+                        # 2) TICKET-168 FLAT-MASK watchdog: 150+ recent ratio
+                        #    samples with ~zero spread = the endpoint carries a
+                        #    CONSTANT signal (junk), not music — the ZAWA MAKE IT
+                        #    signature (on=150 off=0 spread=0.000, zero Shazam).
+                        #    Explicit-silence zeros make this catch dead-silent
+                        #    streams within ~30 s too.
+                        if blocks % 25 == 0 and blocks >= 150:
+                            with self._buf_lock:
+                                tail = [r for (_, r) in self._vocal_buf[-150:]]
+                            if len(tail) >= 150 and (max(tail) - min(tail)) < 1e-4:
+                                probe_next = True
+                                break            # → reopen via signal probe
+                        # 3) 60 s of CONTINUOUS silence → reopen regardless.
                         #    Covers same-name re-routes and endpoint invalidation
                         #    the name check can't see. A genuinely paused system
                         #    just re-opens the same device once a minute (cheap).
                         if self._live_silent:
                             silence_run += self.block
                             if silence_run >= 60.0:
-                                break                # → reopen
+                                probe_next = True
+                                break                # → reopen via signal probe
                         else:
                             silence_run = 0.0
             except Exception:
@@ -212,6 +235,32 @@ class SongChangeDetector(threading.Thread):
                      and spk and spk.name in m.name), None)
         return loop or next((m for m in mics
                              if getattr(m, "isloopback", False)), None)
+
+    def _probe_best_loopback(self, sc, np, per_dev_s=0.5):
+        """TICKET-168: find the loopback that is actually CARRYING audio.
+        The default speaker is not always where the music renders (multi-
+        device setups: HDMI displays, headsets, virtual devices) — binding
+        the default fed a constant junk mask for entire songs (spread=0.000,
+        zero Shazam IDs). Record a short block from every loopback and pick
+        the strongest VARYING signal; None when everything is silent."""
+        best = None
+        try:
+            mics = [m for m in sc.all_microphones(include_loopback=True)
+                    if getattr(m, "isloopback", False)]
+        except Exception:
+            return None
+        for m in mics:
+            try:
+                with m.recorder(samplerate=self.sr, channels=1) as rec:
+                    rec.record(numframes=1024)              # prime the stream
+                    data = rec.record(numframes=int(self.sr * per_dev_s))
+                rms = float(np.sqrt(np.mean(np.square(data, dtype="float64")) + 1e-12))
+                var = float(np.std(np.abs(data)))
+                if rms > 1e-4 and (best is None or (rms + var) > best[0]):
+                    best = (rms + var, m)
+            except Exception:
+                continue
+        return best[1] if best else None
 
     # ── analysis of one block ──
     def _feed(self, np, data):
@@ -325,6 +374,7 @@ class SongChangeDetector(threading.Thread):
         now = time.time()
         with self._buf_lock:
             buf = self._vocal_buf[-30:]                # last ~6 s
+            tail150 = [r for (_, r) in self._vocal_buf[-150:]]
         ratios = [r for (_, r) in buf]
         # adaptive on/off split, mirrors the correlator's logic
         on = off = 0
@@ -353,6 +403,9 @@ class SongChangeDetector(threading.Thread):
             "vocal_baseline": round(self._vocal_baseline, 3),
             "buffer_len": len(self._vocal_buf),
             "blocks_seen": self._blocks_seen,
+            "device": self.active_device,
+            "flat_mask": (len(tail150) >= 150
+                          and (max(tail150) - min(tail150)) < 1e-4),
             "music_for_s": round(self._music_for, 2),
             "silent_for_s": round(self._silent_for, 2),
         }

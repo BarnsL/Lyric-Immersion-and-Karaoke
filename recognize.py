@@ -40,8 +40,19 @@ def _capture(seconds=_DUR):
 
     spk = sc.default_speaker()
     mics = sc.all_microphones(include_loopback=True)
-    loop = next((m for m in mics if getattr(m, "isloopback", False)
-                 and spk.name in m.name), None)
+    # TICKET-168: the parent's boundary detector knows which loopback actually
+    # CARRIES the music (multi-device setups: the default speaker can be a
+    # silent endpoint while the browser renders elsewhere — that fed Shazam
+    # junk and killed every ID). Prefer the device it hands down via env;
+    # fall back to the default-speaker logic.
+    import os as _os
+    pref = (_os.environ.get("KARAOKE_LOOPBACK_DEVICE") or "").strip().lower()
+    loop = None
+    if pref:
+        loop = next((m for m in mics if getattr(m, "isloopback", False)
+                     and pref in m.name.lower()), None)
+    loop = loop or next((m for m in mics if getattr(m, "isloopback", False)
+                         and spk.name in m.name), None)
     loop = loop or next((m for m in mics if getattr(m, "isloopback", False)), None)
     if loop is None:
         return None, None

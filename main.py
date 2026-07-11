@@ -5082,12 +5082,23 @@ class Overlay:
                 else:
                     cmd = [_sys.executable, str(Path(__file__).parent / "recognize.py"),
                            "--child", str(seconds), str(attempts), "--out", outp]
+                # TICKET-168: tell the child WHICH loopback carries the music —
+                # the boundary detector's probe already found it; without this
+                # the child re-binds the (possibly silent) default speaker.
+                _env = _os.environ.copy()
+                try:
+                    _dev = getattr(self._boundary, "active_device", None)
+                    if _dev:
+                        _env["KARAOKE_LOOPBACK_DEVICE"] = str(_dev)
+                except Exception:
+                    pass
                 spawned = False
                 try:
                     proc = _sp.Popen(
                         cmd,
                         stdout=_sp.PIPE,
                         stderr=_sp.PIPE,
+                        env=_env,
                         creationflags=0x08000000 | 0x00000040,  # no window + IDLE_PRIORITY_CLASS
                     )
                     spawned = True
@@ -13366,9 +13377,33 @@ class Overlay:
         def work():
             res = None
             try:
-                res = deep_transcribe.fetch_captions_only(query, lang=lang,
-                                                          max_dur=caps_max,
-                                                          any_lang=subs)
+                # TICKET-169: movie-streaming sites (f2movies family) hide the
+                # video inside embed iframes yt-dlp can't read — but their own
+                # subtitle panels are OpenSubtitles rips. In Subtitles mode,
+                # fetch the SAME subs directly (title/year off the watch page →
+                # legacy OpenSubtitles REST → SRT), shaped like a caption track.
+                # Two entries: the exact URL when the browser pushed one, else
+                # the browser WINDOW title ('Watch X Movie… - F2movies - …').
+                if subs:
+                    try:
+                        import movie_subs
+                        q = str(query or "")
+                        if re.match(r"https?://", q) and movie_subs.is_movie_site(q):
+                            mres = movie_subs.fetch_for_url(q, log=log.info)
+                            if mres:
+                                res = (mres[0], mres[1])
+                        elif not re.match(r"https?://", q):
+                            rt = getattr(self, "_last_raw_title", "") or ""
+                            if movie_subs.is_movie_window_title(rt):
+                                mres = movie_subs.fetch_for_window_title(rt, log=log.info)
+                                if mres:
+                                    res = (mres[0], mres[1])
+                    except Exception as e:
+                        log.info("movie-subs error: %s", e)
+                if res is None:
+                    res = deep_transcribe.fetch_captions_only(query, lang=lang,
+                                                              max_dur=caps_max,
+                                                              any_lang=subs)
             except Exception as e:
                 log.info("captions error: %s", e)
             finally:
