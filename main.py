@@ -600,6 +600,47 @@ class MediaWatcher:
             self.error = str(e)
 
     async def _loop(self):
+        # PORTING.md §2 — MediaSessionProvider seam. Windows uses SMTC (WinRT);
+        # Linux uses MPRIS over D-Bus (media_mpris, CI-tested); macOS has no
+        # public system-wide now-playing API since 15.4 (see PORTING §4), so it
+        # runs with no session provider — by-ear ID + window titles still work.
+        if sys.platform == "win32":
+            await self._loop_win32()
+        elif sys.platform.startswith("linux"):
+            await self._loop_mpris()
+        else:
+            while not self._stop:                 # darwin / other: no provider
+                await asyncio.sleep(0.5)
+
+    async def _loop_mpris(self):
+        """Linux now-playing via the MPRIS provider — fills the SAME _state /
+        _all_sessions contract the SMTC loop does, so _pick / list_sessions /
+        the tray picker all consume it unchanged."""
+        try:
+            import media_mpris
+        except Exception as e:
+            self.error = f"MPRIS provider unavailable ({e}) — install dbus-next"
+            return
+        mp = media_mpris.MprisWatcher()
+        mp.start()
+        try:
+            while not self._stop:
+                snap = mp.get()
+                with self._lock:
+                    if snap:
+                        self._state = snap
+                        entry = dict(snap)
+                        entry["id"] = snap.get("source", "mpris")
+                        self._all_sessions = [entry]
+                        self._last_pick_reason = "mpris"
+                    else:
+                        self._state = None
+                        self._all_sessions = []
+                await asyncio.sleep(0.15)
+        finally:
+            mp.stop()
+
+    async def _loop_win32(self):
         from winsdk.windows.media.control import (
             GlobalSystemMediaTransportControlsSessionManager as MM,
         )

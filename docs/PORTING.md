@@ -1,8 +1,13 @@
 # Porting Plan: Lyric Immersion and Karaoke on Linux and macOS
 
-Status: plan of record. Nothing in this document is started unless a phase says so.
-Source tree: this repository root. Overlay renderer: the companion Tauri project
-that produces `overlay/lyric-overlay.exe` for the frozen build.
+Status: plan of record. Source tree: this repository root. Overlay renderer:
+the companion Tauri project that produces `overlay/lyric-overlay.exe`.
+
+**Progress (v1.1.74).**
+- ✅ **Phase 0** — import-clean on ubuntu/macos/windows; CI matrix (`.github/workflows/ci.yml`) runs the import gate on all three plus the live MPRIS mock-player test.
+- ✅ **Linux now-playing wired** — `media_mpris.MprisWatcher` is now selected by `MediaWatcher._loop` on Linux (SMTC stays on Windows; macOS runs provider-less). Fills the same state contract; `_pick`/`list_sessions`/tray picker consume it unchanged.
+- ✅ **Cross-platform build** — `DesktopKaraoke.spec` is platform-guarded (Windows-only winsdk/pycaw/comtypes/.ico/version-resource/child-exes; Linux dbus-next + X11/AppIndicator tray; macOS `.app` BUNDLE). `.github/workflows/release.yml` builds Windows + Linux + macOS on their own runners and attaches to the release for a `vX.Y.Z` tag (or Linux+macOS backfill via manual dispatch).
+- ⏳ **Not yet** — the Tauri-only overlay consolidation on Linux/Wayland, the macOS AppleScript per-player adapters, notarization, and the whisper add-on bundling for the non-Windows builds (lean beta ships without it). The CI-built Linux/macOS artifacts are **unvalidated-on-hardware betas**.
 
 ## 1. Executive summary, honest version
 

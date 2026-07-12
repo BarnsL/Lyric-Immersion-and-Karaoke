@@ -1,8 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller build spec for Desktop Karaoke → a single windowed .exe.
+# PyInstaller build spec — cross-platform (PORTING.md). Windows → windowed .exe
+# (onedir, wrapped by Inno into the one-click Setup.exe); Linux → onedir the
+# release workflow tars; macOS → .app BUNDLE. Windows-only bits (winsdk / pycaw
+# / comtypes / .ico / version resource / the overlay + dev-console child exes)
+# are guarded so the same spec builds green on the ubuntu/macos CI runners.
 #   pyinstaller --noconfirm DesktopKaraoke.spec   (or run build.bat)
 import os
+import sys
 from PyInstaller.utils.hooks import collect_all
+
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
 
 # OPTIONAL "Sync by listening" stack (faster-whisper) is bundled ONLY when it has
 # been vendored into ./.deps (pip install --target .deps faster-whisper). Without
@@ -33,12 +42,7 @@ if os.path.isfile(devconsole_exe):
 # copyrighted text baked into the build. (bundled_lyrics/ was removed from the repo.)
 binaries = []
 hiddenimports = [
-    "pystray._win32", "PIL._tkinter_finder", "PIL.ImageTk", "PIL.ImageGrab",
-    "winsdk.windows.media.control", "winsdk.windows.foundation",
-    "winsdk.windows.storage.streams", "winsdk.windows.storage",
-    # concert-banner OCR (concert_ocr.py) uses the built-in Windows OCR engine:
-    "winsdk.windows.media.ocr", "winsdk.windows.globalization",
-    "winsdk.windows.graphics.imaging",
+    "PIL._tkinter_finder", "PIL.ImageTk", "PIL.ImageGrab",
     # local modules imported lazily inside functions — pin them so the
     # frozen build always includes them.
     "appdata", "version", "updater", "songchange", "align", "api", "character", "recognize", "fetch_lyrics", "gpu_setup", "metrics",
@@ -63,14 +67,8 @@ hiddenimports = [
     # original-artist tags on browser sources). Lazy-imported in main.py inside
     # _maybe_fetch_yt_description; pin here so PyInstaller bundles it.
     "yt_description",
-    # TICKET-118: audible-session preference (Core Audio peak meter → pick the
-    # AUDIBLE SMTC session when multiple tabs publish to SMTC and one is muted).
-    # Lazy-imported inside audible_sessions.get_process_audio_levels(); pin
-    # pycaw + comtypes.gen so the frozen build can resolve the runtime COM
-    # proxy stubs comtypes generates lazily.
-    "audible_sessions",
-    "pycaw", "pycaw.pycaw",
-    "comtypes", "comtypes.gen",
+    # (TICKET-118 audible-session Core Audio metering — audible_sessions/pycaw/
+    # comtypes — is Windows-only; pinned in the IS_WIN block below.)
     # M2: GPU-driven lyric renderer child process. Lazy-imported in main.py
     # ONLY when sys.argv contains --gpu-renderer-child (dispatched from the
     # same exe). pygame + moderngl + PIL are picked up via collect_all; the
@@ -80,6 +78,24 @@ hiddenimports = [
     "moderngl", "moderngl.context", "moderngl.program",
     "pygame", "pygame.image", "pygame.display", "pygame.event", "pygame.time",
 ]
+# ── platform-specific hidden imports ──────────────────────────────────────
+if IS_WIN:
+    hiddenimports += [
+        "pystray._win32",
+        # SMTC now-playing + built-in Windows OCR (concert_ocr.py):
+        "winsdk.windows.media.control", "winsdk.windows.foundation",
+        "winsdk.windows.storage.streams", "winsdk.windows.storage",
+        "winsdk.windows.media.ocr", "winsdk.windows.globalization",
+        "winsdk.windows.graphics.imaging",
+        # audible-session Core Audio metering (TICKET-118):
+        "audible_sessions", "pycaw", "pycaw.pycaw", "comtypes", "comtypes.gen",
+    ]
+elif IS_LINUX:
+    # MPRIS now-playing (media_mpris) + the pystray backends X11 / AppIndicator.
+    hiddenimports += ["media_mpris", "dbus_next", "dbus_next.aio",
+                      "pystray._xorg", "pystray._appindicator", "pystray._gtk"]
+elif IS_MAC:
+    hiddenimports += ["pystray._darwin"]
 
 # BUGFIX (v1.1.70): PyInstaller ALWAYS runs the pkg_resources runtime hook
 # (pyi_rth_pkgres) at startup; pkg_resources imports jaraco.text/.functools/
@@ -104,25 +120,30 @@ hiddenimports += ["jaraco", "jaraco.text", "jaraco.functools",
 # Packages that ship data files / dynamically-imported submodules.
 # NOTE: unidic_lite bundles the ~50 MB dictionary fugashi/cutlet need at runtime
 # — collect_all is what pulls those data files into the exe.
-for pkg in ("winsdk", "soundcard", "shazamio", "pykakasi", "jaconv",
-            "fugashi", "unidic_lite", "cutlet", "mojimoji",
-            "pypinyin", "ToJyutping", "hangul_romanize", "deep_translator", "syncedlyrics",
-            "pystray", "spotipy", "aiohttp", "aiosignal", "pydub", "numpy",
-            # TICKET-118: pycaw uses comtypes-generated proxy stubs at runtime
-            # — collect_all pulls the data files / lazy submodules PyInstaller
-            # would otherwise miss in the frozen build.
-            "pycaw", "comtypes",
-            # M2: pygame-ce (SDL2) + moderngl drive the GPU renderer child.
-            # collect_all pulls the SDL DLLs, OpenGL fallback, and moderngl's
-            # platform-specific extension modules.
-            "pygame", "moderngl",
-            # yt-dlp: pulls a YouTube video's own caption track (accurate lyrics
-            # + perfect timing, locked to the video) — strictly better than a
-            # provider LRC for browser videos. ~10 MB, pure Python.
-            "yt_dlp",
-            # The faster-whisper stack is appended only when ./.deps exists.
-            *(("faster_whisper", "ctranslate2", "av", "tokenizers",
-               "huggingface_hub", "onnxruntime") if WHISPER else ())):
+_collect_pkgs = [
+    "soundcard", "shazamio", "pykakasi", "jaconv",
+    "fugashi", "unidic_lite", "cutlet", "mojimoji",
+    "pypinyin", "ToJyutping", "hangul_romanize", "deep_translator", "syncedlyrics",
+    "pystray", "spotipy", "aiohttp", "aiosignal", "pydub", "numpy",
+    # M2: pygame-ce (SDL2) + moderngl drive the GPU renderer child.
+    # collect_all pulls the SDL DLLs, OpenGL fallback, and moderngl's
+    # platform-specific extension modules.
+    "pygame", "moderngl",
+    # yt-dlp: pulls a YouTube video's own caption track (accurate lyrics
+    # + perfect timing, locked to the video) — strictly better than a
+    # provider LRC for browser videos. ~10 MB, pure Python.
+    "yt_dlp",
+]
+if IS_WIN:
+    # SMTC + audible-session Core Audio metering (comtypes runtime proxy stubs).
+    _collect_pkgs += ["winsdk", "pycaw", "comtypes"]
+elif IS_LINUX:
+    _collect_pkgs += ["dbus_next"]         # MPRIS now-playing over D-Bus
+# The faster-whisper stack is appended only when ./.deps exists.
+if WHISPER:
+    _collect_pkgs += ["faster_whisper", "ctranslate2", "av", "tokenizers",
+                      "huggingface_hub", "onnxruntime"]
+for pkg in _collect_pkgs:
     try:
         d, b, h = collect_all(pkg)
         datas += d
@@ -168,6 +189,13 @@ pyz = PYZ(a.pure)
 # instantly (a one-file build re-extracts ~100 MB — including the 50 MB UniDic
 # dictionary — to a temp folder on EVERY launch, which is slow and brittle). The
 # Inno Setup installer wraps this folder into the one-click DesktopKaraoke-Setup.exe.
+# Platform icon + Windows version resource (both no-ops on the other OSes).
+if IS_WIN:
+    _icon = "icon.ico"
+elif IS_MAC:
+    _icon = "icon.icns" if os.path.isfile("icon.icns") else None
+else:
+    _icon = None
 exe = EXE(
     pyz,
     a.scripts,
@@ -180,11 +208,12 @@ exe = EXE(
     upx=False,
     console=False,            # no console window — clean GUI app
     disable_windowed_traceback=False,
-    icon="icon.ico",
+    icon=_icon,
     # Embed real Windows file metadata (company / product / version). An exe with
     # NO version resource is a strong Defender/SmartScreen false-positive signal on
     # clean machines. version_info.txt keeps its four numbers in sync with version.py.
-    version="version_info.txt" if os.path.isfile("version_info.txt") else None,
+    version=("version_info.txt" if (IS_WIN and os.path.isfile("version_info.txt"))
+             else None),
 )
 coll = COLLECT(
     exe,
@@ -194,3 +223,21 @@ coll = COLLECT(
     upx=False,
     name="DesktopKaraoke",
 )
+# macOS: wrap the onedir into a proper .app so it's double-clickable and
+# codesign/notarize-able (the release workflow zips DesktopKaraoke.app).
+if IS_MAC:
+    app = BUNDLE(
+        coll,
+        name="Lyric Immersion and Karaoke.app",
+        icon=_icon,
+        bundle_identifier="us.purpleindustries.lyric-immersion",
+        info_plist={
+            "CFBundleShortVersionString": os.environ.get("LI_VERSION", "1.1.74"),
+            "LSMinimumSystemVersion": "11.0",
+            "NSHighResolutionCapable": True,
+            # TCC usage strings (window-title reading / capture guidance):
+            "NSMicrophoneUsageDescription":
+                "Listen to system audio (via a loopback device) to identify songs "
+                "and sync lyrics.",
+        },
+    )

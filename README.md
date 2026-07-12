@@ -8,7 +8,7 @@ Korean, Spanish, German, and Russian) by singing along.**
 
 > ### ⬇️ Just want to use it? [**Download the latest release**](https://github.com/BarnsL/Lyric-Immersion-and-Karaoke/releases/latest) → run **`Lyric-Immersion-and-Karaoke-Setup.exe`** (no admin needed) → done. Prefer no installer? Grab the portable **`.zip`** from the same page, extract, and double-click `Lyric-Immersion-and-Karaoke.exe`. No Python, no account.
 >
-> **Windows today.** Linux and macOS ports are planned — the full engineering plan lives in [docs/PORTING.md](docs/PORTING.md) (Linux first: it can reach near-parity; macOS will launch with per-player support).
+> **Windows** is the full experience. **Linux** (`.tar.gz`) and **macOS** (`.app`) beta builds are now published on every release, built on CI for each OS — see [Install](#-install-one-click-no-python-needed) for the per-platform notes and the honest capability matrix in [docs/PORTING.md](docs/PORTING.md).
 
 Play a song in **Spotify, YouTube, or any app** that talks to Windows' media
 controls, and Lyric Immersion and Karaoke pulls the **real playback position** and streams
@@ -106,6 +106,27 @@ while it runs.
    download **`Lyric-Immersion-and-Karaoke-<version>.zip`**.
 2. Right-click → **Extract All**.
 3. Double-click **`Lyric-Immersion-and-Karaoke.exe`** inside.
+
+### 🐧 Linux (beta) — `.tar.gz`
+
+1. Download **`...-linux-x86_64.tar.gz`** from the release, extract, and run
+   `./DesktopKaraoke/Lyric-Immersion-and-Karaoke`.
+2. Needs PulseAudio/PipeWire (standard on modern desktops). Now-playing comes
+   from **MPRIS** (Spotify, VLC, mpv, Firefox, Chromium all publish it);
+   listen/identify uses the PipeWire monitor source. X11 or XWayland for the
+   overlay. The AI "sync/generate by ear" add-on isn't bundled in the lean beta
+   (`pip install faster-whisper` if running from source).
+
+### 🍎 macOS (experimental) — `.app`
+
+1. Download **`...-macos.zip`**, unzip, drag the `.app` to Applications.
+2. It's **unsigned**, so first launch: **right-click → Open → Open** (Gatekeeper
+   only warns once). No admin needed.
+3. Honest caveats (Apple platform limits, see [docs/PORTING.md](docs/PORTING.md)):
+   **Spotify/Music** get full now-playing; other apps are title-only or need
+   by-ear. Listen/identify needs a loopback device (**BlackHole 2ch**) since
+   macOS has no driver-free capture. This is a preview — Windows and Linux are
+   the recommended platforms.
 
 That's it. The app starts in your **system tray** (the little purple microphone by
 the clock), and lyrics appear the moment you play a song. It's **fully portable** —
