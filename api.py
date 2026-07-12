@@ -21,7 +21,7 @@ Endpoints (also at GET /):
   GET  /lyrics      → the full loaded, annotated lyric lines
   POST /identify    → re-identify the song by SOUND now
   POST /wrong       → mark the current lyrics wrong → re-identify + re-fetch
-  POST /nudge?s=2.5 → shift sync by s seconds (+ = lyrics later)
+  POST /nudge?s=2.5 → shift sync by s seconds (+ = lyrics earlier)
   POST /reset       → reset the sync offset to 0
   POST /reindex     → rescan the local lyric library
 
@@ -72,7 +72,7 @@ _ROUTES = {
     "POST": {
         "/identify": "re-identify by sound now",
         "/wrong": "mark current lyrics wrong → re-identify + re-fetch",
-        "/nudge": "shift sync by ?s=2.5 seconds (+ = lyrics later)",
+        "/nudge": "shift sync by ?s=2.5 seconds (+ = lyrics earlier)",
         "/reset": "reset the sync offset to 0",
         "/align": "sync by listening — transcribe the audio + match to lyrics, one-shot (needs faster-whisper)",
         "/forcesync": "FORCE SYNC — reset to 0, then try RANKED match candidates (skip chorus traps), forward-verifying each until one holds; nuclear",

@@ -6288,7 +6288,15 @@ class Overlay:
             _, res = self._identify_result
             self._identify_result = None
             self._identifying = False
+            if not res and getattr(self, "_user_identify_pending", False):
+                # v1.1.75 (menu audit): a USER-initiated "Identify by sound" that
+                # found nothing must SAY so — Shazam legitimately can't fingerprint
+                # most VTuber originals, and the silent None left a stale
+                # "🎧 Listening…" toast that read as a dead button.
+                self._user_identify_pending = False
+                self._hint("🔍 Couldn't identify by sound — not in Shazam")
             if res:
+                self._user_identify_pending = False
                 title, artist, offset, t_cap = res
                 self._intro_anchored = True   # Shazam can align this → drop the MV dead-space guess
                 # SOUND IS THE AUTHORITY. Shazam often romanizes JP titles
@@ -9637,7 +9645,12 @@ class Overlay:
         if new_off == self.offset and self._pending_offset is None:
             return
         delta = new_off - self.offset
-        apply_min = float(self._tune.get("sync_apply_min_s", 0.22))
+        # v1.1.75 (menu audit): the apply_min floor rejects tiny AUTO Shazam-
+        # wobble corrections — but a MANUAL nudge/reset shares this path, so the
+        # ±0.2s "fine" step (< 0.22 default) was silently swallowed and looked
+        # dead. Manual input is always intentional: never floor it.
+        apply_min = (0.0 if str(reason).startswith("manual")
+                     else float(self._tune.get("sync_apply_min_s", 0.22)))
         if abs(delta) < apply_min and self._pending_offset is None:
             self._sync_event("offset_skip_small", reason=reason or "auto",
                              to=round(new_off, 2), frm=round(self.offset, 2),
@@ -11849,7 +11862,17 @@ class Overlay:
         source repo (where lyrics are git-ignored) it harmlessly no-ops.
         Runs in the background."""
         if not (_DATA / ".git").exists():
+            # v1.1.75 (menu audit): say so instead of a silent no-op (a portable
+            # install has no library repo, so "Back up now" did nothing visibly).
+            self._hint("No lyric-library repo here — nothing to back up")
             return
+        self._hint("💾 Backing up the lyric library…")
+
+        def _toast(msg):
+            try:
+                self.root.after(0, lambda: self._hint(msg))
+            except Exception:
+                pass
 
         def work():
             # Commit ONLY the lyrics pathspec — `git commit -- lyrics` ignores
@@ -11871,7 +11894,11 @@ class Overlay:
                     subprocess.run(["git", "-C", str(_DATA), "push"],
                                    capture_output=True, timeout=90,
                                    creationflags=_NO_WINDOW)
+                    _toast("💾 Library backed up")
+                else:
+                    _toast("Library already up to date — nothing new")
             except Exception:
+                _toast("Backup failed (git)")
                 return
         threading.Thread(target=work, daemon=True).start()
 
@@ -13048,8 +13075,20 @@ class Overlay:
         # loop re-engages on demand (the lock would otherwise still gate decide
         # for a fraction of a second before _on_track_change re-evaluates it).
         self._title_locked = False
+        # v1.1.75 (menu audit): CLEAR the loaded body + any pending swap first.
+        # Without this, _on_track_change's same-song early-return (self.lines
+        # truthy + unchanged title) ate the re-fetch — a silent no-op exactly
+        # when wrong lyrics are on screen. Mirrors report_wrong's clear.
+        self.lines, self.idx, self._kara = [], -1, []
+        try:
+            self._cancel_pending_swap("refetch")
+        except Exception:
+            pass
         if self._track:
+            self._hint("🔄 Re-fetching lyrics…")
             self._on_track_change(self._track, self._cur_duration)
+        else:
+            self._hint("Nothing playing to re-fetch")
 
     def mark_concert_boundary(self):
         """v1.1.64 (docs/CONCERT_RESEARCH.md §5): append a concert-boundary
@@ -13292,7 +13331,17 @@ class Overlay:
         self._start_identify()
 
     def identify_by_sound(self):
+        # v1.1.75 (menu audit): make a USER click always land visibly. Surface
+        # the common silent-guard bails, flag the request so the result path can
+        # toast on a null Shazam match, then listen.
+        if self._identifying:
+            self._hint("🎧 Already listening…")
+            return
+        if self._subs_suppresses_sound():
+            self._hint("Subtitles mode is on — identify by sound is off")
+            return
         self._sound_song = None
+        self._user_identify_pending = True
         self._hint("🎧 Listening to identify the song…")
         self._start_identify()
 
@@ -13363,6 +13412,8 @@ class Overlay:
         except Exception:
             return
         if not self._track:
+            if not silent:                       # v1.1.75: manual click feedback
+                self._hint("Nothing playing to caption yet")
             return
         # v1.1.72 (survey P1): captions ALREADY loaded for this track → done.
         # The subs bootstrap (+1.2s) and _maybe_fetch_captions (+4s) both call
@@ -13381,6 +13432,8 @@ class Overlay:
         # to completion in its thread even when the result will be discarded, so
         # the guard is essential, not just an optimization.
         if getattr(self, "_captions_fetching", False):
+            if not silent:                       # v1.1.75: manual click feedback
+                self._hint("📥 Already pulling captions…")
             # SUBTITLES (v1.1.56): for an EPISODE this call is the ONLY caption/
             # generation trigger (live-gated deadlines don't fire) — a previous
             # track's in-flight fetch must not silently kill it. Retry shortly.
