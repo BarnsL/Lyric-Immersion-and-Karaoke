@@ -12,9 +12,13 @@ sync-by-listening AND the wrong-lyrics reject path in every shipped build from
 v1.1.74 to v1.1.76 — the app just showed "needs faster-whisper" hints and every
 listen feature degraded, with nothing in the log.
 
-This runs BEFORE PyInstaller and FAILS the build (exit 1) on a skew, so the
-broken bundle is never produced. The post-build `--selftest` smoke test is the
-backstop that proves the finished .exe actually imports the stack.
+This runs BEFORE PyInstaller. It FAILS the build (exit 1) only on UNAMBIGUOUS
+corruption — duplicate dist-info dirs (two versions of one package present). A
+plain version difference vs the env is a WARNING, because *.dist-info metadata
+can lag the actual module files (a manual copy of just av/ updates the .pyd but
+leaves the old dist-info), so a hard error there could block a build whose
+bundled module is fine. The POST-BUILD `--selftest` smoke test is the definitive
+gate — it imports the real frozen module and fails the build if it's broken.
 
 Run: python scripts/check_build_deps.py   (build.bat calls it in step 1)
 """
@@ -106,14 +110,19 @@ def main() -> int:
               + " — collect_all will source these from the build environment.")
 
     if skews:
-        print("\n[deps-check] ERROR — version SKEW between .deps and the build environment:")
+        # WARN, don't fail: this compares *.dist-info metadata, which can go stale
+        # vs the actual module files (a manual robocopy of just av/ updates the .pyd
+        # but leaves the old dist-info) — so a hard error here could block a build
+        # whose bundled module is actually fine. The POST-BUILD `--selftest` is the
+        # definitive gate: it imports the real frozen module and fails the build if
+        # it's broken. This is the early heads-up.
+        print("\n[deps-check] WARNING (TICKET-177) — .deps dist-info versions differ from the build env:")
         for s in skews:
             print("    " + s)
-        print("\n  A skewed native stack bundles mismatched Python modules + DLLs and breaks\n"
-              "  `import av` / faster-whisper at runtime (the av._core failure, TICKET-175).\n"
-              "  Rebuild .deps so it matches the environment (or vice-versa):\n"
-              "      rmdir /s /q .deps  &&  pip install --target .deps faster-whisper\n")
-        return 1
+        print("  If the post-build --selftest fails, rebuild .deps clean:\n"
+              "      rmdir /s /q .deps  &&  pip install --target .deps faster-whisper\n"
+              "  (dist-info can also just be stale after a partial copy — --selftest is authoritative.)")
+        return 0
 
     print("[deps-check] OK — .deps and the build environment agree on the AI stack.")
     return 0

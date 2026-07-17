@@ -110,7 +110,7 @@ The spec sets `WHISPER = os.path.isdir(".deps")`: **no `.deps` → lean ~150 MB 
 `sys.path` vendor fails on PyAV's `av._core` DLLs. The ASR model (~75 MB) downloads
 to the app's data folder on first use (copy `models\` next to the `.exe` to pre-seed).
 
-> ### ⚠️ `.deps` MUST match the build environment (TICKET-175)
+> ### ⚠️ `.deps` MUST match the build environment (TICKET-177)
 > `collect_all` bundles the native stack (PyAV / ctranslate2 / faster-whisper /
 > tokenizers) from **both** `.deps` and your pip environment. If they disagree on a
 > version — e.g. `.deps` PyAV 17.x while your env has 18.x — a **skewed mix of Python

@@ -21,11 +21,13 @@ if %errorlevel%==1 (
 
 echo.
 echo [1b/5] Checking the AI stack (.deps vs build env) is version-consistent ...
-REM TICKET-175: a version SKEW between the vendored .deps and the build env bundles
+REM TICKET-177: a version SKEW between the vendored .deps and the build env bundles
 REM mismatched PyAV modules + FFmpeg DLLs and silently breaks faster-whisper import
 REM at runtime (av._core) - which killed generate-by-ear, sync-by-listening AND the
-REM wrong-lyrics reject path in every shipped build v1.1.74..v1.1.76 with no log. Fail
-REM the build NOW rather than ship a broken one; remediation is printed by the check.
+REM wrong-lyrics reject path in every shipped build v1.1.74..v1.1.76 with no log.
+REM This warns on a version diff (dist-info can lag the real module) and hard-fails
+REM only on DUPLICATE dist-info (unambiguous corruption); the post-build --selftest
+REM below is the definitive gate. Remediation is printed by the check.
 python scripts\check_build_deps.py || goto :err
 
 echo.
