@@ -58,6 +58,28 @@ def _ensure_deps_path():
     the frozen app, where Windows won't search a vendored package's own folder."""
     import os
     import sys
+    # v1.1.77 (TICKET-176): FROZEN APP — register the app's OWN bundled native-lib
+    # dirs. faster-whisper imports PyAV, whose C-extension `av._core` loads the
+    # FFmpeg DLLs from `av.libs`. PyAV's delvewheel shim adds that dir via a path
+    # computed RELATIVE TO av/__init__.py's __file__, which does NOT resolve in the
+    # PyInstaller runtime — so `import av` died with "DLL load failed while importing
+    # _core", which made available() return False and silently disabled ALL whisper
+    # features (generate-by-ear, sync-by-listening, decide-by-ear reject) in EVERY
+    # packaged release. The DLLs are present in _internal/av.libs; we just have to
+    # register that dir ourselves, BEFORE `import faster_whisper` runs (in available()).
+    if getattr(sys, "frozen", False) and hasattr(os, "add_dll_directory"):
+        base = getattr(sys, "_MEIPASS", None) or os.path.dirname(sys.executable)
+        for sub in ("av.libs", "ctranslate2.libs", "ctranslate2", "tokenizers",
+                    "onnxruntime/capi", "numpy.libs",
+                    "nvidia/cublas/bin", "nvidia/cudnn/bin", "nvidia/cuda_nvrtc/bin"):
+            d = os.path.join(base, sub)
+            if os.path.isdir(d) and d not in _dll_dirs_added:
+                try:
+                    _dll_dir_handles.append(os.add_dll_directory(d))
+                    os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+                    _dll_dirs_added.add(d)
+                except Exception:
+                    pass
     try:
         from appdata import data_dir
     except Exception:

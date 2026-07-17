@@ -138,24 +138,25 @@ folder anywhere, or run it off a USB stick. To build it yourself, see
 romaji / pinyin / romaja, English translation, the karaoke fill, identify-by-sound
 (Shazam), playlist import, and multi-monitor. No extra downloads.
 
-> #### 🧠 Optional AI features (you almost certainly don't need them)
-> To keep the download small (**~120 MB** instead of ~750 MB), the heavy **Whisper**
-> AI (`faster-whisper`, ~600 MB of libraries) is **left out of the portable build**.
-> Whisper is only a **last resort to GENERATE lyrics by ear** for a song that *no*
-> lyric site or caption track has, plus the optional "identify / sync by listening"
-> extras. **For normal use you never need it** — provider lyrics + the video's own
-> caption track already cover almost every song.
+> #### 🧠 Everything works out of the box — nothing extra to install
+> The Windows download (**~180 MB installer / ~273 MB zip**) bundles **everything**,
+> including the **Whisper** AI (`faster-whisper`) used for the "generate lyrics by
+> ear" last resort and the optional "identify / sync by listening" extras. There is
+> **no separate AI download and no `pip install` step** — provider lyrics and the
+> video's own caption track cover almost every song, and Whisper is there as the
+> fallback when they don't. The small speech model (~75 MB) downloads itself once,
+> on first use, into the app's data folder.
 >
-> If you specifically want those AI features, run the app **from source** and add
-> Whisper there: `pip install faster-whisper` (or run `install_extras.bat`). See
-> [BUILD.md](docs/BUILD.md). NVIDIA users can then `python gpu_setup.py` for a CUDA
-> speed-up. (A separate, larger "AI" download with Whisper pre-bundled can be provided
-> on request.)
+> The **only** on-demand extra is optional **NVIDIA GPU acceleration** — the tray's
+> **⚡ Enable GPU acceleration** fetches the CUDA libraries (~1.5 GB) if you want the
+> marginal transcription speed-up. It's hidden entirely on machines without an
+> NVIDIA GPU, and the CPU path is plenty fast (a 16-second clip takes ~2 seconds).
 
 #### ✅ What you need for each feature
 
-**Everything below except the AI add-on is built into the portable build** — nothing
-extra to install. The right-hand column is only for running **from source**.
+**Everything below is built into the portable Windows build** — including the AI
+features; nothing extra to install. The right-hand column is only for running
+**from source**. (Linux/macOS betas are leaner — see their notes above.)
 
 | Feature | Portable build | From source (`pip install -r requirements.txt` covers all but the optional ones) |
 |---|---|---|
@@ -164,8 +165,8 @@ extra to install. The right-hand column is only for running **from source**.
 | Use the video's own caption track for exact, perfectly-timed lyrics | ✅ built-in | ✅ in `requirements.txt` |
 | Multi-monitor: move to a screen · span/scroll across all · mirror | ✅ built-in | ✅ in `requirements.txt` |
 | Import playlists (Spotify OAuth · Exportify CSV · YouTube Music) | ✅ built-in | ✅ in `requirements.txt` |
-| 🧠 **Generate lyrics by ear** (last resort, when no source has them) · **identify / sync by listening** | ⬇️ optional — **`install_extras.bat`** (downloads **faster-whisper** once) | `pip install faster-whisper` |
-| 🧠 **Deep transcription** (downloads the source audio + transcribes the whole song — see [docs/GENERATION.md](docs/GENERATION.md)) | ⬇️ optional — **`install_extras.bat`** | `pip install faster-whisper yt-dlp` **+** a JS runtime on `PATH` (**Node** or **Deno**) so YouTube downloads don't 403 |
+| 🧠 **Generate lyrics by ear** (last resort, when no source has them) · **identify / sync by listening** | ✅ **built-in** (faster-whisper bundled; ~75 MB model auto-downloads on first use) | `pip install faster-whisper` |
+| 🧠 **Deep transcription** (downloads the source audio + transcribes the whole song — see [docs/GENERATION.md](docs/GENERATION.md)) | ✅ built-in — also needs a JS runtime on `PATH` (**Node** or **Deno**) so YouTube downloads don't 403 | `pip install faster-whisper yt-dlp` **+** a JS runtime on `PATH` (**Node** or **Deno**) |
 | GPU acceleration (NVIDIA, optional speed-up) | tray → **⚡ Enable GPU acceleration** (downloads CUDA on demand) | same, or `python gpu_setup.py` |
 
 Every optional piece **degrades gracefully** — if it's missing, that one feature

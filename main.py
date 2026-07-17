@@ -2771,6 +2771,15 @@ class Overlay:
         # body-trusted by construction. Until True, a verified+title-LOCKED song is NOT
         # immune to a by-ear body check (right title, wrong body — the kamone case).
         self._body_corroborated = False
+        # v1.1.77 (TICKET-174): WORD-level body proof, distinct from _body_corroborated.
+        # _body_corroborated is also granted by an ENERGY timing-lock, which only
+        # proves the line grid matches the vocal on/off pattern — NOT that the words
+        # are right (bvdiz: a wrong lrclib body energy-aligned to the audio, got
+        # "corroborated", and decide-by-ear was skipped so the wrong words were never
+        # caught). Only an actual transcript match (decide-by-ear) sets this, and ONLY
+        # this grants decide-by-ear immunity — so every title-locked body is word-
+        # checked at least once before it's trusted.
+        self._body_word_verified = False
         self._body_probe_retried = False   # one bounded extra by-ear listen per track
         # TICKET batch4: wall-clock of the most recent True→False transition
         # of self._verified. Drives the verified_render_gate_s grace window
@@ -3640,6 +3649,7 @@ class Overlay:
         self._verified_meta = False
         self._verified = False
         self._body_corroborated = False    # new song → BODY not yet corroborated; re-earn per song
+        self._body_word_verified = False   # …and word-verification is re-earned per song too
         self._body_probe_retried = False
         self._translate_tries = {}         # fresh song → fresh translation-backfill budget
         # TICKET batch4: a real SMTC track change must wipe lyrics immediately
@@ -4283,6 +4293,7 @@ class Overlay:
         self._verified_meta = False
         self._sound_corroborated = False
         self._body_corroborated = False
+        self._body_word_verified = False
         self._body_probe_retried = False
         self._verified_gate_t = 0.0
         self._title_locked = False
@@ -4465,6 +4476,7 @@ class Overlay:
         self._verified_meta = False
         self._verified = False
         self._body_corroborated = False    # kamone fix: BODY re-earns corroboration per song
+        self._body_word_verified = False
         self._body_probe_retried = False
         # TICKET batch4: takeover is an intentional swap to a different song;
         # the render gate exists for transient mid-track demotions, not real
@@ -7193,6 +7205,7 @@ class Overlay:
             self._verified_meta = False           # TICKET-099
             self._sound_corroborated = False      # TICKET-099
             self._body_corroborated = False       # kamone fix: BODY re-earns corroboration per song
+            self._body_word_verified = False
             self._body_probe_retried = False
             self._verified_gate_t = 0.0           # TICKET batch4: explicit teardown, no gate
         self.meta = {"title": self._gen_title, "artist": self._gen_artist,
@@ -8035,6 +8048,7 @@ class Overlay:
         # uncorroborated and must earn body-trust via a clean energy lock or by-ear read
         # (_note_energy_verdict / _score_ear_corrob) before they get switch/regen immunity.
         self._body_corroborated = bool(_bsrc.startswith("bundled"))
+        self._body_word_verified = bool(_bsrc.startswith("bundled"))  # baked = words are authoritative
         self._relayout_song()           # size lanes/blocks to this song's rows
         # PERF-102: hold the whole song's bitmaps so a line renders at most ONCE
         # (repeats/choruses are free). NB: background prewarm was tried and reverted
@@ -10411,6 +10425,7 @@ class Overlay:
             "source": self.meta.get("source"),
             "verified": bool(getattr(self, "_verified", False)),
             "body_corroborated": bool(getattr(self, "_body_corroborated", False)),
+            "body_word_verified": bool(getattr(self, "_body_word_verified", False)),
             "live_mode": bool(self._live_mode),
             "verify_cadence_s": round(float(getattr(self, "_sync_tier_interval", 0.0)), 1),
             "last_energy_align": getattr(self, "_last_energy", None),
@@ -14392,15 +14407,21 @@ class Overlay:
             return "OK"
         if dec.get("inconclusive"):
             return "OK"      # too little heard to judge — not evidence of wrongness
-        # kamone fix: a by-ear run on an UNCORROBORATED title-locked body is a body PROBE,
+        # kamone fix: a by-ear run on a WORD-UNVERIFIED title-locked body is a body PROBE,
         # not steady-state corroboration. Don't let one noisy probe transcript escalate
         # decision-engine strikes toward SWITCH/REGEN (that path blacklists+unlinks the LRC
         # with no bundled exemption and could thrash a CORRECT periodic body on a single
         # Whisper hallucination). Recovery for a genuinely wrong body happens inside
-        # _decide_by_ear's own switch/refetch (MIN+titlelock-bump gated). Once the body is
-        # corroborated this guard lifts and ear_corrob resumes normal behavior.
+        # _decide_by_ear's own switch/refetch (MIN+titlelock-bump gated, now blacklists the
+        # poisoned body before re-fetching so it can't reload). Once the body's WORDS are
+        # verified this guard lifts and ear_corrob resumes normal behavior.
+        # v1.1.77 (TICKET-174): keyed on _body_word_verified, NOT _body_corroborated — an
+        # ENERGY timing-lock (which sets _body_corroborated) is not word proof, so a wrong-
+        # but-timing-aligned body (bvdiz) must stay in the "probe, don't strike" regime and
+        # a CORRECT generated body that's only energy-locked must not be struck to REGEN on
+        # one noisy probe (both were exposed once decide-by-ear stopped skipping them).
         if (getattr(self, "_verified", False) and getattr(self, "_title_locked", False)
-                and not getattr(self, "_body_corroborated", False)):
+                and not getattr(self, "_body_word_verified", False)):
             return "OK"
         ranked = dec.get("ranked") or []
         if not ranked:
@@ -15201,9 +15222,9 @@ class Overlay:
         # energy, Shazam silent) stays checkable so the wrong body is caught and re-fetched.
         # The title-lock MIN/MARGIN bump (below), short-transcript guard, and artist
         # penalty keep a noisy transcript from switching a CORRECT body away (Suisei 綺麗事).
-        if (self._verified and self._title_locked and self._body_corroborated and not forced
+        if (self._verified and self._title_locked and self._body_word_verified and not forced
                 and not int(self._tune.get("decide_after_verified", 0))):
-            log.info("decide-by-ear (%s): SKIPPED — verified + title-locked + body-corroborated", reason)
+            log.info("decide-by-ear (%s): SKIPPED — verified + title-locked + body WORD-verified", reason)
             return
         in_concert = (self._live_arrangement or self._live_mode
                       or reason == "boundary")
@@ -15216,7 +15237,17 @@ class Overlay:
         st = self.media.get()
         if not (st and st.get("status") == PLAYING):
             return
-        if float(st.get("position") or 0.0) < self._tune.get("decide_at_s", 20.0) - 2:
+        # Wait until the song has played ~decide_at_s so there are vocals to transcribe.
+        # v1.1.77 (TICKET-174): browser/YouTube sources report an UNRELIABLE SMTC position
+        # (live-caught: a YT-Music "…- Topic" bvdiz sat at position=1.04s for the whole
+        # song), which made this gate silently return EVERY time — so decide-by-ear (and
+        # thus the entire reject-by-transcription path this ticket depends on) NEVER ran for
+        # browser videos. Fall back to WALL-CLOCK elapsed since the track started: whichever
+        # of (SMTC position, seconds actually playing) is far enough in is proof there are
+        # vocals to hear. (status==PLAYING above guards against counting paused time.)
+        min_in = float(self._tune.get("decide_at_s", 20.0)) - 2
+        played_s = time.time() - float(getattr(self, "_track_t0", 0.0) or 0.0)
+        if float(st.get("position") or 0.0) < min_in and played_s < min_in:
             return
         try:
             import align
@@ -15454,6 +15485,7 @@ class Overlay:
                         self.offset = 0.0
                         self.idx = -1
                         self._body_corroborated = True
+                        self._body_word_verified = True   # LLM matched the sung words
                         self._hint("🎯 Corrected to the song being sung")
                         self.root.after(700, lambda: self._auto_align_by_energy("post-decide"))
                         return
@@ -15461,6 +15493,7 @@ class Overlay:
                     log.info("decide-by-ear: LLM switch failed: %s", e)
             elif lk in ("loaded", loaded_key):
                 self._body_corroborated = True      # LLM confirms loaded IS playing
+                self._body_word_verified = True     # …and it confirms the WORDS match
         # kamone fix: a healthy by-ear read of the LOADED body (real >=20-char transcript
         # scoring at the in-sync bar) is positive proof the body matches the singing —
         # corroborate so this verified+locked song earns by-ear immunity going forward.
@@ -15469,6 +15502,7 @@ class Overlay:
         # corroborated and falls through to the switch / re-fetch paths below.
         if loaded_score >= float(self._tune.get("decide_min_score", 55.0)):
             self._body_corroborated = True
+            self._body_word_verified = True   # transcript scored the LOADED body's words as a match
         # A LIBRARY-WIDE identification (broad search over every cached song) must
         # clear a HIGHER bar than a title-confined check, so a short transcript can't
         # latch onto a stray song among hundreds.
@@ -15531,6 +15565,7 @@ class Overlay:
                     and best_score >= max(50.0, MIN - 10.0)
                     and best_score - loaded_score >= 3.0 * MARGIN)
         if (best_key not in ("loaded", loaded_key)
+                and not block_cross_artist          # v1.1.77: honor the cross-artist BLOCK
                 and ((best_score >= MIN and best_score - loaded_score >= MARGIN)
                      or lopsided)):
             try:
@@ -15554,14 +15589,35 @@ class Overlay:
             except Exception as e:
                 log.info("decide-by-ear: switch failed: %s", e)
         if loaded_score < self._tune.get("decide_wrong_floor", 32.0) and best_score < MIN:
-            # loaded matches the singing POORLY and NOTHING cached fits → the right
-            # song isn't in the library yet. Fetch fresh (qualified by the cover's
-            # original artist when it's a cover, so a generic title finds the right one).
-            log.info("decide-by-ear: loaded doesn't match the singing (%.0f) and no library "
-                     "song fits → re-fetching %r", loaded_score, self._clean_title_cache)
-            if self._track:
+            # loaded matches the singing POORLY and NOTHING cached fits. This means one of:
+            # a genuinely WRONG body (bvdiz), OR a correct body with one degenerate Whisper
+            # probe (a >=20-char hallucination that scored the RIGHT lyrics low). We can't
+            # tell from a single probe — so require a CONSISTENT failure before destroying
+            # the current body.
+            # v1.1.77 (TICKET-174): the re-verify caught that blacklisting on the FIRST probe
+            # can EVICT a correct energy-locked (not-yet-word-verified) body on one noisy read.
+            # Only the RETRY probe (this is the 2nd word-fail in a row → genuinely wrong) may
+            # blacklist + re-fetch. The first failure just waits for the retry scheduled below.
+            consistent = bool(getattr(self, "_body_probe_retried", False))
+            if not consistent:
+                log.info("decide-by-ear: loaded scored low (%.0f) on the first probe — "
+                         "re-checking once more before correcting", loaded_score)
+            elif self._track:
                 art = (self._cover_original_artist if self._is_cover
                        else self._clean_artist_cache) or ""
+                # Word-failed TWICE → the body is wrong. BLACKLIST it BEFORE re-fetching,
+                # else the provider (lrclib etc.) just returns the SAME wrong body and it
+                # reloads unchanged — the bvdiz no-progress loop: a wrong body with the right
+                # TITLE that Shazam confirms and energy timing-locks would re-fetch to itself
+                # forever. Blacklisting its signature makes the fetch skip it (reject_sigs) →
+                # the next provider, or, if none has it, generation-by-ear of the sung words.
+                log.info("decide-by-ear: loaded word-failed twice (%.0f) and no library song "
+                         "fits → blacklist + re-fetch %r", loaded_score, self._clean_title_cache)
+                try:
+                    self._blacklist_current_lyrics("decide-by-ear-wrong-body")
+                except Exception as _e:
+                    log.info("decide-by-ear: blacklist-before-refetch failed (%s)", _e)
+                self._fetch_key = None    # ensure the re-fetch runs (as report_wrong does)
                 self._hint("🎯 Wrong lyrics — re-identifying…")
                 self._start_fetch(art, self._clean_title_cache, self._cur_duration,
                                   cover=self._is_cover)
@@ -15569,7 +15625,7 @@ class Overlay:
         # corroborated the body nor switched/re-fetched (e.g. vocals absent in the listen
         # window), give a body-unconfirmed title-locked song ONE more checked listen so a
         # wrong body isn't stranded until the next track. Capped via _body_probe_retried.
-        if (self._verified and self._title_locked and not self._body_corroborated
+        if (self._verified and self._title_locked and not self._body_word_verified
                 and not getattr(self, "_body_probe_retried", False)
                 and track_seq == self._track_seq):
             self._body_probe_retried = True
