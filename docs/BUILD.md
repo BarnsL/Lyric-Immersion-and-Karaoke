@@ -110,6 +110,28 @@ The spec sets `WHISPER = os.path.isdir(".deps")`: **no `.deps` → lean ~150 MB 
 `sys.path` vendor fails on PyAV's `av._core` DLLs. The ASR model (~75 MB) downloads
 to the app's data folder on first use (copy `models\` next to the `.exe` to pre-seed).
 
+> ### ⚠️ `.deps` MUST match the build environment (TICKET-175)
+> `collect_all` bundles the native stack (PyAV / ctranslate2 / faster-whisper /
+> tokenizers) from **both** `.deps` and your pip environment. If they disagree on a
+> version — e.g. `.deps` PyAV 17.x while your env has 18.x — a **skewed mix of Python
+> modules and FFmpeg DLLs** ships and `import av` (→ faster-whisper → `align.available()`)
+> dies at runtime with `av._core`, **silently** disabling *every* listen feature
+> (generate-by-ear, sync-by-listening, and the wrong-lyrics reject path). This shipped
+> broken in v1.1.74–v1.1.76.
+>
+> **Two guards make this impossible now — both run inside `build.bat`:**
+> - **Pre-build** (`python scripts/check_build_deps.py`): fails the build if `.deps` and
+>   the env disagree on any native-stack version, or if `.deps` has duplicate dist-info
+>   dirs (a `pip install --upgrade --target` leaves the old one behind — rebuild `.deps`
+>   from scratch: `rmdir /s /q .deps && pip install --target .deps faster-whisper`).
+> - **Post-build** (`<exe> --selftest --out FILE`): the finished `.exe` imports the whole
+>   stack before any GUI shows and exits non-zero if it can't — so a whisper-broken bundle
+>   never gets packaged. Run it yourself any time to check a build:
+>   `dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe --selftest --out check.txt`.
+>
+> If you `pip install --target .deps` a package that pulls a **different** native version
+> than your env, pin them to match (`pip install --target .deps av==<env-version> ...`).
+
 ## Optional: deep lyric transcription (`yt-dlp` + a JS runtime)
 
 The background **deep generation** ([docs/GENERATION.md](docs/GENERATION.md)) — which

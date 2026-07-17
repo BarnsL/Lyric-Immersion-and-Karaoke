@@ -20,12 +20,40 @@ if %errorlevel%==1 (
 )
 
 echo.
+echo [1b/5] Checking the AI stack (.deps vs build env) is version-consistent ...
+REM TICKET-175: a version SKEW between the vendored .deps and the build env bundles
+REM mismatched PyAV modules + FFmpeg DLLs and silently breaks faster-whisper import
+REM at runtime (av._core) - which killed generate-by-ear, sync-by-listening AND the
+REM wrong-lyrics reject path in every shipped build v1.1.74..v1.1.76 with no log. Fail
+REM the build NOW rather than ship a broken one; remediation is printed by the check.
+python scripts\check_build_deps.py || goto :err
+
+echo.
 echo [2/5] Building Lyric-Immersion-and-Karaoke.exe ...
 python -m PyInstaller --noconfirm DesktopKaraoke.spec || goto :err
 REM v1.1.62 BUGFIX: '->' in cmd is `-` + `>` (redirect), which OVERWROTE the
 REM freshly-built exe with 7 bytes of "    -\r\n" — every build was silently
 REM broken. Escape the `>` with `^>` so it stays literal text in the echo.
 echo     -^> dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe
+
+echo.
+echo [2b/5] Smoke-testing the built app's AI stack (whisper actually imports) ...
+REM TICKET-175 BACKSTOP: prove the FINISHED .exe can import av + faster-whisper and
+REM that align.available() is True. --selftest runs before any GUI init and exits
+REM 0/1 (writing a one-line verdict to the --out file), so a whisper-broken bundle
+REM fails the build here even if the pre-build .deps check passed. -Wait -PassThru
+REM reliably waits for the windowed exe and returns its exit code; no window appears.
+powershell -NoProfile -Command ^
+  "$exe='dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe'; $out='dist\selftest.txt';" ^
+  "if (Test-Path $out) { Remove-Item $out -Force };" ^
+  "$p=Start-Process -FilePath $exe -ArgumentList '--selftest','--out',$out -Wait -PassThru;" ^
+  "if (Test-Path $out) { Write-Host ('    '+((Get-Content $out -Raw).Trim())) };" ^
+  "exit $p.ExitCode"
+if errorlevel 1 (
+    echo [!] SELFTEST FAILED - refusing to package a build whose AI/whisper stack is broken.
+    echo     See docs/BUILD.md ^(TICKET-175^): rebuild .deps to match the build env.
+    goto :err
+)
 
 echo [3/5] Building the installer (optional) ...
 where iscc >nul 2>nul

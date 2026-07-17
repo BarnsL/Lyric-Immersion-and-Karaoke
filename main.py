@@ -17309,6 +17309,55 @@ def main():
         except Exception as e:
             print(f"gpu_renderer child died: {e!s}", file=sys.stderr)
         return
+    if "--selftest" in sys.argv[1:]:
+        # TICKET-175 — POST-BUILD SMOKE TEST. Prove the optional AI stack actually
+        # IMPORTS inside the FROZEN app. A `.deps`/bundled PyAV whose version skews
+        # from the collected av DLLs silently broke `import faster_whisper` — which
+        # took down generate-by-ear, sync-by-listening AND decide-by-ear (the whole
+        # wrong-lyrics reject path) in EVERY shipped build since v1.1.74, invisibly
+        # (align.available() just returned False and every feature degraded to a
+        # hint). build.bat runs this against the freshly-built exe and FAILS the
+        # build on a non-zero exit, so a whisper-broken build can never ship again.
+        # Runs BEFORE any GUI init and os._exit()s, so no window ever appears; the
+        # one-line verdict is written to the path after `--out` (a windowed
+        # PyInstaller exe has no reliable stdout).
+        import os as _os
+        _a = sys.argv[1:]
+        _out = None
+        if "--out" in _a:
+            try:
+                _out = _a[_a.index("--out") + 1]
+            except Exception:
+                _out = None
+        problems = []
+        try:
+            import av  # noqa: F401  (the exact import that skewed: PyAV's FFmpeg DLLs)
+        except Exception as e:
+            problems.append(f"import av FAILED: {type(e).__name__}: {e}")
+        try:
+            import align
+            if not align.available():
+                problems.append("align.available() is False: "
+                                + str(getattr(align, "_last_error", "unknown")))
+        except Exception as e:
+            problems.append(f"import align/faster_whisper FAILED: {type(e).__name__}: {e}")
+        ok = not problems
+        msg = ("selftest OK: av + faster-whisper import and align.available() is True "
+               "in the frozen app"
+               if ok else "selftest FAILED (the AI/whisper stack is broken):\n  "
+               + "\n  ".join(problems))
+        if _out:
+            try:
+                with open(_out, "w", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
+        try:
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        _os._exit(0 if ok else 1)
     if "--recognize-child" in sys.argv[1:]:
         # TICKET-135: identify-by-sound in a SEPARATE PROCESS so the GIL-heavy
         # capture+fingerprint can't stall the parent's render thread (the
