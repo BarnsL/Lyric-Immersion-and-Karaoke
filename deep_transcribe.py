@@ -316,7 +316,8 @@ def _parse_vtt(path: Path) -> list[dict]:
     return ded
 
 
-def _captions_from_dir(dest: Path, lang: str | None, any_lang: bool = False):
+def _captions_from_dir(dest: Path, lang: str | None, any_lang: bool = False,
+                       orig_lang: str | None = None):
     """Find + parse the best MANUAL caption track matching the song's ORIGINAL
     language → (lines, lang) or None. A Japanese song's 'ja' track is its lyrics; a
     'zh-TW'/'en' track is a TRANSLATION we must never show as the lyrics.
@@ -325,11 +326,22 @@ def _captions_from_dir(dest: Path, lang: str | None, any_lang: bool = False):
     whatever language they exist — accept whatever track this video has (any
     of the many languages we support) and REPORT its actual language so the
     annotate/translate pass reads the body correctly.
+
+    ``orig_lang`` (v1.1.76, SUBTITLES mode): the video's OWN spoken language
+    per yt-dlp. Big channels ship manual TRANSLATED tracks — an English tech
+    video with a manual 'ja' track picked ja first (subs_fallback is ja-led
+    for the VTuber-heavy default) and an English speaker got Japanese
+    subtitles for an English video. The video's original language is what a
+    subtitles user wants; translations of it rank after.
     """
     # Explicit language HINT beats the fallbacks for MUSIC mode; for
     # SUBTITLES mode we still prefer the requested lang if it exists, but
     # gracefully take whatever else is on offer.
     preferred = [lang] if lang in ("ja", "zh", "ko") else []
+    if any_lang and orig_lang:
+        # both the full tag and its base ('en-US' videos publish 'c.en.vtt')
+        ol = orig_lang.lower()
+        preferred = list(dict.fromkeys([ol, ol.split("-")[0]] + preferred))
     # Ranked fallback: CJK first (music-mode: only CJK carries the song's own
     # lyrics), then broadly for subtitles mode.
     music_fallback = ["ja", "zh-Hans", "zh", "zh-Hant", "ko"]
@@ -509,20 +521,29 @@ def fetch_captions_only(query: str, lang: str | None = None,
         else:
             target = f"ytsearch1:{q}"
         last_err = None
+        orig_lang = None      # the video's OWN spoken language, once yt-dlp tells us
         for vopts in _yt_variants(opts):
             try:
                 with yt_dlp.YoutubeDL(vopts) as y:
-                    y.extract_info(target, download=True)
+                    info = y.extract_info(target, download=True)
+                # v1.1.76: remember the video's original language so the picker
+                # prefers the video's OWN track over a manual translation (an
+                # English tech video with a manual 'ja' track showed Japanese
+                # subtitles to an English speaker).
+                if info and not orig_lang:
+                    e0 = (info.get("entries") or [info])[0] or {}
+                    orig_lang = e0.get("language") or None
                 # v1.1.72: pass any_lang so a non-CJK manual track (en/es/fr —
                 # the common talk-show case) is RECOGNIZED as success here; the
                 # old check ranked it 99/reject and burned every remaining
                 # client variant on captions that were already on disk.
-                if _captions_from_dir(tmp, lang, any_lang=any_lang):
+                if _captions_from_dir(tmp, lang, any_lang=any_lang,
+                                      orig_lang=orig_lang):
                     break
             except Exception as e:
                 last_err = e
                 continue
-        res = _captions_from_dir(tmp, lang, any_lang=any_lang)
+        res = _captions_from_dir(tmp, lang, any_lang=any_lang, orig_lang=orig_lang)
         # v1.1.69 — SUBTITLES-MODE AUTO-CAPTIONS RETRY. Most YouTube shows /
         # podcasts / lectures publish NO manual subs — only Google's ASR-
         # generated auto-captions. The primary attempt above deliberately asks

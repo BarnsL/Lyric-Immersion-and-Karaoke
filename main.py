@@ -3483,6 +3483,7 @@ class Overlay:
         self._last_drift = 0.0        # last audio-vs-display drift measured (sync telemetry)
         self._last_drift_t = 0.0      # when that drift was measured (time.time)
         self._pending_switch = None   # a contradicting heard song awaiting a 2nd confirming read
+        self._pending_switch_t = 0.0  # when it was set (drives the live-mode fast re-check)
         self._sound_fail_streak = 0   # consecutive times the SAME other song was heard (wrong-song strikes)
         self._last_heard_contra = None  # the last contradicting heard song (for the strike streak)
         self._deciding = False        # a by-ear song decision (Whisper) is in flight
@@ -4704,6 +4705,45 @@ class Overlay:
                         and len(short) / max(1, len(lng)) >= 0.8
                         and _loose_ok(short, xa)):
                     return True
+        # Layer 4 (v1.1.76, TICKET-172, live-caught): KATAKANA-LOANWORD titles.
+        # Shazam says 'feelingradation' for the loaded 'フィーリングラデーション'
+        # — the SAME English word — but Hepburn romaji ('fīringuradēshon') is
+        # too far from English spelling for the layers above, so every hearing
+        # counted a wrong-song STRIKE: 5 strikes broke the title lock,
+        # blacklisted the CORRECT body (reason=decision-switch) and re-fetched
+        # the same song in a loop, for the whole track. Fold both sides to a
+        # loanword skeleton (l→r, -tion→shon, epenthetic u dropped, long
+        # vowels/doubles collapsed) and fuzzy-compare; a stricter vowel-blind
+        # pass backstops vowel-quality mismatches (サマー 'samaa' vs 'summer').
+        # Gated on ARTIST agreement + ≥8 folded chars so short generic titles
+        # ('ghost' vs 'ghosting', the canonical wrong pair) can never slip in.
+        if _has_cjk(a) != _has_cjk(b) and self._artists_corroborate(artist_a, artist_b):
+            try:
+                from fetch_lyrics import romanize
+                from rapidfuzz import fuzz as _fuzz
+                import unicodedata as _ud
+
+                def _fold(s):
+                    s = romanize(s, "ja") if _has_cjk(s) else (s or "")
+                    s = _ud.normalize("NFKD", s)
+                    s = "".join(c for c in s if not _ud.combining(c))
+                    s = re.sub(r"[^a-z0-9]", "", s.lower())
+                    s = s.replace("l", "r")
+                    s = re.sub(r"[st]ion", "shon", s)
+                    s = re.sub(r"([bcdfghjkmpstz])u", r"\1", s)
+                    s = re.sub(r"([aeiou])\1+", r"\1", s)
+                    return re.sub(r"([bcdfghjkrmnpqstvwxyz])\1+", r"\1", s)
+
+                la, lb = _fold(_title_core(a)), _fold(_title_core(b))
+                if la and lb and min(len(la), len(lb)) >= 8:
+                    if _fuzz.ratio(la, lb) >= 82.0:
+                        return True
+                    va = re.sub(r"[aeiou]", "a", la)
+                    vb = re.sub(r"[aeiou]", "a", lb)
+                    if _fuzz.ratio(va, vb) >= 88.0:
+                        return True
+            except Exception:
+                pass
         return False
 
     @staticmethod
@@ -5234,6 +5274,47 @@ class Overlay:
         self._recal_after = self.root.after(int(max(1, delay) * 1000),
                                             self._recalibrate_loop)
 
+    def _live_hearing_corroborated(self, title, artist):
+        """True when ONE Shazam read is enough evidence to act on in a CONCERT.
+
+        Live audio fingerprints RARELY — only faithful sections match, usually
+        the intro — so demanding a 2nd agreeing read regularly outlasts the
+        song (TICKET-171, ReGLOSS "Reach the top": the opener was heard ONCE at
+        its intro, then ~30 null reads followed while the await-confirmation
+        gate kept junk ad lyrics up for 4.5 min until the 6.5-min watchdog
+        rescued it). A read the concert's own context CORROBORATES doesn't need
+        that second opinion: the heard ARTIST appears in the live video's
+        title/artist (concert channels carry the group name), or the heard
+        TITLE is in the chapter setlist / description candidate pool. Covers
+        performed live keep the 2-read rule (their heard artist is the
+        original's, unrelated to the channel) — OCR/setlist carry those."""
+        try:
+            v_artist, v_title = (self._track or ("", ""))
+        except Exception:
+            v_artist = v_title = ""
+        hay = _norm_title(f"{v_title} {v_artist}")
+        na = _norm_title(artist or "")
+        # ≥4 normalized chars so a short heard artist can't substring-match
+        # into an unrelated word ('ado' in 'shadow').
+        if na and len(na) >= 4 and hay and na in hay:
+            return True
+        for c in (getattr(self, "_concert_candidates", None) or ()):
+            try:
+                ct = c.get("title", "") if isinstance(c, dict) else str(c)
+                if ct and self._same_song_title(ct, title):
+                    return True
+            except Exception:
+                continue
+        for ch in (getattr(self, "_concert_setlist", None) or ()):
+            try:
+                ct = ch[1] if isinstance(ch, (tuple, list)) else (
+                    ch.get("title", "") if isinstance(ch, dict) else str(ch))
+                if ct and self._same_song_title(ct, title):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _recalibrate_loop(self):
         """Listen again to re-lock timing AND catch a new song within one long
         video (compilation / concert / DJ set / livestream). The audio boundary
@@ -5369,13 +5450,31 @@ class Overlay:
         # Any OCR text that fuzzy-matches an OPEN top-level window title is
         # window chrome, not a lyric banner — discard it.
         if uncached and self._text_matches_window_title(uncached):
-            log.info("concert OCR read %r matches an open WINDOW title — "
-                     "chrome, not a banner; discarded", uncached)
+            # v1.1.76: log each distinct discard ONCE per 10 min — a persistent
+            # page ad ('Custom men's t-shirts') repeated this line every 8s.
+            if (getattr(self, "_ocr_discard_last", None) != uncached
+                    or time.time() - getattr(self, "_ocr_discard_t", 0.0) > 600.0):
+                log.info("concert OCR read %r matches an open WINDOW title — "
+                         "chrome, not a banner; discarded", uncached)
+            self._ocr_discard_last, self._ocr_discard_t = uncached, time.time()
             return
         if (uncached
                 and not self._same_song_title(
                     cur, uncached, artists=((self._track or ("", ""))[0],))
                 and uncached != self._ocr_song):
+            # v1.1.76 (TICKET-171): require TWO consecutive identical reads before
+            # fetching an uncached title. The window-title cross-check can't catch
+            # every stray string the capture lands on ('Games and Software' was
+            # fetched cover-style mid-concert); a real banner persists ~10s+, so
+            # it re-reads identically on the next pass — one-off junk doesn't.
+            if getattr(self, "_ocr_pending_read", None) != uncached:
+                self._ocr_pending_read = uncached
+                # re-poll fast so a short-lived banner still gets its 2nd read
+                self._last_ocr_t = 0.0
+                log.info("concert OCR read uncached %r — awaiting a 2nd "
+                         "consistent read", uncached)
+                return
+            self._ocr_pending_read = None
             self._ocr_song = uncached
             self.root.after(0, lambda t=uncached: self._fetch_ocr_song(t))
 
@@ -6295,7 +6394,19 @@ class Overlay:
                 # "🎧 Listening…" toast that read as a dead button.
                 self._user_identify_pending = False
                 self._hint("🔍 Couldn't identify by sound — not in Shazam")
+            if not res:
+                # v1.1.76 (TICKET-171): null reads were INVISIBLE — a concert sat
+                # through ~30 consecutive misses with nothing in the log to show
+                # why the pending switch never confirmed. Count them and surface
+                # a rate-limited trace so the failure mode is diagnosable.
+                self._null_read_streak = getattr(self, "_null_read_streak", 0) + 1
+                if self._null_read_streak % 8 == 0:
+                    pend = (f"; switch to {self._pending_switch[0]!r} still pending"
+                            if self._pending_switch else "")
+                    log.info("identify: %d consecutive null reads%s",
+                             self._null_read_streak, pend)
             if res:
+                self._null_read_streak = 0
                 self._user_identify_pending = False
                 title, artist, offset, t_cap = res
                 self._intro_anchored = True   # Shazam can align this → drop the MV dead-space guess
@@ -6315,6 +6426,18 @@ class Overlay:
                 else:
                     f_artist, f_title = artist, title
                     if _has_cjk(g_title) and not same_song:
+                        if time.time() - getattr(self, "_track_t0", 0.0) < 20.0:
+                            # v1.1.76 (TICKET-171): the session flipped tracks only
+                            # seconds ago (ad → content is the common case), so this
+                            # capture overlapped the OLD audio. Neither its identity
+                            # nor its offset describes what's playing NOW — drop the
+                            # read; the next one hears the new track. (Live-caught:
+                            # ZAWA MAKE IT resumed after a 30s ad and the ad-audio
+                            # read was 'trusted over the stale session'.)
+                            log.info("discarding stale-capture read %r — track "
+                                     "changed %.0fs ago", title,
+                                     time.time() - getattr(self, "_track_t0", 0.0))
+                            return
                         log.info("player title %r and Shazam title %r share no content "
                                  "— trusting Shazam (player session likely stale)",
                                  g_title, title)
@@ -6763,6 +6886,7 @@ class Overlay:
                     self._set_verified(False, reason="smtc-paused-demote")
                     self._title_locked = False
                     self._pending_switch = heard
+                    self._pending_switch_t = time.time()
                     # Also seed last_heard_contra so the title-lock strike flow
                     # would also count this; both paths funnel into the takeover
                     # branch on the next agreeing read.
@@ -6943,22 +7067,45 @@ class Overlay:
                     # throw away the good result before it lands.
                     if heard != self._pending_switch:
                         self._pending_switch = heard
+                        self._pending_switch_t = time.time()
                         log.info("heard %r while title fetch for %r is still in flight "
                                  "— holding sound override until the fetch resolves",
                                  f_title, g_title)
-                elif self.lines and heard != self._pending_switch:
+                elif (self.lines and heard != self._pending_switch
+                      and not (self._live_mode
+                               and self._live_hearing_corroborated(f_title, f_artist))):
                     # Heard a DIFFERENT song while we already have lyrics for the
                     # current one. A single contradicting reading is usually a
                     # spurious Shazam mis-ID on a niche track (Tombi briefly heard as
                     # a piano concerto), which used to reset the offset + re-fetch +
                     # re-generate. Require a SECOND reading of the same new song
                     # before switching; a real song change re-confirms in seconds.
+                    # v1.1.76 (TICKET-171): EXCEPT in a concert when the heard song
+                    # is corroborated by the concert's own context — live audio
+                    # fingerprints rarely, so "re-confirms in seconds" doesn't hold
+                    # there and one corroborated read IS the second signal.
                     self._pending_switch = heard
+                    self._pending_switch_t = time.time()
                     log.info("heard %r ≠ loaded %r — awaiting confirmation before switch",
                              f_title, self.meta.get("title", ""))
                 else:
                     # A different song, confirmed (or nothing loaded yet) → switch to
                     # it; start its timing fresh rather than carrying the old offset.
+                    # v1.1.76 (TICKET-171): in a CONCERT with nothing loaded, an
+                    # UNCORROBORATED hearing is usually a YouTube ad's music (a
+                    # music-video ad Shazam matches perfectly — 'Tokyo Midnight
+                    # Cruising Club' loaded over Reach the top), and loading it
+                    # poisons the concert until a watchdog rescues it. Hold junk
+                    # for a 2nd agreeing read; corroborated songs load instantly.
+                    if (self._live_mode and not self.lines
+                            and heard != self._pending_switch
+                            and not self._live_hearing_corroborated(f_title, f_artist)):
+                        self._pending_switch = heard
+                        self._pending_switch_t = time.time()
+                        log.info("heard %r / %r (uncorroborated in a concert, nothing "
+                                 "loaded) — holding for a 2nd read before first load",
+                                 f_title, f_artist)
+                        return
                     self._pending_switch = None
                     self._sound_song = heard
                     self._last_sound_lock_t = time.time()
@@ -10470,6 +10617,14 @@ class Overlay:
                                          if self._last_audio_off_t else None),
                 "sound_song": self._sound_song,
                 "sound_title_alias": self._sound_title_alias,
+                # v1.1.76 (TICKET-171): identify-stream visibility — how many
+                # consecutive Shazam reads returned nothing, and which heard song
+                # (if any) is still waiting on its confirming read.
+                "null_read_streak": getattr(self, "_null_read_streak", 0),
+                "pending_switch": (list(self._pending_switch)
+                                   if self._pending_switch else None),
+                "pending_switch_age_s": (round(time.time() - self._pending_switch_t, 1)
+                                         if self._pending_switch else None),
                 "title_locked": self._title_locked,
                 # TICKET-099: SMTC vs Shazam priority telemetry
                 "source_priority": self._source_priority,
@@ -13668,6 +13823,22 @@ class Overlay:
         # 2-6 min heuristic (TICKET-063): a CONCERT song still showing after ~6.5 min
         # almost certainly changed and we missed the boundary → force a re-identify.
         if self._live_mode and not self._identifying:
+            # v1.1.76 (TICKET-171): a PENDING switch is a real hearing waiting on
+            # its confirming read — on live audio those reads mostly miss, so
+            # escalate with a longer capture instead of letting the 6.5-min
+            # watchdog be the only rescue (Reach the top's opener sat unconfirmed
+            # for 4.5 min over junk ad lyrics). Escalate FAST when nothing is
+            # showing yet (15s — a blank overlay is the worst state) and slower
+            # when lyrics are already up (90s — they might even be right).
+            _pend_wait = 15.0 if not self.lines else 90.0
+            if (self._pending_switch is not None
+                    and now - getattr(self, "_pending_switch_t", 0.0) > _pend_wait
+                    and now - getattr(self, "_last_forced_reid_t", 0.0) > 20.0):
+                log.info("concert: switch to %r still unconfirmed after %.0fs → "
+                         "forced re-identify", self._pending_switch[0], _pend_wait)
+                self._last_forced_reid_t = now
+                self._start_identify(seconds=5, attempts=2)
+                return
             if self._lyrics_path != getattr(self, "_concert_song_path", None):
                 self._concert_song_path, self._concert_song_t = self._lyrics_path, now
             elif now - getattr(self, "_concert_song_t", now) > 390.0 \
