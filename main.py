@@ -12266,6 +12266,30 @@ class Overlay:
         except Exception:
             pass
         if on:
+            # v1.1.78 (TICKET-178): a LONG non-music video (e.g. a 33-min reaction/
+            # talk video) is flagged `_live_mode` by the VIDEO-LENGTH heuristic at
+            # track change. When the user then toggles Subtitles ON MID-VIDEO, the
+            # concert-vs-subtitles split that CLEARS that length-based live-mode
+            # (in _on_track_change) never re-runs — so `_subs_suppresses_sound()`
+            # stays False and `_apply_captions` REFUSES the fetched captions
+            # ("subtitles no longer own this track"), giving an empty overlay on a
+            # video whose en captions downloaded fine. Re-run the split here so a
+            # mid-video toggle owns the track (idempotent — at track change
+            # `_live_mode` is already cleared). A REAL music-concert cue in the title
+            # still keeps the concert pipeline; the background category probe flips
+            # back only if the video turns out to be Music.
+            if self._live_mode and not self._music_app_source():
+                _t = (self._track or ("", ""))[1] or ""
+                if not is_live_or_compilation(_t, None):
+                    self._live_mode = False
+                    self._live_video_nonmusic = True
+                    try:
+                        threading.Thread(target=self._subs_music_category_check,
+                                         args=(self._track_seq,), daemon=True).start()
+                    except Exception:
+                        pass
+                    log.info("subtitles ON mid-video — cleared length-based live-mode "
+                             "so captions own this track (bg category check may flip back)")
             self._hint("📺 Subtitles mode")
             # Captions ride the PLAYER CLOCK exactly — any sync offset left
             # over from music handling (or a concert chapter anchor) would
@@ -13765,7 +13789,14 @@ class Overlay:
         # but the APPLY must re-check LIVE OWNERSHIP — a mid-fetch toggle-off
         # (or a subs→concert flip) used to still paint the show's dialogue over
         # the music overlay (and its token bumps killed the music-mode work).
-        if subtitle and not self._subs_suppresses_sound():
+        if (subtitle and not self._subs_suppresses_sound()
+                and not getattr(self, "_live_video_nonmusic", False)):
+            # v1.1.78 (TICKET-178): …unless the video is CONFIRMED non-music. A long
+            # talk/reaction video can carry a length-based `_live_mode` (which makes
+            # _subs_suppresses_sound() False), but if it's been confirmed non-music
+            # (category probe / mid-video toggle split) then subtitles DO own it and
+            # its captions must paint. A real concert keeps _live_video_nonmusic=False
+            # and still blocks here.
             log.info("captions: subtitles no longer own this track — not applying show dialogue")
             return
         # JP-vagency language guard: a known JP act (ReGLOSS / hololive / Hajime /
