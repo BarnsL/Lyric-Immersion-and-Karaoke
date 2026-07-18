@@ -29,6 +29,7 @@ realtime best-effort generation simply stands. See ``docs/GENERATION.md``.
 from __future__ import annotations
 
 import glob
+import html
 import logging
 import os
 import re
@@ -287,6 +288,14 @@ def _parse_vtt(path: Path) -> list[dict]:
         nonlocal cur, buf
         if cur and buf:
             txt = re.sub(r"<[^>]+>", "", " ".join(buf)).strip()
+            # TICKET-179: YouTube auto-captions carry HTML ENTITIES in the cue text
+            # — `&gt;&gt;` (speaker-change markers), `&amp;`, `&#39;`, `&quot;` …
+            # Without decoding, the overlay literally shows "&gt;&gt; All right…".
+            # unescape AFTER the tag strip (real <c> tags are already gone), then
+            # drop the decoded `>>` speaker-change markers (caption convention, not
+            # spoken words — noise on a lyric-style overlay).
+            txt = html.unescape(txt)
+            txt = re.sub(r"\s*>>+\s*", " ", txt)
             # Drop sound-event annotations — [音楽]/[Music]/【拍手】/♪ etc. are never
             # lyrics; bracketed tags in a caption are always non-vocal markers.
             txt = re.sub(r"[\[【][^\]】]*[\]】]", "", txt).replace("♪", "")

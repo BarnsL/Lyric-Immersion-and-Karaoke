@@ -24,6 +24,7 @@ returns None and the caller falls back to the existing whisper/OCR tiers.
 from __future__ import annotations
 
 import gzip
+import html as _html
 import io
 import json
 import re
@@ -184,6 +185,11 @@ def _parse_srt(text: str):
         body = block[m.end():]
         rows = [ln.strip() for ln in body.splitlines() if ln.strip()]
         txt = _SRT_TAGS.sub("", " ".join(rows)).strip()
+        # TICKET-179: decode HTML entities (&amp; / &#39; / &gt;&gt; …) and drop
+        # `>>` speaker-change markers, same as the VTT path — otherwise the overlay
+        # shows literal "&gt;&gt;" / "&amp;".
+        txt = _html.unescape(txt)
+        txt = re.sub(r"\s*>>+\s*", " ", txt).strip()
         if not txt:
             continue
         low = txt.lower()
