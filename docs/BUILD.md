@@ -172,8 +172,14 @@ to the app's data folder on first use (copy `models\` next to the `.exe` to pre-
 >   never gets packaged. Run it yourself any time to check a build:
 >   `dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe --selftest --out check.txt`.
 >
+> **At runtime**, `GET /diag` exposes `whisper.available` and `whisper.last_error` — the
+> same `align.available()` verdict, on the machine that actually has the build. The guards
+> above prove the bundle was *assembled* correctly; this is how a deployed app or a CI
+> probe confirms the listen features are genuinely live without reading logs.
+>
 > If you `pip install --target .deps` a package that pulls a **different** native version
-> than your env, pin them to match (`pip install --target .deps av==<env-version> ...`).
+> than your env, re-pin `requirements-deps.txt` so `.deps` and the env agree, and rebuild
+> `.deps` from scratch rather than upgrading into it.
 
 ## Optional: deep lyric transcription (`yt-dlp` + a JS runtime)
 
