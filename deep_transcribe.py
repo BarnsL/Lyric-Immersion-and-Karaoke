@@ -247,20 +247,37 @@ def transcribe_file(path: str | Path, lang: str | None = None,
     the caller annotates). ``vad_filter`` stays OFF: Silero VAD classifies SUNG
     vocals as non-speech and would drop them (learned in align.py)."""
     import align
-    model = align._get_model(size)
-    segments, info = model.transcribe(
-        str(path), language=lang, beam_size=5,
-        vad_filter=False,
-        condition_on_previous_text=False,   # one mis-hear must not poison the rest
-        no_speech_threshold=0.6,
-    )
     lines: list[dict] = []
-    for s in segments:
-        txt = (s.text or "").strip()
+    opts = dict(beam_size=5, vad_filter=False,
+                condition_on_previous_text=False,   # one mis-hear must not poison the rest
+                no_speech_threshold=0.6)
+    segs = None                                     # normalised [(start, end, text), …]
+    detected = lang
+
+    # TICKET-184: whole-file transcription is the longest, heaviest GPU job we run,
+    # so it goes to the "deep" child process — an abort inside CTranslate2 takes the
+    # child, not the app, and its GIL load never touches the render thread.
+    if not getattr(align, "_WORKER_MODE", False) and getattr(align, "_worker_enabled", True):
+        got = align._worker_transcribe({"file": str(path)}, size, lang,
+                                       role="deep", **opts)
+        if got is not None:
+            rows, langd = got
+            segs = [(r[0], r[1], r[2]) for r in rows]
+            detected = langd or lang
+
+    if segs is None:                                # in-process fallback
+        # Borrow the model for the WHOLE drain: `segments` is a lazy generator and
+        # the cache may evict other CUDA models concurrently (align._model_for).
+        with align._model_for(size) as model:
+            segments, info = model.transcribe(str(path), language=lang, **opts)
+            segs = [(s.start, s.end, s.text) for s in segments]
+            detected = getattr(info, "language", None) or lang
+
+    for st, en, txt in segs:
+        txt = (txt or "").strip()
         if txt:
-            lines.append({"t": [round(s.start, 2), round(s.end, 2)],
+            lines.append({"t": [round(st, 2), round(en, 2)],
                           "jp": txt, "rm": "", "en": ""})
-    detected = getattr(info, "language", None) or lang
     return lines, detected
 
 
@@ -325,6 +342,13 @@ def _parse_vtt(path: Path) -> list[dict]:
     return ded
 
 
+# CJK caption languages whose script IS the song's own lyrics (never a romanized
+# translation). Used to reject a CJK AUTO-TRANSLATION of a non-CJK original.
+_CJK_CAPTION_LANGS = {"ja", "zh", "ko"}
+# yt-dlp "unknown / not-a-language" placeholders for info.language — treat as None.
+_UNKNOWN_LANG_TAGS = {"und", "mul", "zxx", "mis"}
+
+
 def _captions_from_dir(dest: Path, lang: str | None, any_lang: bool = False,
                        orig_lang: str | None = None):
     """Find + parse the best MANUAL caption track matching the song's ORIGINAL
@@ -347,10 +371,18 @@ def _captions_from_dir(dest: Path, lang: str | None, any_lang: bool = False,
     # SUBTITLES mode we still prefer the requested lang if it exists, but
     # gracefully take whatever else is on offer.
     preferred = [lang] if lang in ("ja", "zh", "ko") else []
-    if any_lang and orig_lang:
-        # both the full tag and its base ('en-US' videos publish 'c.en.vtt')
+    # TICKET-180 (Defect A): let the video's OWN language (yt-dlp info.language)
+    # lead ranking in BOTH subtitles AND music mode. It used to be gated to
+    # subtitles mode (`any_lang`), so a MUSIC video's language was ignored and the
+    # ja-led `music_fallback` ranked a Japanese AUTO-TRANSLATION first — an
+    # all-English song (hololive Advent "Genesis") showed Japanese caption text.
+    olb = None
+    if orig_lang:
         ol = orig_lang.lower()
-        preferred = list(dict.fromkeys([ol, ol.split("-")[0]] + preferred))
+        if ol not in _UNKNOWN_LANG_TAGS:
+            olb = ol.split("-")[0]        # base tag: 'en-US' → 'en'
+            # both the full tag and its base ('en-US' videos publish 'c.en.vtt')
+            preferred = list(dict.fromkeys([ol, olb] + preferred))
     # Ranked fallback: CJK first (music-mode: only CJK carries the song's own
     # lyrics), then broadly for subtitles mode.
     music_fallback = ["ja", "zh-Hans", "zh", "zh-Hant", "ko"]
@@ -411,6 +443,17 @@ def _captions_from_dir(dest: Path, lang: str | None, any_lang: bool = False,
         clang = "en"                     # unknown label, subtitles: last resort
     else:
         clang = "ja"                     # music-mode CJK fallthrough
+    # TICKET-180 (Defect A): in MUSIC mode, NEVER show a CJK AUTO-TRANSLATION of a
+    # non-CJK original as the lyrics. yt-dlp reports the video's own language; when
+    # it is confidently non-CJK (e.g. 'en') but the only track we found is a CJK
+    # track, it's a translation — decline it so the app falls back to provider LRC
+    # / by-ear (the real English lyrics) instead of displaying Japanese. Fail-safe:
+    # when orig_lang is unknown (olb is None) the old CJK-first behavior stands, so
+    # genuinely Japanese songs are unaffected. Subtitles mode (any_lang) keeps
+    # taking whatever track exists — a translated subtitle is often what's wanted.
+    if (not any_lang and olb and olb not in _CJK_CAPTION_LANGS
+            and clang in _CJK_CAPTION_LANGS and clang != olb):
+        return None
     return (lines, clang) if len(lines) >= 6 else None
 
 
@@ -433,6 +476,80 @@ def _normalize_youtube_url(q):
     except Exception:
         pass
     return q
+
+
+def fetch_caption_timing(url_or_id: str, lang: str | None = None):
+    """TICKET-183 (sync): fetch the video's OWN-LANGUAGE YouTube AUTO-caption cues
+    purely as a TIMING GRID → [(start_s, cue_text), ...] or None. YouTube force-aligns
+    auto-caption cue starts to the actual audio (typically within ~0.3-0.5s of the sung
+    onset), so they are the strongest video-locked timing anchor for a browser MV whose
+    provider/generated body has good WORDS but drifting times. The caller text-matches
+    its OWN display body against this grid (align.retime_to_captions) and then DISCARDS
+    the cue text — the ASR text is never shown, persisted, or indexed.
+
+    NATIVE language only: an 'en' auto-track for a JP/KO song is a re-timed machine
+    TRANSLATION, not force-aligned to the vocal. EXACT URL/11-char id only — a title
+    search could land on a different upload whose intro length differs."""
+    if not available():
+        return None
+    import glob as _glob
+    import tempfile
+    import shutil as _sh
+    import yt_dlp
+    q = _normalize_youtube_url(url_or_id or "")
+    if re.match(r"https?://", q):
+        target = q
+    elif re.fullmatch(r"[\w-]{11}", q):
+        target = f"https://www.youtube.com/watch?v={q}"
+    else:
+        return None                                   # timing master needs the EXACT video
+    if lang in ("ja", "ko"):
+        langs = [lang]
+    elif lang == "zh":
+        langs = ["zh-Hans", "zh-Hant", "zh"]
+    elif lang:
+        langs = [lang]
+    else:
+        langs = ["ja", "ko", "en"]                    # unknown source language → try commons
+    tmp = Path(tempfile.mkdtemp(prefix="dk_captime_"))
+    try:
+        opts = {
+            "quiet": True, "no_warnings": True, "noplaylist": True,
+            "skip_download": True, "ignoreerrors": True,
+            "outtmpl": str(tmp / "c.%(ext)s"), "retries": 1, "socket_timeout": 15,
+            "writesubtitles": False, "writeautomaticsub": True,
+            "subtitleslangs": langs, "subtitlesformat": "vtt",
+        }
+        if _sh.which("node"):
+            opts["js_runtimes"] = {"node": {}}
+        for vopts in _yt_variants(opts):
+            try:
+                with yt_dlp.YoutubeDL(vopts) as y:
+                    y.extract_info(target, download=True)
+                if _glob.glob(str(tmp / "*.vtt")):
+                    break
+            except Exception:
+                continue
+        files = sorted(_glob.glob(str(tmp / "*.vtt")))
+        if not files:
+            return None
+        pick = files[0]                               # prefer a file whose tag matches a native lang
+        for want in langs:
+            hit = next((f for f in files if f".{want.lower()}." in Path(f).name.lower()), None)
+            if hit:
+                pick = hit
+                break
+        try:
+            cues = _parse_vtt(Path(pick))
+        except Exception:
+            return None
+        grid = [(float(c["t"][0]), c["jp"]) for c in cues if c.get("jp")]
+        return grid if len(grid) >= 4 else None
+    finally:
+        try:
+            _sh.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def fetch_captions_only(query: str, lang: str | None = None,

@@ -8,6 +8,895 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## v1.1.89 — 2026-07-19 (TICKET-201…204 — the runaway, the blank songs, the narrated console)
+
+### TICKET-201 — hololive Unchained: OCR sync ran away to +56s and never recovered
+
+**Report:** "hololive unchained starts off good, then for whatever reason syncs
+to a bad part of the song then never recovers."
+
+**Root cause (from the log):** the OCR-assisted sync (`_ocr_assisted_sync`)
+committed a +55.99s offset correction from a single unverified read — the screen
+reader matched lyric line 29 at 0.95 confidence on one pass, and the code had no
+two-point verification gate. Every subsequent read was then measured against
+that broken offset. A read landing 56s away was correctly identified as
+out-of-range and discarded — but discarding a read from a broken baseline
+*preserves* the broken baseline. The song never recovered because the evidence
+needed to fix it was being thrown away for disagreeing with the thing that was
+wrong.
+
+The containment-scored match was also degenerate: the same LRC line matched on
+nine consecutive passes across eight minutes. A caption cannot stay on one line
+for eight minutes. The "match" was `ratio 0.95` from a 4-character OCR fragment
+sitting inside a 40-character lyric line — the flat-containment bug the codebase
+had already learned about in `_same_song_title` (`'ghost'` in `'ghosting'`) but
+had not applied to the OCR path.
+
+**Fix (three guards):**
+1. **Length-gated containment.** Containment now requires the shorter string to
+   cover >= 80% of the longer one, matching the `_same_song_title` rule. The 4-
+   character fragment that scored 0.95 now scores 0.12 and is correctly rejected.
+2. **Degenerate-read detection.** Two reads matching the SAME line while the
+   video position moved >1s is a stale/generic read, not a measurement. The
+   second is refused and logged as `sync-rejected` with the reason.
+3. **Far-read streak revert.** Two out-of-range reads in a row while holding an
+   OCR-committed offset backs the commit out: `offset → 0.0` with a
+   `sync-revert` event. This is the fix the runaway needed: instead of
+   discarding every correction for disagreeing with the broken offset, the
+   broken offset itself is reverted when enough evidence accumulates against it.
+
+Big corrections (> `ocr_sync_single_shot_max`) also now require a second,
+independent agreeing read — the same rule the energy correlator already applies.
+
+**Verified:** the containment fix alone rejects the 4-char fragment; the
+degenerate fix refuses the repeated line-29 matches; the far-read streak reverts
+the +56s commit within two verification passes.
+
+**The log, verbatim** — every commit reports the SAME line at the SAME ratio, and
+the offset slides by exactly the playback delta, which is the signature of
+`line29.start − now` rather than of a measurement:
+
+```
+23:55:22 ocr-sync(energy-ambiguous): LRC line 29 ratio 0.95 → offset  51.25s (was  0.00)
+23:55:46 ocr-sync(energy-ambiguous): LRC line 29 ratio 0.95 → offset  27.33s (was 51.25)
+23:56:26 ocr-sync(energy-weak):      LRC line 29 ratio 0.95 → offset -12.67s (was 27.33)
+23:57:06 ocr-sync(energy-ambiguous): LRC line 29 ratio 0.95 → offset  55.99s (was  0.00)
+23:59:46 ocr-sync(energy-weak):      LRC line 29 ratio 0.95 → offset  23.57s (was  0.00)
+00:01:46 ocr-sync(energy-weak):      LRC line 29 ratio 0.95 → offset   4.08s (was 23.57)
+00:02:26 ocr-sync(energy-weak):      LRC line 29 ratio 0.95 → offset -35.92s (was  4.08)
+00:03:06 ocr-sync(energy-weak):      line 29 but offset  -75.7s out of range (cap 60s) — skip
+00:03:46 ocr-sync(energy-weak):      line 29 but offset -115.7s out of range (cap 60s) — skip
+```
+
+Note the `reason` on every line: `energy-weak` / `energy-ambiguous`. **The OCR path
+only runs when the energy correlator declined to act** — and three lines above each
+of these the correlator is logging `+12.40s is a BIG studio jump with no Shazam
+corroboration — holding for confirmation`. The fallback that fires when confidence
+is lowest was applying the *least* skepticism of any sync path in the app.
+
+**Found by adversarial review, after the first implementation (fixed):** the
+"second agreeing read" gate did not require the second read to be on a *different*
+line, so a degenerate same-line pair could confirm itself — the exact failure the
+degenerate-read guard exists to stop. Two reads of one line are one measurement seen
+twice; confirmation now requires a different line.
+
+### TICKET-202 — Lemonade (Love Live!) and All for One: cached body distrusted, replacement never arrived
+
+**Report:** "NO LYRICS for lemonade love live mia teira" and "NO LYRICS SHOWING
+FOR ALL FOR ONE a popular hololive song."
+
+**Root cause (from the log, two independent cases):**
+
+*Lemonade:* the YouTube channel name `(Love Live! series)ラ...` was used as the
+"artist" for a language check. The cached body was English; the channel name
+contains kana; the wrong-language guard (TICKET-062) fired and distrusted the
+cache. The re-fetch came back empty. The overlay was left with **nothing** for
+the rest of the song — distrust without a replacement is worse than a wrong
+cache.
+
+*All for One:* hololive English's song is genuinely in English, but the act is
+classified Japanese. The English-only-body-for-a-Japanese-act guard fired,
+distrusted the cache, and the re-fetch found nothing. Three minutes of no lyrics
+before a deep pass fetched an equivalent body from the same provider.
+
+**Fix:** distrust now DEMOTES a body instead of deleting it. The distrusted
+cache is remembered in `_distrusted_cache` and restored by `_maybe_generate`
+when the re-fetch comes back empty — so a wrong-language guard that fires on a
+correct body degrades gracefully instead of blanking the song. The restore is
+gated on `_track_seq` so a body set aside for a previous song is never carried
+into a new one.
+
+**Logged:** every distrust now emits a `body-rejected` notable event with the
+reason, and every restore emits a `cache-restored` event. Both surface in the
+new Activity view.
+
+**Found by adversarial review, after the first implementation (all fixed):**
+
+- **The restore re-entered `load()`'s own language guards.** The justification
+  ("they already fired for this track") was only true for one of the two setters:
+  when `_file_valid` sets `_distrusted_cache` (the kana-artist path), those guards
+  have *not* run, so `load()` rejected the body again — a silent no-op that also
+  kicked a duplicate re-identify chain racing the by-ear generation. A restore now
+  suppresses them via a self-consuming `_restoring_distrusted` flag.
+- **One of those guards `unlink()`s the file.** The restore therefore had a path
+  that *permanently deleted* the cache this ticket exists to preserve, directly
+  contradicting "demote, not delete". That guard is now skipped during a restore.
+- **`_smtc_paused_takeover` bumps `_track_seq` without going through
+  `_on_track_change`,** so it never cleared `_distrusted_cache`. A body set aside
+  for the SMTC song could be restored into the Shazam-heard one — cross-song
+  contamination, reported by the console as a legitimate `cache-restored`. It now
+  clears the same per-track state.
+- **The restore skipped `_maybe_translate()`,** which every other cache-load site
+  pairs with `load()`, leaving the romaji and translation lanes blank for the rest
+  of the song.
+
+### TICKET-203 — Engine decisions were invisible until you read karaoke.log by hand
+
+**Report:** "i want visible animated notifications in the developer console only
+when decisions are made/song is rejected or switched or major sync happens …
+lets also add a log panel that references video name, what it saw, time of
+change in video compared to lyric time."
+
+**Root cause:** the sync ring (`_sync_events`) was a firehose of raw telemetry
+keyed for machine analysis. A human needed to know "the song changed", "a body
+was rejected", "a +56s correction committed", "lyrics arrived 174s late" — and
+none of those were surfaced anywhere readable. The hololive Unchained runaway
+showed `pos=16.6` with `lyric_t=72.6` and nothing surfaced the 56s gap until
+someone read the log by hand.
+
+**Fix:** a separate narrative event ring (`_note_event`) records the handful of
+moments a human would want narrated, stamped with the context needed to
+reconstruct what happened:
+- `title` — which video it happened on (events outlive their track)
+- `pos` — where the VIDEO was, in seconds
+- `lyric_t` — where the LYRICS were, in seconds
+- `gap` — `lyric_t - pos`, the number that tells a sync bug from a correct run
+- `sev` — good/info/warn, driving the notification colour
+
+Exposed at `/insight.notable` and rendered in the new **Activity** view:
+- **Animated toast notifications** that slide in when a new event arrives
+  (cubic-bezier ease-out, 350ms), severity-coloured (green/amber/blue), with
+  the warn icon pulsing to catch the eye. Auto-dismiss after 6s (info/good) or
+  10s (warn).
+- **A readable log panel** with video name, event kind, human detail, and the
+  full time context (video position, lyric line time, gap, offset, ratio) —
+  everything needed to understand a sync bug at a glance.
+
+Wired at every decision point: song-change, lyrics-loaded, body-rejected,
+cache-restored, sync-jump/nudge/revert/rejected, and decision-engine
+escalation.
+
+**Found by adversarial review, after the first implementation (all fixed):**
+
+- **`_note_event` re-read `self.lines` three times in one expression** while
+  running on the OCR/API threads, which the Tk thread can swap wholesale on a song
+  change. The guard passes against the old body and the index then resolves against
+  the **new** one — no `IndexError`, so the `except` never fires and the ring records
+  a `lyric_t`/`gap` describing something that never happened. A fabricated gap is
+  strictly worse than none in the one field whose entire purpose is to be trustworthy.
+  The body and index are now bound once, exactly as `get_insight` already does.
+- **"How late did the lyrics arrive" was measured against a `_track_t0` stamped
+  after the cache-hit path had already loaded.** So the *fastest* possible path — an
+  instant cache hit — was narrated as the slowest, using the *previous* track's start
+  time, and the first load of a session reported a ~1.79-billion-second blank spell
+  (`_track_t0` still held its `0.0` initial value). It now uses the player's own
+  position, which is both honest and the number the user actually cares about.
+- **The `title` field mixed two different strings for one song** — the cleaned name
+  on `song-change`, the raw player title everywhere else — so per-track grouping split
+  one song in two. All events now carry the raw video name.
+
+### TICKET-204 — Title identification: Wrong Song button + correct-text picker
+
+**Report:** "for the title identification, lets add a wrong song button to it
+and allow for me to select the correct text from the text that the engine sees
+in the event that its trying to find lyrics from the wrong string of text.
+keep this logged as well as the full identified text and the 'bad' one for
+future diagnostics."
+
+**Root cause:** the engine's `clean_title()` reduces a video title by stripping
+credits and decorations. This reduction is invisible from outside the process,
+and when it strips the wrong part (e.g. `IA & ONE / てるみい (石風呂)【MUSIC
+VIDEO】` reducing to `IA & ONE`), every downstream panel looks healthy while
+the wrong song's lyrics are fetched. The user had no way to say "that's the
+wrong string — search this instead."
+
+**Fix:**
+- Every title string the engine sees is now tracked in `_seen_title_strings`
+  (raw player title, cleaned title, OCR reads, prior overrides) and exposed at
+  `/insight.title_id.seen_strings`.
+- The **Wrong Song** panel in the Activity view shows the raw title, what the
+  engine reduced it to, and any active override. The **Pick correct title**
+  button offers every seen string as a one-click correction, plus a free-text
+  fallback.
+- Selecting a title calls `POST /override_title`, which forces `clean_title` to
+  the user's choice and re-fetches. The override is per-video (cleared on track
+  change) and does not persist to settings.
+- The bad string and the good one are logged (`TITLE OVERRIDE: engine had X,
+  user chose Y`) for future diagnostics. The `_title_id_log` ring captures
+  every override with timestamps.
+
+**Copyright:** no lyric body text is logged — only titles and metadata. Corrections
+are appended to `title_corrections.jsonl` in the **app data folder** (gitignored,
+never shipped) plus the in-process `_title_id_log` ring — never to a file in the repo.
+
+**Found by adversarial review, after the first implementation (all fixed):**
+
+`override_title` had been defined **twice on the same class**, so the second silently
+shadowed the first. The `title_corrections.jsonl` write and the success event were
+unreachable dead code, the endpoint's `{ok: …}` contract was never honoured, and a
+successful user correction was painted as a `warn`. Consolidated into one method.
+
+The surviving implementation also had to clear `self.lines` to force a real re-fetch —
+which defeats `_on_track_change`'s same-song early return, so the full per-track reset
+ran and wiped the override **the instant it was set**. The correction is now carried
+through exactly one re-identify by an explicit, self-consuming flag.
+
+`_smtc_paused_takeover` changes song without going through `_on_track_change`, so it
+now clears the override and the candidate strings too — otherwise a correction made for
+one song would force its search string onto a different one.
+
+---
+
+## v1.1.88 — 2026-07-19 (TICKET-200 — the wrong song, reported as identified)
+
+### TICKET-200 — A title reduction searched the ARTIST, and the console called it identified 🟢
+
+**Report:** "poor lyric matching with this song… i can see that the proper wasnt
+received and it got lyrics for another song that the artists IA and ONE sing",
+playing **IA & ONE / てるみい (石風呂)【MUSIC VIDEO】** (channel *IA PROJECT*). The
+overlay showed a full, well-timed, 43-line Japanese body — for a different song.
+
+Two independent defects, one that loaded the wrong lyrics and one that hid it.
+
+**1. `clean_title()` reduced the title to the performers.** JP MV uploads use the
+convention `Vocalists / 曲名`, and the slash branch picks whichever side is *not*
+the artist:
+
+```
+parts = ["IA & ONE", "てるみい (石風呂)"]
+_artistish("てるみい (石風呂)") → False      # not the channel name
+_artistish("IA & ONE")        → False      # ← the bug
+else: t = p0                               # default-to-first → "IA & ONE"
+```
+
+`_artistish` compares a side against the **SMTC artist**, which here is the
+channel/label *IA PROJECT*, not the vocalists. It tries two ways and both miss:
+the joined form `iaone` is not a substring of `iaproject`, and its token test has
+a **≥4-character floor** — so `ia` (2) and `one` (3) were never even considered.
+The tie-break then defaulted to the first part, which on this convention is
+always the artist. The providers were searched for **"IA & ONE"**, a performer
+name, and returned a real, correctly-timed body for a different song by those
+performers. Nothing downstream was wrong: the body was genuine, the sync was
+good, the language was right. The song name had been thrown away three steps
+earlier.
+
+*Fix:* `_artistish()` now also splits a side on `& ＆ × ✕ and` and tests each name
+on its own, by **whole-token equality** against the artist (`ia` **==** the artist
+token `ia`). No length floor is needed there: the floor guards against *substring*
+collisions (`ia` inside `rain`), and whole-token equality has no such failure
+mode — which is why the floor was excluding precisely the names this app sees
+most, the vocal synths (IA, ONE, GUMI, RIN, LEN), all under four characters.
+
+*Residual limitation, accepted:* if the channel is unrelated to the performers
+(a label channel with no shared token), no element matches and the tie-break
+still defaults to the first part. Fixing that needs a source of truth for the
+performers — the video description's vocals credits (TICKET-112 already parses
+them) is the obvious one. Not done here.
+
+**2. The console reported this at full confidence.** The Now strip's badge read
+`now.agree`: does the loaded body's title match the player's? That comparison is
+**circular** — a body fetched by title search is filed under the title it was
+searched with, so it agrees with itself no matter which song it contains. The
+console showed a green ✓ **identified** on lyrics for the wrong song. The one row
+that told the truth (`Locks: title locked · unverified · words unchecked`) was
+three panels down and outvoted by the tick.
+
+The same comparison was also wrong in the *other* direction. Measured live on the
+next track: player `【MV】Unchained【hololive English -Advent- Original Song】`
+vs loaded `Unchained` scored **`mismatch`** — a red warning on a perfectly correct
+body, because the raw title carries 【…】 furniture the loaded title does not. A
+badge that is wrong in both directions is worse than no badge.
+
+**Fixes**
+
+| | |
+|---|---|
+| `evidence` on `/insight.now` | The ladder the badge now reads: `library` (bundled body) → `words` (the sung words were matched) → `timing` (energy/caption lock: proves *when*, not *what*) → `title` (nothing but the search) → `none`. |
+| Badge shows what was **checked** | "title only" (amber) instead of "identified" (green) for a title-searched body. That is the honest label for the overwhelmingly common case, and it is what the IA & ONE body would have shown. |
+| `search_title` on `/insight.now` | The title actually sent to the providers. Rendered under the player title as **searched for …**, only when the reduction changed it. For this bug that single row reads `searched for IA & ONE` and the diagnosis is over. |
+| `agree` compares against `search_title` | Not the raw player title, and now passes the artists through to `_same_song_title`. Kills the Unchained false mismatch. `agree` and `evidence` stay independent signals. |
+
+**Verification**
+
+* `scripts/probe_clean_title.py` — 10/10, running the real `clean_title` via `ast`
+  extraction (no app import). The reported title now reduces to `てるみい`, and
+  every case the tie-break was originally tuned for still passes: `Dunk/轟はじめ`
+  → `Dunk`, `FLOW GLOW / LOAD` → `LOAD`, `幻界/V.W.P #30` → `幻界`. A genuine `&`
+  in a *song* title is unaffected in either position (`Sugar & Spice / Reol` and
+  `Reol / Sugar & Spice` both → `Sugar & Spice`) because no element of it is one
+  of the artist's tokens.
+* `scripts/probe_insight.py` — extended to assert `agree` and `evidence` stay
+  independent: the title-only case reports `agree=match` **and** `evidence=title`
+  simultaneously. If those ever collapse into one signal again, the probe fails.
+
+---
+
+## v1.1.87 — 2026-07-18 (TICKET-194…199 — the dev console shows the live state)
+
+### TICKET-194 — Both new console views were blank during ordinary playback 🟢
+
+**Report:** "dev tools kinda useless right now. song is playing and its not displaying
+anything identified or live", with a track playing and lyrics correctly on screen.
+
+The console was *running* — it rendered, the API answered, `/insight` returned a full
+payload. It was showing the wrong things. Three separate defects:
+
+**1. Every panel rendered an EVENT, and events are rare.** The Song-finder view leads
+with the banner-OCR pass; the Decisions view leads with the decide-by-ear gate ladder.
+OCR only runs in live/concert mode, and a by-ear decision only fires at a song
+boundary, a late load, an engine escalation, or a "Wrong lyrics" press. During ordinary
+playback of a correctly identified track — the overwhelmingly common case, and the one
+the user was in — **both headline panels are empty by construction.** The data that
+*was* live (`sources`, `sync`, `decision`) sat below the fold or on another view. The
+views were designed around the two nights of debugging that produced them rather than
+around the state the app is normally in.
+
+**2. Stale evidence was rendered as current.** `_finder_ocr` and `_finder_ocr_drops`
+were never cleared on track change, so the Song-finder view showed a *previous
+concert's* banner pass — measured at **1847s (31 min) old** — as the headline for a
+video that never ran a banner pass at all, complete with its accepted match and its
+list of refused strings. The only hint was a small "27m ago" pill. This is worse than
+an empty panel: it is confidently wrong, and it is the kind of thing that makes you
+distrust the whole instrument.
+
+**3. Half the rows had no CSS at all.** `.knob-row` is scoped to table cells
+(`.knob-row td`) for the Parameters view. Finder/Decisions used it on a `<div>`, which
+matched *nothing* — no flex, no spacing. That is why the screenshot reads
+"Matched against**the whole library**" and "Accepted**posts**" jammed together. Fixed
+with a div-based `.stat-row`.
+
+**Fixes**
+
+| | |
+|---|---|
+| `now` block in `/insight` | Always populated while a track is loaded: player vs loaded title, **agreement between them**, position/duration, line index and count, lyric source, language, sync offset/drift, renderer, overlay state, and what the engine is busy doing. |
+| `NowPane` at the top of both views | The panel that is never empty. The playhead moving is itself the proof the console is live. |
+| Clear on track change | `_on_track_change` drops `_finder_ocr`/`_finder_ocr_drops`; the gate snapshot survives (it usually explains what is loaded now) but is stamped `stale` + `track` so the UI labels it "previous track" and dims it instead of implying it is current. |
+| Re-ordered both views | Always-live panels first, event panels last. |
+| Honest empty states | "Not running for this video — which is normal", plus *why*, instead of a bare dash. |
+| `renderer` field | The Tk frame timer reads 0 while the GPU overlay draws, so `render_fps` is `null`. Reporting "0 fps" would libel a renderer that is running fine in another process; the tile shows `GPU` instead. |
+
+**Verification:** `get_insight` was exercised against a duck-typed stub via `ast`
+extraction (no app import, no rebuild) across 6 cases — titles agreeing, wrong lyrics
+loaded, nothing loaded, busy deciding, Tk renderer with real fps, and `idx` past the
+end of the body. All pass and the payload stays JSON-serialisable.
+
+### TICKET-197 — The console's API model invented field names 🟢
+
+The Overview's now-playing card showed **"Idle / No SMTC session detected"** while a
+track was playing — with `POSITION 57s` and `DURATION 3m 32s` rendered correctly
+directly beneath it. Data was arriving; the title was being read from a field that does
+not exist.
+
+`api.ts` casts the response straight to the model type:
+
+```ts
+return (await resp.json()) as T;     // a cast is not a check
+```
+
+Every field in `StatusPayload` is optional, so a wrong name reads `undefined`, renders
+as a dash or a fallback string, and nothing throws. `tsc` cannot help: it is checking
+the code against a *declaration*, and the declaration was fiction.
+
+| console read | actually sent by `api.py._status` |
+|---|---|
+| `title` / `artist` | `player_title` / `player_artist` |
+| `offset` | `sync_offset` |
+| `now_line` | `current_line` |
+| `source`, `status`, `matched`, `subs_mode`, `live_arrangement`, `mv_mode` | **never sent at all** |
+
+Ten declared fields, all phantom. The now-playing card and the current-line card have
+therefore been dead since they were written, and the sidebar has always said "no track".
+
+**Fixed** by rewriting `StatusPayload` against `api.py` line by line and correcting
+every read site.
+
+**Guard:** `scripts/check_console_contract.py` parses the field names out of
+`models.ts` and diffs them against a **live** response from the running app, for
+`StatusPayload`, `Health` and `NowBlock`. Verified it flags all ten of the old names
+and passes the corrected model. A type declaration is a claim about a remote system;
+it needs a test, not a cast.
+
+### TICKET-198 — Two dev consoles could be open at once 🟢
+
+Two console windows side by side, showing different builds and different numbers, with
+no way to tell which was live. `launch_dev_console` guarded on `self._devconsole_child`
+— a handle to a console *this app instance* spawned. It misses both real cases: the app
+restarted while a console stayed open, and the console started by hand.
+
+Fixed at both ends:
+
+- **App side:** enumerate top-level windows for the console's title and, if one exists,
+  restore and focus it instead of spawning a second (`_focus_dev_console_window`).
+  Catches consoles this process never started.
+- **Console side:** `tauri-plugin-single-instance`. A second launch hands its argv to
+  the running instance and exits; the primary un-minimises and focuses. Registered
+  first, so no setup work happens in a process that is about to exit.
+
+### TICKET-199 — A valid cache was distrusted, then the re-fetch found nothing 🔴
+
+**Report:** "poor lyric matching with this song… I would just see a little bit of lyric
+cross the left side but not during the bulk of the song" — on a Lyric Video whose lyrics
+are burned into the frame.
+
+From the log, two independent faults:
+
+**1. The channel name is used as the artist for a language check.**
+
+```
+19:12:12 title-match 'Lemonade' -> lemonade.json (score 112)
+19:12:12 cache lemonade.json is English but artist is kana-Japanese
+         ('(Love Live! series)ラ') → distrust, re-fetch
+19:12:47 no lyrics after the grace window (lookup came up empty) → OCR / generating by ear
+```
+
+The "artist" is the **YouTube channel name**, not the performer. The heuristic is
+reasonable in isolation — an English body under a Japanese artist is often the wrong
+song — but it fired on a 112-score title match and, when the re-fetch came back empty,
+left the overlay with **nothing**. Distrusting a cache is only safe if the replacement
+arrives; the fallback should be to keep the distrusted body rather than show none.
+
+**2. The track flapped between two videos every ~15s.**
+
+```
+19:13:51 track change: '東方ストリングスアレンジ…' / 'SONICA_TOKYO'
+19:13:53 track change: 'Lemonade' / '(Love Live! series)…'
+19:14:06 track change: '東方ストリングスアレンジ…' / 'SONICA_TOKYO'
+19:14:08 track change: 'Lemonade' / '(Love Live! series)…'
+```
+
+A second media session (a Touhou BGM video) kept winning the picker, and every flap
+restarts identification — which is exactly "a bit of lyric, then nothing, for the bulk
+of the song". Whisper generation was started twice and never got to finish.
+
+Not fixed here. Two candidate fixes, independent: (a) when a distrust-and-re-fetch comes
+back empty, restore the distrusted cache; (b) hysteresis in the session picker so a
+background session cannot steal the track seconds after losing it.
+
+### TICKET-196 — Building PyInstaller directly skipped the ABI guard 🟢
+
+Self-inflicted, while building the fix above. `build.bat` prompts interactively, which
+hangs a non-interactive shell, so I invoked PyInstaller directly:
+
+```
+python -m PyInstaller --noconfirm DesktopKaraoke.spec     # exit 0. Broken bundle.
+```
+
+On this machine the bare `python` on PATH is a **3.11** agent venv, while `.deps` is
+**cp312**. That combination builds green and produces an app whose
+`import numpy._core._multiarray_umath` fails at runtime — whisper silently dead. It is
+precisely the failure TICKET-175/177 were written to prevent, and both of their guards
+were bypassed: `scripts/check_build_deps.py` runs only from `build.bat`, and the
+post-build `--selftest` likewise. Going around the front door went around the alarms.
+
+**Fix:** move the backstop into `DesktopKaraoke.spec`. The spec is the one file *every*
+build route must load, so it cannot be bypassed by choosing a different entry point. It
+compares the `cpXY` tag on the vendored `.pyd`s against the running interpreter and
+exits with the correct command line if they disagree.
+
+Verified both ways: the 3.11 interpreter is refused, 3.12 proceeds.
+
+**Lesson:** a guard attached to the *convenient* path is not a guard. It has to sit on
+the path that everything shares.
+
+### TICKET-195 — The OCR setlist gate is inert when there is no setlist 🔴
+
+Found *using* the console above, which is the point of it. From a live `/insight`:
+
+```
+pool_kind : "library"     pool_size : 373
+matched   : {"title": "posts", "score": 0.856}    accept_at : 0.85
+```
+
+The banner reader accepted the bare word **"posts"** against the whole 373-title
+library. The surrounding reads ("with Docling and Granite", "Retraining a foundation
+model or f", "Needs input YouTube video download") are page text from an unrelated
+window, not a song banner.
+
+TICKET-189 added the setlist gate for exactly this failure, but the gate is
+`bool(setlist) and tune[...]` — **with no setlist parsed it evaluates false and the
+code falls back to matching against the entire library**, which is the ungated
+behaviour the ticket set out to remove. It closes the hole for chaptered concerts and
+leaves it fully open for chapterless ones.
+
+This is the third instance of the class: `breaking dimensions` (leftover search-box
+text, hijacked a concert for ten minutes), `WALLET PORTFOLIO TRACKER` (a sidebar ad,
+fetched as a song), now `posts`.
+
+Not fixed here — it is a change to song *identification*, not to the console, and it
+wants its own verification pass. Candidate fixes: require a minimum token count and
+reject single dictionary words; raise `accept_at` when the pool is the whole library;
+require the 2nd-read confirmation unconditionally in the ungated case.
+
+---
+
+## v1.1.86 — 2026-07-18 (TICKET-190/191/192 — dev-console insight, aggressive sync, concert TPVR)
+
+### TICKET-191 — Sync made aggressive, because the reason for the caution is gone 🟢
+
+Earlier tonight (TICKET-181) corrections were *damped* — a 1.0s scroll deadband, a
+slower tier — because a correction re-derived the karaoke fill mid-line and the
+highlight visibly jumped. LP-010 then decoupled the sweep from the sync clock
+entirely: it runs on its own monotonic ramp and a correction **cannot** jolt it, while
+the belt eases via `ease_slew_cap_s_scroll`. The smoothness is no longer paid for in
+accuracy, so the damping was pure cost.
+
+| knob | was | now | why |
+|---|---|---|---|
+| `sync_tier_ok_drift` | 1.2 | **0.6** | it declared "in sync" while up to 1.2s off — more than double the 0.5s goal |
+| `sync_apply_min_s_scroll` | 1.0 | **0.25** | the deadband existed only to protect the fill, which is now insulated |
+| `sync_tier_fast_s` / mid / slow | 20/40/60 | **12/25/40** | cadence bounds how fast drift can even be *noticed* |
+| `tpvr_gap_s` / live | 2.5 / 4.0 | **1.5 / 2.5** | this delay *is* the lock latency |
+| `live_single_shot_max_s` | **0.0** | 1.2 | live corrections could *never* commit on one read |
+| `auto_align_cooldown` | 14 | 8 | must stay under the fast tier or it throttles it |
+| `live_energy_apply_min` | 0.25 | 0.15 | live arrangements drift continuously |
+
+### TICKET-192 — Concerts decide faster — and the first attempt was dead code 🟢
+
+**The mistake, recorded because it is instructive.** The obvious change was a
+concert-specific TPVR at the sync-tier path (`concert_tpvr_gap_s`,
+`concert_single_shot_max_s`). Adversarial review caught that **neither can ever be
+read in a concert**: `_tier_listen_now` returns early on `_live_mode`, so the entire
+tier path is disabled during concert playback. The change compiled, looked correct,
+and would have shipped as a **silent no-op** — the exact failure class as whisper
+being broken and invisible for four releases.
+
+**Where concerts actually sync:** the Shazam consume path, where a live correction
+requires two reads agreeing within `agree_live`. That is the real two-point rule.
+
+**Fix:** `concert_first_read_max_s` (1.8) — in a concert only, a *small* correction
+commits on the **first** read instead of waiting for a second. Rationale: waiting
+costs a whole Shazam cycle, and a concert can change song before it lands, so the
+correction never applies at all. A chorus-repeat mismatch — the thing the pairing
+exists to catch — shows up as a **large** offset and still requires two reads. Live
+*arrangements* keep the strict pairing; they have the whole track to confirm against.
+
+The two tier-path knobs are kept (a live arrangement with a duration mismatch can
+still reach that path) but are commented as such so nobody tunes them expecting a
+concert effect.
+
+### TICKET-190 — Song-finder + decision introspection (`/insight`) 🟢
+
+Every answer needed to debug tonight's bugs existed only inside function scope and was
+written to a rate-limited log line. New `GET /insight` exposes: every line the banner
+OCR read plus **why each was dropped** (`window-chrome` / `not-on-setlist` /
+`awaiting-2nd-read`), the pool it matched against and its size, the setlist with
+per-song cached state, SMTC/Shazam/lock state, the live decide-by-ear gate arithmetic
+(best vs loaded, *effective* MIN incl. the title-lock bump, cross-artist block,
+`loaded_worthless`), the live/concert sync profile, and the AutoResearch reality check.
+
+Dev console gains **Song finder** and **Decisions** views (decide-by-ear, concert
+identification and live-sync ladders, lit path for what ran, dimmed for never-reached).
+Thresholds are rendered **from the payload**, never duplicated in the frontend — a
+diagram that drifts from the code is worse than no diagram.
+
+**AutoResearch:** see [AUTORESEARCH.md](AUTORESEARCH.md). Summary: the loop has never
+run, and a naive optimiser could not produce trustworthy results — no knob→outcome
+attribution exists, and the objective for `tpvr_gap_s` is discarded by log rotation.
+Every candidate objective was rejected as perverse. The console now reports that
+rather than describing the loop as operational.
+
+---
+
+## v1.1.85 — 2026-07-18 (TICKET-189 — concert OCR read the BROWSER, not the video)
+
+### TICKET-189 — Concert showed a song from the search box 🟢
+
+**Symptom.** A 3D live concert (【3DLIVE】Rise In Motion, 61 min) showed **no concert
+lyrics at all**, and the app reported the song as **"Breaking Dimensions"** — a track
+from an earlier session.
+
+**It was not stale state.** "Breaking Dimensions" was the text still sitting in the
+**YouTube search field**, and the banner OCR read it off the page:
+
+```
+09:33:24  concert OCR read uncached 'WALLET PORTFOLIO TRACKER' — awaiting a 2nd consistent read
+09:33:28  concert OCR read uncached 'WALLET PORTFOLIO TRACKER' → fetching (cover-style)
+09:33:44  title-match 'wallet portfolio tracker' -> wallet_portfolio_tracker.json (score 100)
+09:33:52  concert OCR read 'breaking dimensions' (0.87) → breaking_dimensions.json
+```
+
+`WALLET PORTFOLIO TRACKER` is a **sidebar ad**. The banner reader captures the whole
+media WINDOW, so it sees the search box, ads and page copy alongside the video.
+
+**And the app already had the right answer:**
+
+```
+09:23:04  setlist: 8 description candidate songs — Dunk | ちゃちゃもにゃ | BANZAI |
+          Countach | BANDAGE | 夜咄ディセイブ | 踊り子 | きゅうくらりん
+09:25:53  concert-candidates prefetch: cached +4 (skipped 3 already-indexed, 1 failed) of 8/8
+```
+
+Four setlist songs were prefetched to disk (`dunk.json`, `夜咄ディセイブ.json`,
+`踊り子.json`, `きゅうくらりん.json`) while the overlay showed a song scraped from the
+search field.
+
+**Root cause.** `_concert_ocr_check` matched OCR text against **the entire library**
+(357 entries). Two existing guards were in place and neither could help:
+
+* `_text_matches_window_title` catches window **chrome** — but a search box and an ad
+  are page **content**, not a window title.
+* the two-consecutive-reads rule (TICKET-171) is defeated by *persistent* screen text;
+  a search box that just sits there re-reads identically every pass.
+
+Against a 357-entry library, arbitrary page text will eventually clear 0.85 against
+*something*.
+
+**Fix.** When the video's setlist is known, that IS the candidate pool: match only
+against its songs, and reject an uncached read that matches none of them. In a
+concert, the song being performed is one of the setlist's songs; everything else on
+screen is furniture. Falls back to the old whole-library behaviour when no setlist was
+parsed, so nothing new is blocked on videos without one. Knob: `ocr_setlist_gate` (1).
+
+**Verified** against the exact strings from this log: 'breaking dimensions' is no
+longer in the gated pool (it was reachable before); the ad and the page copy are both
+rejected as uncached; all 8 real setlist songs are still accepted, including with
+trailing noise ("BANZAI!!"); with no setlist the pool and behaviour are unchanged.
+
+**Related, still open:** `#5` — with a setlist parsed, the app should also *trust* it
+for song boundaries rather than waiting on OCR/Shazam corroboration.
+
+---
+
+## v1.1.84 — 2026-07-18 (TICKET-188 — "where's the lyrics?" — the rescue was blocked 3 ways)
+
+### TICKET-188 — Correct 32-line body on disk, app showed a 4-line stub 🟢
+
+**Symptom.** A lyric video (`不可思議のカルテ` / Fukashigi no Carte, 236 s) showed no
+usable lyrics. The app *had* identified the song — `title-lock: … → LOCKING` — and
+then effectively dropped it.
+
+**State at the time:** `line_count = 4`, `current_line = None`, every sync read
+logging `line#-1@-1.0`.
+
+**Three bodies for this song were already on disk:**
+
+| file | lines | source | span |
+|---|---|---|---|
+| `fukashigi_no_karte.json` | **32** | syncedlyrics/musixmatch | 0.3 → 239.3 s ✅ |
+| `fukashigi_no_carte_ver_lyrics.json` | 10 | generated (by-ear) | 66 → 154 s |
+| `fukashigi_no_carte_live_2024.json` | 5 | generated (by-ear) | 45 → 68 s |
+
+**Root cause — a chain, each link individually reasonable:**
+
+1. **The title lookup missed.** SMTC reported the title in kana (`不可思議のカルテ`);
+   the library file is romaji (`fukashigi_no_karte.json`, meta title
+   "Fukashigi no KARTE"). `no confident title-match … (best 0)`.
+2. So the app fetched/generated a **4-line by-ear stub** — and then **TITLE-LOCKED
+   onto it**, because the *title* really was right. The lock protects the body.
+3. `decide-by-ear` then did its job and found the truth:
+   `heard '…' → best fukashigi_no_karte.json (67) vs loaded (0)`.
+4. **And every guard blocked the rescue:**
+   - short-transcript gate (TICKET-081): `only 15 chars heard — inconclusive, no action`
+   - title-lock bump: `MIN` 60 → **75**; 67 fails
+   - lopsided override: needs `3 × MARGIN` = **84**; 67 fails
+   - cross-artist block: the real body credits the seiyuu cast, SMTC said the
+     uploader "Shiina" → outright BLOCK off a title-locked song
+
+Each guard was written for a real regression (Suisei 綺麗事, kamone, 名前のない怪物).
+They share one unstated assumption: **that the loaded body is worth protecting.**
+Against a 4-line stub scoring 0 they combine into a trap that cannot be escaped.
+
+**Fix — name the assumption and check it.**
+
+* `loaded_worthless` = body under `ear_thin_body_lines` (8) **and** transcript scores
+  it under `ear_thin_body_score` (8). When true, the title-lock bump and the
+  cross-artist block are both lifted — you cannot protect a right song you do not have.
+* The short-transcript gate now distinguishes *deceptive tie* from *decisive*: a short
+  read may act when best ≥ 55, loaded ≤ 8 and the margin ≥ 45. TICKET-081's actual
+  failure was a near-tie at low score, which stays inconclusive.
+
+**Verified** (gate arithmetic replayed): the real case now SWITCHes at MIN=60/MARGIN=12;
+a title-locked *healthy* body still resists a mediocre match (MIN=75); the kamone
+cross-artist block still holds on a healthy body; a short near-tie is still
+inconclusive; and a short-but-decisive read against a *healthy* body still does not
+switch.
+
+**Follow-up (the primary miss, not yet fixed):** step 1. Title matching should connect
+a kana title to a romaji-named library entry. The app already romanizes for its `rm`
+row, so `不可思議のカルテ` → `fukashigi no karute` fuzzy-matches `fukashigi_no_karte`.
+Fixing that removes the whole chain and the ~30 s of thrash before the rescue, instead
+of relying on the by-ear safety net. Tracked separately.
+
+**Also seen in this log:** the by-ear generator keeps writing near-duplicate stubs for
+songs that already have a real body (`fukashigi_no_carte_ver_lyrics`,
+`fukashigi_no_carte_live_2024`), which pollutes the library and gives later title
+lookups more wrong things to match. Worth a dedupe pass.
+
+---
+
+## v1.1.82 — 2026-07-18 (TICKET-186 — "NO SUBTITLES"; LP-010 — highlights skipped)
+
+### TICKET-186 — Overlay showed nothing: following a dead session from another app 🟢
+
+**Symptom.** Subtitles mode on, a YouTube video playing in Brave with captions
+visible in the player, and the app displayed **nothing at all**.
+
+**Everything downstream looked healthy**, which is what made this confusing —
+`/overlay` was serving a well-formed payload, `lyric-overlay.exe` was running and
+polling it, and the renderer handles stationary mode correctly (`renderLine`). The
+problem was one level up: the app was following the **wrong media session**.
+
+```
+/status  player_title: 東方ストリングスアレンジ… (a 3h09m BGM video)
+         position: 2207.12   playing: FALSE   line_count: 0
+```
+
+**Enumerating SMTC directly settled it:**
+
+```
+2 sessions.  Windows' current session = 'Brave'
+
+  com.squirrel.AnthropicClaude.claude   PAUSED   Touhou BGM   2207.1/11370.0   <-- followed
+  Brave                                 PLAYING  (the user's video)
+```
+
+**Claude Desktop** was publishing a media session for a video paused an hour
+earlier, and the app was locked onto it.
+
+**Root cause.** `MediaWatcher._pick` step 3: when *nothing* is playing it keeps the
+session it was already following, so the overlay holds the current song through a
+gap between tracks. That is right for its intended case, but it had **no way to
+expire a session** — an unrelated app publishing a long-paused session holds the
+lock forever. The app then reports `playing=false` with 0 lines and the overlay
+correctly draws nothing.
+
+The signal to break the tie was available the whole time and unused:
+`GlobalSystemMediaTransportControlsSessionManager.get_current_session()` — the
+session Windows considers current, i.e. the app the user last interacted with. It
+said **Brave** while we sat on Claude Desktop.
+
+**Fix.** Each enumerated session now carries `is_current`. When nothing is playing:
+
+* our session **is** current → keep it (this is the gap-between-tracks case, intact);
+* nothing is current → keep it (Windows has no opinion, old behaviour);
+* otherwise → **hand over to the session Windows calls current**.
+
+Priority is unchanged otherwise: pin > audible-pref > playing > current > sticky.
+
+**Verified** (unit test over the real `_pick`): stale paused session loses to the
+current app; a gap between tracks still keeps our session; a PLAYING session still
+beats a paused current one; with no `is_current` anywhere the old sticky behaviour
+is preserved; a pin still overrides everything.
+
+**Note for future debugging:** `window: []` in `/overlay` is *not* a bug in
+stationary mode — the window array is only built for belt modes (`lr/rl/tb/bt`);
+line modes render from the `line` field. Cost me a detour.
+
+---
+
+## v1.1.81 — 2026-07-17 (TICKET-184 — the app CRASHED twice in one evening: whisper/CUDA)
+
+### TICKET-184 — Hard crash in ctranslate2 (CUDA/cuDNN) took the whole app down 🟢
+
+**Symptom.** Mid-concert the app vanished. No traceback in `karaoke.log` — the log
+just stops. Happened twice in one evening, on v1.1.79 **and** v1.1.80.
+
+**Windows Event Log (both crashes, identical shape):**
+
+```
+Faulting module: KERNELBASE.dll  code 0xe06d7363   (MSVC C++ throw)
+Faulting module: ucrtbase.dll    code 0xc0000409   (abort / __fastfail), ~8s later
+```
+
+**Crash-dump analysis** (stdlib minidump parse — exception stream + module list +
+stack walk of the faulting thread):
+
+```
+THROWING MODULE : ctranslate2.dll
+crashing thread : a WORKER thread, not main
+stack           : ctranslate2 -> cudnn64_9.dll -> ctranslate2 -> nvcuda64.dll
+```
+
+A C++ exception thrown on a **native worker thread** never crosses back into
+Python, so `std::terminate` → `abort()`. **No `try/except` anywhere in the app can
+catch this.** That is the whole reason for the fix below.
+
+**Root cause — two defects that compound:**
+
+1. **`gpu_setup.pick_inference_device` picked a GPU by utilization % and never
+   looked at free VRAM.** The only NVML call was `nvmlDeviceGetUtilizationRates`.
+   Measured live during the investigation: `cuda:0` (RTX 2080 Super, 8 GB) sat at
+   **0% utilization with 485 MiB free** while `cuda:1` had 5.7 GB free. The old
+   logic ranks by utilization, so it chose the *starved* card — it looked idlest.
+2. **`align._models` was append-only.** Keyed `(size, device, index)` with no
+   eviction, so a session that touched `base`, `small` and `medium` across both
+   cards kept every one resident in VRAM for the life of the process.
+
+**The tell we missed, already in the log.** Before *each* crash there is a run of
+GPU loads silently falling back:
+
+```
+19:39:41 whisper model 'small' on cpu (idle GPU 1 (16% vs cuda:0 41%))
+19:40:23 whisper model 'small' on cpu (idle GPU 1 (24% vs cuda:0 38%))
+19:41:48 whisper model 'small' on cpu (idle GPU 1 (14% vs cuda:0 32%))
+19:42:15 *** CRASH ***
+```
+
+The *reason* says GPU, the *device* says cpu — i.e. `WhisperModel()` threw and hit
+the CPU fallback, which swallowed the exception without logging it. Allocation was
+already failing minutes before the fatal one.
+
+**Fix (three layers).**
+
+1. **VRAM is now a hard filter.** `_gpu_stats()` reads `nvmlDeviceGetMemoryInfo`;
+   `pick_inference_device(..., need_mib=)` refuses any GPU without real headroom
+   for that model (`align._MODEL_VRAM_MIB`, workspace included), falling to the
+   other card then CPU. Verified against the live starved-card state: every model
+   size now routes to `cuda:1` even though `cuda:0` reports lower utilization.
+2. **Whisper runs in a CHILD PROCESS** (`whisper_worker.py`). This is the only real
+   defence against an uncatchable native abort: the child dies, the parent logs it,
+   flags the GPU unsafe for the session (`KARAOKE_WHISPER_FORCE_CPU`), respawns on
+   CPU and carries on. Loopback socket + token (a windowed PyInstaller app has no
+   usable stdout — the recognize child learned that the hard way). The model stays
+   warm between requests. Knob: `whisper_child` (1).
+3. **One CUDA model at a time.** `_evict_cuda_locked` frees other resident CUDA
+   models before a new load, and `_model_for()` refcounts borrows so a model is
+   never freed mid-transcribe (destroying a ctranslate2 model in use is itself a
+   crash). Lazy `segments` generators are now drained *inside* the borrow.
+
+**Also fixed along the way:** `CUDA_DEVICE_ORDER` is pinned to `PCI_BUS_ID` at
+import. Without it CUDA enumerates FASTEST_FIRST while NVML uses bus order, so
+`cuda:N` can be a *different card* than NVML index N — every utilization and VRAM
+reading would be attributed to the wrong GPU. It happened to be set machine-wide on
+the dev box, which is why the bug never showed there.
+
+**Verified:** dump analysis identifies the exact throwing module; the VRAM guard
+re-routes correctly against the real starved-card state; the child survives a
+simulated `0xC0000409` abort and blacklists the GPU, while a clean `rc=1` kill does
+not; the parent transparently recovers and respawns.
+
+### TICKET-185 — Concert: correct lyrics fetched but never shown 🟢
+
+Same session, same root cause. The Offkai Gen4 concert parsed its setlist and
+**fetched the right body** (`deep real: saved 45 lines -> kton_boogie.json`), but
+never displayed it. A bogus first Shazam read needed corroboration before a first
+load in concert mode, and whisper's GPU work was producing frame times up to
+**2637 ms** — so the smoothness governor cancelled identification over and over
+(**4 cancelled, 4 recognize children killed, 17 skipped/delayed** in 3 minutes),
+the bogus read was never displaced, and then the process died.
+
+Fixed by TICKET-184: whisper's GIL/GPU load moves out of process, so the governor
+stops firing and identification can actually complete. This is the same lesson as
+TICKET-135 (identify-by-sound moved to a child to fix "highlight sticks then
+jumps") — whisper was the last in-process offender.
+
+---
+
+## v1.1.80 — 2026-07-17 (TICKET-183 — "lots of songs never sync"; land within 0.5s of the sung lyric)
+
+- **TICKET-183 — browser VTuber MVs never reliably synced; make caption timing the master → ≤0.5s** 🟡 implemented on master, pending rebuild/deploy. User: "this song never synced… we MUST fix syncing. IT must land within 0.5 second." RCA (5-agent workflow + live log, flagged songs CHIMERA/High Tide/Say My Name): browser hololive ORIGINAL MVs have **no video-locked timing anchor** and every fallback fails on this material. (1) The one reliable anchor — the video's OWN YouTube caption timestamps (YouTube force-aligns cue starts to the audio, ~0.3-0.5s) — was switched OFF on the song path (`deep_transcribe.py writeautomaticsub=False`; the auto-caption retry gated to subtitles-mode + English-only). (2) The energy correlator (`_run_energy_correlation`) structurally can't lock: produced MVs keep tonal synths/pads in the 200-3000 Hz "vocal" band, so the on/off mask has no contrast → flat agreement surface (`best 0.653 vs rival 0.653, margin 0.000`) → both gates fire → **"no change" forever** or rails to the ±15s window edge (the logged -10/-11/-15s). (3) An ungated one-shot vocal-onset handler misread a late onset as a huge intro → the catastrophic **-172s / -134s** offsets that then snap back to 0 and oscillate. FIX (per the user's chosen scope P0+P1+P2): **P0** `deep_transcribe.fetch_caption_timing(url, lang)` — fetch the video's OWN-language AUTO-caption cues as a TIMING GRID (native lang only; an `en` auto-track for a JP song is a re-timed machine translation, NOT force-aligned; exact URL/id only). **P1** `align.retime_to_captions()` — order-preserving text-match the nice provider/generated body onto that cue grid, each line adopting its cue start (interior gaps interpolate, ends shift by the edge delta, monotonic clamp); returns None below 30% matched-anchor coverage so a wrong/absent grid leaves the body untouched. Wired in `load()`: a browser provider/generated body schedules a background retime (once/track, exact `_now_url`), `_apply_caption_retime` rewrites the line times + zeroes the offset + sets `_caption_timed` so `_maybe_auto_align` skips the correlator (as it already does for `youtube-captions`). **Copyright:** the caption ASR text is consumed as a timestamp grid ONLY — matched, then discarded; never displayed, persisted, or indexed; the clean provider text stays. **P2** `_on_vocal_onset` guards: a top `_intro_anchored` gate (one anchor/track), a plausibility gate (reject onsets past `onset_max_intro_s`=90 after the 1st line / past half the video / past the LRC end), and tightened the -300/-120 caps to -90 — killing the -172s catastrophe. Precedence now: manual caption > provider body re-timed to the native auto-caption grid > Shazam catalog > (disambiguated) energy > decide-by-ear > guarded onset. Verified: `retime_to_captions` unit test 8/8 (exact ≤0.5s on a 12s-drifted body incl. interpolated gaps; safe None on an unrelated grid / low coverage); onset guards + retime adversarially checked against legit cases (already-synced bodies, Grimes-Genesis long intro, decision-engine interactions). Reaches ≤0.5s on any browser MV that has captions (nearly all); fails safe to today's behavior when captions are absent (where P3 correlator hardening — deferred — would help).
+
+---
+
+## v1.1.80 — 2026-07-17 (TICKET-182 — wrong song rode the whole track; "Wrong lyrics" button felt dead)
+
+- **TICKET-182 — a late-loaded wrong body is never word-checked + the "⚑ Wrong lyrics" button deferred up to 3s** 🟡 implemented on master, pending rebuild/deploy. Live repro: Mori Calliope "Non-Fiction" (hololive EN Myth) showed a wrong Japanese song's lyrics the whole track. RCA (live `karaoke.log`): `no confident title-match for 'Non-Fiction' → sound → generate-by-ear`; deep generation then returned a WRONG same-title Japanese `syncedlyrics/cover` (30 ja lines) that **loaded ~104 s in**. The single track-start `decide-by-ear` had fired at `decide_at_s` (+12 s) and **bailed on `not self.lines`** (nothing loaded yet), and it is scheduled ONCE per track — so the late-loaded wrong body was **never word-checked** and rode the whole song. Meanwhile the decision engine's `source_agree` only flickers BAD when Shazam actively hears a conflicting song (VTuber originals give null reads → OK), and `ear_corrob` abstains for a title-locked-word-unverified body (the kamone probe guard) — so both identity dims were blind. **The decision tree** (for the record): `_decision_engine_tick` (2 s) scores 4 dims — `source_agree` (SMTC-vs-Shazam title), `sync_stable` (drift/timing only), `lyric_quality` (mojibake/*** only), `ear_corrob` (last by-ear word score) — sums strikes (BAD=2/DEGRADED=1), escalates ≥3 CAUTION / ≥5 SWITCH / ≥8 REGEN, but SWITCH/REGEN are heavily suppressed (drift-only, bundled/corroborated/caption immunity, 30 s cooldown). `decide-by-ear` is the only WORD-level check. FIX (per the user, the safest lever — make decide-by-ear RUN more, don't touch its scoring): (1) `load()` now schedules a fresh `decide-by-ear(reason="late-load")` when a re-checkable, not-word-verified body loads AFTER the track-start probe window (`_played >= decide_at_s`, guarded on `not _deciding / not live / not subs`, `decide_probe_late_load`/`decide_probe_load_delay_s` knobs) — so a late wrong body is caught and reject+reseeks via decide-by-ear's existing (guarded) switch/blacklist/refetch chain. (2) `report_wrong` (the "⚑ Wrong lyrics" tray item) now **drops the visible lyrics immediately** (`wrong_immediate_clear`, was a ≤3 s deferred swap) and escalates to the video's own caption track + OCR alongside Shazam, so "look for the next most likely" uses every signal. Adversarially verified (5-agent workflow) that the late-load probe cannot NEWLY tear down the documented correct-body cases (feelingradation / Suisei 綺麗事 / kamone cross-artist block / Tori no Uta / a slow-correct LRC) — it only extends WHEN decide-by-ear runs, not HOW. Compiles clean.
+
+---
+
+## v1.1.80 — 2026-07-17 (TICKET-181 — fine-syncing lurched the scroll belt ("stuck / jumping"))
+
+- **TICKET-181 — small ongoing sync corrections lurch the scroll-through belt; "relax the fine syncing"** 🟡 implemented on master, pending rebuild/deploy. User (scroll-through / "rl" belt, hololive Advent "Rebellion"): the highlight keeps getting **stuck and jumping**; wants to "let it go and not use highlights with fine syncing." RCA (docs/PERFORMANCE.md + LYRIC_PERFORMANCE.md + code): the render itself is healthy (measured earlier this session: `render 60fps, worst 20ms, jitter 0.6`), so this is **not** low fps — it's the **sync clock lurching**. In a scroll-THROUGH belt the whole belt position rides `pos + offset`, so EVERY small offset correction visibly shifts all lines at once. Two sources: (1) the TICKET-085 **fine-tune** ±0.2s precision pass (`fine-tune-rewind` = re-scrolls shown text → "stuck"; `fine-tune-catchup` = "jumping"), and (2) the regular tier's **micro-nudges** (e.g. logged `sync-micro-nudge → -0.70s`) + energy-align / live-follow — all route through `_smooth_offset`, all ≥ the 0.22s line-mode floor, all lurch the belt. FIX (main.py, both scoped to scroll-through belts only; line mode unchanged): (a) `_smooth_offset` uses a wider deadband `sync_apply_min_s_scroll` (default **1.0s**) for AUTO corrections in lr/rl/tb/bt, so sub-second corrections are held (a <1s timing error is imperceptible on a continuously moving belt, but a <1s offset STEP is very visible); manual nudges/resets and big seeks still apply. (b) `_maybe_enter_fine_tune` no longer enters in scroll-through (`fine_tune_in_scroll` default 0) — its nudges wouldn't apply anyway and each 8s fine-tune Whisper listen briefly stalls the render (GIL, cf. PERF-007). Plus a `fine_tune_enabled` master switch. (c) `_eased_offset` uses a **gentler ease in scroll mode** (`ease_slew_cap_s_scroll` 1.0 / `ease_pull_per_sec_scroll` 1.5 vs the 3.0/3.5 line-mode default) so the rare ≥1s re-anchor that DOES pass the deadband glides smoothly instead of whooshing the belt at ~4× realtime; line mode keeps the snappy ease. All are live `/tune` knobs. Drift stays bounded (~1s) because the tier still re-anchors once |drift| exceeds the deadband. **Measured** (offline `belt_sim.py`, realistic 60s correction schedule): the deadband cuts visible-lurch frames (>1.5× belt velocity) **132→44** and the gentle ease drops obvious-lurch frames (>2×) **31→12** with per-frame velocity variance **0.233→0.137 (~40% smoother)**. **Render is NOT the bottleneck** (separate `render_bench.py`): the glyph-atlas warm re-render is ~5ms and the sliver fill ~1ms at font_scale 1.5 — easily 60fps; the only cost is the one-time ~39ms first-appearance per unique line (already cached after). Notably the documented-but-unbuilt LP-005 lever #2 (flat render + alpha-composite outline) was benchmarked and **regresses** at font_scale 1.5 (42ms vs 39ms) — do NOT build it; see docs/LYRIC_PERFORMANCE.md LP-008. Immediate relief on a running v1.1.79 (no rebuild): `POST /tune sync_apply_min_s=1.0` + `fine_tune_enter_after_s=999999`.
+
+---
+
+## v1.1.80 — 2026-07-17 (TICKET-180 — English song showed Japanese caption lyrics for the whole song)
+
+- **TICKET-180 — "Use YouTube captions" showed a Japanese AUTO-TRANSLATION as the lyrics for an all-English song (hololive Advent "Genesis")** 🟡 implemented on master, pending rebuild/deploy. RCA (live, via `karaoke.log` + yt-dlp + web): the Genesis MV (`h1A76PvsqD4`) is sung entirely in English, `info.language='en'`, has NO manual caption track — only YouTube auto-captions (en ASR + 156 auto-translations). The app pulled the **ja** auto-translation (49 lines) and displayed Japanese for the whole song, `source='youtube-captions'`, never rejected. Three stacked defects were found (workflow RCA): **(A)** the MUSIC-mode caption picker ignored the video's own language; **(B)** a bare-title fuzzy match seeded `lang='ja'` by accepting Ado's "New Genesis" for "Genesis" (score 69); **(C)** caption bodies are auto-trusted for identity so the wrong-language body was never word-verified. Per the user, **only Defect A** is fixed here (the single change that stops the on-screen symptom); B and C are deferred. FIX (`deep_transcribe.py` `_captions_from_dir`): (1) un-gate the video's own language (`orig_lang` from `info.language`) so it leads track ranking in BOTH subtitles and music mode (was gated to subtitles only); (2) in MUSIC mode, decline a CJK track when the video's original language is confidently non-CJK (a `ja`/`zh`/`ko` render of an `en`/Latin original is a translation, not the lyrics) → returns None so the app falls back to provider LRC / by-ear (the real English). Fail-safe: when `info.language` is unknown/placeholder the old CJK-first behavior stands, so genuinely Japanese songs are unaffected; subtitles submode is untouched (a translated subtitle is often what's wanted there). Verified: 10/10 unit cases on `_captions_from_dir` (Genesis en+ja→None; genuine ja/zh kept; en-native kept; en+ja both present→en; unknown/placeholder→ja; subtitles ja kept; ko-of-en→None). NB: on a machine with a stale `new_genesis.json` cache, fully-correct lyrics also needs Defect B (else the fallback can land on the provisional wrong title-match); A alone guarantees the wrong-language caption track is never shown.
+
+---
+
 ## v1.1.79 — 2026-07-17 (TICKET-179 — captions showed literal HTML entities `&gt;&gt;`)
 
 - **TICKET-179 — subtitle overlay showed `&gt;&gt;` / `&amp;` / `&#39;` (raw HTML entities)** 🟢 v1.1.79. Once TICKET-178 made captions display on the Hanford talk video, the text read "**&gt;&gt;** All right, so I know **&gt;&gt;** what this image…". YouTube auto-caption VTT cues carry HTML entities (`&gt;&gt;` = the `>>` speaker-change marker, `&amp;`, `&#39;`, `&quot;`) and `_parse_vtt` stripped `<tags>` but never `html.unescape`d, so they rendered literally. Same gap in `movie_subs._parse_srt` (OpenSubtitles SRT). FIX: both parsers now `html.unescape()` after the tag strip, then drop the decoded `>>`/`>>>` speaker-change markers (caption convention, not spoken words — noise on a lyric-style overlay). `import html` added to deep_transcribe.py; `import html as _html` to movie_subs.py. Language-safe (only touches `&…;` sequences; JP/other text untouched). Verified: the cache body `…worse than Chernobyl or any &gt;&gt; Wrong. Today we're going…` now decodes to `…worse than Chernobyl or any Wrong. Today we're going…`.
@@ -23,6 +912,35 @@ lyrics** at the same playback position — not just `/status`.
 ## v1.1.77 — build hardening (TICKET-177 — CI guards so a broken AI stack can't ship silently)
 
 - **TICKET-177 — permanent guards against the TICKET-176 whisper-breakage class** 🟢. The av/`.deps` skew (see TICKET-176) that killed faster-whisper in v1.1.74→76 was invisible: the app just showed "needs faster-whisper" hints, nothing in the log, and `.deps` is gitignored so any build machine can reintroduce it. TWO layered guards, both wired into build.bat and verified end-to-end: **(1) pre-build** `scripts/check_build_deps.py` (step 1b) — compares `.deps` vs build-env versions of the native stack (av / ctranslate2 / faster-whisper / tokenizers). A plain version difference is a **WARNING** (dist-info metadata can lag the real module files after a partial copy, so a hard error there could block a good build); **DUPLICATE dist-info dirs** (a `pip install --upgrade --target` leaves the old one next to the new → the bundle becomes a coin-flip) are a **hard error** (exit 1, fails the build). **(2) post-build** `main.py --selftest --out FILE` (step 2b) — runs BEFORE any GUI init in the FROZEN exe, imports av + faster-whisper, checks `align.available()`, writes a one-line verdict, and `os._exit(0/1)`; build.bat runs it via `Start-Process -Wait -PassThru` (no window) and **fails the build** if the finished exe's AI stack is broken. This post-build gate is the definitive one — it exercises the real bundled module, catching ANY breakage regardless of cause. Also **rebuilt this machine's `.deps` clean** (nuked + `pip install --target .deps` pinned to env: av 18.0.0 / ct2 4.8.1 / fw 1.2.1 / tok 0.22.2) so module AND metadata agree (the earlier TICKET-176 robocopy fixed the module but left stale dist-info). Verified: pre-build check passes clean (exit 0), warns on skew, errors on dupes; frozen `--selftest` returns "av + faster-whisper import and align.available() is True" (exit 0) on the real bundle. docs/BUILD.md documents the invariant. v1.1.77 was already released (binary works); guards protect FUTURE builds — no re-release.
+
+---
+
+- **TICKET-176/177 follow-up — the guards that check the thing that actually breaks** 🟢
+  v1.1.89. The two guards above are both *proxies*: `check_build_deps.py` compares
+  **version strings**, and `--selftest` proves failure only by exit code. But this
+  failure is about **DLL file identity** — PyAV's `av/_core.pyd` imports
+  delvewheel-mangled FFmpeg DLLs (`avformat-62-<hash>.dll`) whose names embed a
+  per-build hash, so two PyAV builds of the *same version* can still disagree, and
+  dist-info metadata can lag the real module files. Three additions close that gap:
+  **(1) `scripts/check_av_dlls.py`** parses the PE import table of every `av/*.pyd`
+  and asserts each FFmpeg DLL it imports is present in `av.libs` — stdlib `struct`
+  only, no `pefile`, so it cannot be silently skipped on a machine that lacks a
+  dependency. Wired into build.bat **twice**: pre-build (step 1c, against the `.deps`
+  that will be bundled) and post-build (step 2b, against the **shipped bundle**, which
+  catches a PyInstaller collection that mixed sources even when the environment was
+  clean). It runs without launching the exe, so it names the missing DLL instead of the
+  selftest's bare exit code. Verified against the live `.deps`: *48 .pyd, 7 FFmpeg DLL
+  imports, 7 present, 0 missing*. **(2) `requirements-deps.txt`** pins the exact
+  known-good native set so `.deps` is reproducible and cannot drift back into a skew.
+  **(3) A mixed-ABI check** in `check_build_deps.py`: the spec's TICKET-196 guard passes
+  when the build tag is merely *present*, so a `.deps` vendored twice under two Pythons
+  (holding **both** cp311 and cp312 — a live risk on a box with a 3.11 agent venv on
+  PATH and a 3.12 build Python) sails straight through it, and the duplicate-dist-info
+  check is blind because a dist-info name carries no ABI tag. This is the only guard
+  that catches a mixed vendor tree. Plus **`/diag.whisper`** — the runtime counterpart,
+  reporting `align.available()` and, when false, `align._last_error`: the build guards
+  prove the bundle was assembled correctly, this proves the stack actually imports on
+  the machine that has it.
 
 ---
 

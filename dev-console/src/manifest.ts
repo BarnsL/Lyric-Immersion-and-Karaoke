@@ -14,6 +14,12 @@ export const DIAGRAM_NODES: DiagramNode[] = [
   { id: "recog",    label: "recognize.py",       sub: "Shazam fingerprint",         col: 2, row: 0, kind: "analyzer" },
   { id: "sc",       label: "songchange.py",      sub: "boundary + vocal onset",     col: 2, row: 1, kind: "analyzer" },
   { id: "align",    label: "align + deep_transcribe", sub: "energy / Whisper sync", col: 2, row: 2, kind: "analyzer" },
+  // TICKET-200: this step was missing from the map, and it is the one that decides
+  // WHAT STRING the providers get asked for. It silently reduced an
+  // "Artist / Song【MV】" title to just the artist and fetched a real body for the
+  // wrong song. A map that goes straight from the player to the providers hides the
+  // single most consequential transformation in the whole identification path.
+  { id: "clean",    label: "clean_title()",      sub: "credits → search title",     col: 2, row: 3, kind: "analyzer" },
 
   { id: "overlay",  label: "main.py Overlay",    sub: "state + settings + clock",   col: 3, row: 0, kind: "decision" },
   { id: "decision", label: "confidence.py",      sub: "TRUST · CAUTION · SWITCH",   col: 3, row: 1, kind: "decision" },
@@ -40,6 +46,8 @@ export const DIAGRAM_EDGES: DiagramEdge[] = [
   { from: "discord",  to: "overlay" },
 
   { from: "smtc",     to: "overlay" },
+  { from: "smtc",     to: "clean" },
+  { from: "clean",    to: "prov" },
   { from: "audio",    to: "recog" },
   { from: "audio",    to: "sc" },
   { from: "audio",    to: "align" },
@@ -175,3 +183,17 @@ export const RESOURCES: Resource[] = [
   { kind: "external", title: "yt-dlp",                location: "captions + audio fetch",            href: "https://github.com/yt-dlp/yt-dlp", detail: "Fetches manual caption tracks + optional audio for whisper generation." },
   { kind: "external", title: "LRCLIB",                location: "provider — synced lyrics",          href: "https://lrclib.net/", detail: "Primary duration-exact provider, then scored fallback." },
 ];
+
+// Docs the console links to. Absolute paths so the Tauri opener hands them to the
+// OS regardless of the console's own working directory (it runs from _internal/
+// in a frozen install, and from src-tauri/target/release/ in development).
+// FORWARD slashes, deliberately. Windows accepts them everywhere, and a
+// double-quoted JS string treats `\D` / `\d` as unknown escapes and silently
+// DROPS the backslash: "D:\Desktop-Karaoke\docs\DEV_CONSOLE.md" evaluates to
+// "D:Desktop-KaraokedocsDEV_CONSOLE.md", so the "How to use this console" button
+// opened nothing at all. No error, no warning — the path was simply wrong.
+export const DOCS = {
+  devConsole: "D:/Desktop-Karaoke/docs/DEV_CONSOLE.md",
+  autoResearch: "D:/Desktop-Karaoke/docs/AUTORESEARCH.md",
+  issues: "D:/Desktop-Karaoke/docs/ISSUES.md",
+};

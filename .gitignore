@@ -84,6 +84,11 @@ lyrics/*.json.tmp
 /Assets/
 priconfig.xml
 
+# TICKET-204: the "Wrong song" title-correction diagnostics the app appends at
+# runtime. Titles and artist names only (never lyric text), but it is still the
+# user's own runtime data — it stays on their machine and never ships.
+title_corrections.jsonl
+
 # Local 3h-watch + release packaging artifacts
 _monitor.py
 _monitor*.jsonl

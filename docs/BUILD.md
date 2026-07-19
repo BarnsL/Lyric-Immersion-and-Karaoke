@@ -100,9 +100,16 @@ first (kept off the C: drive):
 
 ```bat
 set PIP_CACHE_DIR=<pip-cache>
-pip install --target .deps faster-whisper
-pyinstaller --noconfirm DesktopKaraoke.spec    :: now auto-detects .deps and bundles it (~650 MB .exe)
+py -3.12 -m pip install --target .deps -r requirements-deps.txt
+py -3.12 -m PyInstaller --noconfirm DesktopKaraoke.spec  :: auto-detects .deps (~650 MB .exe)
 ```
+
+**Vendor from `requirements-deps.txt`, not from a bare `pip install faster-whisper`.**
+That file pins the exact known-good native set (PyAV, ctranslate2, tokenizers,
+onnxruntime, huggingface-hub). These packages ship compiled extensions whose DLL
+filenames embed a per-build hash, so an unpinned install silently drifts and
+reintroduces the skew described below. To bump the pin: upgrade in the build env,
+run a clean build, and update the file once `--selftest` passes.
 
 The spec sets `WHISPER = os.path.isdir(".deps")`: **no `.deps` → lean ~150 MB build**
 (the feature shows a "needs faster-whisper" hint); **`.deps` present → self-contained
@@ -119,11 +126,47 @@ to the app's data folder on first use (copy `models\` next to the `.exe` to pre-
 > (generate-by-ear, sync-by-listening, and the wrong-lyrics reject path). This shipped
 > broken in v1.1.74–v1.1.76.
 >
-> **Two guards make this impossible now — both run inside `build.bat`:**
+> **Three guards make this impossible now:**
+> - **In the spec** (`DesktopKaraoke.spec`, TICKET-196) — the only one that cannot be
+>   bypassed. It compares the `cpXY` tag on the vendored `.pyd`s against the running
+>   interpreter and refuses to build on a mismatch. This matters because **the bare
+>   `python` on the Windows build box is a 3.11 agent venv while `.deps` is cp312**:
+>   invoking PyInstaller directly (to dodge `build.bat`'s interactive prompt) built a
+>   silently whisper-dead app that exited 0.
+>
+>   `build.bat` now resolves `py -3.12` itself, so the documented command works. If
+>   you invoke PyInstaller by hand, name the interpreter explicitly:
+>   `py -3.12 -m PyInstaller --noconfirm DesktopKaraoke.spec`
+>
+>   Scope: this checks the **ABI tag only**. It cannot see a version *skew* between
+>   `.deps` and the env (PyAV 17 vs 18) — that is the pre-build check's job, below —
+>   and it is blind to extensions that carry no `cpXY` tag at all. It fails open when
+>   `.deps` has no tagged modules.
+>
+> The others run inside `build.bat`, so they only fire on that path:
 > - **Pre-build** (`python scripts/check_build_deps.py`): fails the build if `.deps` and
->   the env disagree on any native-stack version, or if `.deps` has duplicate dist-info
->   dirs (a `pip install --upgrade --target` leaves the old one behind — rebuild `.deps`
->   from scratch: `rmdir /s /q .deps && pip install --target .deps faster-whisper`).
+>   the env disagree on any native-stack version, if `.deps` has duplicate dist-info
+>   dirs (a `pip install --upgrade --target` leaves the old one behind), or if `.deps`
+>   holds extensions built for a **foreign CPython ABI**. Rebuild `.deps` from scratch
+>   rather than upgrading into it:
+>   `rmdir /s /q .deps && py -3.12 -m pip install --target .deps -r requirements-deps.txt`
+>
+>   The ABI arm is deliberately stricter than the spec's: the spec passes when the build
+>   tag is merely *present*, so a `.deps` vendored twice under two Pythons (holding
+>   **both** cp311 and cp312) sails through it. Nothing else catches a mixed vendor tree
+>   — a dist-info directory name carries no ABI tag, so the duplicate check is blind to it.
+> - **Pre- and post-build** (`python scripts/check_av_dlls.py` / `--internal dist\DesktopKaraoke`):
+>   the **direct** detector, and the one that actually names the fault. A version check is
+>   only a proxy — dist-info metadata can lag the real module files, and this failure is
+>   about **DLL file identity**, not version strings. PyAV's `av/_core.pyd` is linked
+>   against delvewheel-mangled FFmpeg DLLs (`avformat-62-<hash>.dll`) whose names embed a
+>   per-build hash, so a `_core.pyd` from one PyAV build needs *different files* than
+>   another build's `av.libs`. This parses the PE import table and asserts every FFmpeg
+>   DLL the `.pyd` imports is present. Stdlib-only (`struct`, no `pefile`), so it cannot
+>   be silently skipped on a machine that happens to lack a dependency. The post-build arm
+>   checks the **shipped bundle**, catching a PyInstaller collection that mixed sources
+>   even when the environment was clean — and it does so without launching the exe, so it
+>   reports the missing DLL by name instead of the `--selftest`'s bare exit code.
 > - **Post-build** (`<exe> --selftest --out FILE`): the finished `.exe` imports the whole
 >   stack before any GUI shows and exits non-zero if it can't — so a whisper-broken bundle
 >   never gets packaged. Run it yourself any time to check a build:

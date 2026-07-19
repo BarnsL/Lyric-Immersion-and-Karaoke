@@ -144,17 +144,20 @@ export function Overview({ health, status, diag, online }: Props) {
         <div className="hero">
           <div>
             <div className="eyebrow"><Music size={11} /> now playing</div>
-            <h2>{status?.title ? `${status.title}` : "Idle"}</h2>
+            <h2>{status?.player_title || "Idle"}</h2>
             <p>
-              {status?.artist ? `${status.artist}` : "No SMTC session detected."}
-              {status?.source ? ` · ${status.source}` : ""}
-              {status?.subs_mode === "on" && " · subtitles ON"}
-              {status?.live_arrangement && " · live arrangement"}
-              {status?.live_mode && !status?.live_arrangement && " · live"}
-              {status?.mv_mode && " · MV mode"}
+              {status?.player_artist || "No SMTC session detected."}
+              {/* The loaded body is a different thing from the playing track, and
+                  the gap between them is the whole ballgame — call it out here
+                  rather than making the reader open another view. */}
+              {status?.matched_title && status.matched_title !== status.player_title
+                && <> · lyrics: <strong>{status.matched_title}</strong></>}
+              {status?.lang ? ` · ${status.lang}` : ""}
+              {status?.live_mode && " · live"}
+              {status?.playing === false && " · paused"}
             </p>
             <div className="grid-metrics" style={{ marginTop: 14 }}>
-              <div className="metric"><strong>{status?.offset != null ? `${status.offset.toFixed(2)}s` : "—"}</strong><span>sync offset</span></div>
+              <div className="metric"><strong>{status?.sync_offset != null ? `${status.sync_offset.toFixed(2)}s` : "—"}</strong><span>sync offset</span></div>
               <div className="metric"><strong>{status?.position != null ? fmtDuration(status.position) : "—"}</strong><span>position</span></div>
               <div className="metric"><strong>{status?.duration != null ? fmtDuration(status.duration) : "—"}</strong><span>duration</span></div>
               <div className="metric"><strong>{fmtDuration(health?.uptime_s)}</strong><span>uptime</span></div>
@@ -169,11 +172,11 @@ export function Overview({ health, status, diag, online }: Props) {
               <h2>What's on screen</h2>
             </div>
           </div>
-          {status?.now_line?.jp || status?.now_line?.rm || status?.now_line?.en ? (
+          {status?.current_line?.jp || status?.current_line?.rm || status?.current_line?.en ? (
             <div style={{ display: "grid", gap: 8 }}>
-              {status?.now_line?.jp && <div style={{ color: "#f3f2ff", fontSize: 20, letterSpacing: "-.02em" }}>{status.now_line.jp}</div>}
-              {status?.now_line?.rm && <div style={{ color: "#c4c2e9", fontSize: 14 }}>{status.now_line.rm}</div>}
-              {status?.now_line?.en && <div style={{ color: "#9095a8", fontSize: 13, fontStyle: "italic" }}>{status.now_line.en}</div>}
+              {status.current_line.jp && <div style={{ color: "#f3f2ff", fontSize: 20, letterSpacing: "-.02em" }}>{status.current_line.jp}</div>}
+              {status.current_line.rm && <div style={{ color: "#c4c2e9", fontSize: 14 }}>{status.current_line.rm}</div>}
+              {status.current_line.en && <div style={{ color: "#9095a8", fontSize: 13, fontStyle: "italic" }}>{status.current_line.en}</div>}
             </div>
           ) : (
             <div className="empty">No line highlighted.<small>Toggle Show/Hide from the tray if the overlay is hidden.</small></div>

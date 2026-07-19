@@ -113,7 +113,109 @@ song". Verified the lyrics themselves were correct (overlay romaji matched the
 video's own captions). Likely eased once LP-002 restores headroom.
 **Needs-measurement:** hold on ONE song and confirm sync; re-check after LP-002.
 
+## LP-008 — Render bench: the render is NOT the bottleneck; the "stutter" is the sync clock 🟢
+**Trigger:** user reported the highlight "getting stuck and jumping" on the scroll belt and asked
+for a full render perf test + optimize (TICKET-181). **Method:** a standalone PIL micro-benchmark
+(`scripts/render_bench.py`) faithfully replicating the hot primitives — glyph atlas
+(`_atlas_tile`), line compose (`_paint_one_layer`), sliver fill (`_advance_fill`) — on a worst-case
+4-row dense JP block (kanji+furigana+romaji+english, 119 glyphs), at font_scale 1.0 and 1.5.
+**Measured (font_scale 1.5, 828×270 block):**
+| path | ms | note |
+|---|---|---|
+| warm re-render (cached atlas tiles) | **5.6** | steady-state per-line cost — trivially 60fps |
+| sliver fill step (per frame) | **1.4** | the karaoke fill is basically free |
+| first-appearance (cold, per-glyph stroke) | **38.9** | one-time per UNIQUE line, then cached |
+| flat + alpha-composite outline (LP-005 lever #2) | **41.6** | **SLOWER — regresses at 1.5×** |
+
+**Conclusions:**
+1. The render pipeline is already optimal for steady playback — warm 5 ms + fill 1 ms leaves huge
+   headroom. The only cost is the **one-time ~39 ms first-appearance** of each unique line.
+2. **Do NOT build the flat-outline optimization** (LP-005 lever #2 / LP-004 note): at the user's
+   font_scale 1.5 it composites the full-block alpha at ~13 offsets (each a full W×H paste), which
+   costs MORE than the per-glyph stroke it replaces. It only wins below ~scale 1.2 — not worth the
+   fill-alignment risk. Benchmark settled this.
+3. The user-reported "stuck/jumping" is **not render fps** — it's the **sync clock moving the belt**
+   (esp. on the GPU/Tauri overlay, where the Tk render loop is withdrawn and `/diag.fps` reads 0).
+   Fixed in TICKET-181: a scroll-mode correction **deadband** (`sync_apply_min_s_scroll` 1.0) + a
+   **gentler scroll-mode ease** (`ease_slew_cap_s_scroll`/`ease_pull_per_sec_scroll`) + no fine-tune
+   in scroll. Offline `scripts/belt_sim.py` measured lurch frames (>1.5× belt velocity) 132→44 and
+   velocity variance −40%.
+**Remaining render lever (open):** the one-time first-appearance spike scales with font_scale²
+(LP-004) — 1.0–1.2 roughly halves it. Still a product call (shrinks the user's text).
+
 ---
+
+## LP-009 — "Highlights start not smooth": the first sung frame pays a full render 🟢
+
+**Symptom (user):** the belt scrolls smoothly, then the moment a line *starts being
+highlighted* it hitches.
+
+**Cause.** `_sung_layer` is built lazily at first fill. That was a deliberate fix —
+rendering base+sung together at spawn cost a visible 100-150 ms hitch — but it only
+*moved* the cost onto the first highlighted frame of every line.
+
+It is worse than it looks, because the glyph atlas is keyed by **colour**. The base
+layer warms BASE-coloured tiles; the sung layer needs SUNG-coloured tiles, which are
+a fresh rasterise. So the sung render behaves like a **cold** one (LP-008: 38.9 ms
+at `font_scale` 1.5) rather than a warm compose (5.6 ms). At a 62 fps target the
+frame budget is 16.1 ms — so highlight-start was a ~2.4-frame stall, and worst at
+the start of a song when nothing is cached.
+
+**Fix.** `_prewarm_sung()` builds the *next* line's sung layer using the frame's
+LEFTOVER budget, one block per frame, wired into both the horizontal and vertical
+scroll updates.
+
+Why this is safe where **LP-005's background prewarm was not**: that one rendered on
+a worker thread and its GIL holds stalled the scroll belt (measured 7 fps / 371 ms,
+reverted). This runs on the render thread *inside the existing `_over_budget()`
+time budget*, so it can only ever spend slack a frame already had — a busy frame
+skips it entirely and falls back to the old lazy behaviour.
+
+**Knobs:** `sung_prewarm` (1), `sung_prewarm_lead_s` (2.0).
+
+**The other half of the stutter was not the renderer at all.** Measured at idle the
+render is 61 fps / 16.4 ms / jitter 0.5 ms — essentially perfect. The real frame
+killer was Whisper running **in-process**: frame times up to **2637 ms** during
+transcription (see ISSUES TICKET-184/185). Moving it to a child process is the
+larger of the two wins here, and is the same lesson as TICKET-135, which moved
+identify-by-sound out of process to fix "highlight sticks then jumps".
+
+## LP-010 — Highlights skipped instead of sweeping 🟢
+
+**User rule, hard-coded:** *the highlight sweep is a visual ramp, never a sync
+readout.* Two independent defects both made it step.
+
+**1. The sweep was quantised to CHARACTER cells.** `_advance_fill` compared whole
+character indices and skipped the row unless the boundary crossed a full glyph:
+
+```python
+on = int(old_frac * len(chars) + 0.5)
+nn = int(frac     * len(chars) + 0.5)
+if nn <= on: continue          # this row gained no chars
+```
+
+On a 12-character line over 4 s that is **one move every 333 ms**. Fixed with
+`_row_fill_x`, which interpolates a continuous pixel boundary between adjacent
+character origins; the repaint gate now triggers on ≥1 px of movement instead of a
+character crossing (≈ every frame). `scroll_fill_interval` also went 0.04 → 0, since
+a sliver fill measures ~1.4 ms and the 25 fps per-block cap was itself visible.
+
+**2. The sweep was re-derived from the song clock every frame**, so every sync
+correction moved it mid-line. `_fill_frac` now runs the sweep off a **local
+monotonic clock** at the line's own rate. Sync still decides which line is current
+and when it starts; it no longer touches the sweep inside a line. Corrections are
+absorbed by bending the rate ±25%; only a genuine discontinuity snaps.
+
+**Simulated** (60 fps, 12-char line, 4 s, 600 px):
+
+| scenario | old: px/frame | new: px/frame |
+|---|---|---|
+| steady clock | 2.50 | 2.50 |
+| sync nudge −0.30 s | **−42.5 (jumps BACKWARD)** | 1.87 … 2.50, 0 reversals |
+| sync nudge +0.25 s | **+40.0 jump** | 0 … 3.13, **0 jumps** |
+| real seek +1.6 s | jump | jump (correct — a seek *should* snap) |
+
+**Knobs:** `smooth_fill` (1), `smooth_fill_snap` (0.34).
 
 ## LP-100 — Single composited strip per lane (medium effort) 🔴
 Pre-render each visible line into ONE wide strip and move that single item; karaoke
@@ -150,6 +252,7 @@ can't hold 30 fps.
 | 1.0.56d | + bg prewarm (LP-005) | 7 (warmup) | 371 | REVERTED — GIL stalls scroll during prewarm |
 | 1.0.56e | revert prewarm + stroke cap 3→2 | 22 (warmup) | 144 | smaller first-pass spikes |
 | 1.0.56e | **+ font_scale 1.5→1.1, 3 lanes, warm** | **30** | **104** | **steady 30fps, 0 frames >60ms — GOAL** |
+| 1.1.80  | render_bench (LP-008): warm 5.6ms / fill 1.4ms / cold 38.9ms @1.5× | — | — | render not the bottleneck; flat-outline regresses at 1.5× |
 
 **Outcome:** post-warmup is a clean **30 fps at 3 lanes** (the fast-mode ceiling), zero
 spikes. The brief per-song first-pass (~15 s while each new line renders once) is now

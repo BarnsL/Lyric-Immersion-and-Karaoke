@@ -656,6 +656,18 @@ class MediaWatcher:
                     raw_sessions = list(mgr.get_sessions())
                 except Exception:
                     raw_sessions = []
+                # TICKET-186: which session does WINDOWS consider current? That is the
+                # one the user most recently interacted with, and it is the only signal
+                # that can break a tie when NOTHING is playing. Without it the picker
+                # falls back to blind stickiness and can sit on a stale PAUSED session
+                # from an unrelated app forever (observed: Claude Desktop still
+                # publishing a video paused an hour earlier, while Windows said the
+                # current session was Brave — the overlay showed nothing at all).
+                try:
+                    _cur = mgr.get_current_session()
+                    cur_src = (_cur.source_app_user_model_id or "").lower() if _cur else ""
+                except Exception:
+                    cur_src = ""
                 all_states = []
                 for rs in raw_sessions:
                     try:
@@ -687,6 +699,7 @@ class MediaWatcher:
                             "duration": rs_tl.end_time.total_seconds(),
                             "rate": rs_rate,
                             "source": rs_src,
+                            "is_current": bool(cur_src) and rs_src == cur_src,
                             "ts": time.time(),
                             "_sess": rs,            # for _pick(); stripped from snapshots
                         })
@@ -812,13 +825,41 @@ class MediaWatcher:
         # 3) NOTHING is playing (likely a gap between Mix tracks). Do NOT jump to
         #    a paused tab — keep the session we were following if it still exists,
         #    so the overlay holds the current song through the gap.
+        #
+        #    TICKET-186: …UNLESS what we're holding is stale and Windows says the
+        #    user is somewhere else. Stickiness assumed our session was the user's;
+        #    that breaks when an unrelated app keeps publishing a long-paused
+        #    session (Claude Desktop holding a video paused an hour earlier), because
+        #    nothing here ever expires it — the app follows a dead session, reports
+        #    playing=false with 0 lines, and the overlay renders NOTHING. So when our
+        #    session is not the one Windows considers current, and another session IS,
+        #    hand over to it. Windows' "current" is the last one the user touched.
         if self._pick_src:
+            held = None
             for s in sessions:
                 if sid(s) == self._pick_src:
+                    held = s
+                    break
+            if held is not None:
+                # Keep it when it IS the user's current app (this is the gap-between-
+                # tracks case stickiness exists for — the user is still sitting in that
+                # player), or when Windows offers no opinion at all.
+                if held.get("is_current") or not any(s.get("is_current") for s in sessions):
                     self._last_pick_reason = "sticky-paused"
-                    return s
-        # 4) Final fallback: ANY session (the original get_current_session()
-        #    behavior, but sourced from our cache).
+                    return held
+                for s in sessions:                 # hand over to the user's actual app
+                    if s.get("is_current"):
+                        self._pick_src = sid(s)
+                        self._last_pick_reason = "windows-current (held session went stale)"
+                        return s
+                self._last_pick_reason = "sticky-paused"
+                return held
+        # 4) Final fallback: whatever Windows calls the current session, else ANY.
+        for s in sessions:
+            if s.get("is_current"):
+                self._pick_src = sid(s)
+                self._last_pick_reason = "windows-current"
+                return s
         if sessions:
             self._last_pick_reason = "fallback"
             return sessions[0]
@@ -1521,13 +1562,41 @@ def clean_title(title, source="", artist=""):
     a_low = (artist or "").lower()
     a_norm = re.sub(r"[^0-9a-z぀-ヿ一-鿿]", "", a_low)
     a_tok = {x for x in re.split(r"[^0-9a-z]+", a_low) if len(x) >= 4}
+    # TICKET-200: the same tokens with NO length floor. The >=4 floor exists to
+    # stop a short generic word colliding by substring, but that risk is a
+    # SUBSTRING risk — whole-token equality has no such failure mode, and the
+    # floor was silently excluding exactly the names this app sees most: the
+    # vocal synths (IA, ONE, GUMI, RIN, LEN) are all under four characters.
+    a_all = {x for x in re.split(r"[^0-9a-z]+", a_low) if x}
 
     def _artistish(p):
         pl = p.lower()
         pn = re.sub(r"[^0-9a-z぀-ヿ一-鿿]", "", pl)
         if pn and a_norm and (pn in a_norm or a_norm in pn):
             return True
-        return bool({x for x in re.split(r"[^0-9a-z]+", pl) if len(x) >= 4} & a_tok)
+        if {x for x in re.split(r"[^0-9a-z]+", pl) if len(x) >= 4} & a_tok:
+            return True
+        # TICKET-200: a side naming SEVERAL performers ('IA & ONE', '初音ミク×GUMI')
+        # matches nothing as a whole — 'iaone' is not a substring of the channel
+        # artist 'IA PROJECT', and neither 'ia' nor 'one' clears the 4-char token
+        # floor. Test each NAME on its own instead: 'IA' IS one of the artist's
+        # tokens. Without this the JP MV convention 'Vocalists / 曲名' fell to the
+        # default-to-first tie-break below and searched the PERFORMERS as if they
+        # were the song, which is how a wrong-but-real body got loaded.
+        els = [e.strip() for e in re.split(r"\s*[&＆×✕✖]\s*|\s+and\s+", p, flags=re.I)
+               if e.strip()]
+        if len(els) >= 2:
+            for e in els:
+                # Whole-token equality only (no containment, no length floor):
+                # 'ia' == the artist token 'ia' is proof; 'ia' merely appearing
+                # inside 'rain' is not, and that is the collision the floor was
+                # there to prevent.
+                if {x for x in re.split(r"[^0-9a-z]+", e.lower()) if x} & a_all:
+                    return True
+                en = re.sub(r"[^0-9a-z぀-ヿ一-鿿]", "", e.lower())
+                if en and a_norm and en == a_norm:
+                    return True
+        return False
 
     # "X / Y" (cover / MV uploads): EITHER order occurs — 'Dunk/Todoroki Hajime'
     # (Song/Artist → Dunk) vs 'FLOW GLOW / LOAD' (Group/Song → LOAD). Keep the side
@@ -2616,7 +2685,15 @@ class Overlay:
         self._last_artist = None
         self._clean_title_cache = ""
         self._clean_artist_cache = ""
-        self._is_cover = False       # current title is a 歌ってみた / cover (title-first fetch)
+        self._is_cover = False
+        # TICKET-204: manual title override + title-ID diagnostics. The engine
+        # sometimes reduces a video title to the wrong substring (e.g. stripping
+        # the song name and leaving the artist). The "Wrong song" button in the
+        # dev console lets the user pick the correct title from every string the
+        # engine has seen. This override persists for the current video only.
+        self._title_override = None         # user-supplied correct title (str|None)
+        self._seen_title_strings = []        # every distinct title seen this video
+        self._title_id_log = []              # [{t, raw, clean, search, artist, overridden}]       # current title is a 歌ってみた / cover (title-first fetch)
         self._cover_signal = None    # TICKET-086: 'explicit' / 'amp_collab' / None
         self._cover_lang = None      # cross-language cover: language SUNG (en/es/ko…) or None
         self._title_feat_artists = []  # artist(s) pulled from a title '(feat. X)' credit
@@ -2771,6 +2848,8 @@ class Overlay:
         # body-trusted by construction. Until True, a verified+title-LOCKED song is NOT
         # immune to a by-ear body check (right title, wrong body — the kamone case).
         self._body_corroborated = False
+        self._caption_timed = False     # TICKET-183: did THIS body adopt the caption cue grid's timing?
+        self._retime_seq = None         # TICKET-183: last track_seq a caption-retime ran for
         # v1.1.77 (TICKET-174): WORD-level body proof, distinct from _body_corroborated.
         # _body_corroborated is also granted by an ENERGY timing-lock, which only
         # proves the line grid matches the vocal on/off pattern — NOT that the words
@@ -2851,10 +2930,32 @@ class Overlay:
             "sync_confirm_hold_ms": 2600,   # hesitation before the confirming listen
             "sync_confirm_listen_s": 5.0,   # confirming-listen capture length
             # ── two-point-verify (TPVR) chorus differentiation (v1.1.52) ──
-            "tpvr_gap_s":            2.5,   # studio: seconds between the 1st (held) and 2nd (confirming) tier read
-            "live_tpvr_gap_s":       4.0,   # LIVE/cover: longer gap so a repeated chorus can't be read at the same wrong offset twice and falsely "agree" (幸祜/KOKO chorus-lock)
+            "tpvr_gap_s":            1.5,   # TICKET-191: 2.5 → 1.5. Confirm the held read sooner; the 2nd read is what gates the correction, so this delay IS the lock latency.
+            "live_tpvr_gap_s":       2.5,   # TICKET-191: 4.0 → 2.5. Still longer than studio (a repeated chorus must not be read twice at the same wrong offset) but 4s was most of a phrase.
             "single_shot_max_s":     2.0,   # studio: a drift ≤ this applies on ONE read (low-risk)
-            "live_single_shot_max_s": 0.0,  # LIVE: 0 = NEVER single-shot — every live correction must be two-point verified (chorus repeats make a single read untrustworthy)
+            # TICKET-191: was 0.0 — LIVE corrections were NEVER single-shot, so every
+            # one waited for two agreeing reads. In a concert, where the song changes
+            # under you, that pairing frequently never completes and the track simply
+            # never locks. A SMALL drift is not the chorus-lock risk this guarded
+            # against: mis-locking onto a repeated chorus produces a LARGE offset, and
+            # anything above this value still requires two-point verification.
+            "live_single_shot_max_s": 1.2,  # LIVE arrangement: a small drift may commit on one read; bigger ones still need 2
+            # TICKET-192 — CONCERT-ONLY, looser than a live arrangement on purpose.
+            # A concert changes song every few minutes, so a two-point verification
+            # frequently never completes before the song does. Being briefly wrong is
+            # recoverable (the next tier read corrects it, and the no-anchor strikes
+            # still reject a genuinely wrong body); being slow means no lyrics at all.
+            # NOTE (TICKET-192): these two are read by the sync-TIER path, which
+            # returns early on _live_mode (main.py _tier_listen_now) — so in a real
+            # concert they are never consulted. Kept because a live ARRANGEMENT with
+            # a duration mismatch can still reach that path, but the knob that
+            # actually speeds a CONCERT up is concert_first_read_max_s below.
+            "concert_single_shot_max_s": 1.8,  # concert: commit a bigger drift on ONE read (tier path only)
+            "concert_tpvr_gap_s":        1.2,  # concert: confirm fast (tier path only)
+            # THE one that matters for concerts: on the live/Shazam path, a first read
+            # this small commits immediately instead of waiting for a 2nd agreeing read.
+            # Bigger corrections still pair up (a chorus-repeat mismatch is large).
+            "concert_first_read_max_s":  1.8,  # concert: apply a small correction on read #1
             "applause_min_s":        2.5,   # loud-non-vocal seconds = a concert applause gap
             "live_resync_s":         6.0,   # (legacy) LIVE/concert lyric-match RESYNC cadence (TICKET-106: 12.0 → 6.0)
             # Concert/live ARRANGEMENTS resync on a rolling, aggressive de-escalation:
@@ -2871,7 +2972,7 @@ class Overlay:
             "reset_offset_max":      5.0,   # only reset when |offset| < this
             "drift_align_trigger":   6.0,   # integral → trigger auto-align
             "drift_min_for_accum":   0.8,   # |drift| > this contributes to integral
-            "auto_align_cooldown":  14.0,   # min s between auto-aligns (< fast tier so it doesn't throttle it)
+            "auto_align_cooldown":   8.0,   # TICKET-191: 14 → 8. Must stay under the fast tier (now 12s) or it throttles the very cadence it is meant to keep up with.
             "auto_align_min_pos":   12.0,   # min player pos before auto-align
             "shazam_lock_grace":    30.0,   # auto-align skipped within N s of lock
             # ── TICKET-099: SMTC-paused Shazam takeover ──
@@ -2961,8 +3062,30 @@ class Overlay:
             "perf_record_raw_frame_ms": 1,
             "ease_slew_cap_s":       3.0,   # max seconds-per-second the eased offset can slew
             "ease_pull_per_sec":     3.5,   # exponential pull rate (higher = catches up faster)
+            # TICKET-181: scroll-THROUGH belts read the eased offset as MOTION, so the
+            # snappy line-mode ease above whooshes the whole belt (up to ~4× realtime)
+            # when a >=1s re-anchor glides. Use a GENTLER ease in scroll mode so those
+            # rare re-anchors slide smoothly (offline belt sim: per-frame velocity
+            # variance ~40% lower, obvious-lurch frames ~60% fewer). Line mode keeps
+            # the snappier defaults (a fast highlight snap is wanted there).
+            "ease_slew_cap_s_scroll": 1.0,
+            "ease_pull_per_sec_scroll": 1.5,
             "ease_snap_jump_s":     12.0,   # larger correction = seek/track-change; cut instead of long glide
             "sync_apply_min_s":      0.22,   # ignore tiny Shazam wobble corrections below this
+            # TICKET-181: in a scroll-THROUGH belt (lr/rl/tb/bt) the whole belt rides
+            # `pos + offset`, so EVERY small ongoing sync correction visibly lurches the
+            # scroll ("stuck / jumping"). A sub-second timing error is imperceptible in a
+            # continuously moving belt, but a sub-second offset STEP is very visible — so
+            # hold the belt still for small auto corrections and only re-anchor on a real
+            # drift. Line mode is unaffected (keeps the tight sync_apply_min_s floor).
+            # TICKET-191: was 1.0. That deadband was added (TICKET-181) because a
+            # correction re-derived the karaoke fill mid-line and the highlight
+            # visibly jumped, so withholding corrections bought smoothness. LP-010
+            # removed that coupling entirely — the sweep now runs on its own
+            # monotonic clock and a correction cannot jolt it — and the belt eases
+            # via ease_slew_cap_s_scroll. The smoothness is no longer paid for in
+            # accuracy, so the deadband goes back down to near the line-mode value.
+            "sync_apply_min_s_scroll": 0.25, # scroll-belt correction deadband (0 = same as line mode)
             "sync_live_follow_alpha": 0.35,  # live-follow low-pass: target = old + alpha*(heard-old)
             "sync_immediate_commit_s": 5.0,  # don't wait for line boundary beyond this; still glide visually
             # TICKET-088: per-frame fraction cap so a single heavy frame (e.g. 300ms
@@ -2997,6 +3120,13 @@ class Overlay:
             "decide_wrong_floor":    32.0,  # loaded match below this = the lyrics are the wrong song → search the library
             "decide_listen_s":       12.0,  # seconds of vocals to transcribe for the decision
             "decide_at_s":           12.0,  # run the by-ear decision this many s into a new track (20→12: faster wrong-body detection on ambiguous covers)
+            "wrong_immediate_clear":       1,  # TICKET-182: the "⚑ Wrong lyrics" tray press drops the visible lyrics IMMEDIATELY (0 = keep the old ≤3s deferred swap)
+            "decide_probe_late_load":   1,  # TICKET-182: word-probe a body that LOADS after the track-start decide window (async fetch / generation), so a late wrong body is still caught
+            "decide_probe_load_delay_s": 6.0,  # after such a late load, wait this long (hear the new body's vocals) before the probe
+            "onset_max_intro_s":        90.0,  # TICKET-183: max plausible MV instrumental intro; a vocal onset later than this (or past half the video / the LRC end) is a mid-song mis-trigger, not an intro — ignored (was an implicit -300/-120 cap that admitted -172s)
+            "caption_retime":              1,  # TICKET-183: re-time a provider/generated body onto the video's OWN auto-caption cue grid (video-locked ~0.5s) — the primary browser-MV sync anchor
+            "caption_retime_delay_s":    1.5,  # after a body loads, wait this long before the (background) caption-timing fetch + re-time
+            "caption_retime_skip_off_s": 0.4,  # TICKET-183: if a tighter audio sync (|offset| below this, recent) is already locked, skip the caption re-time so a Shazam-catalog ~0.06s lock isn't loosened to the caption grid's ~0.5s
             # v1.1.64 P0 (docs/CONCERT_RESEARCH.md §4): scope by-ear song ID
             # inside a concert wrapper to _concert_candidates (the description
             # parsed pool from parse_song_candidates) instead of blind whole-
@@ -3055,10 +3185,17 @@ class Overlay:
             # Verify sync ~3×/min while syncing or after a miss; once a check CONFIRMS
             # we're in sync, relax toward 1×/min; ANY miss snaps back to fast and
             # resyncs (two-point verified). Endpoints are the user's 3×/min ↔ 1×/min.
-            "sync_tier_fast_s":     20.0,   # escalated verify cadence (~3×/min)
-            "sync_tier_mid_s":      40.0,   # one hysteresis step (after 1 good check)
-            "sync_tier_slow_s":     60.0,   # relaxed cadence (1×/min) once sync holds
-            "sync_tier_ok_drift":    1.2,   # TICKET batch1: 0.8 → 1.2 — unblocks tier scheduler on periodic JP tracks
+            # TICKET-191: verify faster across the board (20/40/60 → 12/25/40). The
+            # cadence bounds how quickly a drift can even be NOTICED, so the slow
+            # tier was capping worst-case detection at a full minute.
+            "sync_tier_fast_s":     12.0,   # escalated verify cadence (~5×/min)
+            "sync_tier_mid_s":      25.0,   # one hysteresis step (after 1 good check)
+            "sync_tier_slow_s":     40.0,   # relaxed cadence once sync holds
+            # TICKET-191: 1.2 → 0.6. This is the bar for declaring "in sync", and at
+            # 1.2 the app called a track synced while it sat up to 1.2s off — more
+            # than double the 0.5s target. Anything above 0.6 now counts as drift and
+            # gets corrected instead of being accepted.
+            "sync_tier_ok_drift":    0.6,   # confirmed-in-sync bar (was 1.2 — looser than the 0.5s goal)
             "sync_tier_listen_s":    4.0,   # TICKET batch1: 6.0 → 4.0 — faster retry cadence
             # ── FORCE SYNC (manual nuclear resync) ──
             "force_sync_streak":       3,   # confirming reads in a row before a candidate locks
@@ -3068,7 +3205,7 @@ class Overlay:
                                             # (so it can't lock inside ONE repeating chorus pass)
             "force_sync_top_n":        6,   # candidate offsets ranked per read (try best→next on failure)
             "energy_apply_min":      0.4,   # min |new-old| to apply correlation
-            "live_energy_apply_min": 0.25,  # v1.1.50: FINER auto-sync for live/cover arrangements (apply smaller corrections; studio keeps 0.4 to avoid micro-jitter)
+            "live_energy_apply_min": 0.15,  # TICKET-191: 0.25 → 0.15. Live arrangements drift continuously; a correction under 0.25s was being discarded as noise while the user watched the lyrics sit a quarter-second off.
             "energy_lift_floor":     0.045, # min peak-vs-median lift to accept (was 0.10; kamone's correct shift had lift≈0.049 and was being rejected, so the cache loaded right but sync never locked). Rival-peak margin + Shazam sanity + energy_apply_min still guard false alarms.
             "live_energy_lift_floor":  0.025, # v1.1.49: relaxed peak-lift bar for LIVE/concert arrangements — re-sung-over-crowd audio is noisy, so a CORRECT constant offset (V.W.P 共鳴 LIVE MV sat 2-3s off all song) read as a weak peak and never locked
             "live_energy_peak_margin": 0.035, # v1.1.49: relaxed rival-peak margin for live (small-shift penalty + Shazam ±4s check still guard chorus-repetition false jumps)
@@ -3085,10 +3222,24 @@ class Overlay:
             # gate LINE-mode work (line mode's per-char measure_text + per-font
             # canvas ascent measurement is unbudgeted — see TICKET-104/105).
             "scroll_heavy_budget_ms": 14.0, # scroll-mode only: max ms of spawn+repaint work per heavy frame (40% more PIL slice with +1 core)
-            "scroll_repaint_budget":   3.0, # scroll-mode only: max karaoke-fill SLIVER pastes per heavy frame (cheap now)
-            "scroll_fill_interval":   0.04, # scroll-mode only: min seconds between a block's fill repaints (25 fps cap; was 0.06=16 fps)
+            "scroll_repaint_budget":   4.0, # scroll-mode only: max karaoke-fill SLIVER pastes per heavy frame (cheap now)
+            # The sweep must GLIDE, so stop rate-capping it. A sliver fill measures
+            # ~1.4 ms; the real limiters are the pixel gate (only repaint once the
+            # boundary actually moved a pixel) and scroll_heavy_budget_ms. The old
+            # 0.04 hard-capped every block at 25 fps, which reads as stepping.
+            "scroll_fill_interval":    0.0, # scroll-mode only: min seconds between a block's fill repaints (0 = every frame)
+            # HARD RULE: the highlight sweep is a visual ramp, never a sync readout.
+            # 1 = drive the fill from a local monotonic clock so sync corrections can
+            # never jerk it mid-line (see _fill_frac). 0 = old sync-coupled behaviour.
+            "smooth_fill":               1,
+            "smooth_fill_snap":       0.34, # frac error that counts as a real seek and snaps
             "scroll_spawn_budget":     1.0, # scroll-mode only: max block PIL-renders per heavy frame (alloc spikes still dangerous, keep low)
-            "scroll_fill_skip":        2.0, # scroll-mode only: heavy work runs every Nth frame (fills are sliver-cheap)
+            # LP-009: pre-build the next line's SUNG layer with a frame's leftover
+            # budget, so the first highlighted frame doesn't pay for a full glyph
+            # render ("highlights start not smooth"). 0 = back to lazy-at-first-fill.
+            "sung_prewarm":            1,
+            "sung_prewarm_lead_s":     2.0, # how far ahead of a line's start to warm it
+            "scroll_fill_skip":        1.0, # scroll-mode only: heavy work runs every Nth frame (1 = every frame; fills are sliver-cheap and spawns stay capped by scroll_spawn_budget + scroll_heavy_budget_ms)
             "scroll_motion_catchup":   4.0, # scroll-mode only: extra seconds-per-second the belt may catch up after a stall / sync nudge
             "scroll_motion_seek_snap_s": 4.0, # scroll-mode only: large jump = real seek / track change, cut through instead of gliding
             "scroll_motion_back_snap_s": 2.0, # v1.1.49: backward jump > this cuts cleanly (bounds max belt FREEZE at ~this many s)
@@ -3122,6 +3273,8 @@ class Overlay:
             # For lyrics-behind drift it uses the existing _smooth_offset (boundary-
             # deferred) path. Anything outside the [-1.5, +1.5] s envelope exits to
             # the normal tier (which has the two-point verifier for big moves).
+            "fine_tune_enabled":            1,  # TICKET-181: master switch (0 = never run the ±0.2s fine-tune pass)
+            "fine_tune_in_scroll":          0,  # TICKET-181: run fine-tune in scroll-THROUGH belts? default OFF — its sub-second nudges only lurch the belt (held by sync_apply_min_s_scroll) and each 8s Whisper listen briefly stalls the render
             "fine_tune_enter_after_s":   20.0,  # wall-time in good streak before entering
             "fine_tune_target_s":         0.2,  # |drift| at-or-below this = locked
             "fine_tune_min_step_s":       0.2,  # smallest pause; below this is in-target
@@ -3141,6 +3294,26 @@ class Overlay:
             # unaffected (they always get the idlest GPU when not gaming and
             # the non-game-card when gaming).
             "gpu_solo_override":            0,  # 1 = allow GPU on single-GPU machines, 0 = stay on CPU per policy
+            # TICKET-184: Whisper runs in a CHILD PROCESS. CTranslate2 throws C++
+            # exceptions on native worker threads when a CUDA/cuDNN op fails (out of
+            # VRAM), which aborts the process — Python cannot catch it. Isolating it
+            # means the child dies instead of the app, and keeps its GIL load off the
+            # render thread. 0 = back to in-process (diagnostics only).
+            # TICKET-188: a decide-by-ear rescue when the LOADED body is a stub.
+            # Every guard in decide-by-ear assumes the loaded song is probably right;
+            # these define "there is nothing to protect", which lifts them.
+            "ear_thin_body_lines":          8,    # fewer lines than this = a stub
+            "ear_thin_body_score":        8.0,    # …and the transcript scores it this low
+            # A SHORT transcript is only deceptive when the scores are close. These
+            # let a short-but-unambiguous read act (best high, loaded ~0, wide margin).
+            "ear_short_switch_min":      55.0,
+            "ear_short_loaded_max":       8.0,
+            "ear_short_margin":          45.0,
+            "whisper_child":                1,
+            # Extra free VRAM (MiB) a GPU must have BEYOND the model's own footprint
+            # before Whisper will use it. An OOM inside cuDNN kills the child and
+            # drops the session to CPU, so err generous.
+            "whisper_vram_margin_mib":      768,
             "ocr_when_gaming":              0,  # TICKET-125: 1 = allow OCR (capture+WinRT-OCR, GPU-backed) even while a game uses the GPU; 0 = back off so it can't hitch the game
             # ── v1.1.68 anime hardsub-OCR (Subtitles mode only) ──
             # A stream on animepahe / aniwave / hianime / 9anime / gogoanime
@@ -3276,6 +3449,13 @@ class Overlay:
             "ocr_sync_in_live":               1,  # OCR-assisted sync allowed in live/concert mode
             "ocr_sync_min":                0.66,  # OCR↔LRC match bar (studio)
             "ocr_sync_min_live":           0.58,  # looser OCR↔LRC bar for live arrangements
+            # TICKET-201: an OCR correction bigger than this needs a SECOND read, on a
+            # DIFFERENT line, that agrees — mirroring the energy correlator's refusal to
+            # take a big jump uncorroborated. Committing one unverified read is what put
+            # a correctly-synced song 23s into the wrong part of itself.
+            "ocr_sync_single_shot_max":     4.0,
+            "notable_events_enabled":         1,  # narrative event ring (console log panel)
+            "notable_events_size":          120,
             "offset_defer_cap_s":           3.0,
             "overlay_heartbeat_stale_s":    6.0,
             "pos_stale_thresh_s":           1.5,
@@ -3304,6 +3484,11 @@ class Overlay:
             # concert setlist: use the live video's YouTube CHAPTERS as the
             # per-song source of truth (titles + boundaries); OCR/by-ear fall back
             "concert_setlist_on":             1,
+            # TICKET-189: when a concert's setlist is known, the banner OCR matches
+            # ONLY against those songs. The capture includes the whole browser window
+            # (search box, ads, page copy); matching that against the full library let
+            # leftover search text and an ad both load as "songs". 0 = old behaviour.
+            "ocr_setlist_gate":               1,
             "setlist_gen_deadline_s":      45.0,  # chapter w/o lyrics → generate by ear
             # v1.1.57 OFFLINE CONCERT AUDIO ANALYSIS (concert_audio.py) — download
             # the concert once, find each song's true vocal onset + fingerprint it.
@@ -3416,6 +3601,15 @@ class Overlay:
         # decision/force-sync) — never appended per-frame, so it's cheap. Lets a
         # "highlights fucked" report be diagnosed by one curl. See _sync_event().
         self._sync_events = []
+        # ── song-finder introspection (surfaced via /insight, TICKET-190) ──
+        # Latest-value snapshots of what the IDENTIFIER can see and what the
+        # gates decided. These exist because the answers were previously written
+        # to a log line and then discarded: diagnosing "it read my search box as
+        # the song title" or "the rescue was blocked by MIN=75" meant grepping
+        # karaoke.log by hand. Bounded, overwritten in place, never per-frame.
+        self._finder_ocr = None       # last banner-OCR pass: every line it read
+        self._finder_ocr_drops = []   # recent discards + WHY (bounded)
+        self._finder_gates = None     # last decide-by-ear gate arithmetic
         self._drift_sign_hist = []                  # recent sign(drift) reads (monotonic-drift detect)
         self._drift_monotonic_since = 0.0           # wall-time a one-directional drift streak began (0=none)
         self._idx_minus_one_since = 0.0  # wall-time of the first tick idx hit -1 (for instrumental-gap boundary)
@@ -3628,6 +3822,17 @@ class Overlay:
                 self._cur_duration = duration
             log.info("same song re-reported (%r) — keeping sync, no reset", title)
             return
+        # TICKET-194: the song-finder snapshots describe the video they were read
+        # FROM. Carrying them into the next track made the console lie: half an hour
+        # after a concert ended it still showed that concert's banner pass as the
+        # headline of the Song-finder view, complete with its accepted match — for a
+        # normal track that never ran a banner pass at all.
+        #
+        # This sits AFTER the same-song early return on purpose. SMTC re-reports the
+        # current track constantly (a metadata refresh, a position update), and
+        # clearing at the top of this function threw the evidence away on every one
+        # of those — so the panel was empty for the song you were actually watching.
+        self._clear_finder_evidence()
         self.character.set_artist(artist or title)   # spawn this song's artist
         self._cur_duration = duration
         self._health_attempts = 0
@@ -3649,6 +3854,8 @@ class Overlay:
         self._verified_meta = False
         self._verified = False
         self._body_corroborated = False    # new song → BODY not yet corroborated; re-earn per song
+        self._caption_timed = False        # TICKET-183: new song → not caption-retimed yet
+        self._retime_seq = None
         self._body_word_verified = False   # …and word-verification is re-earned per song too
         self._body_probe_retried = False
         self._translate_tries = {}         # fresh song → fresh translation-backfill budget
@@ -3662,6 +3869,32 @@ class Overlay:
         self._source_priority = "agree"
         self._pending_corr = 1e9   # drop any pending large-offset confirmation
         self._pending_offset = None  # drop any deferred sync-offset commit from prev track
+        # TICKET-201: the OCR-sync confirmation state is per-song. A held correction
+        # or a "we committed this" marker carried into the next track would let the
+        # PREVIOUS video's caption confirm a jump in THIS one.
+        self._ocr_sync_pending = None
+        self._ocr_sync_applied = None
+        self._ocr_far_streak = 0
+        # TICKET-202: a body set aside for the PREVIOUS song must never be restored
+        # into this one. The whole value of the restore is that it is the same song's
+        # cache; carried across a track change it would be the wrong song's lyrics.
+        self._distrusted_cache = None
+        # TICKET-204: a manual title correction applies to the video the user was
+        # looking at, not to whatever plays next. Same for the candidate strings —
+        # offering the previous video's title as a "correct" option is exactly the
+        # wrong-song trap this picker exists to get out of.
+        #
+        # EXCEPT when override_title() is the thing driving this re-identification.
+        # It has to clear self.lines to force a real re-fetch, which defeats the
+        # same-song early return above, so the full reset runs and would wipe the
+        # correction the user just made — the override was dead on arrival. The flag
+        # is consumed here so it can only ever survive ONE re-identify.
+        if getattr(self, "_keep_title_override", False):
+            self._keep_title_override = False
+        else:
+            self._title_override = None
+            self._seen_title_strings = []
+            self._title_id_log = []
         # TICKET-111: a real new track invalidates any in-flight swap target
         # (those lyrics are for the OLD song). Cancel; the new track's flow
         # below will run through the normal load/_start_fetch path.
@@ -3783,6 +4016,15 @@ class Overlay:
         log.info("track change: %r / %r (dur %s)%s%s", title, artist, duration,
                  " [live-arrangement]" if self._live_arrangement else "",
                  " [cover]" if getattr(self, "_is_cover", False) else "")
+        # No explicit `title=`: `title` here is the CLEANED name, while every other
+        # call site falls through to the RAW player title. Mixing the two split one
+        # song into two entries in the log and broke per-track grouping, so let the
+        # fallback supply the raw video name everywhere.
+        self._note_event(
+            "song-change", sev="info",
+            detail=f"Now playing: {artist or 'unknown artist'}"
+                   + (" [live arrangement]" if self._live_arrangement else "")
+                   + (" [cover]" if getattr(self, "_is_cover", False) else ""))
 
         # For covers / known live performances, use the original artist for
         # lyric search instead of the uploader/channel — "Coffee - Alka | Lumi"
@@ -4201,6 +4443,66 @@ class Overlay:
         st = self.media.get()
         if st and st.get("status") == PLAYING:
             why = "lookup came up empty" if not self._fetching else "lookup still running"
+            # TICKET-202: a language guard may have REFUSED a cached body that matched
+            # this title at the top score, on the theory that a better one was a fetch
+            # away. When that fetch returns nothing, refusing it a second time leaves
+            # the song with NO lyrics at all — strictly worse than the body we had.
+            # Observed twice in one night on popular songs: 'Lemonade' (cache distrusted
+            # as English-under-a-kana-artist) and 'All for One' (English body under a
+            # "Japanese act"), both left blank for minutes while a perfectly good cache
+            # sat on disk. Distrust has to DEMOTE a body, not delete it.
+            dz = getattr(self, "_distrusted_cache", None)
+            if dz and not self._fetching and not self.lines:
+                path, dreason = dz
+                try:
+                    # Suppress load()'s OWN language guards for this one call.
+                    #
+                    # The original justification here was wrong, and the review
+                    # caught it: only ONE of the two setters is inside load(). When
+                    # `_file_valid` sets `_distrusted_cache` (the kana-artist guard),
+                    # load()'s guards have NOT fired for this track, so re-entering
+                    # load() re-rejects the body — a silent no-op that ALSO kicks a
+                    # duplicate re-identify chain. Worse, the fast-switch lang guard's
+                    # remedy is `Path(path).unlink()`, so the restore had a path that
+                    # DELETED the very cache this ticket exists to preserve.
+                    #
+                    # Restoring is a deliberate override of those guards: we have
+                    # already tried their way, the re-fetch produced nothing, and this
+                    # body is the best available. The flag is consumed by load() so it
+                    # can never leak into an ordinary load.
+                    self._distrusted_cache = None
+                    self._restoring_distrusted = True
+                    if Path(path).exists():
+                        self.load(path)
+                    # load() can still bail on its own guards. Only claim the restore
+                    # — and only skip generation — if a body is genuinely up now.
+                    if self.lines:
+                        # Provisional, not proven: leave the body unverified so the
+                        # normal by-ear/energy corroboration still gets to reject it,
+                        # and so the console shows `title only` rather than implying
+                        # this was confirmed.
+                        self._body_corroborated = False
+                        self._body_word_verified = False
+                        log.info("restored the distrusted cache %s (%s) — the re-fetch "
+                                 "came up empty, and a suspect body beats no body",
+                                 Path(path).name, dreason)
+                        self._note_event(
+                            "cache-restored", sev="good",
+                            detail=f"Put back {Path(path).name} ({dreason}) after the "
+                                   f"re-fetch came up empty — {len(self.lines)} lines. "
+                                   f"Unverified, so it can still be rejected by ear.")
+                        # Every other cache-load site pairs load() with this; without
+                        # it the restored body shows with the romaji and translation
+                        # lanes permanently blank for the rest of the song.
+                        try:
+                            self._maybe_translate()
+                        except Exception:
+                            pass
+                        return
+                except Exception as e:
+                    log.info("could not restore the distrusted cache: %s", e)
+                finally:
+                    self._restoring_distrusted = False
             log.info("no lyrics after the grace window (%s) → OCR / generating by ear", why)
             self._stats_bump("by_ear")
             # TICKET-120: BEFORE generating by ear, try to READ the lyrics burned into
@@ -4293,6 +4595,8 @@ class Overlay:
         self._verified_meta = False
         self._sound_corroborated = False
         self._body_corroborated = False
+        self._caption_timed = False            # TICKET-183: new song → not caption-retimed yet
+        self._retime_seq = None
         self._body_word_verified = False
         self._body_probe_retried = False
         self._verified_gate_t = 0.0
@@ -4476,6 +4780,8 @@ class Overlay:
         self._verified_meta = False
         self._verified = False
         self._body_corroborated = False    # kamone fix: BODY re-earns corroboration per song
+        self._caption_timed = False        # TICKET-183: new song → not caption-retimed yet
+        self._retime_seq = None
         self._body_word_verified = False
         self._body_probe_retried = False
         # TICKET batch4: takeover is an intentional swap to a different song;
@@ -4494,6 +4800,15 @@ class Overlay:
         self._deep_token += 1
         self._generating = False
         self._gen_defers = 0
+        # TICKET-202/204: this path changes the SONG without going through
+        # _on_track_change, so the per-track state that method clears has to be
+        # cleared here too. A body set aside for the SMTC song would otherwise be
+        # restorable into the Shazam-heard one — the cross-song contamination the
+        # restore must never cause — and a title correction made for the old song
+        # would force its search string onto the new one.
+        self._distrusted_cache = None
+        self._title_override = None
+        self._seen_title_strings = []
         # Look up the heard song's cache and load / fetch — same as the
         # wrong-song correction's tail. _prefer_cjk_cache covers the
         # romanized-vs-CJK title case.
@@ -4596,6 +4911,14 @@ class Overlay:
             if lang == "en" and re.search(r"[぀-ゟ゠-ヿ]", self._clean_artist_cache or ""):
                 log.info("cache %s is English but artist is kana-Japanese (%r) → distrust, re-fetch",
                          Path(path).name, (self._clean_artist_cache or "")[:20])
+                # TICKET-202: remember what we refused. If the re-fetch finds nothing,
+                # _maybe_generate restores this rather than leaving the song blank.
+                self._distrusted_cache = (path, "English body under a kana-Japanese artist")
+                self._note_event(
+                    "body-rejected", sev="warn",
+                    detail=f"Set aside the cached {Path(path).name}: it is English but the "
+                           f"artist name is Japanese kana, so it is probably a same-title "
+                           f"collision. Re-fetching.")
                 return False
             return True
         except Exception:
@@ -5420,6 +5743,77 @@ class Overlay:
         finally:
             self._arm_recal(nxt)
 
+    def _note_tpvr_outcome(self, agreed, spread):
+        """TICKET-193: tally the two-point-verify verdict, keyed by the GAP that
+        produced it.
+
+        This is the direct, physically correct objective for the tpvr gap knobs, and
+        it existed only as a log.info line — which karaoke.log then rotated away at
+        256 KB. So the one measurement that could honestly tune the knob was being
+        deleted. Keyed by (profile, gap) it is self-attributing: no config-fingerprint
+        plumbing is needed, because the tally IS indexed by the value in force.
+
+        Read it via /insight.tpvr. A short gap that still agrees is evidence the gap
+        can come down; a short gap that starts disagreeing is evidence it cannot."""
+        try:
+            key = "%s@%.2f" % (getattr(self, "_tier_tpvr_profile", "studio"),
+                               float(getattr(self, "_tier_tpvr_gap", 0.0) or 0.0))
+            tally = getattr(self, "_tpvr_stats", None)
+            if tally is None:
+                tally = self._tpvr_stats = {}
+            e = tally.setdefault(key, {"agree": 0, "disagree": 0, "spread_sum": 0.0})
+            e["agree" if agreed else "disagree"] += 1
+            e["spread_sum"] = round(e["spread_sum"] + float(spread or 0.0), 3)
+            self._sync_event("tpvr", agreed=bool(agreed),
+                             gap=getattr(self, "_tier_tpvr_gap", None),
+                             profile=getattr(self, "_tier_tpvr_profile", None),
+                             spread=round(float(spread or 0.0), 3))
+        except Exception:
+            pass
+
+    def _clear_finder_evidence(self):
+        """Drop the per-video song-finder snapshots on a genuine track change.
+
+        The gate snapshot SURVIVES (it usually explains what is loaded now) but is
+        stamped stale so the console labels it "previous track" instead of implying
+        it is current.
+
+        `_finder_gen` closes a race: `_concert_ocr_check` runs on a background
+        thread and can finish AFTER this clear, writing the previous video's banner
+        read back over the fresh state — resurrecting exactly the stale evidence
+        this exists to remove. That thread captures the generation before it reads
+        and discards its result if the track moved on."""
+        self._finder_gen = getattr(self, "_finder_gen", 0) + 1
+        self._finder_ocr = None
+        self._finder_ocr_drops = []
+        try:
+            if isinstance(self._finder_gates, dict):
+                self._finder_gates["stale"] = True
+        except Exception:
+            pass
+
+    def _note_ocr_drop(self, text, reason):
+        """TICKET-190: remember an OCR string we REFUSED and why. The guards each
+        log once per 10 min to keep the log readable, which is right for a log and
+        useless for a live view — the console needs the current truth, not a
+        rate-limited sample. Bounded, dedup'd on (text, reason). Never raises."""
+        try:
+            if not text:
+                return
+            t = str(text)[:90]
+            drops = self._finder_ocr_drops
+            for d in drops:
+                if d.get("text") == t and d.get("reason") == reason:
+                    d["n"] = int(d.get("n", 1)) + 1
+                    d["t"] = round(time.time(), 2)
+                    return
+            drops.append({"text": t, "reason": reason, "n": 1,
+                          "t": round(time.time(), 2)})
+            if len(drops) > 24:
+                del drops[:len(drops) - 24]
+        except Exception:
+            pass
+
     def _concert_ocr_check(self):
         """(background thread) Read the on-screen song-title banner and, if it
         confidently names a song we have, switch the overlay to that song's lyrics.
@@ -5429,6 +5823,10 @@ class Overlay:
             return                       # v1.1.49 — no OCR song-ID on a social feed
         if self._subs_suppresses_sound():
             return                       # v1.1.56/72 — a show has no song banner; a concert does
+        # Capture the finder generation BEFORE reading. If the track changes while
+        # this thread is in read_banner_lines (OCR is slow — hundreds of ms), the
+        # result describes the previous video and must be dropped, not published.
+        _gen = getattr(self, "_finder_gen", 0)
         try:
             import concert_ocr
             if not concert_ocr.available():
@@ -5438,9 +5836,56 @@ class Overlay:
             # reading VS Code). Falls back to a desktop grab inside read_banner_lines
             # when the hwnd is unknown.
             lines = concert_ocr.read_banner_lines(hwnd=self._source_window_hwnd())
-            cands = [e.get("title") for e in self.index.entries if e.get("title")]
+            # TICKET-189: when this video's SETLIST is known, match ONLY against its
+            # songs. The capture is the whole media WINDOW, so it also contains the
+            # YouTube search box, sidebar ads and page copy — and matching that against
+            # the entire library is what let leftover search-box text ("breaking
+            # dimensions", still sitting in the search field from an earlier search)
+            # score 0.87 against a library file and hijack a concert for ten minutes,
+            # and an ad ("WALLET PORTFOLIO TRACKER") get fetched as a song, creating a
+            # wallet_portfolio_tracker.json. The window-title guard below only catches
+            # window CHROME; it cannot see page CONTENT. The setlist can: in a concert
+            # the song being performed is one of the setlist's songs, full stop.
+            setlist = [c.get("title") for c in
+                       (getattr(self, "_concert_candidates", None) or ())
+                       if c.get("title")]
+            gate = bool(setlist) and bool(int(self._tune.get("ocr_setlist_gate", 1)))
+            cands = (list(setlist) if gate
+                     else [e.get("title") for e in self.index.entries if e.get("title")])
             m = concert_ocr.match_song(lines, cands) if cands else None
             uncached = concert_ocr.plausible_title(lines)
+            # TICKET-190: remember EVERY line this pass read, plus which pool it was
+            # matched against. This is the answer to "what else does it see and could
+            # it use?" — and the thing that made the search-box hijack invisible.
+            if getattr(self, "_finder_gen", 0) != _gen:
+                return                   # track moved on mid-read — this is stale
+            try:
+                self._finder_ocr = {
+                    "t": round(time.time(), 2),
+                    "lines": [str(x)[:90] for x in (lines or [])][:14],
+                    "pool_kind": "setlist" if gate else "library",
+                    "pool_size": len(cands or []),
+                    "matched": ({"title": m[0], "score": round(float(m[1]), 3)}
+                                if m else None),
+                    "accept_at": 0.85,
+                    "plausible": (uncached or None),
+                    "pending_2nd": getattr(self, "_ocr_pending_read", None),
+                }
+            except Exception:
+                pass
+            if gate and uncached and not any(
+                    self._same_song_title(uncached, t) for t in setlist):
+                # Not on the setlist → screen furniture, not a banner. Log each
+                # distinct discard once per 10 min (a persistent ad repeats forever).
+                if (getattr(self, "_ocr_setlist_drop_last", None) != uncached
+                        or time.time() - getattr(self, "_ocr_setlist_drop_t", 0.0) > 600.0):
+                    log.info("concert OCR read %r is not on this video's %d-song "
+                             "setlist — screen text, not a banner; discarded",
+                             uncached[:40], len(setlist))
+                    self._ocr_setlist_drop_last = uncached
+                    self._ocr_setlist_drop_t = time.time()
+                self._note_ocr_drop(uncached, "not-on-setlist")
+                uncached = None
         except Exception:
             return
         cur = self.meta.get("title", "")
@@ -5469,6 +5914,7 @@ class Overlay:
                 log.info("concert OCR read %r matches an open WINDOW title — "
                          "chrome, not a banner; discarded", uncached)
             self._ocr_discard_last, self._ocr_discard_t = uncached, time.time()
+            self._note_ocr_drop(uncached, "window-chrome")
             return
         if (uncached
                 and not self._same_song_title(
@@ -5485,6 +5931,7 @@ class Overlay:
                 self._last_ocr_t = 0.0
                 log.info("concert OCR read uncached %r — awaiting a 2nd "
                          "consistent read", uncached)
+                self._note_ocr_drop(uncached, "awaiting-2nd-read")
                 return
             self._ocr_pending_read = None
             self._ocr_song = uncached
@@ -6697,7 +7144,32 @@ class Overlay:
                                 # jitter, and keep following (pending stays set so each read
                                 # nudges the offset).
                                 AGREE_LIVE = self._tune["agree_live"]
-                                if abs(corr - self._pending_corr) < AGREE_LIVE:
+                                # TICKET-192: CONCERTS decide faster. This is the real
+                                # two-point rule for live/concert playback (the tier-path
+                                # TPVR never runs here — _tier_listen_now returns early on
+                                # _live_mode). Waiting for a 2nd agreeing read costs a whole
+                                # Shazam cycle, and in a concert the song can change before
+                                # it lands, so the correction never applies at all.
+                                # A SMALL correction is the safe case to commit early: a
+                                # chorus-repeat mismatch — the thing the pairing exists to
+                                # catch — shows up as a LARGE offset and still needs two
+                                # reads. Live ARRANGEMENTS keep the strict pairing; they
+                                # have the whole track to confirm against.
+                                _first = (self._pending_corr is None
+                                          or abs(self._pending_corr) >= 1e8)
+                                _concert_fast = (
+                                    getattr(self, "_live_mode", False) and _first
+                                    and abs(diff) <= float(self._tune.get(
+                                        "concert_first_read_max_s", 1.8)))
+                                if _concert_fast:
+                                    log.info("sync(live/concert): applying %+.2fs on the FIRST "
+                                             "read (drift %+.2f within %.1fs) — a concert can "
+                                             "change song before a 2nd read lands",
+                                             corr, diff, float(self._tune.get(
+                                                 "concert_first_read_max_s", 1.8)))
+                                    self._smooth_offset(corr, "sync(live)-concert-first")
+                                    self._pending_corr = corr
+                                elif abs(corr - self._pending_corr) < AGREE_LIVE:
                                     alpha = max(0.05, min(1.0, float(
                                         self._tune.get("sync_live_follow_alpha", 0.35))))
                                     new = round(
@@ -7205,6 +7677,8 @@ class Overlay:
             self._verified_meta = False           # TICKET-099
             self._sound_corroborated = False      # TICKET-099
             self._body_corroborated = False       # kamone fix: BODY re-earns corroboration per song
+            self._caption_timed = False           # TICKET-183: new song → not caption-retimed yet
+            self._retime_seq = None
             self._body_word_verified = False
             self._body_probe_retried = False
             self._verified_gate_t = 0.0           # TICKET batch4: explicit teardown, no gate
@@ -7573,6 +8047,20 @@ class Overlay:
             self._save_generated_only(merged, into_pending=True)
             return
         self.lines = new_lines
+        # TICKET-183: generated body installed in-place (bypasses load()) — clear the
+        # caption-timing flag (a stale True would suppress the correlator on this new
+        # body) and schedule a caption-timing retime: Whisper word-timing is imprecise,
+        # so pinning it to the video's own caption cue grid gets it to ~0.5s.
+        self._caption_timed = False
+        self._retime_seq = None
+        try:
+            if (getattr(self, "_now_url", None) and new_lines
+                    and not self._live_mode and not self._subs_suppresses_sound()
+                    and int(self._tune.get("caption_retime", 1))):
+                self.root.after(int(float(self._tune.get("caption_retime_delay_s", 1.5)) * 1000),
+                                lambda t=self._track_seq: self._retime_from_captions(t))
+        except Exception:
+            pass
         self._relayout_song()
         self._save_generated_only(merged, into_pending=False)
 
@@ -7976,11 +8464,29 @@ class Overlay:
                     _jp_content = False
             except Exception:
                 pass
+            # TICKET-202: a deliberate restore overrides this guard. We already tried
+            # its way — the body was set aside and the re-fetch found nothing — so
+            # re-rejecting it here just returns the song to having no lyrics at all.
+            if _jp_content and getattr(self, "_restoring_distrusted", False):
+                log.info("load: ENGLISH-only guard overridden — restoring the set-aside "
+                         "body because the re-fetch came up empty")
+                _jp_content = False
             if _jp_content:
                 _live = bool(getattr(self, "_live_mode", False))
                 log.info("load: ENGLISH-only body for a Japanese act (src=%s) → %s",
                          _xsrc, "generating by ear" if _live else "re-fetching native")
                 self._enonly_rejected_seq = self._track_seq
+                # TICKET-202: keep the rejected body reachable. hololive English's
+                # "All for One" IS an English song; the act being classified Japanese
+                # made a correct body look wrong, the re-fetch found nothing, and the
+                # song played for three minutes with no lyrics at all before a deep
+                # pass fetched an equivalent body from the SAME provider.
+                self._distrusted_cache = (path, "English body under a Japanese act")
+                self._note_event(
+                    "body-rejected", sev="warn",
+                    detail=f"Set aside an English-only body for a Japanese act "
+                           f"(source {_xsrc}). "
+                           + ("Generating by ear." if _live else "Re-fetching a native one."))
                 self.lines, self.meta, self._lyrics_path = [], {"source": ""}, None
                 self.root.after(50, self._begin_generation if _live else self.report_wrong)
                 return
@@ -8004,7 +8510,13 @@ class Overlay:
                 _ptitle = (self.media.get() or {}).get("title") or ""
             except Exception:
                 _ptitle = ""
+            # TICKET-202: this guard's remedy is to UNLINK the file. During a
+            # deliberate restore that would destroy the last copy of the body we are
+            # trying to put back — an unrecoverable outcome for a guard whose whole
+            # premise ("a better body is one fetch away") has already been disproved
+            # for this track.
             if (self.lines and _xsrc not in ("bundled",)
+                    and not getattr(self, "_restoring_distrusted", False)
                     and self._track_seq != getattr(self, "_lang_rejected_seq", None)
                     and _blang in _BAD_LANGS_FOR_JP
                     and is_jp_vagency(_btitle, _bartist, extras=[_ptitle],
@@ -8049,6 +8561,71 @@ class Overlay:
         # (_note_energy_verdict / _score_ear_corrob) before they get switch/regen immunity.
         self._body_corroborated = bool(_bsrc.startswith("bundled"))
         self._body_word_verified = bool(_bsrc.startswith("bundled"))  # baked = words are authoritative
+        self._caption_timed = False    # TICKET-183: a fresh body isn't caption-retimed yet
+        # TICKET-203: narrate the arrival. `late` is the number the user asked for
+        # when a song plays blank for minutes and then suddenly works — how long the
+        # video had been running before lyrics existed. It is the difference between
+        # "the app is broken" and "the app took 174s to find them", and only the log
+        # could tell them apart before this.
+        try:
+            # `_track_t0` is stamped LATE in _on_track_change — after the cache-hit
+            # branch has already called load(). Measuring against it unconditionally
+            # reported the FASTEST path (an instant cache hit) as the slowest, using
+            # the PREVIOUS track's start time, and the first load of a session as
+            # ~1.79e9 seconds because `_track_t0` still held its 0.0 initial value.
+            # Use the player's own position instead: how far into the video the
+            # lyrics actually appeared is both the honest number and the one the
+            # user cares about. Fall back to silence rather than invent a duration.
+            _t0 = float(getattr(self, "_track_t0", 0.0) or 0.0)
+            _st = self.media.get() or {}
+            _pos = float(_st.get("position") or 0.0)
+            _late = _pos if _pos > 0 else (time.time() - _t0 if _t0 > 0 else 0.0)
+            _slow = _late >= 20
+            self._note_event(
+                "lyrics-loaded", sev="warn" if _slow else "good",
+                detail=(f"Loaded {len(self.lines)} lines from {_bsrc or 'unknown'}"
+                        + (f" — {_late:.0f}s into the video, which is a long blank spell."
+                           if _slow else ".")),
+                source=_bsrc, lines=len(self.lines), late_s=round(_late, 1))
+        except Exception:
+            pass
+        # TICKET-182 (word-level probe): the track-start decide-by-ear fires ONCE at
+        # decide_at_s. A body that loads LATER — an async provider fetch, generate-by-
+        # ear, or a deep-generation result — was then NEVER word-checked, so a wrong
+        # same-title body could ride the whole song. Live-caught: Mori "Non-Fiction"
+        # got a wrong Japanese same-title `syncedlyrics/cover` (30 ja lines) that
+        # landed ~104 s in, long after the +12 s probe bailed on not-yet-loaded lines.
+        # So when a RE-CHECKABLE, not-yet-word-verified body loads AFTER the track-start
+        # probe window, schedule a fresh probe: decide-by-ear transcribes the vocals and
+        # rejects+reseeks a wrong body (all its existing anti-thrash guards apply — this
+        # only makes it RUN on late loads, it does not change its scoring/switch logic).
+        try:
+            _rechk = bool(_bsrc) and not _bsrc.startswith("bundled") and _bsrc != "youtube-captions"
+            _played = time.time() - float(getattr(self, "_track_t0", 0.0) or 0.0)
+            if (_rechk and not self._body_word_verified and self.lines
+                    and not self._deciding and not self._live_mode
+                    and not self._subs_suppresses_sound()
+                    and _played >= float(self._tune.get("decide_at_s", 12.0))
+                    and int(self._tune.get("decide_probe_late_load", 1))):
+                self._body_probe_retried = False        # a fresh body earns its own retry
+                self.root.after(int(float(self._tune.get("decide_probe_load_delay_s", 6.0)) * 1000),
+                                lambda t=self._track_seq: self._decide_by_ear(t, reason="late-load"))
+        except Exception:
+            pass
+        # TICKET-183 (sync): a provider/generated body on a browser video has good WORDS
+        # but drifting TIMES (a studio LRC applied to an MV, or Whisper word-timing). Re-
+        # time it onto the video's OWN auto-caption cue grid (video-locked ~0.5s) in the
+        # background, keeping the clean text. Skips captions/bundled (already video-locked),
+        # live/subs, and anything with no exact _now_url.
+        try:
+            _rt_ok = bool(_bsrc) and not _bsrc.startswith("bundled") and _bsrc != "youtube-captions"
+            if (_rt_ok and self.lines and getattr(self, "_now_url", None)
+                    and not self._live_mode and not self._subs_suppresses_sound()
+                    and int(self._tune.get("caption_retime", 1))):
+                self.root.after(int(float(self._tune.get("caption_retime_delay_s", 1.5)) * 1000),
+                                lambda t=self._track_seq: self._retime_from_captions(t))
+        except Exception:
+            pass
         self._relayout_song()           # size lanes/blocks to this song's rows
         # PERF-102: hold the whole song's bitmaps so a line renders at most ONCE
         # (repeats/choruses are free). NB: background prewarm was tried and reverted
@@ -8063,6 +8640,15 @@ class Overlay:
             self._kara = []
             self._clear_stream()
             self.cv.delete("all")
+            # TICKET-187: the GPU overlay caches DOM blocks per LINE INDEX, so a new
+            # body reusing indices 0..k hits every cached block and keeps rendering
+            # the OLD text (with the old fill ramp) until it scrolls out. Tk is torn
+            # down right above; this is the same teardown for the GPU client — the
+            # 0.6 s blank forces idx=-1 and an empty window, which is what makes it
+            # evict and rebuild. Only when NOT keep_idx: the keep_idx path is
+            # re-alignment, where the text is unchanged and blanking would be a
+            # needless dropout.
+            self._overlay_relayout_until = time.time() + 0.6
         # Auto-enable MV mode when the LRC is much shorter than the video — the
         # video has an instrumental intro and/or outro the studio LRC doesn't
         # know about (Grimes "Genesis" video is 5:32; the song is ~4:20 with
@@ -8551,7 +9137,23 @@ class Overlay:
         if (rawt != self._last_raw_title or src != self._last_src
                 or rawa != self._last_artist):
             self._last_raw_title, self._last_src, self._last_artist = rawt, src, rawa
-            self._clean_title_cache = clean_title(rawt, src, rawa)
+            _reduced = clean_title(rawt, src, rawa)
+            # TICKET-204: a user-supplied correction outranks the reduction. The
+            # override is per-track (cleared on track change), so this only holds
+            # while the video the user was looking at is still playing.
+            _ovr = getattr(self, "_title_override", None)
+            self._clean_title_cache = _ovr or _reduced
+            # TICKET-204: record every title string the engine sees, for the
+            # dev console's "Wrong song" correct-text picker. Dedup on insertion.
+            try:
+                _seen = getattr(self, "_seen_title_strings", None) or []
+                for _candidate in (rawt, _reduced, rawa):
+                    _c = (_candidate or "").strip()
+                    if _c and _c not in _seen:
+                        _seen.append(_c)
+                self._seen_title_strings = _seen[-30:]
+            except Exception:
+                pass
             # TICKET-086: source-aware bypass — YouTube Music delivers a clean
             # SMTC artist field already (e.g. '轟はじめ', not 'Hajime Ch. 轟はじめ
             # ‐ ReGLOSS'), so the channel-stripping rules tuned for the regular
@@ -9265,12 +9867,15 @@ class Overlay:
             chars = row["chars"]
             if not chars:
                 continue
-            n = int(frac * len(chars) + 0.5)
-            if n <= 0:
+            # LP-010: the SAME continuous pixel boundary _advance_fill uses. This
+            # used to round to a whole character index while _advance_fill advanced
+            # in pixels, so after a full rebuild (a seek-back) the painted boundary
+            # and the next sliver's start disagreed — leaving a visible seam.
+            x_sung = self._row_fill_x(row, frac, w)
+            if x_sung <= 0:
                 continue
-            # Reveal the sung layer up to the boundary char + a hair past it so the
-            # boundary glyph's left stroke isn't sliced.
-            x_sung = w if n >= len(chars) else int(chars[n][1]) + sw
+            x_sung = int(x_sung) + sw   # a hair past, so the boundary glyph's left
+                                        # stroke isn't sliced
             # FULL-GLYPH vertical band: glyphs are drawn anchor="lm" (centred at
             # row["y"]), so cover ±(half text height) PLUS the stroke and a margin —
             # the old y+0.4·fs cut off descenders (g, y, p) and the lower outline,
@@ -9285,6 +9890,78 @@ class Overlay:
         out = base.copy()
         out.paste(sung, (0, 0), mask)
         return out
+
+    def _fill_frac(self, b, ln, pos_f):
+        """Smooth karaoke-fill fraction for one block. HARD RULE (user request):
+
+            **the highlight sweep must GLIDE — it is a visual ramp, not a sync readout.**
+
+        Deriving it straight from the song clock (`(pos - start) / dur`) meant every
+        sync correction re-derived the sweep MID-LINE, so the highlight visibly
+        jumped. Sync still decides WHICH line is current and when it starts; it no
+        longer touches the sweep inside a line.
+
+        Once a line starts singing the sweep runs off a LOCAL monotonic clock at the
+        line's own nominal rate, which is perfectly even by construction. Ordinary
+        corrections are absorbed by bending the RATE by at most ±25% (invisible);
+        only a real discontinuity — a seek, or a line restart — snaps."""
+        dur = max(0.05, float(ln.end - ln.start))
+        target = max(0.0, min(1.0, (pos_f - ln.start) / dur))
+        if not int(self._tune.get("smooth_fill", 1)):
+            return target                              # diagnostics: old coupled behaviour
+        now = time.monotonic()
+        # BEFORE the line starts there is nothing to sweep, so pin to 0 — otherwise
+        # the local clock keeps ticking and the highlight creeps forward before a
+        # note is sung. Deliberately NOT symmetric: once target saturates at 1.0 we
+        # let the ramp run on at its own rate until it reaches the end naturally,
+        # because snapping there put a visible jump on the last frames of every line.
+        if target <= 0.0:
+            b["fclk_val"], b["fclk_last"] = 0.0, now
+            return 0.0
+        prev, last = b.get("fclk_val"), b.get("fclk_last")
+        if prev is None or last is None:               # first sight of this line
+            b["fclk_val"], b["fclk_last"] = target, now
+            return target
+        # Clamp dt so a stalled frame (GC, a heavy spawn) can't lurch the sweep
+        # forward — a stall should pause the highlight, never teleport it.
+        dt = max(0.0, min(0.25, now - last))
+        b["fclk_last"] = now
+        val = prev + dt / dur                          # nominal, perfectly even sweep
+        err = target - val
+        if abs(err) >= float(self._tune.get("smooth_fill_snap", 0.34)):
+            val = target                               # genuine discontinuity → snap once
+        else:
+            # Absorb the correction as a RATE change of at most ±25% of nominal —
+            # fast enough to close a typical drift in about a second, far too gentle
+            # for the eye to read as a jump.
+            val += max(-0.25, min(0.25, err * 5.0)) * (dt / dur)
+        val = max(0.0, min(1.0, val))
+        b["fclk_val"] = val
+        return val
+
+    def _row_fill_x(self, row, frac, w):
+        """Continuous PIXEL x of the sung boundary for a row at `frac`.
+
+        The old fill snapped to character cells, so the highlight advanced one glyph
+        at a time — a visible step every ~300 ms on a typical line. Interpolating
+        between adjacent character origins makes the boundary move sub-glyph, which
+        is what actually reads as a sweep."""
+        chars = row["chars"]
+        n = len(chars)
+        # This row's OWN right edge, not the block width. spec["w"] is the WIDEST
+        # row's edge plus margin, so interpolating a narrow row's final glyph toward
+        # `w` made that last character's sweep race across all the leftover block
+        # width. Every row already carries its own `rx`.
+        rx = float(row.get("rx", w))
+        if n <= 0:
+            return 0.0
+        p = max(0.0, min(1.0, frac)) * n
+        i = int(p)
+        if i >= n:
+            return rx
+        x_i = float(chars[i][1])
+        x_next = float(chars[i + 1][1]) if i + 1 < n else rx
+        return x_i + (x_next - x_i) * (p - i)
 
     def _advance_fill(self, b, frac):
         """Karaoke fill without the whole-block recomposite. We keep a persistent
@@ -9311,12 +9988,15 @@ class Overlay:
             chars = row["chars"]
             if not chars:
                 continue
-            on = int(old_frac * len(chars) + 0.5)
-            nn = int(frac * len(chars) + 0.5)
-            if nn <= on:
-                continue                                  # this row gained no chars
-            x0 = max(0, (w if on >= len(chars) else int(chars[on][1])) - sw)
-            x1 = w if nn >= len(chars) else int(chars[nn][1]) + sw
+            # PIXEL boundaries, not character cells. The old code compared whole
+            # character indices and skipped the row unless the sweep had crossed a
+            # full glyph, which is what made the highlight step instead of glide.
+            xa = self._row_fill_x(row, old_frac, w)
+            xb = self._row_fill_x(row, frac, w)
+            if xb - xa < 0.5:
+                continue                                  # sub-pixel — nothing to paint yet
+            x0 = max(0, int(xa) - sw)
+            x1 = min(w, int(xb + 0.999) + sw)
             if x1 <= x0:
                 continue
             try:
@@ -9597,19 +10277,17 @@ class Overlay:
                 continue
             ln = self.lines[b["idx"]]
             dur = ln.end - ln.start
-            if dur > 0:
-                frac = max(0.0, min(1.0, (pos_f - ln.start) / dur))   # TICKET-082: raw clock + clamp
-            else:
-                frac = 0.0
+            # Smooth, sync-decoupled sweep (see _fill_frac) — NOT the raw song clock.
+            frac = self._fill_frac(b, ln, pos_f) if dur > 0 else 0.0
             if b.get("img"):
-                n = int(frac * b["nchars"] + 0.5)
-                # Each fill repaint is a costly PhotoImage paste, so cap the
-                # repaints per frame, each block's repaint rate, AND the total
-                # heavy-frame time — a karaoke sweep at ~5fps reads fine.
-                if (n != b["sung_n"] and repaints < repaint_budget
+                # Repaint as soon as the sweep has moved one PIXEL. The old gate
+                # compared whole character counts, so a line only advanced when the
+                # sweep crossed a glyph — a visible ~300 ms step, not a sweep.
+                moved_px = abs(frac - b.get("fill_frac", 0.0)) * max(1, b.get("w", 1))
+                if (moved_px >= 1.0 and repaints < repaint_budget
                         and now - b.get("paint_t", 0.0) >= self._tune.get("scroll_fill_interval", self._fill_interval)
                         and not _over_budget()):
-                    b["sung_n"] = n
+                    b["sung_n"] = int(frac * b["nchars"] + 0.5)
                     b["paint_t"] = now
                     # SLIVER fill (PERF-102): paste ONLY the strip that newly
                     # became sung — O(changed pixels), not a whole-block
@@ -9624,6 +10302,40 @@ class Overlay:
                     repaints += 1
             else:
                 self._highlight_block(b, frac)
+        self._prewarm_sung(pos_f, _over_budget)
+
+    def _prewarm_sung(self, pos_f, over_budget):
+        """LP-009: build the NEXT line's sung layer with this frame's LEFTOVER budget.
+
+        ``_sung_layer`` is a full glyph render. Deferring it to first fill (see its
+        docstring) stopped it colliding with the spawn render, but it just moved the
+        cost onto the first HIGHLIGHTED frame of every line — which is exactly the
+        "highlights start not smooth" hitch: the belt is gliding, the line starts to
+        sing, and one frame costs tens of ms.
+
+        Doing it here is safe where the LP-005 background prewarm was not. That one
+        rendered on a WORKER thread and its GIL holds stalled the scroll belt. This
+        runs on the render thread, inside the existing per-frame time budget, one
+        block per frame — so it can only ever spend slack a frame already had, and
+        a busy frame skips it entirely."""
+        try:
+            if not int(self._tune.get("sung_prewarm", 1)) or over_budget():
+                return
+            lead = float(self._tune.get("sung_prewarm_lead_s", 2.0))
+            best = None
+            for b in self._stream:
+                if b.get("sung") is not None or b.get("base") is None:
+                    continue                      # already warm, or not a fill block
+                idx = b.get("idx")
+                if idx is None or idx >= len(self.lines):
+                    continue
+                dt = self.lines[idx].start - pos_f
+                if 0.0 <= dt <= lead and (best is None or dt < best[0]):
+                    best = (dt, b)                # the most imminent unwarmed line
+            if best is not None:
+                self._sung_layer(best[1])         # ONE per frame, budget permitting
+        except Exception:
+            pass                                  # prewarm is an optimisation, never fatal
 
     def _block_x_v(self, w, i=None):
         """Horizontal X for a block in VERTICAL scroll, from the `position`
@@ -9724,16 +10436,14 @@ class Overlay:
                 continue
             ln = self.lines[b["idx"]]
             dur = ln.end - ln.start
-            if dur > 0:
-                frac = max(0.0, min(1.0, (pos_f - ln.start) / dur))   # TICKET-082: raw clock + clamp
-            else:
-                frac = 0.0
+            # Smooth, sync-decoupled sweep (see _fill_frac) — NOT the raw song clock.
+            frac = self._fill_frac(b, ln, pos_f) if dur > 0 else 0.0
             if b.get("img"):
-                n = int(frac * b["nchars"] + 0.5)
-                if (n != b["sung_n"] and repaints < repaint_budget
+                moved_px = abs(frac - b.get("fill_frac", 0.0)) * max(1, b.get("w", 1))
+                if (moved_px >= 1.0 and repaints < repaint_budget
                         and now - b.get("paint_t", 0.0) >= self._tune.get("scroll_fill_interval", self._fill_interval)
                         and not _over_budget()):
-                    b["sung_n"] = n
+                    b["sung_n"] = int(frac * b["nchars"] + 0.5)
                     b["paint_t"] = now
                     if b.get("base") is not None:
                         self._advance_fill(b, frac)
@@ -9742,6 +10452,7 @@ class Overlay:
                     repaints += 1
             else:
                 self._highlight_block(b, frac)
+        self._prewarm_sung(pos_f, _over_budget)      # LP-009 (vertical scroll too)
 
     def _spawn_block(self, i, frac, place=None):
         """One image block (fast) if possible, else fall back to text items."""
@@ -9812,6 +10523,14 @@ class Overlay:
         # dead. Manual input is always intentional: never floor it.
         apply_min = (0.0 if str(reason).startswith("manual")
                      else float(self._tune.get("sync_apply_min_s", 0.22)))
+        # TICKET-181: widen the deadband in a scroll-THROUGH belt so small ongoing
+        # auto corrections (fine-tune nudges, Shazam micro-nudges, energy-align,
+        # live-follow) don't lurch the whole belt. Manual nudges/resets keep the
+        # 0.0 floor above; real re-anchors (> this) and big seeks still apply.
+        if (not str(reason).startswith("manual")
+                and self._effective_scroll() in ("lr", "rl", "tb", "bt")):
+            apply_min = max(apply_min,
+                            float(self._tune.get("sync_apply_min_s_scroll", 1.0)))
         if abs(delta) < apply_min and self._pending_offset is None:
             self._sync_event("offset_skip_small", reason=reason or "auto",
                              to=round(new_off, 2), frm=round(self.offset, 2),
@@ -9890,6 +10609,503 @@ class Overlay:
                 del ev[:len(ev) - cap]
         except Exception:
             pass
+
+    def _note_event(self, kind, detail="", sev="info", title=None, **extra):
+        """TICKET-203 — the NARRATIVE event ring: the handful of moments a human
+        would want narrated, in a form a human can read.
+
+        Distinct from `_sync_event` on purpose. That ring is a firehose of raw
+        sync telemetry keyed for machine analysis; this one records *decisions* —
+        the song changed, a body was rejected, a big correction committed, lyrics
+        finally arrived — and stamps each with the context you need to reconstruct
+        what happened without the log file:
+
+          title    which video it happened on (events outlive the track they
+                   describe, and an event attributed to the wrong song is worse
+                   than no event)
+          pos      where the VIDEO was, in seconds
+          lyric_t  where the app thought the LYRICS were at that instant. The gap
+                   between these two is the entire story of a sync bug — the
+                   runaway showed pos=16.6 with lyric_t=72.6 and nothing surfaced
+                   it until someone read the log by hand.
+          sev      good | info | warn — drives the console's notification colour
+
+        Never raises: diagnostics must not be able to break playback.
+        """
+        try:
+            if not int(self._tune.get("notable_events_enabled", 1)):
+                return
+            st = self.media.get() or {}
+            pos = float(st.get("position") or 0.0)
+            try:
+                # Bind the body and the index ONCE. This runs on the OCR/API threads
+                # while the Tk thread can swap self.lines wholesale on a song change,
+                # and re-reading it mid-expression yields a Line from the NEW song
+                # WITHOUT raising — fabricating a lyric_t/gap that describes nothing
+                # that ever happened. get_insight binds `body` once for this same
+                # reason; a plausible wrong number is worse here than None, because
+                # `gap` is the number this whole ring exists to make trustworthy.
+                body = self.lines or []
+                _i = self.idx
+                ln = body[_i] if 0 <= _i < len(body) else None
+                lyric_t = round(float(ln.start), 2) if ln is not None else None
+            except Exception:
+                lyric_t = None
+            ev = {
+                "t": round(time.time(), 2),
+                "kind": kind,
+                "sev": sev,
+                "detail": str(detail)[:300],
+                "title": (title if title is not None
+                          else (st.get("title") or self._track_title() or ""))[:120],
+                "pos": round(pos, 2),
+                "lyric_t": lyric_t,
+                # The number that makes a sync event legible at a glance: how far
+                # apart the video and the lyrics were when this happened.
+                "gap": (round(lyric_t - pos, 2) if lyric_t is not None else None),
+                "offset": round(float(getattr(self, "offset", 0.0) or 0.0), 2),
+            }
+            for k, v in extra.items():
+                if isinstance(v, (int, float, bool, str)) or v is None:
+                    ev[k] = v
+            ring = getattr(self, "_notable", None)
+            if ring is None:
+                ring = self._notable = []
+            ring.append(ev)
+            cap = int(self._tune.get("notable_events_size", 120))
+            if len(ring) > cap:
+                del ring[:len(ring) - cap]
+        except Exception:
+            pass
+
+    def get_title_identification(self):
+        """TICKET-204 — everything the title engine has seen for this video, so the
+        console's "Wrong song" picker can offer the user the RIGHT string.
+
+        The whole point: when identification goes wrong it is usually because the
+        engine searched for the wrong text, and until now the only way to see that
+        text was to read the log. Exposing the candidates turns an unfixable
+        mystery into a two-click correction."""
+        st = self.media.get() or {}
+        raw = st.get("title") or ""
+        ovr = getattr(self, "_title_override", None)
+        seen = list(getattr(self, "_seen_title_strings", None) or [])
+        # The strings actually worth offering: what the player reported, what the
+        # reduction produced, the artist, plus anything the screen reader read.
+        try:
+            for extra in ((getattr(self, "_finder_ocr", None) or {}).get("lines") or []):
+                e = (extra or "").strip()
+                if e and e not in seen:
+                    seen.append(e)
+        except Exception:
+            pass
+        try:
+            heard = (getattr(self, "_sound_song", None) or "").strip()
+            if heard and heard not in seen:
+                seen.append(heard)
+        except Exception:
+            pass
+        return {
+            "raw_title": raw[:200],
+            # What clean_title() would produce, override or not — so the picker can
+            # show what it is CORRECTING, not just what is currently in force.
+            "clean_title": (clean_title(raw, st.get("source") or "",
+                                        st.get("artist") or "")[:200] if raw else ""),
+            "search_title": (self._clean_title_cache or "")[:200],
+            "artist": (st.get("artist") or "")[:120],
+            "overridden": bool(ovr),
+            "override_title": ovr,
+            "seen_strings": [s[:200] for s in seen][:40],
+        }
+
+    def override_title(self, correct_title, reason="dev-console"):
+        """TICKET-204 — the user picked the correct title from what the engine saw.
+
+        The reduction sometimes throws the song name away and searches the artist
+        (TICKET-200). When it does, everything downstream looks healthy and there
+        was no way to correct it from outside the process. This forces the providers
+        to be searched for the user's chosen string instead.
+
+        Records the correction to `title_corrections.jsonl` in the app data folder
+        (the GOOD string, the BAD one it replaces, and the full raw player title)
+        so the reduction rules can be improved from real misses rather than guesses.
+        Titles and artist names only — factual metadata, never lyric text — so the
+        diagnostics can never carry copyrighted content.
+
+        Per-video: cleared on the next real track change, not on this re-identify.
+        """
+        correct_title = (correct_title or "").strip()
+        if not correct_title:
+            self._hint("Override cancelled — empty title")
+            return {"ok": False, "action": "empty title"}
+        correct_title = correct_title[:200]
+        st = self.media.get() or {}
+        raw = (getattr(self, "_last_raw_title", "") or st.get("title") or "")
+        bad = (self._clean_title_cache or "")
+
+        rec = {"t": round(time.time(), 2), "raw_title": raw[:300],
+               "bad_title": bad[:200], "good_title": correct_title,
+               "artist": (self._clean_artist_cache or st.get("artist") or "")[:120],
+               "source": (st.get("source") or "")[:60], "reason": str(reason)[:40]}
+        # Two records on purpose: the file is the durable training set that outlives
+        # the process, the in-memory list is what the console can show right now.
+        try:
+            with open(Path(_DATA) / "title_corrections.jsonl", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            log.info("title-override: could not record the correction: %s", e)
+        try:
+            self._title_id_log = (getattr(self, "_title_id_log", None) or [])
+            self._title_id_log.append(rec)
+            self._title_id_log = self._title_id_log[-20:]
+        except Exception:
+            pass
+
+        log.info("TITLE OVERRIDE: engine had %r (raw %r), user chose %r — re-fetching",
+                 bad, raw[:80], correct_title)
+        self._note_event(
+            "title-override", sev="good",
+            detail=f"You corrected the search title: '{bad}' → '{correct_title}'. "
+                   f"Re-fetching lyrics under the corrected title.",
+            bad_title=bad[:120], correct_title=correct_title[:120])
+
+        self._title_override = correct_title
+        self._clean_title_cache = correct_title
+        # The reduction is memoised on the raw title, so without invalidating that
+        # key the next poll recomputes and silently discards the override.
+        self._last_raw_title = None
+        try:
+            _seen = getattr(self, "_seen_title_strings", None) or []
+            if correct_title not in _seen:
+                _seen.append(correct_title)
+            self._seen_title_strings = _seen[-30:]
+        except Exception:
+            pass
+        self._title_locked = False
+        self.lines, self.idx, self._kara = [], -1, []
+        try:
+            self._cancel_pending_swap("override_title")
+        except Exception:
+            pass
+        if self._track:
+            self._hint(f"Title overridden to: {correct_title}")
+            # Clearing self.lines above defeats _on_track_change's same-song early
+            # return, so the FULL reset runs — which would wipe the override we just
+            # set. This flag tells that reset to keep it, exactly once.
+            self._keep_title_override = True
+            self._on_track_change(self._track, self._cur_duration)
+        else:
+            self._hint("Nothing playing to override")
+            return {"ok": False, "action": "nothing playing"}
+        return {"ok": True, "action": f"searching for {correct_title!r}"}
+
+    def _track_title(self):
+        """Best-effort current track title for event stamping."""
+        try:
+            return (self._track or ("", ""))[1] or ""
+        except Exception:
+            return ""
+
+    def _autoresearch_state(self):
+        """TICKET-190: is the AutoResearch loop actually running, or just described?
+
+        The console has a whole page documenting an iterative `experiment:`-commit
+        loop in a side worktree. Checked live: the worktree and branch exist but hold
+        ZERO experiment commits and sit 0 ahead of master — it has never run, and the
+        skill it tells you to install is not installed. Reporting aspiration as
+        working state is exactly the sort of thing this console should not do.
+
+        Cached for 60s: this runs THREE `git` subprocesses, and the console polls
+        /insight every 2.5s while the AutoResearch/Finder/Decisions views are open.
+        Uncached that is ~72 process spawns a minute on the API thread, competing
+        with the render loop for CPU on a machine that is also playing video — a
+        diagnostic that degrades the thing it is diagnosing. The state it reports
+        changes on the order of hours."""
+        import subprocess as _sp
+        _c = getattr(self, "_ar_state_cache", None)
+        if _c and time.time() - _c[0] < 60.0:
+            return _c[1]
+        out = {"worktree": None, "branch": "autoresearch", "exists": False,
+               "experiments": 0, "ahead_of_master": 0, "last_commit": None,
+               "skill_installed": False}
+        try:
+            import os as _o
+            from pathlib import Path as _P
+            wt = _P("D:/Lyric-Immersion-AR")
+            out["worktree"] = str(wt)
+            out["exists"] = wt.is_dir()
+            out["skill_installed"] = (
+                _P(_o.path.expanduser("~/.claude/skills/autoresearch")).is_dir())
+            if not out["exists"]:
+                return out
+
+            def _git(*a):
+                return _sp.run(["git", *a], cwd=str(wt), capture_output=True,
+                               text=True, timeout=6,
+                               creationflags=0x08000000).stdout.strip()
+
+            out["experiments"] = sum(
+                1 for ln in _git("log", "--oneline", "-n", "400").splitlines()
+                if "experiment:" in ln.lower())
+            ahead = _git("rev-list", "--count", "master..autoresearch")
+            out["ahead_of_master"] = int(ahead or 0)
+            out["last_commit"] = _git("log", "-1", "--format=%cs %h %s")[:110] or None
+        except Exception:
+            pass
+        self._ar_state_cache = (time.time(), out)
+        return out
+
+    def get_insight(self):
+        """TICKET-190: everything the SONG FINDER can see, and every gate that
+        decided with it — for the dev console's Song-finder and Decision views.
+
+        Exists because these answers were previously log-only and rate-limited:
+        "it matched my YouTube search box" and "the rescue lost to a MIN of 75"
+        were both invisible from outside the process. Read-only, cheap (latest-value
+        snapshots + a slice of the existing event ring), never raises."""
+        def _s(v, n=90):
+            try:
+                return str(v)[:n] if v is not None else None
+            except Exception:
+                return None
+
+        st = self.media.get() or {}
+        m = self.meta if isinstance(self.meta, dict) else {}
+
+        # Setlist / candidate pool, with per-song cache state — the pool the OCR
+        # gate whitelists against and the by-ear scorer scopes to.
+        songs = []
+        try:
+            for c in (getattr(self, "_concert_candidates", None) or ())[:40]:
+                title = c.get("title") or ""
+                if not title:
+                    continue
+                hit = None
+                try:
+                    hit = self.index.match((self._track or ("", ""))[0], title,
+                                           self._cur_duration)
+                except Exception:
+                    hit = None
+                songs.append({"title": _s(title, 60), "kind": c.get("kind"),
+                              "cached": bool(hit), "file": (hit.name if hit else None)})
+        except Exception:
+            pass
+
+        chapters = []
+        try:
+            for ch in (getattr(self, "_concert_setlist", None) or ())[:40]:
+                chapters.append({"start": round(float(ch[0]), 1), "title": _s(ch[1], 60)})
+        except Exception:
+            pass
+
+        sources = {
+            # The media dict carries `status` (a PlaybackStatus enum), NOT `playing`
+            # — `st.get("playing")` was silently always False. Same phantom-field
+            # class as TICKET-197, on the Python side of the same feature.
+            "smtc": {"title": _s(st.get("title")), "artist": _s(st.get("artist")),
+                     "source": _s(st.get("source")),
+                     "playing": bool(st.get("status") == PLAYING)},
+            "loaded": {"title": _s(m.get("title")), "artist": _s(m.get("artist")),
+                       "source": _s(m.get("source")), "lang": _s(m.get("lang")),
+                       "lines": len(self.lines or [])},
+            "shazam": {"heard": _s(getattr(self, "_sound_song", None)),
+                       "alias": _s(getattr(self, "_sound_title_alias", None)),
+                       "corroborated": bool(getattr(self, "_sound_corroborated", False))},
+            "locks": {"title_locked": bool(getattr(self, "_title_locked", False)),
+                      "verified": bool(getattr(self, "_verified", False)),
+                      "body_corroborated": bool(getattr(self, "_body_corroborated", False)),
+                      "body_word_verified": bool(getattr(self, "_body_word_verified", False))},
+            # `_subs_mode_on` does not exist — never assigned anywhere — so this
+            # reported "subtitles: off" unconditionally. `_subs_on()` is the real
+            # predicate (it is what the renderer itself consults).
+            "mode": {"live": bool(getattr(self, "_live_mode", False)),
+                     "subtitles": bool(self._subs_on()),
+                     "non_music_page": bool(getattr(self, "_non_music_page", False))},
+        }
+
+        # TICKET-194: the ALWAYS-POPULATED block. Everything else in this payload
+        # describes an EVENT (a banner pass, a by-ear gate) and those only happen on
+        # concerts and song boundaries — so during ordinary playback the console had
+        # nothing live to show and read as broken even though the app was working.
+        # This is the "is it identified, is it running" answer, and it is never null
+        # while a track is loaded.
+        # Bind the body ONCE: this runs on the API thread while the Tk thread can
+        # swap self.lines wholesale on a song change. Re-reading it after the bounds
+        # check would let a shorter list slip in between and raise IndexError, taking
+        # the whole /insight response down with it.
+        body = self.lines or []
+        # Snapshot idx ONCE too. `self.idx if 0 <= self.idx < len(body)` loads the
+        # attribute twice, so the bounds check can pass for one value while a
+        # different, out-of-range value is what actually gets used.
+        _i = self.idx
+        idx = _i if 0 <= _i < len(body) else -1
+        ln = body[idx] if idx >= 0 else None
+        play_title = st.get("title") or ""
+        load_title = m.get("title") or ""
+        # The title the engine actually SEARCHED providers with, after clean_title()
+        # stripped the credits and decorations off the player's title. TICKET-200:
+        # this is the step that silently turned 'IA & ONE / てるみい (石風呂)【MUSIC
+        # VIDEO】' into 'IA & ONE' and fetched a different song by those performers.
+        # Comparing against the RAW player title cannot show that — the reduction is
+        # invisible from outside — so publish it and let the console show both.
+        search_title = _s(getattr(self, "_clean_title_cache", None), 120)
+        try:
+            # Compare the loaded body against the SEARCHED title, not the raw player
+            # title: the raw title carries 【MV】/【… Original Song】 furniture that
+            # makes a correct body read as a mismatch (live example: player
+            # '【MV】Unchained【hololive English -Advent- Original Song】' vs loaded
+            # 'Unchained' scored `mismatch`). Fall back to the raw title when the
+            # reduction is unavailable. Artists are passed so _same_song_title can
+            # skip segments that are merely the artist's name.
+            _lhs = search_title or play_title
+            _arts = tuple(x for x in (st.get("artist"), m.get("artist")) if x)
+            agree = ("match" if _lhs and load_title
+                     and self._same_song_title(_lhs, load_title, artists=_arts,
+                                               artist_a=st.get("artist") or "",
+                                               artist_b=m.get("artist") or "")
+                     else "mismatch" if _lhs and load_title else "none")
+        except Exception:
+            agree = "none"
+        # HOW WELL DO WE KNOW this body belongs to this song? `agree` cannot answer
+        # that: a title-searched body is filed under the very title it was searched
+        # with, so agreement is a tautology and reads "match" at full confidence
+        # precisely when there is no evidence at all (TICKET-200 — the wrong body
+        # showed a green "identified"). This is the evidence ladder instead.
+        _bsrc = (m.get("source") or "")
+        if not body:
+            evidence = "none"
+        elif _bsrc.startswith("bundled") or _bsrc.startswith("baked"):
+            evidence = "library"          # shipped/curated body — authoritative
+        elif getattr(self, "_body_word_verified", False):
+            evidence = "words"            # the sung WORDS were matched to this body
+        elif getattr(self, "_body_corroborated", False):
+            evidence = "timing"           # energy/caption lock, but words unchecked
+        else:
+            evidence = "title"            # nothing but the title search backs it
+        now = {
+            "playing": bool(st.get("status") == PLAYING),
+            "position": round(float(st.get("position") or 0.0), 2),
+            "duration": round(float(st.get("duration") or 0.0), 2),
+            "player_title": _s(play_title, 120),
+            "player_artist": _s(st.get("artist"), 80),
+            "search_title": search_title,
+            "loaded_title": _s(load_title, 120),
+            "loaded_artist": _s(m.get("artist"), 80),
+            "loaded_source": _s(m.get("source")),
+            "loaded_lang": _s(m.get("lang")),
+            # `body`, not `self.lines` — re-reading defeats the whole point of
+            # binding it, and a swap between the two reads would report an idx
+            # from the old body against a count from the new one.
+            "line_count": len(body),
+            # Does the loaded body name the same song as the player? The single most
+            # useful yes/no in the app, and it was not exposed anywhere.
+            "agree": agree,
+            # …and how well that is actually KNOWN. Drive the UI badge off this one.
+            "evidence": evidence,
+            "idx": idx,
+            # `self.lines` holds `Line` DATACLASS instances (see class Line), not
+            # dicts. An earlier version guarded these three on `isinstance(ln, dict)`,
+            # which is statically always False — so the console was told every song
+            # has no romaji and no translation, and line_t was permanently null. It
+            # returned 200 with plausible, wrong JSON: exactly the silent-bad-data
+            # failure TICKET-194/197 exist to kill. api.py `_current_line` has always
+            # done this correctly; copy from there, not from memory.
+            "line_t": ([round(float(ln.start), 2), round(float(ln.end), 2)]
+                       if ln is not None else None),
+            "has_romaji": bool(ln is not None and (getattr(ln, "rm", "") or "").strip()),
+            "has_english": bool(ln is not None and (getattr(ln, "en", "") or "").strip()),
+            # What the engine is busy doing right now — so a console that looks
+            # frozen can be distinguished from an engine that is genuinely thinking.
+            "busy": ("deciding by ear" if getattr(self, "_deciding", False)
+                     else "aligning" if getattr(self, "_aligning", False)
+                     else None),
+            "frame_ms": round(float(getattr(self, "_frame_ms", 0.0) or 0.0), 1),
+            # NB: this is the TK canvas timer. With the GPU overlay on, Tk is not
+            # drawing, so it reads 0 and the fps here is None — reporting "0 fps"
+            # would be a lie about a renderer that is running fine in another
+            # process. The console shows `renderer` instead when this is None.
+            "render_fps": (round(1000.0 / self._frame_ms)
+                           if getattr(self, "_frame_ms", 0.0) else None),
+            "renderer": ("gpu" if getattr(self, "tauri_overlay_on", False) else "tk"),
+            "perf": _s(getattr(self, "perf", None), 20),
+            "overlay": ("subtitles" if getattr(self, "_subs_on", lambda: False)()
+                        else "lyrics" if (self.lines and idx >= 0) else "idle"),
+        }
+        return {
+            "now": now,
+            # TICKET-193: two-point-verify evidence, keyed by the gap in force.
+            # The honest objective for the tpvr knobs; see docs/AUTORESEARCH.md.
+            # list(...) the items FIRST: the Tk thread inserts keys into
+            # _tpvr_stats via setdefault, and iterating a dict that grows during
+            # the comprehension raises RuntimeError — which would 500 the whole
+            # /insight response, blanking every console view at random.
+            "tpvr": {k: dict(v, agree_pct=round(
+                        100.0 * v["agree"] / max(1, v["agree"] + v["disagree"]), 1))
+                     for k, v in list((getattr(self, "_tpvr_stats", None) or {}).items())},
+            "ocr": getattr(self, "_finder_ocr", None),
+            "ocr_drops": list(getattr(self, "_finder_ocr_drops", []) or [])[-24:],
+            "gates": getattr(self, "_finder_gates", None),
+            # gate_on must mean "the gate is ACTUALLY filtering", not "the knob is
+            # set". _concert_ocr_check computes `gate = bool(setlist) and knob`, so
+            # with no parsed setlist the knob is on and the gate is inert — which
+            # is TICKET-195, and reporting it as "on" is how it stayed hidden.
+            "setlist": {"candidates": songs, "chapters": chapters,
+                        "idx": getattr(self, "_setlist_idx", None),
+                        "gate_on": bool(int(self._tune.get("ocr_setlist_gate", 1))
+                                        and songs),
+                        "gate_knob": bool(int(self._tune.get("ocr_setlist_gate", 1)))},
+            "sources": sources,
+            "decision": {"state": getattr(self, "_decision_state", None),
+                         "strikes": getattr(self, "_decision_strikes", 0),
+                         "dims": dict(getattr(self, "_decision_dim_scores", {}) or {})},
+            # The LIVE/CONCERT sync posture. Live is a different machine from studio
+            # (two-point verification, its own thresholds), and it is the path the
+            # user sees fail on concerts — so the console needs it separately rather
+            # than inferring it from the studio numbers.
+            "sync": {
+                "live": bool(getattr(self, "_live_mode", False)
+                             or getattr(self, "_live_arrangement", False)),
+                "offset": round(float(getattr(self, "offset", 0.0) or 0.0), 3),
+                "drift": getattr(self, "_last_drift", None),
+                "tier_interval_s": round(float(getattr(self, "_sync_tier_interval", 0.0) or 0.0), 1),
+                "ok_drift": float(self._tune.get("sync_tier_ok_drift", 0.6)),
+                # Report the threshold ACTUALLY in force (TICKET-192 three-way split:
+                # studio / live arrangement / concert). Reporting the studio value on
+                # a concert would make the console lie about the live path.
+                "profile": ("concert" if getattr(self, "_live_mode", False)
+                            else "live" if getattr(self, "_live_arrangement", False)
+                            else "studio"),
+                "single_shot_max": float(self._tune.get(
+                    "concert_single_shot_max_s" if getattr(self, "_live_mode", False)
+                    else "live_single_shot_max_s" if getattr(self, "_live_arrangement", False)
+                    else "single_shot_max_s", 2.0)),
+                "tpvr_gap_s": float(self._tune.get(
+                    "concert_tpvr_gap_s" if getattr(self, "_live_mode", False)
+                    else "live_tpvr_gap_s" if getattr(self, "_live_arrangement", False)
+                    else "tpvr_gap_s", 1.5)),
+                "apply_min_s": float(self._tune.get("sync_apply_min_s_scroll", 0.25)),
+                "pending": getattr(self, "_pending_offset", None),
+                "held": bool(getattr(self, "_tier_tpvr", None) is not None),
+                "fine_active": bool(getattr(self, "_fine_active", False)),
+                "caption_timed": bool(getattr(self, "_caption_timed", False)),
+                "fail_streak": int(getattr(self, "_sync_fail_streak", 0) or 0),
+            },
+            # AutoResearch reality check: the console describes a loop; this reports
+            # whether it has ever actually run.
+            "autoresearch": self._autoresearch_state(),
+            "events": [e for e in list(self._sync_events)[-160:]],
+            # TICKET-203: the human-readable decision log. Separate from `events`
+            # (raw sync telemetry) because the console renders this one as prose and
+            # raises a notification per new entry — mixing the firehose in would make
+            # both useless.
+            "notable": list(getattr(self, "_notable", None) or [])[-80:],
+            # TICKET-204: title identification diagnostics for the "Wrong song"
+            # picker. Every title string the engine has seen, what it reduced to,
+            # and any manual override — so the user can pick the correct one.
+            # Built by get_title_identification() rather than inline: the override
+            # endpoint needs the same view, and two copies would drift.
+            "title_id": self.get_title_identification(),
+        }
 
     def get_sync_diag(self):
         """Ring buffer of recent sync events + a live snapshot of the highlight
@@ -10145,8 +11361,15 @@ class Overlay:
         # Default: 3 s/s slew speed cap, 70%/sec exponential pull. A 1s drift
         # finishes in ~0.5s; a 4s drift in ~1.5s.
         dt = max(0.001, min(0.25, now - last_t)) if last_t > 0 else (self._fps / 1000.0)
-        rate_per_sec = float(self._tune.get("ease_slew_cap_s", 3.0))
-        pull = float(self._tune.get("ease_pull_per_sec", 3.5))
+        # TICKET-181: gentler ease in a scroll-THROUGH belt (the offset is belt
+        # MOTION there) so a >=1s re-anchor glides smoothly instead of whooshing;
+        # line mode keeps the snappier ease for a fast highlight snap.
+        if self._effective_scroll() in ("lr", "rl", "tb", "bt"):
+            rate_per_sec = float(self._tune.get("ease_slew_cap_s_scroll", 1.0))
+            pull = float(self._tune.get("ease_pull_per_sec_scroll", 1.5))
+        else:
+            rate_per_sec = float(self._tune.get("ease_slew_cap_s", 3.0))
+            pull = float(self._tune.get("ease_pull_per_sec", 3.5))
         delta = target - cur
         # exponential pull: approach target at rate proportional to remaining distance
         step = delta * (1.0 - 2.71828 ** (-pull * dt))
@@ -10661,6 +11884,15 @@ class Overlay:
                 "last_takeover_age_s": (round(time.time() - self._last_takeover_t, 1)
                                         if self._last_takeover_t else None),
                 "live_arrangement": self._live_arrangement,
+                # TICKET-197: the dev console has always RENDERED these two rows
+                # (Overview.tsx "live" and "body corroborated") but this block never
+                # sent them, so both read undefined and displayed a permanent dash.
+                # They are meaningful — `live_mode` distinguishes a concert from a
+                # live-arrangement single, and body-corroboration is a different
+                # signal from sound-corroboration — so emit them rather than delete
+                # the rows.
+                "live_mode": bool(getattr(self, "_live_mode", False)),
+                "body_corroborated": bool(getattr(self, "_body_corroborated", False)),
                 "effective_song_time": round(eff, 2) if eff is not None else None,
                 "showing_idx": self.idx,
                 "should_show_idx": want_idx,
@@ -10755,7 +11987,32 @@ class Overlay:
             # concert banner OCR (live-mode song ID from the on-screen title) — lets a
             # field report confirm OCR is firing AND what it last read (e.g. 'ダリア').
             "ocr": self._diag_ocr(),
+            # TICKET-176: the RUNTIME counterpart to the build-time whisper guards.
+            # Those prove the bundle was assembled correctly; this proves the stack
+            # actually imports on THIS machine, which is the only thing that decides
+            # whether the listen features work.
+            "whisper": self._diag_whisper(),
         }
+
+    def _diag_whisper(self):
+        """faster-whisper availability for /diag — the runtime counterpart to the
+        build-time guards (scripts/check_av_dlls.py + <exe> --selftest). Exposes
+        align.available() and, when False, align._last_error (e.g. the av._core
+        'DLL load failed' skew that silently disabled every listen feature in
+        v1.1.74→76 with nothing in the log). Cheap after the first call (the import
+        is cached); never raises."""
+        try:
+            import align
+            avail = bool(align.available())
+            return {
+                "available": avail,
+                "last_error": (None if avail
+                               else str(getattr(align, "_last_error", None))),
+                "model_ready": bool(align.model_ready()),
+                "frozen": bool(getattr(sys, "frozen", False)),
+            }
+        except Exception as e:
+            return {"available": None, "last_error": f"{type(e).__name__}: {e}"}
 
     def _diag_ocr(self):
         """Concert banner OCR state for /diag. Never raises. OCR only runs in
@@ -11433,6 +12690,20 @@ class Overlay:
                 align.set_gpu_solo_override(bool(new))
             except Exception:
                 pass
+        # TICKET-184: whisper_child flips out-of-process transcription live, so the
+        # isolation can be turned off (or back on) without a rebuild.
+        if key == "whisper_child":
+            try:
+                import align
+                align.set_whisper_child(bool(new))
+            except Exception:
+                pass
+        if key == "whisper_vram_margin_mib":
+            try:
+                import align
+                align.set_vram_margin(new)
+            except Exception:
+                pass
         # TICKET-118: a /tune POST that flips prefer_audible_session (or the
         # threshold) must propagate to MediaWatcher so the next _pick honors
         # it without an app restart.
@@ -11905,11 +13176,34 @@ class Overlay:
         """
         if self._sound_song is not None or not self.lines:
             return
+        # TICKET-183 (sync): once ANY path has anchored the intro (an earlier onset,
+        # the intro-hold timeout, or Shazam), a LATE one-shot onset event must NOT
+        # re-anchor. A missed/late onset misread as a huge intro is exactly what
+        # produced the catastrophic -172s / -134s offsets (High Tide: onset@181s vs
+        # 1st line@8.8s). One anchor per track — matches this method's docstring.
+        if getattr(self, "_intro_anchored", False):
+            return
         st = self.media.get()
         if not (st and st.get("status") == PLAYING):
             return
         vpos = float(st.get("position") or 0.0)
         first_start = self.lines[0].start if self.lines else 0.0
+        # TICKET-183: plausibility gate — vocals arriving THIS late cannot be a
+        # leading intro. Past ~onset_max_intro_s after the LRC's 1st line, past half
+        # the video, or past the LRC's last line ⇒ a mid-song / mis-baselined trigger,
+        # not an intro. Reject so a single detector event can't inject a huge offset.
+        try:
+            _vdur = float(st.get("duration") or 0.0)
+        except Exception:
+            _vdur = 0.0
+        _lrc_end = self.lines[-1].end if self.lines else 0.0
+        _max_intro = float(self._tune.get("onset_max_intro_s", 90.0))
+        if (vpos > first_start + _max_intro
+                or (_vdur > 0 and vpos > 0.5 * _vdur)
+                or (_lrc_end > 0 and vpos > _lrc_end)):
+            log.info("vocal onset @%.1fs implausible as an intro (1st@%.1fs vdur=%.0f "
+                     "lrc_end=%.0f) — ignored", vpos, first_start, _vdur, _lrc_end)
+            return
         # Need a real intro: vocal-onset must be at least 8 s in (a song that
         # starts immediately with vocals has nothing to calibrate), the LRC's
         # first vocal line must be near 0 (a relative/song-only LRC, NOT one
@@ -11930,7 +13224,7 @@ class Overlay:
             gap = vpos - first_start
             if cover_or_live and gap > 15.0:
                 new_off = round(first_start - vpos, 2)
-                if -300.0 < new_off < 0.0:
+                if -_max_intro < new_off < 0.0:                 # TICKET-183: was -300
                     self._intro_anchored = True
                     log.info("vocal onset @%.1fs (1st line @%.1fs) cover/live extended "
                              "intro → calibrated offset %+.1fs", vpos, first_start, new_off)
@@ -11947,8 +13241,8 @@ class Overlay:
         # We want first_start = vpos, so offset = first_start - vpos.
         new_off = round(first_start - vpos, 2)
         # Sanity cap: a YouTube video with an instrumental intro is typically
-        # 5-90 s of intro; bigger and something's off.
-        if -120.0 < new_off < 0.0:
+        # 5-90 s of intro; bigger and something's off. (TICKET-183: was -120)
+        if -_max_intro < new_off < 0.0:
             self._intro_anchored = True
             self.offset = new_off
             self.idx = -1
@@ -13098,7 +14392,12 @@ class Overlay:
         else:
             _OUTLINE = _OUTLINE_FULL     # 5 items/char, 60fps
             self._fps = 16
-            self._fill_skip = 3          # belt moves at 60fps; fills/spawns at ~20fps
+            # LP-010: was 3 (fills/spawns at ~20fps). That throttle dates from when a
+            # fill re-composited the whole block (~85 ms); a sliver fill is ~1.4 ms, and
+            # capping the sweep at 20 fps is itself visible as stepping. Spawns remain
+            # capped by scroll_spawn_budget + scroll_heavy_budget_ms, and fills only
+            # repaint once the boundary has moved a pixel — so this costs little.
+            self._fill_skip = 1          # belt AND fills at the full 62fps
         # mirror into the live-tune dict so /tune reflects the mode's defaults
         if hasattr(self, "_tune"):
             self._tune["scroll_fill_skip"] = float(self._fill_skip)
@@ -13476,6 +14775,25 @@ class Overlay:
                 pass
             self.index.refresh()
         self._fetch_key = None
+        # TICKET-182: a USER "⚑ Wrong lyrics" press means "these are wrong — get them
+        # OFF the screen NOW". Drop the visible lyrics IMMEDIATELY instead of deferring
+        # up to swap_defer_user_max_s (~3s of the wrong lyrics lingering after the
+        # click, which read as "the button did nothing"). Clearing self.lines here also
+        # makes the deferred-swap guard below fall through to the immediate re-identify
+        # path. Automatic (decision-engine) transitions keep the smooth deferred swap.
+        # Also escalate to the video's OWN caption track + burned-in OCR so "look for
+        # the next most likely" uses EVERY signal, not just Shazam — which can't
+        # fingerprint VTuber originals, the common wrong-song case.
+        if int(self._tune.get("wrong_immediate_clear", 1)):
+            self.lines, self.idx, self._kara = [], -1, []
+            self._sound_song = None
+            self._title_locked = False
+            self._hint("🎧 Dropped — listening for the right song…")
+            try:
+                self._escalate_to_captions()
+                self._maybe_escalate_ocr()
+            except Exception:
+                pass
         # TICKET-111: defer the visible clear so the current line / belt finishes
         # before the new lyrics drop in. User-driven path uses a TIGHTER safety
         # cap (swap_defer_user_max_s, default 3.0s) when the user explicitly
@@ -14686,6 +16004,9 @@ class Overlay:
         style = {
             "scroll": scroll,
             "scroll_speed": round(v_eff, 2),
+            # LP-010: the GPU overlay runs its own sweep clock (app.js smoothFillFor);
+            # ship the knob so `smooth_fill 0` disables it there too, not just in Tk.
+            "smooth_fill": int(self._tune.get("smooth_fill", 1)),
             "motion_catchup": round(float(self._tune.get("scroll_motion_catchup", 4.0)), 3),
             "motion_seek_snap_s": round(float(self._tune.get("scroll_motion_seek_snap_s", 4.0)), 3),
             # v1.1.49 — the overlay's belt-motion clock (smoothMotionPos in app.js)
@@ -14768,6 +16089,18 @@ class Overlay:
                  state, self._decision_strikes, dims)
         if state == "TRUST":
             return
+        # Only the states that ACT get narrated. TRUST returns above, and CAUTION is
+        # an internal step on the way somewhere — narrating every strike would bury
+        # the two events that actually change what you see.
+        if state in ("SWITCH", "REGEN"):
+            _bad = ", ".join(k for k, v in (dims or {}).items() if v not in ("OK", "GOOD"))
+            self._note_event(
+                "decision", sev="warn",
+                detail=f"{state}: {self._decision_strikes} strikes"
+                       + (f" — {_bad} looking wrong" if _bad else "")
+                       + (". Finding different lyrics." if state == "SWITCH"
+                          else ". Regenerating by ear."),
+                state=state, strikes=self._decision_strikes)
         if state == "CAUTION":
             self._hint("🔎 Verifying current song…")
             try:
@@ -15149,6 +16482,30 @@ class Overlay:
         self.idx = -1
         self._kara = []
         self._idx_minus_one_since = 0.0
+        # TICKET-187: same reason as load() — this installs a NEW body in place, and
+        # the GPU overlay caches DOM blocks per line index. Without a blank window it
+        # never evicts, so it keeps drawing the OLD body's text at the NEW body's
+        # timings until each line scrolls out. Setting idx=-1 alone is invisible to
+        # the client: the tick loop reassigns it within ~16 ms, far inside the
+        # client's 250 ms poll.
+        self._overlay_relayout_until = time.time() + 0.6
+        # TICKET-183: this in-place install bypasses load(), so the caption-timing
+        # flag must be cleared here too — a stale True would make _maybe_auto_align
+        # suppress the energy correlator on the NEW (un-retimed) body forever, the
+        # exact "visible but never self-corrects" failure. Also re-arm + reschedule a
+        # caption-timing retime so the swapped browser body still reaches ~0.5s.
+        self._caption_timed = False
+        self._retime_seq = None
+        try:
+            _sw_src = (new_meta.get("source") or "") if isinstance(new_meta, dict) else ""
+            if (_sw_src and not _sw_src.startswith("bundled") and _sw_src != "youtube-captions"
+                    and new_lines and getattr(self, "_now_url", None)
+                    and not self._live_mode and not self._subs_suppresses_sound()
+                    and int(self._tune.get("caption_retime", 1))):
+                self.root.after(int(float(self._tune.get("caption_retime_delay_s", 1.5)) * 1000),
+                                lambda t=self._track_seq: self._retime_from_captions(t))
+        except Exception:
+            pass
         # 5. Drop the verified gate ONLY if this swap was the one that set it.
         if p.get("set_gate"):
             self._verified_gate_t = 0.0
@@ -15482,7 +16839,30 @@ class Overlay:
         # logs as "in sync" while the song is actually way off. Treat short
         # transcripts as inconclusive — don't switch, don't claim alignment.
         heard_text = res.get("heard") or ""
-        if len(heard_text.strip()) < 20:
+        # TICKET-188: …but a short transcript is only *deceptive* when the scores are
+        # CLOSE. The failure this guard was written for is a near-tie at low score.
+        # When the loaded body has essentially NO support and a library candidate
+        # clears a strong bar by a wide margin, that is not a tie to be deceived by —
+        # it is short but unambiguous evidence, and discarding it is how the app sat
+        # on an empty 4-line by-ear stub while the correct 32-line body was already
+        # on disk (不可思議のカルテ: heard 15 chars, best 67, loaded 0, no action).
+        _short = len(heard_text.strip()) < 20
+        _decisive = (best_score >= float(self._tune.get("ear_short_switch_min", 55.0))
+                     and loaded_score <= float(self._tune.get("ear_short_loaded_max", 8.0))
+                     and (best_score - loaded_score) >= float(
+                         self._tune.get("ear_short_margin", 45.0))
+                     and best_key not in ("loaded", loaded_key))
+        if _short and _decisive:
+            log.info("decide-by-ear: only %d chars heard, but %s scores %.0f vs a "
+                     "loaded body scoring %.0f — decisive despite the short listen",
+                     len(heard_text.strip()), Path(best_key).name, best_score, loaded_score)
+            # The record was pre-flagged inconclusive at construction (short text);
+            # this one IS conclusive, so let _score_ear_corrob count it.
+            try:
+                self._last_decision["inconclusive"] = False
+            except Exception:
+                pass
+        elif _short:
             log.info("decide-by-ear: only %d chars heard — inconclusive, no action",
                      len(heard_text.strip()))
             # v1.1.56: mark the recorded decision INCONCLUSIVE so _score_ear_corrob
@@ -15577,12 +16957,33 @@ class Overlay:
                     else:
                         log.info("decide-by-ear: best candidate's artist %r ≠ SMTC artist %r "
                                  "— penalizing best_score by 8", best_artist_n, smtc_artist_n)
+        # TICKET-188: every guard from here down assumes the LOADED body is worth
+        # protecting. When it is a near-empty stub that the transcript scores at ~0,
+        # there is nothing to protect and these guards instead PREVENT the rescue.
+        #
+        # 不可思議のカルテ: the title matched in kana but the library file is romaji
+        # (fukashigi_no_karte.json), so the title lookup scored 0 and the app loaded a
+        # 4-line by-ear stub — then TITLE-LOCKED onto it. decide-by-ear then found the
+        # correct 32-line body at 67 vs 0 and was blocked THREE ways: the title-lock
+        # MIN bump (to 75), the lopsided margin (needed 84), and the cross-artist block
+        # (the real body credits the seiyuu cast; SMTC reported the uploader "Shiina").
+        # A lock on an empty body is not ground truth.
+        _lines_now = len(getattr(self, "lines", []) or [])
+        loaded_worthless = (
+            _lines_now < int(self._tune.get("ear_thin_body_lines", 8))
+            and loaded_score <= float(self._tune.get("ear_thin_body_score", 8.0)))
+        if loaded_worthless and block_cross_artist:
+            log.info("decide-by-ear: cross-artist block LIFTED — the loaded body is a "
+                     "%d-line stub scoring %.0f, so there is no right song to protect",
+                     _lines_now, loaded_score)
+            block_cross_artist = False
         # GUARD: a title-LOCKED song came from a confident title match — strong ground
         # truth. Require an OVERWHELMING library match before a by-ear read may override
         # it, so one noisy/short clip can't switch away from the right song (the Suisei
         # 綺麗事 → Tip Taps Tip case — the hallucination filter is the primary fix; this
         # is defense-in-depth for any garbage transcript that still slips through).
-        if getattr(self, "_title_locked", False) and loaded_key not in ("loaded",):
+        if (getattr(self, "_title_locked", False) and loaded_key not in ("loaded",)
+                and not loaded_worthless):
             MIN += self._tune.get("decide_titlelock_bump", 15.0)
             MARGIN = max(MARGIN, self._tune.get("decide_titlelock_margin", 28.0))
         # TICKET-080: "lopsided win" override — when the loaded lyrics are clearly
@@ -15595,10 +16996,45 @@ class Overlay:
         lopsided = (expanded and loaded_score < wrong
                     and best_score >= max(50.0, MIN - 10.0)
                     and best_score - loaded_score >= 3.0 * MARGIN)
-        if (best_key not in ("loaded", loaded_key)
-                and not block_cross_artist          # v1.1.77: honor the cross-artist BLOCK
-                and ((best_score >= MIN and best_score - loaded_score >= MARGIN)
-                     or lopsided)):
+        _will_switch = (best_key not in ("loaded", loaded_key)
+                        and not block_cross_artist
+                        and ((best_score >= MIN and best_score - loaded_score >= MARGIN)
+                             or lopsided))
+        # TICKET-190: publish the gate arithmetic. This is the single most useful
+        # number set in the app and it existed only inside this function — working
+        # out WHY a correct body was refused (TICKET-188: best 67 vs a MIN of 75)
+        # meant reading the source and replaying the maths by hand.
+        try:
+            self._finder_gates = {
+                "t": round(time.time(), 2),
+                # TICKET-194: set false here, flipped by _on_track_change. A gate
+                # snapshot from the PREVIOUS song is still worth showing (it is
+                # often the decision that explains what is loaded now) but the
+                # console has to be able to say so.
+                "stale": False,
+                "track": " — ".join(x for x in (self._track or ()) if x) or None,
+                "expanded": bool(expanded),
+                "best": round(float(best_score), 1),
+                "loaded": round(float(loaded_score), 1),
+                "best_key": (Path(best_key).name if best_key not in ("loaded",) else "loaded"),
+                "min_required": round(float(MIN), 1),
+                "margin_required": round(float(MARGIN), 1),
+                "margin_actual": round(float(best_score - loaded_score), 1),
+                "title_locked": bool(getattr(self, "_title_locked", False)),
+                "block_cross_artist": bool(block_cross_artist),
+                "loaded_worthless": bool(loaded_worthless),
+                "loaded_lines": int(_lines_now),
+                "lopsided": bool(lopsided),
+                "short_transcript": bool(_short),
+                "short_decisive": bool(_decisive),
+                "heard_chars": len(heard_text.strip()),
+                "outcome": ("switch" if _will_switch else
+                            ("blocked-cross-artist" if block_cross_artist else
+                             ("below-min" if best_score < MIN else "below-margin"))),
+            }
+        except Exception:
+            pass
+        if _will_switch:
             try:
                 p = Path(best_key)
                 if p.exists() and self._file_valid(p, self._cur_duration):
@@ -15663,6 +17099,93 @@ class Overlay:
             self.root.after(int(self._tune.get("decide_listen_s", 12.0) * 1000) + 8000,
                             lambda t=track_seq: self._decide_by_ear(t, reason="track-start"))
 
+    def _retime_from_captions(self, track_seq):
+        """TICKET-183 (sync): for a browser provider/generated body that has good WORDS
+        but no video-locked timing anchor, fetch the video's OWN-language YouTube
+        auto-caption cue grid and re-time the body onto it — ~0.5s video-locked sync
+        while keeping the clean furigana/romaji text. Network fetch runs on a daemon
+        thread; the re-time is applied on the Tk thread. The caption cue TEXT is used
+        only to align and is then DISCARDED (never shown, persisted, or indexed)."""
+        if track_seq != self._track_seq or not self.lines:
+            return
+        if getattr(self, "_retime_seq", None) == track_seq:
+            return                                  # one caption-timing fetch per track
+        url = getattr(self, "_now_url", None)
+        if not url or len(self.lines) < 4:
+            return
+        self._retime_seq = track_seq
+        lang = (self.meta.get("lang") if isinstance(self.meta, dict) else None)
+        starts = [ln.start for ln in self.lines]
+        texts = [getattr(ln, "jp", "") or "" for ln in self.lines]
+        sig = self._body_sig(texts)                 # detect a same-track body swap while fetching
+
+        def _work():
+            try:
+                import deep_transcribe
+                import align as _al
+                grid = deep_transcribe.fetch_caption_timing(url, lang)
+                if not grid:
+                    return
+                new_starts = _al.retime_to_captions(starts, texts, grid)
+                if not new_starts:
+                    log.info("caption-retime: no confident cue match (%d lines vs %d cues) "
+                             "— kept existing timing", len(texts), len(grid))
+                    return
+                self.root.after(0, lambda ns=new_starts, t=track_seq, s=sig:
+                                self._apply_caption_retime(ns, t, s))
+            except Exception as e:
+                log.info("caption-retime failed: %s", e)
+        import threading as _th
+        _th.Thread(target=_work, daemon=True).start()
+
+    @staticmethod
+    def _body_sig(texts):
+        """Cheap identity of a lyric body — to detect an equal-length same-track body
+        swap that happened while a background caption-timing fetch was in flight."""
+        return (len(texts), (texts[0][:24] if texts else ""), (texts[-1][:24] if texts else ""))
+
+    def _apply_caption_retime(self, new_starts, track_seq, sig=None):
+        """Apply video-locked line starts on the Tk thread (TICKET-183). Rewrites each
+        line's start/end from the caption-aligned grid, zeroes the offset (per-line
+        times now carry absolute video timing), and flags the body so the energy
+        correlator leaves it alone (it would only nudge a video-locked body off)."""
+        if track_seq != self._track_seq or len(new_starts) != len(self.lines):
+            return
+        # The body could have been SWAPPED (same track, same length, different words)
+        # while the caption fetch was in flight — re-verify identity before rewriting
+        # its times, or we'd stamp one song's timing onto another's lines.
+        cur_texts = [getattr(ln, "jp", "") or "" for ln in self.lines]
+        if sig is not None and self._body_sig(cur_texts) != sig:
+            log.info("caption-retime: body changed mid-fetch — dropped")
+            return
+        # If a TIGHTER audio-based lock landed while we were fetching (a Shazam catalog
+        # match syncs to ~0.06s), keep it — don't loosen it to the caption track's
+        # ~0.5s cue quantization.
+        if (getattr(self, "_last_audio_off", None) is not None
+                and abs(self._last_audio_off) < float(self._tune.get("caption_retime_skip_off_s", 0.4))
+                and getattr(self, "_last_audio_off_t", 0)
+                and (time.time() - self._last_audio_off_t) < 40):
+            log.info("caption-retime: skipped — a tighter audio sync (off=%.2fs) already active",
+                     self._last_audio_off)
+            return
+        for ln, s in zip(self.lines, new_starts):
+            ln.start = round(float(s), 2)
+        for i in range(len(self.lines) - 1):        # end = next start (well-formed, non-overlapping)
+            self.lines[i].end = max(self.lines[i].start + 0.05, self.lines[i + 1].start)
+        if self.lines and self.lines[-1].end <= self.lines[-1].start:
+            self.lines[-1].end = self.lines[-1].start + 3.0
+        self.offset = 0.0
+        self.idx = -1
+        self._caption_timed = True
+        self._body_corroborated = True              # video-locked timing = corroborated
+        try:
+            self._block_cache.clear()               # timings changed → rebuild belt blocks
+        except Exception:
+            pass
+        log.info("caption-retime: adopted video-locked timing for %d lines (offset→0)",
+                 len(self.lines))
+        self._hint("🎯 Synced to the video's own captions")
+
     def _maybe_auto_align(self, reason="periodic"):
         """Background, automatic sync-by-listening. Runs only when conditions are
         right: lyrics loaded, song playing, no other alignment in flight, not in
@@ -15680,6 +17203,11 @@ class Overlay:
         # the energy correlator against them is wasted CPU (and risks nudging a
         # perfect sync). Skip it for caption-sourced lyrics.
         if (self.meta.get("source") or "") == "youtube-captions":
+            return
+        # TICKET-183: a provider/generated body RE-TIMED onto the video's own auto-
+        # caption cue grid is video-locked too — the correlator (ambiguous/thrashing
+        # on this material) must not nudge it back off.
+        if getattr(self, "_caption_timed", False):
             return
         # COVER on a mismatched LRC: the loaded lyrics are the ORIGINAL's timing,
         # which a re-sung cover never matches — correlating the cover's vocal
@@ -15773,8 +17301,20 @@ class Overlay:
                     nl = ocr_lyrics._norm(getattr(ln, "jp", "") or "")
                     if len(nl) < 4:
                         continue
-                    r = 0.95 if (no == nl or no in nl or nl in no) \
-                        else difflib.SequenceMatcher(None, no, nl).ratio()
+                    # TICKET-201: containment used to score a flat 0.95 with no
+                    # length check, so a 4-character OCR fragment sitting inside a
+                    # 40-character lyric line scored as high as an exact match.
+                    # EVERY bad commit in the runaway logged "ratio 0.95" — none of
+                    # them was ever a real match. The codebase already learned this
+                    # lesson in _same_song_title ('ghost' ⊂ 'ghosting'): containment
+                    # only counts when the shorter string COVERS most of the longer.
+                    if no == nl:
+                        r = 1.0
+                    elif (no in nl or nl in no) and \
+                            min(len(no), len(nl)) / max(len(no), len(nl)) >= 0.8:
+                        r = 0.95
+                    else:
+                        r = difflib.SequenceMatcher(None, no, nl).ratio()
                     if best is None or r > best[0]:
                         best = (r, i)
             # Live arrangements re-sing lyrics with small ad-lib differences from the
@@ -15796,18 +17336,104 @@ class Overlay:
             _off_cap = (float(self._tune.get("energy_max_offset_live", 120.0))
                         if _live_ocr else float(self._tune.get("energy_max_offset", 30.0)))
             if abs(target) > _off_cap:
-                log.info("ocr-sync(%s): line %d but offset %.1fs out of range (cap %.0fs) — skip",
-                         reason, idx, target, _off_cap)
+                # TICKET-201: an out-of-range read is EVIDENCE, not a no-op. It says
+                # "the caption I can see is nowhere near where we think we are". If a
+                # previous OCR commit put us here, that commit is what is wrong — and
+                # simply returning is why the runaway never recovered: the offset that
+                # broke the song stayed in force while every later read was discarded
+                # for being too far from it. Two in a row and we back the commit out.
+                self._ocr_far_streak = getattr(self, "_ocr_far_streak", 0) + 1
+                log.info("ocr-sync(%s): line %d but offset %.1fs out of range (cap %.0fs) — "
+                         "skip (streak %d)", reason, idx, target, _off_cap, self._ocr_far_streak)
+                if (self._ocr_far_streak >= 2
+                        and getattr(self, "_ocr_sync_applied", None) is not None):
+                    log.info("ocr-sync: %d far reads in a row while holding an OCR offset "
+                             "of %+.2fs — that commit is the thing that is wrong, reverting to 0",
+                             self._ocr_far_streak, self.offset)
+                    self._note_event(
+                        "sync-revert", sev="warn",
+                        detail=f"Backed out a bad OCR correction: {self.offset:+.2f}s "
+                               f"reverted to 0.00s after {self._ocr_far_streak} reads "
+                               f"landed far outside the {_off_cap:.0f}s cap.",
+                        line=idx, ratio=round(ratio, 2))
+                    self._ocr_sync_applied = None
+                    self._ocr_sync_pending = None
+                    self.root.after(0, lambda: self._smooth_offset(0.0, "ocr-sync-revert"))
                 return
+            self._ocr_far_streak = 0
             self._last_ocr_sync = {"matched": True, "line": idx, "ratio": round(ratio, 2),
                                    "offset": target, "was": round(self.offset, 2),
                                    "t": now, "reason": reason}
             if abs(target - self.offset) < float(self._tune.get("deadband", 0.8)):
                 log.info("ocr-sync(%s): line %d ratio %.2f — already within deadband (%.2fs)",
                          reason, idx, ratio, target - self.offset)
+                self._ocr_sync_pending = None
                 return
+
+            # ── TICKET-201: is this read actually TRACKING the video? ────────────
+            # The runaway matched LRC line 29 on nine consecutive passes across eight
+            # minutes of playback. A caption cannot stay on one line for eight minutes:
+            # either the OCR is re-reading a stale/static region, or the line is generic
+            # enough to match anything. Either way the implied offset is not a
+            # measurement, it is `line29.start - now`, which slides by exactly the
+            # playback delta every pass — which is precisely the ramp seen in the log
+            # (+51 → +27 → −13 → +56 → +24 → +4 → −36).
+            #
+            # Two reads matching the SAME line while the position moved = degenerate.
+            # Two reads matching DIFFERENT lines that agree on the offset = a real,
+            # corroborated measurement. That distinction is the whole fix.
+            prev = getattr(self, "_ocr_sync_pending", None)
+            if prev and prev["line"] == idx and abs(target - prev["target"]) > 1.0:
+                log.info("ocr-sync(%s): line %d matched AGAIN %.0fs later but implies a "
+                         "%+.2fs offset instead of %+.2fs — the read is not following the "
+                         "video (stale or generic line), distrusting it",
+                         reason, idx, now - prev["t"], target, prev["target"])
+                self._ocr_sync_pending = None
+                self._last_ocr_sync["degenerate"] = True
+                self._note_event(
+                    "sync-rejected", sev="warn",
+                    detail=f"Refused a {target - self.offset:+.2f}s correction: the screen "
+                           f"reader matched lyric line {idx + 1} again {now - prev['t']:.0f}s "
+                           f"later, so it is not following the video.",
+                    line=idx, ratio=round(ratio, 2))
+                return
+
+            # Big corrections need a second, independent read that agrees — the same
+            # rule the energy correlator already applies ("BIG studio jump with no
+            # Shazam corroboration — holding for confirmation"). The OCR path had no
+            # such gate and committed +55.99s off one unverified read, which is how a
+            # song that started in sync ended up 23s into the wrong part of itself.
+            _one_shot = float(self._tune.get("ocr_sync_single_shot_max", 4.0))
+            if abs(target - self.offset) > _one_shot:
+                # The confirming read must be a DIFFERENT line. Two reads of the same
+                # line are one measurement seen twice, not corroboration — and a
+                # stalled caption (or a paused player, where the position does not
+                # advance so the implied offset does not move either) would slip past
+                # the degenerate check above and then confirm ITSELF here, which is
+                # precisely the runaway this gate exists to stop.
+                if not (prev and prev["line"] != idx
+                        and abs(target - prev["target"])
+                        <= float(self._tune.get("deadband", 0.8))):
+                    self._ocr_sync_pending = {"line": idx, "target": target, "t": now}
+                    log.info("ocr-sync(%s): holding a %+.2fs correction (line %d, ratio %.2f) "
+                             "for a 2nd agreeing read — too big to commit on one",
+                             reason, target - self.offset, idx, ratio)
+                    self._last_ocr_sync["held"] = True
+                    return
+                log.info("ocr-sync(%s): 2nd read agrees (line %d now, line %d before) → "
+                         "confirmed", reason, idx, prev["line"])
+
+            self._ocr_sync_pending = None
+            self._ocr_sync_applied = target
             log.info("ocr-sync(%s): LRC line %d ratio %.2f → offset %.2fs (was %.2f)",
                      reason, idx, ratio, target, self.offset)
+            _delta = target - self.offset
+            self._note_event(
+                "sync-jump" if abs(_delta) > _one_shot else "sync-nudge",
+                sev="warn" if abs(_delta) > _one_shot else "info",
+                detail=f"Moved sync {_delta:+.2f}s (to {target:+.2f}s): the screen reader "
+                       f"matched lyric line {idx + 1} at {ratio:.2f} confidence.",
+                line=idx, ratio=round(ratio, 2), reason=reason)
             self.root.after(0, lambda o=target: self._smooth_offset(o, "ocr-sync"))
         except Exception as e:
             log.info("ocr-sync error: %s", e)
@@ -16272,20 +17898,33 @@ class Overlay:
             # bullet" locked onto a repeated chorus). So a live sync is NEVER
             # single-shot: it must be TWO-POINT verified with a 2nd confirming read
             # ~4s later (long enough to cross a chorus phrase) before it moves sync.
-            live = bool(getattr(self, "_live_arrangement", False)
-                        or getattr(self, "_live_mode", False))
+            # TICKET-192: a CONCERT is not the same problem as a live ARRANGEMENT, and
+            # they were sharing one set of thresholds. A live cut of a single song has
+            # the whole track to verify against; a concert changes song every few
+            # minutes, so a slow two-point verification often never completes before
+            # the song underneath it changes — and the track simply never locks. The
+            # cost of being slightly wrong in a concert is a correction 12s later; the
+            # cost of being slow is no lyrics at all.
+            concert = bool(getattr(self, "_live_mode", False))
+            live = concert or bool(getattr(self, "_live_arrangement", False))
+            _ss_key = ("concert_single_shot_max_s" if concert else
+                       "live_single_shot_max_s" if live else "single_shot_max_s")
             single_shot_max = float(self._tune.get(
-                "live_single_shot_max_s" if live else "single_shot_max_s",
-                0.0 if live else 2.0))
+                _ss_key, 1.8 if concert else (1.2 if live else 2.0)))
             if (abs(drift) <= single_shot_max
                     and not (abs(offset) > 6.0 and ratio < self._sync_match_floor())):
                 self._tier_commit(offset, ratio, "drift %+.2fs" % drift)
                 return
             # HOLD and confirm with a 2nd listen (two-point). Longer gap on live for
             # chorus differentiation; the window outlasts the gap + a ~6s capture + margin.
-            gap = float(self._tune.get("live_tpvr_gap_s", 4.0) if live
-                        else self._tune.get("tpvr_gap_s", 2.5))
+            gap = float(self._tune.get("concert_tpvr_gap_s", 1.2) if concert
+                        else self._tune.get("live_tpvr_gap_s", 2.5) if live
+                        else self._tune.get("tpvr_gap_s", 1.5))
             self._tier_tpvr, self._tier_tpvr_until = offset, now + gap + 11.5
+            # TICKET-193: remember WHICH gap produced this held read, so the
+            # agree/disagree outcome below can be attributed to it.
+            self._tier_tpvr_gap = gap
+            self._tier_tpvr_profile = ("concert" if concert else "live" if live else "studio")
             log.info("sync-tier: holding %+.2fs — confirming with a 2nd listen in %.1fs", offset, gap)
             self.root.after(int(gap * 1000), self._tier_listen_now)
             return
@@ -16294,8 +17933,10 @@ class Overlay:
         self._tier_tpvr = None
         if abs(offset - first) > 1.2:
             log.info("sync-tier: reads disagree (%.2f vs %.2f) → no change", first, offset)
+            self._note_tpvr_outcome(False, abs(offset - first))
             self._note_sync_verdict("inconclusive")
             return
+        self._note_tpvr_outcome(True, abs(offset - first))
         measured = 0.5 * (first + offset)
         if abs(measured) > 6.0 and ratio < self._sync_match_floor():
             self._note_sync_verdict("inconclusive")
@@ -16332,6 +17973,16 @@ class Overlay:
             return
         if (self.meta.get("source") or "") == "youtube-captions":
             return                                   # caption timing is already exact
+        if not int(self._tune.get("fine_tune_enabled", 1)):
+            return                                   # TICKET-181: fine-tune globally disabled
+        # TICKET-181: skip the ±0.2s fine-tune precision pass in a scroll-THROUGH
+        # belt. Its sub-second nudges would be held by the scroll deadband in
+        # _smooth_offset anyway (never visibly applied), and each 8s fine-tune
+        # Whisper listen briefly stalls the render (GIL) — pure cost, no benefit
+        # here. Line mode keeps fine-tune (there a nudge is unobtrusive).
+        if (not int(self._tune.get("fine_tune_in_scroll", 0))
+                and self._effective_scroll() in ("lr", "rl", "tb", "bt")):
+            return
         try:
             import align
             if not align.available():
@@ -16577,10 +18228,15 @@ class Overlay:
                 self._align_tpvr = offset
                 # v1.1.52 — longer confirm gap on live arrangements for chorus
                 # differentiation (an applause resync happens ONLY in live/concert).
-                _live = bool(getattr(self, "_live_arrangement", False)
-                             or getattr(self, "_live_mode", False))
-                _agap = float(self._tune.get("live_tpvr_gap_s", 4.0) if _live
-                              else self._tune.get("tpvr_gap_s", 2.5))
+                # TICKET-192: same three-way split as the tier path — a concert must
+                # confirm fast or the song changes underneath the confirmation. Kept in
+                # step with _note_tier_read deliberately: two different confirm
+                # schedules for the same held read would be a genuinely confusing bug.
+                _concert = bool(getattr(self, "_live_mode", False))
+                _live = _concert or bool(getattr(self, "_live_arrangement", False))
+                _agap = float(self._tune.get("concert_tpvr_gap_s", 1.2) if _concert
+                              else self._tune.get("live_tpvr_gap_s", 2.5) if _live
+                              else self._tune.get("tpvr_gap_s", 1.5))
                 log.info("applause resync: holding %+.2fs — confirming with a 2nd listen in %.1fs", offset, _agap)
                 self.root.after(int(_agap * 1000), lambda: self.align_by_listening(silent=True))
                 return
@@ -17014,6 +18670,58 @@ class Overlay:
                     pass
         return None
 
+    # The dev-console's own window title, from dev-console/src-tauri/tauri.conf.json.
+    # Used to find an EXISTING console that this process did not spawn.
+    _DEVCONSOLE_TITLE = "Lyric Immersion — Developer Console"
+
+    def _focus_dev_console_window(self):
+        """TICKET-198: find an already-open dev console — whoever started it — and
+        bring it to the front. Returns True if one was found.
+
+        `self._devconsole_child` only knows about a console THIS app instance
+        spawned, so it misses the two common cases: the app was restarted while a
+        console stayed open, and the console was launched by hand. Both leave a
+        stale window behind and the tray happily opens a second one, so you end up
+        comparing two consoles and trusting neither. Matching on the window title
+        catches every case and costs nothing. Best-effort; never raises."""
+        if os.name != "nt":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.windll.user32
+            found = []
+
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def _cb(hwnd, _lp):
+                if not u32.IsWindowVisible(hwnd):
+                    return True
+                n = u32.GetWindowTextLengthW(hwnd)
+                if n:
+                    buf = ctypes.create_unicode_buffer(n + 1)
+                    u32.GetWindowTextW(hwnd, buf, n + 1)
+                    if buf.value.strip() == self._DEVCONSOLE_TITLE:
+                        found.append(hwnd)
+                        return False              # stop enumerating
+                return True
+
+            u32.EnumWindows(_cb, 0)
+            if not found:
+                return False
+            hwnd = found[0]
+            u32.ShowWindow(hwnd, 9)               # SW_RESTORE (un-minimise)
+            # Windows refuses SetForegroundWindow from a process that does not own
+            # the foreground (returns 0 and merely flashes the taskbar button).
+            # Report that honestly: the window IS open either way, so we still
+            # return True and skip the spawn, but the log says whether the user
+            # will actually see it pop or has to click the taskbar.
+            if not u32.SetForegroundWindow(hwnd):
+                log.info("dev-console: window exists but Windows blocked the "
+                         "foreground change — it is flashing in the taskbar")
+            return True
+        except Exception:
+            return False
+
     def launch_dev_console(self):
         """Spawn the dev-console child (windowless), or hint how to build it."""
         # Reuse a live child instead of double-spawning — one dev console window
@@ -17022,10 +18730,18 @@ class Overlay:
             try:
                 if self._devconsole_child.poll() is None:
                     log.info("dev-console: already running (pid %s)", self._devconsole_child.pid)
+                    self._focus_dev_console_window()
                     self._hint("🛠 Dev Console already open")
                     return
             except Exception:
                 pass
+        # Not ours — but one may still be open from a previous app run or a manual
+        # launch. Focus that rather than adding a second window (TICKET-198).
+        if self._focus_dev_console_window():
+            log.info("dev-console: an instance is already open (not spawned by this "
+                     "app run) — focused it instead of starting a second one")
+            self._hint("🛠 Dev Console already open")
+            return
         exe = self._dev_console_exe()
         if exe is None:
             log.info("dev-console: build not found — cd dev-console && npm install && "
@@ -17177,6 +18893,14 @@ class Overlay:
         try:
             import window_titles as _wt
             _wt.stop_watcher()
+        except Exception:
+            pass
+        # TICKET-184: close the Whisper child process(es). They're spawned with
+        # CREATE_NO_WINDOW and would otherwise linger holding a CUDA context (and
+        # its VRAM) after the app is gone.
+        try:
+            import align as _al
+            _al._shutdown_workers()
         except Exception:
             pass
         self.media.stop()
@@ -17389,6 +19113,24 @@ def main():
         except Exception:
             pass
         _os._exit(0 if ok else 1)
+    if "--whisper-worker" in sys.argv[1:]:
+        # TICKET-184: the Whisper worker child. Runs faster-whisper/CTranslate2 in
+        # its own address space so a CUDA/cuDNN failure — which throws a C++
+        # exception on a native worker thread and calls abort(), something Python
+        # can NEVER catch — kills this disposable process instead of the app.
+        # Talks to the parent over a loopback socket (a windowed PyInstaller app
+        # has no usable stdout; see the recognize child below).
+        # NB: import os HERE. `_os` is bound inside the --selftest branch above,
+        # so it is an unbound function-local on this path (caught by the post-build
+        # probe: the frozen child died instantly with UnboundLocalError, which would
+        # have silently disabled the whole crash-isolation feature).
+        import os as _osw
+        try:
+            import whisper_worker
+            _rc = whisper_worker.main(sys.argv[1:])
+        except Exception:
+            _rc = 1
+        _osw._exit(int(_rc or 0))
     if "--recognize-child" in sys.argv[1:]:
         # TICKET-135: identify-by-sound in a SEPARATE PROCESS so the GIL-heavy
         # capture+fingerprint can't stall the parent's render thread (the

@@ -58,6 +58,7 @@ _ROUTES = {
         "/lyrics": "the full loaded lyric lines",
         "/tune": "GET: all live-tunable knobs + current values (weights, TPVR, decision strikes, energy/sync thresholds, display, …)",
         "/diag": "deep diagnostics: full sync state machine, last energy-correlation, FPS/frame-timing, pending-swap (TICKET-111)",
+        "/insight": "TICKET-190: song-finder introspection — every line the banner OCR read and why each was kept/dropped (window-chrome, not-on-setlist, awaiting-2nd-read), the setlist + which candidates are cached, SMTC/Shazam/lock state, and the live decide-by-ear gate arithmetic (best vs loaded, effective MIN/MARGIN, cross-artist block, loaded_worthless)",
         "/metrics": "per-release success/wobbler/fail telemetry counter (TICKET-121)",
         "/sync": "current offset lock state: offset, last energy-align, last OCR-assisted align, verify cadence (TICKET-123)",
         "/measure_sync": "sync accuracy meter: which line is HIGHLIGHTED vs which SHOULD be active for the audio position, the lag in seconds AND lines, offset, last energy best_shift/score, last heard transcription — quantifies the 'highlight is N lines behind' symptom",
@@ -72,6 +73,7 @@ _ROUTES = {
     "POST": {
         "/identify": "re-identify by sound now",
         "/wrong": "mark current lyrics wrong → re-identify + re-fetch",
+        "/override_title": "user picked the correct title (re-fetch with override)",
         "/nudge": "shift sync by ?s=2.5 seconds (+ = lyrics earlier)",
         "/reset": "reset the sync offset to 0",
         "/align": "sync by listening — transcribe the audio + match to lyrics, one-shot (needs faster-whisper)",
@@ -293,6 +295,16 @@ def make_handler(app, log_file, token):
                         self._send(200, {"ok": True, **app.get_diag()})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/insight":
+                    # TICKET-190: what the SONG FINDER can see (every OCR line and
+                    # why each was kept or dropped, the setlist + which songs are
+                    # cached, SMTC/Shazam/locks) and the live decide-by-ear gate
+                    # arithmetic. Drives the dev console's Song-finder + Decisions
+                    # views; previously all of this was log-only and rate-limited.
+                    try:
+                        self._send(200, {"ok": True, **app.get_insight()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/syncdiag":
                     # ring buffer of sync events (hi-snap, idx-skip, offset defer/commit,
                     # drift read, mode change, captions) + a live clock/offset snapshot
@@ -403,6 +415,23 @@ def make_handler(app, log_file, token):
                 elif path == "/wrong":
                     self._run(app.refetch)
                     self._send(200, {"ok": True, "action": "re-identifying + re-fetching"})
+                elif path == "/override_title":
+                    # TICKET-204: user picked the correct title from what the
+                    # engine saw. Forces a re-fetch under the override. The bad
+                    # string + the good one are logged for diagnostics (no lyric
+                    # body text — titles only, keeps the repo clear of copyright).
+                    if body:
+                        try:
+                            parsed = json.loads(body.decode("utf-8") or "{}")
+                        except Exception as e:
+                            return self._err(400, f"bad JSON body: {e}")
+                        correct = (parsed.get("title") or "").strip()
+                    else:
+                        correct = (q.get("title", [""])[0] or "").strip()
+                    if not correct:
+                        return self._err(400, "title required (JSON body {title: ...} or ?title=...)")
+                    self._run(lambda: app.override_title(correct, reason="dev-console"))
+                    self._send(200, {"ok": True, "action": f"title overridden to {correct!r}, re-fetching"})
                 elif path == "/nudge":
                     try:
                         s = float(q.get("s", ["0"])[0])

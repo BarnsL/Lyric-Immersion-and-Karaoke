@@ -214,3 +214,429 @@ p { color: #a2a6b8; font-size: 13px; line-height: 1.55; }
   color: #8a8fa4; font-size: 13px;
 }
 .empty small { display: block; margin-top: 4px; color: #6d7286; font-size: 11px; }
+
+/* ── decision tree (TICKET-190) ──────────────────────────────────────────────
+   A vertical gate ladder. The path that actually executed is lit; steps the
+   evaluation never reached are dimmed, so the shape of the decision is legible
+   at a glance rather than needing the numbers read one by one. */
+.tree { display: flex; flex-direction: column; margin-top: 4px; }
+.tree-step { display: flex; flex-direction: column; }
+.tree-step.unreached { opacity: 0.38; filter: saturate(0.4); }
+.tree-step.unreached .tree-node { border-style: dashed; }
+
+.tree-link {
+  width: 2px; height: 16px; margin-left: 21px;
+  background: var(--line, #2a3346);
+}
+.tree-link.live {
+  background: linear-gradient(180deg, var(--accent, #7c9cff), var(--accent, #7c9cff));
+  /* the pulse travels downward, so a fresh evaluation reads as flowing */
+  animation: tree-flow 1.6s ease-in-out infinite;
+}
+@keyframes tree-flow {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 1; }
+}
+
+.tree-node {
+  border: 1px solid var(--line, #2a3346);
+  border-radius: 10px;
+  padding: 9px 12px;
+  background: var(--card, #131a2a);
+  transition: border-color 180ms ease, background 180ms ease;
+}
+.tree-node-head { display: flex; align-items: center; gap: 8px; }
+.tree-node-body {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; margin-top: 5px; flex-wrap: wrap;
+}
+.tree-node-body code { font-size: 12px; opacity: 0.75; }
+.tree-actual { font-variant-numeric: tabular-nums; font-size: 12.5px; }
+.tree-note { margin: 7px 0 0; font-size: 12px; opacity: 0.72; line-height: 1.45; }
+.tree-verdict { display: inline-flex; }
+
+.tree-step.v-pass.live  .tree-node { border-color: #2f7d5a; }
+.tree-step.v-pass.live  .tree-verdict { color: #4ade80; }
+.tree-step.v-fail.live  .tree-node { border-color: #8a5a2b; background: #1b1710; }
+.tree-step.v-fail.live  .tree-verdict { color: #fbbf24; }
+.tree-step.v-block.live .tree-node { border-color: #8a3030; background: #1d1213; }
+.tree-step.v-block.live .tree-verdict { color: #f87171; }
+.tree-step.v-skip.live  .tree-verdict { color: #94a3b8; }
+
+/* The gate that ENDED the evaluation is the answer to "why?" — pulse it once so
+   the eye lands there first. */
+.tree-step.v-fail.live:last-of-type .tree-node,
+.tree-step.v-block.live .tree-node { animation: tree-land 900ms ease-out 1; }
+@keyframes tree-land {
+  0%   { transform: translateY(-2px); box-shadow: 0 0 0 0 rgba(248,113,113,0.35); }
+  60%  { box-shadow: 0 0 0 6px rgba(248,113,113,0.10); }
+  100% { transform: none; box-shadow: 0 0 0 0 rgba(248,113,113,0); }
+}
+
+/* ── live "now" strip + label/value rows (TICKET-194) ──────────────────────
+   `.knob-row` is scoped to TABLE CELLS (.knob-row td) for the Parameters view.
+   Reusing that class on a <div> gave those rows NO layout at all, which is why
+   the Song-finder rows rendered as run-on text ("Matched againstthe whole
+   library"). `.stat-row` is the div-based equivalent. */
+.stat-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 7px 0; border-bottom: 1px solid #1e2131; font-size: 12px;
+}
+.stat-row:last-child { border-bottom: 0; }
+.stat-row > span:first-child { color: #82889c; }
+.stat-row > span:last-child { text-align: right; color: #e2e0f8; }
+.stat-row strong { color: #f1f0ff; font-weight: 650; }
+
+/* A block whose data describes a PREVIOUS video. Visibly demoted rather than
+   hidden: the content is still useful, it just must not read as current. */
+.stale-block { opacity: .55; filter: saturate(.55); }
+
+.now-card { padding: 0; overflow: hidden; }
+.now-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 16px; padding: 16px 18px 13px;
+}
+.now-title { min-width: 0; }
+.now-title h2 {
+  margin: 0 0 3px; font-size: 19px; letter-spacing: -.02em; color: #fafaff;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.now-title .now-sub { color: #9095a8; font-size: 12px; }
+/* The reduced search title (TICKET-200). Deliberately quiet — it is only shown
+   when the reduction changed the title, and in the healthy case it is a footnote.
+   In the unhealthy case it is the answer, so the title itself stays legible. */
+.now-title .now-searched {
+  display: flex; align-items: center; gap: 5px; margin-top: 4px;
+  color: #6d7286; font-size: 11px; min-width: 0;
+}
+.now-title .now-searched strong {
+  color: #b9bdd0; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.now-badges { display: flex; align-items: center; gap: 6px; flex: none; }
+
+/* The playhead. Also the cheapest proof the console is live: it moves. */
+.now-bar { height: 3px; background: #1e2131; position: relative; }
+.now-bar i { position: absolute; inset: 0 auto 0 0; background: linear-gradient(90deg, #5b51c9, #877df6); }
+.now-times {
+  display: flex; justify-content: space-between; padding: 6px 18px 0;
+  color: #6d7286; font-size: 10.5px; font-variant-numeric: tabular-nums;
+}
+.now-tiles {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  gap: 1px; background: #1e2131; margin-top: 12px;
+}
+.now-tile { background: #131624; padding: 11px 14px; }
+.now-tile strong {
+  display: block; color: #e5e2ff; font-size: 15px; letter-spacing: -.02em;
+  margin-bottom: 2px; font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.now-tile span { color: #85879e; font-size: 9.5px; text-transform: uppercase; letter-spacing: .07em; }
+.now-tile.good strong { color: #98dfb9; }
+.now-tile.bad  strong { color: #ffc0ce; }
+.now-tile.busy strong { color: #f0c782; }
+
+/* Breathes while the engine is thinking, so "working" never looks like "hung". */
+.now-pulse { animation: now-pulse 1.5s ease-in-out infinite; }
+@keyframes now-pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+/* ============================================================
+ * TICKET-203/204: Activity view — toast notifications, event
+ * log, and the Wrong Song title picker.
+ * ============================================================ */
+
+/* ── Toast stack (animated slide-in notifications) ─────────── */
+.toast-stack {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: #1e1e2e;
+  border: 1px solid #353548;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  pointer-events: auto;
+}
+
+/* Severity colours — green for good, amber for warn, blue for info */
+.toast.sev-good { border-color: #2d5a3d; background: #162420; }
+.toast.sev-warn { border-color: #5a4a2d; background: #242016; }
+.toast.sev-info { border-color: #353548; background: #1e1e2e; }
+
+.toast.sev-good .toast-icon { color: #98dfb9; }
+.toast.sev-warn .toast-icon { color: #f0c782; }
+.toast.sev-info .toast-icon { color: #7d72f1; }
+
+/* The slide-in + fade animation */
+.toast-enter {
+  animation: toast-slide-in 0.35s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes toast-slide-in {
+  0%   { transform: translateX(120%) scale(0.95); opacity: 0; }
+  100% { transform: translateX(0)    scale(1);    opacity: 1; }
+}
+
+/* The icon pulses on warn toasts so the eye lands on it */
+.toast.sev-warn .toast-icon {
+  animation: toast-pulse 1.2s ease-in-out infinite;
+}
+@keyframes toast-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.6; transform: scale(1.15); }
+}
+
+.toast-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  padding-top: 1px;
+}
+
+.toast-body { flex: 1; min-width: 0; }
+
+.toast-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.toast-head strong {
+  font-size: 12px;
+  letter-spacing: .02em;
+  color: #e2e0f8;
+}
+
+.toast-ago {
+  font-size: 10px;
+  color: #82889c;
+  white-space: nowrap;
+}
+
+.toast-body p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #c4c2e9;
+}
+
+.toast-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: #82889c;
+}
+
+.toast-meta .toast-title {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toast-meta .gap-bad {
+  color: #ffc0ce;
+  font-weight: 600;
+}
+
+/* ── Event log ─────────────────────────────────────────────── */
+.event-log {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 600px;
+  overflow-y: auto;
+}
+
+.event-row {
+  display: grid;
+  grid-template-columns: 70px 20px 1fr;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  border-left: 2px solid transparent;
+  transition: background 0.15s;
+}
+
+.event-row:hover { background: rgba(255, 255, 255, 0.02); }
+
+.event-row.sev-good { border-left-color: #4a8a5e; }
+.event-row.sev-warn { border-left-color: #b8945a; }
+.event-row.sev-info { border-left-color: #4a4a6a; }
+
+.event-time {
+  display: flex;
+  align-items: flex-start;
+}
+
+.event-ago {
+  font-size: 10px;
+  color: #82889c;
+  white-space: nowrap;
+  padding-top: 1px;
+}
+
+.event-icon {
+  display: flex;
+  align-items: flex-start;
+  padding-top: 1px;
+  color: #82889c;
+}
+
+.event-row.sev-good .event-icon { color: #98dfb9; }
+.event-row.sev-warn .event-icon { color: #f0c782; }
+.event-row.sev-info .event-icon { color: #7d72f1; }
+
+.event-content { min-width: 0; }
+
+.event-kind {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #e2e0f8;
+  letter-spacing: .01em;
+  text-transform: uppercase;
+}
+
+.event-source {
+  font-size: 9.5px;
+  font-weight: 400;
+  color: #82889c;
+  text-transform: none;
+}
+
+.event-detail {
+  margin: 2px 0 4px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #c4c2e9;
+}
+
+.event-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: 10.5px;
+  color: #82889c;
+}
+
+.event-meta code {
+  font-size: 10px;
+  background: rgba(125, 114, 241, 0.1);
+  padding: 0 4px;
+  border-radius: 2px;
+  color: #a4a2c9;
+}
+
+.event-meta .event-title {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Gap severity colours in the log */
+.gap-ok   { color: #98dfb9; }
+.gap-warn { color: #f0c782; }
+.gap-bad  { color: #ffc0ce; font-weight: 600; }
+
+/* ── Wrong Song + title picker ─────────────────────────────── */
+.wrong-song-card { border-color: #3a3548; }
+
+.wrong-song-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.button.warn {
+  background: #4a3a2d;
+  color: #f0c782;
+  border: 1px solid #5a4a3d;
+}
+.button.warn:hover:not(:disabled) {
+  background: #5a4a3d;
+}
+
+.title-id-grid {
+  margin: 10px 0;
+  padding: 8px 0;
+  border-top: 1px solid #2a2a3e;
+  border-bottom: 1px solid #2a2a3e;
+}
+
+.title-id-grid code {
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.title-id-grid .strikethrough {
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
+.title-id-grid .override-active {
+  color: #98dfb9;
+  font-weight: 600;
+}
+
+.title-picker {
+  margin-top: 10px;
+}
+
+.seen-strings {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.seen-string-btn {
+  text-align: left;
+  font-size: 11px;
+  font-family: monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.seen-string-btn:hover:not(:disabled) {
+  background: #2d2d44;
+  color: #98dfb9;
+}
+
+.custom-title {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.custom-title input {
+  flex: 1;
+  font-size: 12px;
+  padding: 6px 10px;
+  background: #1e1e2e;
+  border: 1px solid #353548;
+  border-radius: 4px;
+  color: #e2e0f8;
+}
+
+.custom-title input:focus {
+  outline: none;
+  border-color: #7d72f1;
+}

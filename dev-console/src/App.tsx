@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import {
-  Activity,
+  Activity as ActivityIcon,
   Boxes,
   Cog,
   GitBranch,
@@ -8,19 +8,28 @@ import {
   Library,
   RefreshCw,
   Workflow,
+  Eye,
+  Bell,
+  BookOpen,
   ExternalLink,
 } from "lucide-react";
-import { getDiag, getHealth, getStatus, openExternal } from "./api";
+import { getDiag, getHealth, getInsight, getStatus, openExternal } from "./api";
 import { Overview } from "./components/Overview";
+import { Finder } from "./components/Finder";
+import { Decisions } from "./components/Decisions";
+import { Activity } from "./components/Activity";
 import { DiagramView } from "./components/Diagram";
 import { Parameters } from "./components/Parameters";
 import { AutoResearch } from "./components/AutoResearch";
 import { Resources } from "./components/Resources";
-import { RESOURCES } from "./manifest";
-import type { DiagPayload, Health, StatusPayload, ViewKey } from "./models";
+import { DOCS, RESOURCES } from "./manifest";
+import type { DiagPayload, Health, InsightPayload, StatusPayload, ViewKey } from "./models";
 
 const NAV: { key: ViewKey; label: string; icon: JSX.Element }[] = [
   { key: "overview",     label: "Overview",      icon: <LayoutDashboard size={16} /> },
+  { key: "finder",       label: "Song finder",   icon: <Eye size={16} /> },
+  { key: "decisions",    label: "Decisions",     icon: <GitBranch size={16} /> },
+  { key: "activity",     label: "Activity",       icon: <Bell size={16} /> },
   { key: "diagram",      label: "Runtime map",   icon: <Workflow size={16} /> },
   { key: "parameters",   label: "Parameters",    icon: <Cog size={16} /> },
   { key: "autoresearch", label: "AutoResearch",  icon: <GitBranch size={16} /> },
@@ -32,6 +41,7 @@ export function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [status, setStatus] = useState<StatusPayload | null>(null);
   const [diag, setDiag] = useState<DiagPayload | null>(null);
+  const [insight, setInsight] = useState<InsightPayload | null>(null);
   const [appOnline, setAppOnline] = useState<boolean | null>(null);
   const [ticker, setTicker] = useState(0);
 
@@ -40,6 +50,7 @@ export function App() {
     // Only pull /diag while the Overview tab is visible — no reason to burn
     // cycles polling the sync FSM while the user is on Resources.
     const pollDiag = view === "overview";
+    const pollInsight = view === "finder" || view === "decisions" || view === "activity" || view === "autoresearch";
     async function tick() {
       try {
         const h = await getHealth();
@@ -54,6 +65,12 @@ export function App() {
           const d = await getDiag();
           if (!cancelled) setDiag(d);
         } catch { if (!cancelled) setDiag(null); }
+      }
+      if (pollInsight) {
+        try {
+          const ins = await getInsight();
+          if (!cancelled) setInsight(ins);
+        } catch { if (!cancelled) setInsight(null); }
       }
     }
     tick();
@@ -98,10 +115,10 @@ export function App() {
             </span>
           </div>
           <div className="kv" style={{ marginTop: 6 }}>
-            <Activity size={12} />
+            <ActivityIcon size={12} />
             <span>
-              {status?.title
-                ? <>now: <strong>{status.title}</strong></>
+              {status?.player_title
+                ? <>now: <strong>{status.player_title}</strong></>
                 : "no track"}
             </span>
           </div>
@@ -113,14 +130,26 @@ export function App() {
               <ExternalLink size={11} /> API
             </button>
           </div>
+          <div className="kv" style={{ marginTop: 6 }}>
+            <button
+              className="button quiet tiny"
+              onClick={() => openExternal(DOCS.devConsole)}
+              title="How to use this console — every view, what the numbers mean, troubleshooting"
+            >
+              <BookOpen size={11} /> How to use this console
+            </button>
+          </div>
         </div>
       </aside>
 
       <main className="workspace">
         {view === "overview"     && <Overview health={health} status={status} diag={diag} online={appOnline} />}
+        {view === "finder"       && <Finder insight={insight} online={appOnline} />}
+        {view === "decisions"    && <Decisions insight={insight} online={appOnline} />}
+        {view === "activity"     && <Activity insight={insight} online={appOnline} />}
         {view === "diagram"      && <DiagramView />}
         {view === "parameters"   && <Parameters online={appOnline} />}
-        {view === "autoresearch" && <AutoResearch />}
+        {view === "autoresearch" && <AutoResearch insight={insight} />}
         {view === "resources"    && <Resources />}
       </main>
     </div>

@@ -13,6 +13,31 @@ IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
+# TICKET-196: the vendored ./.deps is built for ONE CPython ABI (cp312 on the
+# Windows build box). Building under a different minor version produces an .exe
+# that starts fine and then fails `import numpy._core._multiarray_umath` at
+# runtime — whisper silently dead, exactly the class of breakage TICKET-175/177
+# exist to stop. `build.bat` guards this via scripts/check_build_deps.py, but
+# invoking PyInstaller DIRECTLY skips that check, and on this machine the bare
+# `python` on PATH is a 3.11 agent venv rather than the 3.12 the app needs — so
+# the direct path is easy to take by accident. The spec is the one file every
+# build route must load, which makes it the right place for the backstop.
+if IS_WIN and os.path.isdir(".deps"):
+    import glob as _glob
+    _tags = {os.path.basename(p).split(".")[-2].split("-")[0]
+             for p in _glob.glob(os.path.join(".deps", "**", "*.pyd"), recursive=True)
+             if ".cp" in os.path.basename(p)}
+    _want = "cp%d%d" % sys.version_info[:2]
+    if _tags and _want not in _tags:
+        raise SystemExit(
+            "\n[spec] ABI MISMATCH — refusing to build a broken bundle.\n"
+            "       .deps is %s, this interpreter is %s (%s)\n"
+            "       Build with the matching Python, e.g.\n"
+            "         C:\\Users\\<you>\\AppData\\Local\\Programs\\Python\\Python312\\python.exe "
+            "-m PyInstaller --noconfirm DesktopKaraoke.spec\n"
+            "       See docs/BUILD.md and ISSUES.md TICKET-196.\n"
+            % ("/".join(sorted(_tags)), _want, sys.executable))
+
 # OPTIONAL "Sync by listening" stack (faster-whisper) is bundled ONLY when it has
 # been vendored into ./.deps (pip install --target .deps faster-whisper). Without
 # it the default build stays lean (~150 MB) and the feature shows a "needs
@@ -46,6 +71,10 @@ hiddenimports = [
     # local modules imported lazily inside functions — pin them so the
     # frozen build always includes them.
     "appdata", "version", "updater", "songchange", "align", "api", "character", "recognize", "fetch_lyrics", "gpu_setup", "metrics",
+    # TICKET-184: the out-of-process Whisper worker. Only imported inside the
+    # `--whisper-worker` argv branch, so pin it — without this the frozen app
+    # can't spawn its own crash-isolated child.
+    "whisper_worker",
     # optional LLM lyric disambiguator — lazy-imported inside _decide_by_ear;
     # pin so the frozen build includes it (stdlib urllib only, no new deps).
     "llm_disambiguate",

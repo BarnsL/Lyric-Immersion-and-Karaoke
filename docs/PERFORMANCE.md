@@ -55,6 +55,26 @@ track-start checks use the cheap energy correlation; Whisper is reserved for a
 confirmed persistent drift (`reason in {drift, drift-integral}`) or the explicit
 "Sync by listening" button.
 
+## PERF-008 — "Stutter/jumping" that is the SYNC CLOCK, not the render (TICKET-181) 🟢
+**Symptom:** scroll-through belt "gets stuck and jumping"; user asked to relax fine-syncing.
+**Two measurement traps to know first:**
+1. **On the GPU/Tauri overlay the `/diag.fps` block reads 0** (`render=null, frame_ms=0`) — the Tk
+   render loop is withdrawn, so those numbers measure nothing. Don't read that as "0 fps"; the GPU
+   overlay draws separately (~60 fps). Confirm the renderer before trusting `/diag.fps`.
+2. A `render_bench.py` of the CPU pipeline shows it is **not** the bottleneck (warm 5 ms, fill 1 ms
+   at font_scale 1.5) — see LYRIC_PERFORMANCE.md **LP-008**.
+**Root cause:** in a scroll belt the whole strip rides `pos + offset`, so every small ongoing sync
+correction (fine-tune nudge, Shazam micro-nudge, energy-align, live-follow) — all routed through
+`_smooth_offset` — visibly lurches the belt. A sub-second timing error is invisible on a moving belt;
+a sub-second offset STEP is not.
+**Fix (all scroll-through-only; line mode unchanged):** (a) widen the correction **deadband** in
+`_smooth_offset` (`sync_apply_min_s_scroll` 1.0) so sub-1 s corrections are held; (b) don't run the
+±0.2 s **fine-tune** pass in scroll (`fine_tune_in_scroll` 0) — its nudges wouldn't apply anyway and
+each 8 s Whisper listen stalls the render (cf. PERF-007); (c) **gentler ease** in scroll
+(`ease_slew_cap_s_scroll`/`ease_pull_per_sec_scroll`) so a rare ≥1 s re-anchor glides instead of
+whooshing. **Measured** (`belt_sim.py`): >1.5× belt-velocity frames 132→44, velocity variance −40%.
+All live-tunable; a `fine_tune_enabled` master switch was also added.
+
 ---
 
 ## PERF-100 — GPU-accelerated overlay (future, big win, big effort) 🔴

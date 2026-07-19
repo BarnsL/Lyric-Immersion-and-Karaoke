@@ -1,4 +1,5 @@
-import { Copy, ExternalLink, GitBranch, ShieldCheck } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Copy, ExternalLink, GitBranch, ShieldCheck } from "lucide-react";
+import type { InsightPayload } from "../models";
 import { AUTORESEARCH } from "../manifest";
 import { openExternal } from "../api";
 import { useState } from "react";
@@ -18,7 +19,66 @@ function CopyBtn({ text }: { text: string }) {
   );
 }
 
-export function AutoResearch() {
+/**
+ * Live status, not documentation. This page previously described the loop as if it
+ * were running; checked against the actual worktree it had ZERO experiment commits
+ * and sat 0 commits ahead of master, and the skill it tells you to install was not
+ * installed. A console that reports aspiration as working state is worse than one
+ * that reports nothing.
+ */
+function LoopStatus({ insight }: { insight: InsightPayload | null }) {
+  const ar = insight?.autoresearch;
+  if (!ar) return null;
+  const everRun = ar.experiments > 0;
+  return (
+    <div className="card" style={{ marginTop: 14 }}>
+      <div className="card-heading">
+        {everRun ? <CheckCircle2 size={15} /> : <AlertTriangle size={15} />}
+        Loop status
+        <span className={everRun ? "pill ok" : "pill warn"}>
+          {everRun ? `${ar.experiments} experiment commits` : "has never run"}
+        </span>
+      </div>
+      <div className="stat-row">
+        <span>Worktree</span>
+        <span>
+          <code>{ar.worktree ?? "—"}</code>{" "}
+          <span className={ar.exists ? "pill ok" : "pill warn"}>{ar.exists ? "present" : "missing"}</span>
+        </span>
+      </div>
+      <div className="stat-row">
+        <span>Skill installed</span>
+        <span className={ar.skill_installed ? "pill ok" : "pill warn"}>
+          {ar.skill_installed ? "yes" : "no — /autoresearch is unavailable"}
+        </span>
+      </div>
+      <div className="stat-row">
+        <span>Ahead of master</span>
+        <span>
+          <strong>{ar.ahead_of_master}</strong> commit{ar.ahead_of_master === 1 ? "" : "s"}
+          {ar.ahead_of_master === 0 && (
+            <span className="pill" title="Nothing on the branch that master doesn't already have — it is a stale snapshot, not work in progress.">
+              stale snapshot
+            </span>
+          )}
+        </span>
+      </div>
+      {ar.last_commit && (
+        <div className="stat-row"><span>Last commit</span><span><code>{ar.last_commit}</code></span></div>
+      )}
+      {!everRun && (
+        <p className="tree-note">
+          The branch exists but contains no <code>experiment:</code> commits, so the loop
+          described below has not actually been run.
+          {!ar.skill_installed && <> Install the skill first — the <code>/autoresearch</code> command
+          does not exist until then.</>}
+        </p>
+      )}
+    </div>
+  );
+}
+
+export function AutoResearch({ insight }: { insight?: InsightPayload | null }) {
   return (
     <>
       <div className="topbar">
@@ -31,6 +91,8 @@ export function AutoResearch() {
           Skill on GitHub <ExternalLink size={13} />
         </button>
       </div>
+
+      <LoopStatus insight={insight ?? null} />
 
       <div className="ar-hero">
         <div>

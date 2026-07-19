@@ -3,9 +3,23 @@ REM Build Lyric Immersion and Karaoke into a portable folder and, if Inno Setup 
 REM    installed, a one-click Setup installer). Run this from the repo folder.
 setlocal
 
+REM TICKET-196: pick the interpreter whose ABI matches ./.deps (cp312), NOT the
+REM bare `python` on PATH. On the Windows build box that resolves to a 3.11 agent
+REM venv, and building cp311 against cp312 .deps produces an app that starts fine
+REM and has a silently dead whisper stack. The spec now refuses that outright, so
+REM without this line every documented build command aborts.
+set "PY=python"
+py -3.12 -c "import sys" >nul 2>nul && set "PY=py -3.12"
+for /f "delims=" %%v in ('%PY% -c "import sys;print('%%d.%%d'%%sys.version_info[:2])" 2^>nul') do set "PYVER=%%v"
+echo [0/5] Build interpreter: %PY%  (Python %PYVER%)
+if not "%PYVER%"=="3.12" (
+    echo     [!] WARNING: .deps is built for cp312. If this build fails in the spec
+    echo         ABI check, install Python 3.12 or set PY to its python.exe.
+)
+
 echo [1/5] Installing build + app dependencies...
-python -m pip install --upgrade pip >nul
-python -m pip install pyinstaller -r requirements.txt || goto :err
+%PY% -m pip install --upgrade pip >nul
+%PY% -m pip install pyinstaller -r requirements.txt || goto :err
 
 echo.
 echo ????????????????????????????????????????????????????????????
@@ -16,7 +30,7 @@ echo ????????????????????????????????????????????????????????????
 choice /C YN /M "Bundle faster-whisper (recommended)?"
 if %errorlevel%==1 (
     echo Installing faster-whisper for bundling...
-    python -m pip install faster-whisper>=1.0 || echo [!] Warning: faster-whisper install failed - build will continue without it.
+    %PY% -m pip install faster-whisper>=1.0 || echo [!] Warning: faster-whisper install failed - build will continue without it.
 )
 
 echo.
@@ -28,18 +42,37 @@ REM wrong-lyrics reject path in every shipped build v1.1.74..v1.1.76 with no log
 REM This warns on a version diff (dist-info can lag the real module) and hard-fails
 REM only on DUPLICATE dist-info (unambiguous corruption); the post-build --selftest
 REM below is the definitive gate. Remediation is printed by the check.
-python scripts\check_build_deps.py || goto :err
+%PY% scripts\check_build_deps.py || goto :err
+
+echo.
+echo [1c/5] Verifying PyAV's FFmpeg DLL imports resolve (the DIRECT skew check) ...
+REM TICKET-176: check_build_deps.py above compares VERSION STRINGS, which is only a
+REM proxy - dist-info can lag the real module files, and the failure is about DLL
+REM FILE IDENTITY. This parses av/_core.pyd's PE import table and asserts every
+REM FFmpeg DLL it imports is actually present in av.libs (the exact thing that
+REM broke: a stale .deps _core.pyd + a newer av.libs => unresolved imports, so
+REM `import av` dies at runtime with "DLL load failed while importing _core").
+REM Stdlib-only, so it can't be silently skipped for a missing pefile.
+%PY% scripts\check_av_dlls.py || goto :err
 
 echo.
 echo [2/5] Building Lyric-Immersion-and-Karaoke.exe ...
-python -m PyInstaller --noconfirm DesktopKaraoke.spec || goto :err
+%PY% -m PyInstaller --noconfirm DesktopKaraoke.spec || goto :err
 REM v1.1.62 BUGFIX: '->' in cmd is `-` + `>` (redirect), which OVERWROTE the
 REM freshly-built exe with 7 bytes of "    -\r\n" — every build was silently
 REM broken. Escape the `>` with `^>` so it stays literal text in the echo.
 echo     -^> dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe
 
 echo.
-echo [2b/5] Smoke-testing the built app's AI stack (whisper actually imports) ...
+echo [2b/5] Verifying the BUNDLED PyAV FFmpeg DLLs resolve (av._core PE imports) ...
+REM TICKET-176: the same check against the ACTUAL shipped bundle, which catches a
+REM PyInstaller collection that pulled mismatched pieces even when the build env
+REM was clean. Runs WITHOUT launching the exe, so it names the missing DLL instead
+REM of the --selftest's opaque exit code - run both, this one first.
+%PY% scripts\check_av_dlls.py --internal dist\DesktopKaraoke || goto :err
+
+echo.
+echo [2c/5] Smoke-testing the built app's AI stack (whisper actually imports) ...
 REM TICKET-175 BACKSTOP: prove the FINISHED .exe can import av + faster-whisper and
 REM that align.available() is True. --selftest runs before any GUI init and exits
 REM 0/1 (writing a one-line verdict to the --out file), so a whisper-broken bundle

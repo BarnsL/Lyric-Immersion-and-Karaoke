@@ -1,4 +1,4 @@
-import type { DiagPayload, Health, StatusPayload, TunePayload, TuneValue } from "./models";
+import type { DiagPayload, Health, InsightPayload, StatusPayload, TunePayload, TuneValue } from "./models";
 
 // The desktop app's local HTTP API. Localhost-only, no token when the app is
 // running under its default settings — see D:\Desktop-Karaoke\api.py.
@@ -19,6 +19,8 @@ export const getHealth = () => j<Health>("/health");
 export const getStatus = () => j<StatusPayload>("/status");
 export const getTune = () => j<TunePayload>("/tune");
 export const getDiag = () => j<DiagPayload>("/diag");
+// TICKET-190 — song-finder introspection + live gate arithmetic.
+export const getInsight = () => j<InsightPayload>("/insight");
 
 // Update a single tune knob. api.py accepts POST /tune?key=…&value=… (query)
 // OR a JSON body {k: v, …}. We stringify booleans/numbers so the server-side
@@ -28,6 +30,22 @@ export async function setTune(key: string, value: TuneValue): Promise<{ ok: bool
   const s = typeof value === "boolean" ? (value ? "1" : "0") : String(value ?? "");
   return j(`/tune?key=${encodeURIComponent(key)}&value=${encodeURIComponent(s)}`, {
     method: "POST",
+  });
+}
+
+// TICKET-204: mark the current lyrics wrong and trigger a re-identify + re-fetch.
+export async function postWrong(): Promise<{ ok: boolean; action: string }> {
+  return j("/wrong", { method: "POST" });
+}
+
+// TICKET-204: override the title the engine reduced the video title to. The
+// user picked the correct string from what the engine saw; this forces a
+// re-fetch under that title. The bad string + good string are logged engine-side.
+export async function overrideTitle(title: string): Promise<{ ok: boolean; action: string }> {
+  return j("/override_title", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
   });
 }
 

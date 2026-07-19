@@ -64,6 +64,33 @@ def _env_version(pkg: str) -> str | None:
     return None
 
 
+def _abi_mismatches() -> list[str]:
+    """`.deps` native extensions embed the CPython ABI tag (`cp312`) in their
+    filenames. If `.deps` was vendored with a DIFFERENT Python than the build
+    interpreter, those `.pyd`s can't load in the frozen app — e.g. a cp312 numpy
+    under a cp311 build dies at runtime with `No module named
+    numpy._core._multiarray_umath`, which surfaces only at the post-build
+    `--selftest` as a confusing NumPy traceback. This catches it in one second
+    with a clear message. Returns a list of foreign ABI tags found (empty = ok).
+    (PyAV's `av/_core.pyd` carries no tag, so we rely on tagged modules like
+    numpy/ctranslate2/tokenizers, of which a real vendor tree always has some.)
+
+    STRICTER than the spec's TICKET-196 backstop, deliberately: that one fails
+    only when the build interpreter's tag is ABSENT from the set found, so a
+    `.deps` holding BOTH cp311 and cp312 — the result of vendoring twice without
+    an `rmdir`, a live risk on a box with two Pythons — sails through it. The
+    duplicate-dist-info check can't see this either, because a dist-info name
+    carries no ABI tag. This is the only guard that catches a mixed vendor tree."""
+    build_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    tag_re = re.compile(r"\.(cp\d{2,3})-")
+    foreign: dict[str, str] = {}
+    for pyd in glob.glob(os.path.join(DEPS, "**", "*.pyd"), recursive=True):
+        m = tag_re.search(os.path.basename(pyd))
+        if m and m.group(1) != build_tag:
+            foreign.setdefault(m.group(1), os.path.relpath(pyd, DEPS))
+    return [f"{tag} (e.g. {ex})" for tag, ex in sorted(foreign.items())]
+
+
 def main() -> int:
     lean = os.environ.get("LEAN_BUILD") == "1"
     if not os.path.isdir(DEPS):
@@ -76,6 +103,21 @@ def main() -> int:
               "                 pip install --target .deps faster-whisper\n"
               "             (set LEAN_BUILD=1 to silence this and build lean on purpose.)")
         return 0  # a lean build is a valid choice, just a loud one
+
+    # ABI first: a Python-version skew makes every downstream check moot (the
+    # .pyd files simply won't load under the build interpreter).
+    abi = _abi_mismatches()
+    if abi:
+        build_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+        print(f"\n[deps-check] ERROR - .deps was vendored for a DIFFERENT Python than this build\n"
+              f"             interpreter ({build_tag}, Python {sys.version_info.major}.{sys.version_info.minor}).\n"
+              f"             Foreign ABI-tagged extensions found in .deps: {', '.join(abi)}.\n"
+              f"             These .pyd files CANNOT load in the frozen app - faster-whisper (and\n"
+              f"             numpy) would die at runtime with an import/DLL error, silently disabling\n"
+              f"             every listen feature. Rebuild .deps with THIS Python:\n"
+              f"                 rmdir /s /q .deps  &&  {sys.executable} -m pip install --target .deps -r requirements-deps.txt\n"
+              f"             (or run the build with the Python that vendored .deps).")
+        return 1
 
     skews, missing, dupes = [], [], []
     for pkg in STACK:

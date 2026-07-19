@@ -23,8 +23,10 @@ uploaded. The model is cached under the app's data dir.
 """
 from __future__ import annotations
 
+import contextlib as _contextlib
 import difflib
 import re
+import threading as _threading
 import time
 
 _SR = 16000          # faster-whisper wants 16 kHz mono
@@ -33,7 +35,65 @@ _MODEL = "base"      # tiny=fastest/weakest … base is a good CPU balance for a
 _MIN_RATIO = 0.42    # reject a match this unsure (avoid setting a bogus offset)
 
 _GEN_MODEL = "small"  # generation transcribes for DISPLAY → bigger model = better JP
-_models = {}          # cached WhisperModel per size
+_models = {}          # cached WhisperModel per (size, device, index)
+
+# TICKET-184: free VRAM a float16 model needs before we dare put it on a GPU —
+# weights PLUS the cuDNN/cuBLAS workspace the encode allocates on top of them.
+# Deliberately generous: undershooting here is what killed the app (an alloc
+# failure deep in cuDNN surfaces as a C++ exception on a ctranslate2 worker
+# thread, which Python cannot catch — the process just aborts).
+_MODEL_VRAM_MIB = {
+    "tiny": 400, "tiny.en": 400,
+    "base": 550, "base.en": 550,
+    "small": 1100, "small.en": 1100,
+    "medium": 2400, "medium.en": 2400,
+    "large-v1": 4200, "large-v2": 4200, "large-v3": 4200, "large": 4200,
+    "distil-large-v3": 2600, "distil-medium.en": 1600,
+}
+_VRAM_DEFAULT_MIB = 2400        # unknown model name → assume medium-ish
+
+# Headroom demanded ON TOP of the model's own footprint. The table above covers
+# weights + a typical cuDNN workspace, but "just fits" is not good enough here:
+# measured live, cuda:0 had 1121 MiB free against a 'small' need of 1100 — a 21 MiB
+# margin, which would almost certainly have OOM'd on the first encode. And the cost
+# of being wrong is asymmetric: an OOM kills the child and blacklists the GPU for
+# the WHOLE session (CPU-only transcription from then on), whereas being cautious
+# just means using the other card. A GPU with under ~1.5 GB free while a browser or
+# game is live is not a safe host for Whisper, full stop.
+try:
+    # The device choice is made INSIDE the worker child, which is a separate
+    # process and so never sees the parent's tuned value — the parent passes it
+    # down through the environment when it spawns one.
+    _VRAM_MARGIN_MIB = max(0, int(__import__("os").environ.get(
+        "KARAOKE_WHISPER_VRAM_MARGIN", "768")))
+except Exception:
+    _VRAM_MARGIN_MIB = 768
+
+
+def set_vram_margin(mib):
+    """Tune knob ``whisper_vram_margin_mib`` — extra free VRAM required beyond the
+    model's own footprint before a GPU is eligible. Recycles the worker children so
+    the new value actually applies (they each read it at spawn)."""
+    global _VRAM_MARGIN_MIB, _worker_gpu_unsafe
+    try:
+        new = max(0, int(mib))
+    except Exception:
+        return
+    old, _VRAM_MARGIN_MIB = _VRAM_MARGIN_MIB, new
+    if new > old and _worker_gpu_unsafe:
+        # A crash latched the GPU off for the rest of the session. Raising the floor
+        # is precisely the cure for the OOM that caused it, so give the GPU one more
+        # chance under the stricter floor — a fresh crash re-latches it in _died().
+        # Only on a RAISE: lowering it makes the GPU path more aggressive and would
+        # just re-arm the same uncatchable abort.
+        _worker_gpu_unsafe = False
+        _log().info("whisper: VRAM margin raised %s → %s MiB — GPU re-enabled for a retry",
+                    old, new)
+    _shutdown_workers()
+
+
+def _model_vram_mib(size) -> int:
+    return int(_MODEL_VRAM_MIB.get(str(size), _VRAM_DEFAULT_MIB)) + int(_VRAM_MARGIN_MIB)
 _FURI = re.compile(r"\(([ぁ-ゖァ-ヺ゛゜ーゝゞ]+)\)")     # half-width furigana readings
 _PUNCT = re.compile(r"[\s,.!?;:'\"…、。！？「」『』（）()・，．]+")
 
@@ -160,6 +220,72 @@ def _plain(jp: str) -> str:
     return _PUNCT.sub("", _FURI.sub("", jp or "")).strip()
 
 
+def retime_to_captions(body_starts, body_texts, grid, min_ratio=0.5, min_coverage=0.30):
+    """TICKET-183 (sync): transfer video-locked TIMING from a YouTube auto-caption cue
+    grid onto an existing, nicely-worded lyric body — WITHOUT changing its text.
+
+    `body_starts`: the body's current per-line start seconds (list[float]).
+    `body_texts` : the body's per-line display text (list[str]) — matched, then KEPT.
+    `grid`       : [(cue_start_s, cue_text), ...] from deep_transcribe.fetch_caption_timing;
+                   the cue TEXT is used only to align and is then DISCARDED (never shown,
+                   persisted, or indexed — copyright + it's ASR-imperfect anyway).
+
+    Returns a new list of per-line start seconds (monotonic non-decreasing) or None if
+    too few lines matched to trust the grid. Order-preserving greedy alignment: each body
+    line adopts the start of the best cue at/after the previous match (both lists run
+    time-ordered over the same span); unmatched interior lines interpolate between anchors;
+    leading/trailing unmatched lines keep their original spacing shifted by the nearest
+    anchor's delta; starts are clamped non-decreasing so ln.start<ln.end stays well-formed."""
+    import difflib
+    if not body_texts or not grid or len(body_texts) != len(body_starts):
+        return None
+    bn = [_plain(t) for t in body_texts]
+    gn = [_plain(t) for (_, t) in grid]
+    gt = [float(s) for (s, _) in grid]
+    n, m = len(bn), len(gn)
+    anchors = {}                                    # body idx -> cue start
+    j0 = 0
+    for i, b in enumerate(bn):
+        if len(b) < 2:
+            continue
+        best_j, best_r = -1, 0.0
+        for j in range(j0, min(m, j0 + 40)):        # bounded forward window: monotonic + cheap
+            g = gn[j]
+            if not g:
+                continue
+            r = (0.97 if (b == g or (len(b) >= 4 and (b in g or g in b)))
+                 else difflib.SequenceMatcher(None, b, g).ratio())
+            if r > best_r:
+                best_r, best_j = r, j
+        if best_j >= 0 and best_r >= min_ratio:
+            anchors[i] = gt[best_j]
+            j0 = best_j + 1
+    if len(anchors) < max(3, int(min_coverage * n)):
+        return None                                 # too few trusted matches — don't retime
+    idxs = sorted(anchors)
+    new = [None] * n
+    for i in idxs:
+        new[i] = anchors[i]
+    for a, b in zip(idxs, idxs[1:]):                # interior gaps: linear interpolate
+        if b - a > 1:
+            t0, t1, span = anchors[a], anchors[b], (b - a)
+            for k in range(a + 1, b):
+                new[k] = t0 + (t1 - t0) * ((k - a) / span)
+    first_a, last_a = idxs[0], idxs[-1]             # ends: shift original times by edge delta
+    sh0 = anchors[first_a] - body_starts[first_a]
+    for k in range(0, first_a):
+        new[k] = body_starts[k] + sh0
+    sh1 = anchors[last_a] - body_starts[last_a]
+    for k in range(last_a + 1, n):
+        new[k] = body_starts[k] + sh1
+    eps = 0.05                                      # monotonic non-decreasing clamp
+    new[0] = max(0.0, new[0] if new[0] is not None else 0.0)
+    for k in range(1, n):
+        if new[k] is None or new[k] < new[k - 1] + eps:
+            new[k] = new[k - 1] + eps
+    return new
+
+
 # Whisper's stock NON-SPEECH hallucinations — the YouTube outro phrases and bracket
 # tags it emits on quiet / instrumental / noisy clips. These poisoned decide-by-ear:
 # a verse-gap clip transcribed as "ご視聴ありがとうございました" once scored 100 against a
@@ -251,7 +377,8 @@ def current_device_choice():
         if not _cuda_runtime_ok():
             return ("cpu", 0, "no CUDA runtime", n)
         dev, idx, reason = gpu_setup.pick_inference_device(
-            _GPU_AVOID_WHEN_GAMING, _GPU_SOLO_OVERRIDE)
+            _GPU_AVOID_WHEN_GAMING, _GPU_SOLO_OVERRIDE,
+            need_mib=_model_vram_mib(_MODEL))
         return (dev, idx, reason, n)
     except Exception:
         return ("cpu", 0, "gpu probe failed", 0)
@@ -274,18 +401,31 @@ def _cuda_runtime_ok() -> bool:
     return _CUBLAS_OK
 
 
-def _select_device():
+def _select_device(size=None):
     """(device, index, compute_type, reason) for a transcription RIGHT NOW: the GPU by
     default, but an idle 2nd GPU or the CPU while a fullscreen game runs, so the AI
-    never fights the game for the card (see gpu_setup.pick_inference_device)."""
+    never fights the game for the card (see gpu_setup.pick_inference_device).
+
+    ``size`` is the model about to be loaded: it sets the free-VRAM floor a GPU must
+    clear (TICKET-184). Without it we'd happily pick a card with 0.5 GB free and die
+    inside cuDNN."""
+    import os as _os
+    # Two ways this is set: the env var (how the PARENT tells a freshly spawned
+    # CHILD), and the module global (the parent's own state). Checking only the env
+    # var was a hole: after a child crashed, the parent's IN-PROCESS fallback path
+    # still selected CUDA and re-ran the very transcription that aborted — inside
+    # the app, where an abort is fatal. That defeats the whole point of TICKET-184.
+    if _os.environ.get("KARAOKE_WHISPER_FORCE_CPU") == "1" or _worker_gpu_unsafe:
+        return ("cpu", 0, "int8", "CPU forced (a previous whisper child crashed)")
     if not _cuda_runtime_ok():
         return ("cpu", 0, "int8", "no CUDA runtime")
     try:
         import gpu_setup
         dev, idx, reason = gpu_setup.pick_inference_device(
-            _GPU_AVOID_WHEN_GAMING, _GPU_SOLO_OVERRIDE)
+            _GPU_AVOID_WHEN_GAMING, _GPU_SOLO_OVERRIDE,
+            need_mib=_model_vram_mib(size if size is not None else _MODEL))
     except Exception:
-        dev, idx, reason = ("cuda", 0, "default")
+        dev, idx, reason = ("cpu", 0, "gpu probe failed → CPU")
     return (dev, idx, "float16" if dev == "cuda" else "int8", reason)
 
 
@@ -314,14 +454,364 @@ def _affinity_cpu_count():
     return _os.cpu_count() or 4
 
 
-def _get_model(size=_MODEL):
+_model_lock = _threading.RLock()
+_model_inuse = {}     # key → how many threads are mid-transcribe on that model
+
+# ---------------------------------------------------------------- worker child
+# TICKET-184: the model lives in a CHILD PROCESS (see whisper_worker.py). A CUDA
+# failure inside CTranslate2 throws a C++ exception on a native worker thread,
+# which Python cannot catch — the process just aborts. Isolating it means that
+# abort kills a disposable child instead of the user's app, and it also keeps
+# GIL-heavy transcription off the render thread (the TICKET-135 lesson).
+_WORKER_MODE = False        # True only INSIDE the child — makes it run locally
+_worker_enabled = True      # parent kill-switch (tune knob: whisper_child)
+_worker_gpu_unsafe = False  # set after a child dies → every later child is CPU-only
+_workers = {}               # role → _Worker ("live" = short probes, "deep" = files)
+_workers_lock = _threading.RLock()
+
+_WORKER_TIMEOUT_S = {"live": 180.0, "deep": 3600.0}
+
+
+def set_whisper_child(on: bool):
+    """Tune knob ``whisper_child``: run Whisper out-of-process (default ON)."""
+    global _worker_enabled
+    _worker_enabled = bool(on)
+    if not _worker_enabled:
+        _shutdown_workers()
+
+
+def _log():
+    import logging
+    return logging.getLogger("karaoke")
+
+
+class _Worker:
+    """One live whisper child + the socket to it. Not thread-safe on its own;
+    every use goes through :meth:`call`, which serialises on ``self.lock``."""
+
+    def __init__(self, role: str):
+        self.role = role
+        self.lock = _threading.RLock()
+        self.proc = None
+        self.sock = None
+        self._next_id = 1
+        self._err_path = None       # child stderr goes to a FILE, never a pipe
+        self._err_fh = None
+
+    # -- lifecycle ---------------------------------------------------------
+    def alive(self) -> bool:
+        return bool(self.proc and self.proc.poll() is None and self.sock)
+
+    def start(self) -> bool:
+        import os as _os, secrets, socket as _sk, subprocess as _sp, sys as _sys
+        from pathlib import Path as _P
+        self.stop()
+        token = secrets.token_hex(16)
+        lis = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+        try:
+            lis.bind(("127.0.0.1", 0))       # loopback only
+            lis.listen(1)
+            lis.settimeout(60.0)
+            port = lis.getsockname()[1]
+            if getattr(_sys, "frozen", False):
+                cmd = [_sys.executable, "--whisper-worker", "--port", str(port),
+                       "--token", token]
+            else:
+                cmd = [_sys.executable, str(_P(__file__).parent / "whisper_worker.py"),
+                       "--port", str(port), "--token", token]
+            env = _os.environ.copy()
+            env["KARAOKE_WHISPER_VRAM_MARGIN"] = str(_VRAM_MARGIN_MIB)
+            if _worker_gpu_unsafe:
+                # A previous child died. Assume the GPU path is what killed it and
+                # keep every later child on the CPU for the rest of the session.
+                env["KARAOKE_WHISPER_FORCE_CPU"] = "1"
+            # stderr goes to a FILE, deliberately NOT a pipe. faster-whisper and
+            # CTranslate2 both log to stderr, and nothing here drains a pipe between
+            # requests — once the ~64 KB pipe buffer filled, the child would block
+            # forever on its next write and the worker would hang for good.
+            import tempfile as _tf
+            fd, self._err_path = _tf.mkstemp(prefix="li_wsp_%s_" % self.role, suffix=".log")
+            self._err_fh = _os.fdopen(fd, "wb")
+            self.proc = _sp.Popen(
+                cmd, stdout=_sp.DEVNULL, stderr=self._err_fh, env=env,
+                creationflags=0x08000000 | 0x00000040,   # no window + IDLE priority
+            )
+            conn, _addr = lis.accept()
+            conn.settimeout(30.0)
+            hello = _recv_msg(conn)
+            if not hello or hello.get("hello") != token:
+                raise RuntimeError("whisper child failed token handshake")
+            conn.settimeout(None)
+            self.sock = conn
+            _log().info("whisper child up (%s, pid %s%s)", self.role,
+                        hello.get("pid"), ", CPU-forced" if _worker_gpu_unsafe else "")
+            return True
+        except Exception as e:
+            _log().warning("whisper child (%s) failed to start: %s: %s",
+                           self.role, type(e).__name__, e)
+            self.stop()
+            return False
+        finally:
+            try:
+                lis.close()
+            except Exception:
+                pass
+
+    def stop(self):
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+        p, self.proc = self.proc, None
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+                p.wait(timeout=5)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        # close + remove the stderr capture file (after the child is gone, so it
+        # can't still be writing to the handle)
+        try:
+            if self._err_fh:
+                self._err_fh.close()
+        except Exception:
+            pass
+        self._err_fh = None
+        if self._err_path:
+            try:
+                import os as _o
+                _o.remove(self._err_path)
+            except Exception:
+                pass
+            self._err_path = None
+
+    def _died(self) -> str:
+        """Describe how the child exited, and flag the GPU unsafe if it crashed."""
+        global _worker_gpu_unsafe
+        rc = self.proc.poll() if self.proc else None
+        err = b""
+        # stderr is a file, so reading it never blocks — safe to call even while
+        # the child is still alive (transport error, timeout).
+        try:
+            if self._err_path:
+                import os as _o
+                with open(self._err_path, "rb") as _f:
+                    _f.seek(0, _o.SEEK_END)
+                    _f.seek(max(0, _f.tell() - 4000), _o.SEEK_SET)
+                    err = _f.read()
+        except Exception:
+            pass
+        # 0xC0000409 = STATUS_STACK_BUFFER_OVERRUN, what abort() raises after an
+        # unhandled C++ throw; 0xE06D7363 is the throw itself.
+        crashed = rc not in (0, None) and (rc & 0xFFFFFFFF) not in (1, 2)
+        if crashed:
+            _worker_gpu_unsafe = True
+        tail = err.decode("utf-8", "replace").strip()[-400:]
+        return "exit=%s (0x%X)%s%s" % (
+            rc, (rc or 0) & 0xFFFFFFFF,
+            " CRASH → GPU disabled for this session" if crashed else "",
+            ("; stderr: " + tail) if tail else "")
+
+    # -- request/response --------------------------------------------------
+    def call(self, req: dict, timeout: float):
+        with self.lock:
+            if not self.alive() and not self.start():
+                return None
+            req = dict(req)
+            req["id"] = self._next_id
+            self._next_id += 1
+            try:
+                _send_msg(self.sock, req)
+                self.sock.settimeout(timeout)
+                res = _recv_msg(self.sock)
+            except Exception as e:
+                _log().warning("whisper child (%s) transport error: %s: %s — %s",
+                               self.role, type(e).__name__, e, self._died())
+                self.stop()
+                return None
+            finally:
+                try:
+                    if self.sock:
+                        self.sock.settimeout(None)
+                except Exception:
+                    pass
+            if res is None:
+                _log().warning("whisper child (%s) died mid-request — %s",
+                               self.role, self._died())
+                self.stop()
+                return None
+            if not res.get("ok"):
+                _log().info("whisper child (%s) error: %s", self.role,
+                            res.get("error"))
+                return None
+            return res
+
+
+def _send_msg(sock, obj) -> None:
+    import json as _json, struct as _st
+    b = _json.dumps(obj).encode("utf-8")
+    sock.sendall(_st.pack(">I", len(b)) + b)
+
+
+def _recv_msg(sock):
+    import json as _json, struct as _st
+
+    def _exact(n):
+        buf = b""
+        while len(buf) < n:
+            c = sock.recv(n - len(buf))
+            if not c:
+                return None
+            buf += c
+        return buf
+
+    head = _exact(4)
+    if head is None:
+        return None
+    (n,) = _st.unpack(">I", head)
+    if n <= 0 or n > 64 * 1024 * 1024:
+        return None
+    body = _exact(n)
+    if body is None:
+        return None
+    return _json.loads(body.decode("utf-8"))
+
+
+def _worker_for(role: str):
+    with _workers_lock:
+        w = _workers.get(role)
+        if w is None:
+            w = _workers[role] = _Worker(role)
+        return w
+
+
+def _shutdown_workers():
+    with _workers_lock:
+        for w in list(_workers.values()):
+            try:
+                w.stop()
+            except Exception:
+                pass
+        _workers.clear()
+
+
+def _worker_transcribe(source: dict, size, lang=None, role="live", **opts):
+    """Run one transcription in the child. Returns ``(segments, language)`` where
+    segments are ``[start, end, text]``, or None if the child is unavailable —
+    the caller then decides whether to fall back in-process."""
+    if _WORKER_MODE or not _worker_enabled:
+        return None
+    req = {"op": "transcribe", "source": source, "size": size, "lang": lang}
+    req.update(opts)
+    res = _worker_for(role).call(req, _WORKER_TIMEOUT_S.get(role, 300.0))
+    if role == "deep":
+        # The "one CUDA model at a time" rule is enforced per-PROCESS, so two live
+        # children quietly break it: the deep child loads `medium`/`large` and then
+        # sits idle holding its VRAM (and ~1.7 GB RSS) for the rest of the session,
+        # squeezing the live child and re-creating the very pressure TICKET-184 is
+        # about. Whole-file transcription is a rare one-shot job whose model reload
+        # costs seconds against a run of minutes, so retire the child when it's done.
+        try:
+            _worker_for("deep").stop()
+        except Exception:
+            pass
+    if not res:
+        return None
+    return res.get("segments") or [], res.get("language")
+
+
+def _raw_audio_file(audio):
+    """Dump a float32 numpy array to a temp file for the child to read back.
+    Cheaper and lossless compared with encoding a wav, and it keeps the socket
+    protocol to small JSON frames."""
+    import tempfile, os as _os
+    fd, path = tempfile.mkstemp(prefix="li_wav_", suffix=".f32")
+    _os.close(fd)
+    try:
+        import numpy as np
+        np.asarray(audio, dtype="float32").tofile(path)
+        return path
+    except Exception:
+        try:
+            _os.remove(path)
+        except Exception:
+            pass
+        raise
+
+
+def _evict_cuda_locked(keep_key):
+    """TICKET-184: free every OTHER resident CUDA model. Call with _model_lock held.
+
+    The cache used to be append-only, so a session that touched 'base', 'small' and
+    'medium' (and both cards) kept every one of them resident in VRAM forever. On an
+    8 GB card already shared with a game and a browser that is what pushed the next
+    allocation over the edge. Models still in use by another thread are NEVER freed —
+    destroying a ctranslate2 model mid-transcribe is itself a hard crash."""
+    gone = []
+    for k in [k for k in list(_models) if k[1] == "cuda" and k != keep_key]:
+        if _model_inuse.get(k, 0) > 0:
+            continue                                 # busy — leave it alone
+        _models.pop(k, None)
+        _device.pop(k, None)
+        _model_inuse.pop(k, None)
+        gone.append(k)
+    if gone:
+        import gc
+        gc.collect()                                 # ctranslate2 frees VRAM in __del__
+        try:
+            import logging
+            logging.getLogger("karaoke").info(
+                "whisper: released %s from VRAM (one CUDA model at a time)",
+                ", ".join(f"{k[0]}@cuda:{k[2]}" for k in gone))
+        except Exception:
+            pass
+    return gone
+
+
+def _acquire_model(size=_MODEL):
+    """(key, model), with the model marked in-use so it can't be evicted underneath
+    the caller. Every caller MUST pair this with :func:`_release_model` — use the
+    :func:`_model_for` context manager instead of calling this directly."""
+    with _model_lock:
+        key, m = _load_model_locked(size)
+        _model_inuse[key] = _model_inuse.get(key, 0) + 1
+        return key, m
+
+
+def _release_model(key):
+    with _model_lock:
+        n = _model_inuse.get(key, 0) - 1
+        if n > 0:
+            _model_inuse[key] = n
+        else:
+            _model_inuse.pop(key, None)
+
+
+@_contextlib.contextmanager
+def _model_for(size=_MODEL):
+    """Borrow a Whisper model for the duration of one transcription."""
+    key, m = _acquire_model(size)
+    try:
+        yield m
+    finally:
+        _release_model(key)
+
+
+def _load_model_locked(size=_MODEL):
     # Re-evaluated each call (cheap: game state is cached): the device can change when
     # a game starts/ends. Models are cached per (size, device) so flipping back never
-    # reloads — both the CUDA and CPU copies stay warm.
-    dev, idx, ctype, reason = _select_device()
+    # reloads — the CPU copy stays warm; CUDA copies are capped at one (VRAM).
+    dev, idx, ctype, reason = _select_device(size)
     key = (size, dev, idx)
     if key not in _models:
         import os
+        if dev == "cuda":
+            _evict_cuda_locked(key)                  # make room BEFORE we allocate
         _ensure_deps_path()
         md = _data_models_dir()
         if md:                                       # keep all model cache off C:
@@ -342,8 +832,22 @@ def _get_model(size=_MODEL):
             kw["device_index"] = idx
         try:
             m = WhisperModel(size, device=dev, **kw)
-        except Exception:                            # GPU load failed → CPU fallback
+        except Exception as e:                       # GPU load failed → CPU fallback
+            # TICKET-184: this used to be swallowed silently, so a run of failing GPU
+            # loads looked identical in the log to a deliberate CPU choice ("model
+            # 'small' on cpu (idle GPU 1 ...)"). Three of those preceded each crash.
+            if dev == "cuda":
+                try:
+                    import logging
+                    logging.getLogger("karaoke").warning(
+                        "whisper: CUDA load of %r on cuda:%d FAILED (%s: %s) → CPU. "
+                        "Free VRAM was too low or the card is unusable.",
+                        size, idx, type(e).__name__, e)
+                except Exception:
+                    pass
+                _evict_cuda_locked(None)             # drop any stale CUDA copies too
             dev, idx, key = "cpu", 0, (size, "cpu", 0)
+            reason = "after CUDA load failure"
             m = _models.get(key) or WhisperModel(size, device="cpu", compute_type="int8",
                                                  download_root=md, cpu_threads=cput)
         _models[key] = m
@@ -355,7 +859,7 @@ def _get_model(size=_MODEL):
                 "cpu" if dev == "cpu" else f"cuda:{idx}", reason)
         except Exception:
             pass
-    return _models[key]
+    return key, _models[key]
 
 
 def _capture(seconds=_CAP):
@@ -382,11 +886,35 @@ def _transcribe(audio, lang, size=_MODEL):
     lang = {"ja-romaji": "ja"}.get(lang, lang)
     if lang not in ("ja", "ko", "zh", "es", "de", "ru", "en", "fr", "it", "pt"):
         lang = None                                  # let Whisper auto-detect
-    model = _get_model(size)
-    segments, _info = model.transcribe(
-        audio, language=lang, beam_size=1, vad_filter=False,
-        condition_on_previous_text=False)
-    return [(seg.start, seg.text) for seg in segments if seg.text.strip()]
+    # Preferred path: the child process (TICKET-184). Falls through to in-process
+    # only if the child can't be started at all.
+    if not _WORKER_MODE and _worker_enabled:
+        import os as _os
+        raw = None
+        try:
+            raw = _raw_audio_file(audio)
+            got = _worker_transcribe({"raw": raw}, size, lang, role="live",
+                                     beam_size=1, vad_filter=False,
+                                     condition_on_previous_text=False)
+            if got is not None:
+                segs, _langd = got
+                return [(s[0], s[2]) for s in segs if (s[2] or "").strip()]
+        except Exception:
+            pass
+        finally:
+            if raw:
+                try:
+                    _os.remove(raw)
+                except Exception:
+                    pass
+
+    with _model_for(size) as model:
+        segments, _info = model.transcribe(
+            audio, language=lang, beam_size=1, vad_filter=False,
+            condition_on_previous_text=False)
+        # NB: `segments` is a lazy generator — it must be drained INSIDE the
+        # borrow, or the model could be evicted mid-iteration.
+        return [(seg.start, seg.text) for seg in segments if seg.text.strip()]
 
 
 def transcribe_vocals(lang="ja", seconds=12, size=_GEN_MODEL):
@@ -485,24 +1013,47 @@ def transcribe_for_generation(pos_cap, lang=None, seconds=16, size=_GEN_MODEL):
     import numpy as np
     if float(np.sqrt(np.mean(np.square(audio)) + 1e-12)) < 4.0e-3:
         return []                                    # essentially silence
-    try:
-        model = _get_model(size)
-        # vad_filter=False: Silero VAD classifies SUNG vocals as non-speech and drops
-        # the whole clip → 0 generated lines for most music (verified live: VAD on
-        # gave 0 segments on the same audio where VAD off transcribed real lyrics).
-        segs, _info = model.transcribe(
-            audio, language=hint, beam_size=5, vad_filter=False,
-            condition_on_previous_text=True)
-        _last_gen_lang = getattr(_info, "language", None) or _last_gen_lang
-    except Exception:
-        return []
+    # vad_filter=False: Silero VAD classifies SUNG vocals as non-speech and drops
+    # the whole clip → 0 generated lines for most music (verified live: VAD on
+    # gave 0 segments on the same audio where VAD off transcribed real lyrics).
+    _opts = dict(beam_size=5, vad_filter=False, condition_on_previous_text=True)
+    segs = None                                      # normalised [(start, end, text), …]
+
+    if not _WORKER_MODE and _worker_enabled:         # child process (TICKET-184)
+        import os as _os
+        raw = None
+        try:
+            raw = _raw_audio_file(audio)
+            got = _worker_transcribe({"raw": raw}, size, hint, role="live", **_opts)
+            if got is not None:
+                rows, langd = got
+                _last_gen_lang = langd or _last_gen_lang
+                segs = [(r[0], r[1], r[2]) for r in rows]
+        except Exception:
+            segs = None
+        finally:
+            if raw:
+                try:
+                    _os.remove(raw)
+                except Exception:
+                    pass
+
+    if segs is None:                                 # in-process fallback
+        try:
+            with _model_for(size) as model:
+                got, _info = model.transcribe(audio, language=hint, **_opts)
+                _last_gen_lang = getattr(_info, "language", None) or _last_gen_lang
+                segs = [(s.start, s.end, s.text) for s in got]   # drain in borrow
+        except Exception:
+            return []
+
     out = []
-    for s in segs:
-        t = (s.text or "").strip()
+    for _st, _en, _tx in segs:
+        t = (_tx or "").strip()
         if len(t) < 2 or _is_hallucination(t):       # skip the "thanks for watching" outros
             continue
-        out.append({"t": [round(pos_cap + float(s.start), 2),
-                          round(pos_cap + float(s.end), 2)], "jp": t})
+        out.append({"t": [round(pos_cap + float(_st), 2),
+                          round(pos_cap + float(_en), 2)], "jp": t})
     return out
 
 

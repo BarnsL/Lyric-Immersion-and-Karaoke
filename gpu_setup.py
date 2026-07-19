@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import ssl
 import urllib.parse
@@ -42,6 +43,15 @@ import zipfile
 from pathlib import Path
 
 import appdata
+
+# TICKET-184: make the CUDA runtime enumerate GPUs in PCI-bus order, which is the
+# order NVML (and nvidia-smi) uses. Without this CUDA defaults to FASTEST_FIRST and
+# cuda:N can be a DIFFERENT card than NVML index N — so every utilization/free-VRAM
+# reading below would be attributed to the wrong GPU, and the "avoid the game's card"
+# and "enough VRAM?" guards would both consult the wrong device. Must be set before
+# anything initializes CUDA, hence module import time. setdefault: never override a
+# user/machine value.
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 # Pinned to the versions that ship with the bundled CTranslate2 (4.8.0) — the same
 # set vendored for local GPU builds. cuBLAS + cuDNN are what CTranslate2 loads on
@@ -151,9 +161,15 @@ def cuda_device_count() -> int:
     return _cuda_count
 
 
-def _gpu_utils() -> dict:
-    """{cuda_index: gpu_util_%} via NVML (nvml.dll ships with the NVIDIA driver — no
-    subprocess, no window). {} if NVML can't be loaded or queried."""
+def _gpu_stats() -> dict:
+    """``{cuda_index: {"util": %, "free_mib": int, "total_mib": int}}`` via NVML
+    (nvml.dll ships with the NVIDIA driver — no subprocess, no window). ``{}`` if
+    NVML can't be loaded or queried.
+
+    TICKET-184: free VRAM is read here, not just utilization. A card can sit at 0%
+    utilization with 400 MiB free (idle browser/game textures still resident) and
+    loading a Whisper model onto it then dies inside cuDNN with an uncatchable C++
+    exception, taking the whole app down. Utilization alone cannot see that."""
     try:
         import ctypes
         nvml = ctypes.CDLL("nvml.dll")
@@ -171,13 +187,25 @@ def _gpu_utils() -> dict:
         class _U(ctypes.Structure):
             _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
 
+        class _M(ctypes.Structure):      # nvmlMemory_t — bytes
+            _fields_ = [("total", ctypes.c_ulonglong),
+                        ("free", ctypes.c_ulonglong),
+                        ("used", ctypes.c_ulonglong)]
+
         for i in range(cnt.value):
             h = ctypes.c_void_p()
             if nvml.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(h)) != 0:
                 continue
+            rec = {}
             u = _U()
             if nvml.nvmlDeviceGetUtilizationRates(h, ctypes.byref(u)) == 0:
-                out[i] = int(u.gpu)
+                rec["util"] = int(u.gpu)
+            m = _M()
+            if nvml.nvmlDeviceGetMemoryInfo(h, ctypes.byref(m)) == 0 and m.total:
+                rec["free_mib"] = int(m.free // (1024 * 1024))
+                rec["total_mib"] = int(m.total // (1024 * 1024))
+            if rec:
+                out[i] = rec
     except Exception:
         pass
     finally:
@@ -188,9 +216,23 @@ def _gpu_utils() -> dict:
     return out
 
 
+def _gpu_utils() -> dict:
+    """{cuda_index: gpu_util_%} — thin view over :func:`_gpu_stats` (kept for callers
+    that only care about load). Missing entry = treated as idle by the ranking."""
+    return {i: r["util"] for i, r in _gpu_stats().items() if "util" in r}
+
+
 def pick_inference_device(avoid_when_gaming: bool = True,
-                          solo_override: bool = False):
+                          solo_override: bool = False,
+                          need_mib: int = 0):
     """Where Whisper should run RIGHT NOW → ``(device, index, reason)``.
+
+    ``need_mib`` is how much free VRAM this model actually needs (weights +
+    cuDNN/cuBLAS workspace); see ``align._MODEL_VRAM_MIB``. A GPU with less than
+    that free is never chosen — TICKET-184, where cuda:0 sat at low utilization
+    with ~0.5 GB free and the load-or-encode died inside cuDNN with a C++
+    exception on a ctranslate2 worker thread (0xe06d7363 → abort), killing the
+    whole app. 0 disables the check (callers that don't know the model size).
 
     POLICY (TICKET-103, user request): GPU acceleration is opt-in for
     multi-GPU machines only. On a single-GPU machine we always stay on CPU
@@ -211,6 +253,24 @@ def pick_inference_device(avoid_when_gaming: bool = True,
     n = cuda_device_count()
     if n <= 0:
         return ("cpu", 0, "no CUDA GPU")
+
+    stats = _gpu_stats()          # {idx: {"util": %, "free_mib": .., "total_mib": ..}}
+    utils = {i: r["util"] for i, r in stats.items() if "util" in r}
+
+    def _fits(i: int) -> bool:
+        """TICKET-184: does GPU i have room for this model RIGHT NOW? A card with a
+        few hundred MiB free is the crash case: the model loads (or half-loads) and
+        then cuDNN throws an uncatchable C++ exception mid-encode. Unknown free VRAM
+        (no NVML) fails OPEN — we can't do better than the old behaviour there."""
+        if need_mib <= 0:
+            return True
+        f = stats.get(i, {}).get("free_mib")
+        return True if f is None else f >= need_mib
+
+    def _vram(i: int) -> str:
+        f = stats.get(i, {}).get("free_mib")
+        return "?" if f is None else f"{f} MiB free"
+
     if n == 1:
         # TICKET-103: single-GPU → CPU unless the user explicitly opted in
         # via gpu_solo_override. Even with the override, the gaming guard
@@ -219,22 +279,31 @@ def pick_inference_device(avoid_when_gaming: bool = True,
             return ("cpu", 0, "single GPU → CPU (policy: solo GPU stays free)")
         if avoid_when_gaming and game_active():
             return ("cpu", 0, "game: single GPU → CPU (override on, but gaming)")
+        if not _fits(0):
+            return ("cpu", 0, f"single GPU has {_vram(0)}, needs {need_mib} MiB → CPU")
         return ("cuda", 0, "single GPU (override on)")
-    utils = _gpu_utils()                              # {idx: util%} — missing = idle
+
     gaming = avoid_when_gaming and game_active()
     BUSY = 30
-    ranked = sorted(range(n), key=lambda i: utils.get(i, 0))
+    # VRAM is a HARD filter and is applied before anything else: a card without room
+    # is not a candidate no matter how idle it looks.
+    roomy = [i for i in range(n) if _fits(i)]
+    if not roomy:
+        return ("cpu", 0,
+                "no GPU has %d MiB free (%s) → CPU"
+                % (need_mib, ", ".join(f"cuda:{i} {_vram(i)}" for i in range(n))))
+    ranked = sorted(roomy, key=lambda i: utils.get(i, 0))
     if gaming:
         free = [i for i in ranked if utils.get(i, 0) < BUSY]
         if not free:
             return ("cpu", 0, "game: all GPUs busy → CPU")
         i = free[0]
-        return ("cuda", i, f"game: idlest GPU {i} ({utils.get(i, 0)}%)")
+        return ("cuda", i, f"game: idlest roomy GPU {i} ({utils.get(i, 0)}%, {_vram(i)})")
     best = ranked[0]
-    if utils.get(best, 0) + 5 >= utils.get(0, 0):
-        return ("cuda", 0, "default")                 # tied or cuda:0 idle enough
+    if 0 in roomy and utils.get(best, 0) + 5 >= utils.get(0, 0):
+        return ("cuda", 0, f"default ({_vram(0)})")   # tied or cuda:0 idle enough
     return ("cuda", best,
-            f"idle GPU {best} ({utils.get(best, 0)}% vs cuda:0 {utils.get(0, 0)}%)")
+            f"GPU {best} ({utils.get(best, 0)}% vs cuda:0 {utils.get(0, 0)}%, {_vram(best)})")
 
 
 def _is_pypi_https(url: str) -> bool:
