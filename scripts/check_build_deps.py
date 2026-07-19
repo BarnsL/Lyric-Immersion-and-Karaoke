@@ -2,7 +2,7 @@
 
 TICKET-175. The spec bundles the optional "sync/generate by ear" stack
 (faster-whisper + ctranslate2 + PyAV + tokenizers) from a vendored `.deps`
-folder (`pip install --target .deps faster-whisper`), with `pathex=[".deps"]`.
+folder (`pip install --target .deps -r requirements-deps.txt`), with `pathex=[".deps"]`.
 PyInstaller's `collect_all("av")` then searches BOTH `.deps` and the active
 environment — so if `.deps` holds one PyAV version and the environment holds
 another, a version-SKEWED mix of Python modules + FFmpeg DLLs gets bundled and
@@ -12,13 +12,20 @@ sync-by-listening AND the wrong-lyrics reject path in every shipped build from
 v1.1.74 to v1.1.76 — the app just showed "needs faster-whisper" hints and every
 listen feature degraded, with nothing in the log.
 
-This runs BEFORE PyInstaller. It FAILS the build (exit 1) only on UNAMBIGUOUS
-corruption — duplicate dist-info dirs (two versions of one package present). A
-plain version difference vs the env is a WARNING, because *.dist-info metadata
+This runs BEFORE PyInstaller. It FAILS the build (exit 1) on UNAMBIGUOUS
+corruption only:
+  * a foreign CPython ABI tag in `.deps` (vendored under a different Python —
+    those `.pyd`s cannot load at all, so every later check is moot), and
+  * duplicate dist-info dirs (two versions of one package present).
+A plain version difference vs the env is a WARNING, because *.dist-info metadata
 can lag the actual module files (a manual copy of just av/ updates the .pyd but
 leaves the old dist-info), so a hard error there could block a build whose
-bundled module is fine. The POST-BUILD `--selftest` smoke test is the definitive
-gate — it imports the real frozen module and fails the build if it's broken.
+bundled module is fine.
+
+This is a VERSION check, which is only a proxy — the real failure is about DLL
+file identity. `scripts/check_av_dlls.py` (TICKET-176) checks that directly by
+parsing the PE import table, and the POST-BUILD `--selftest` is the definitive
+gate: it imports the real frozen module and fails the build if it's broken.
 
 Run: python scripts/check_build_deps.py   (build.bat calls it in step 1)
 """
@@ -99,8 +106,8 @@ def main() -> int:
             return 0
         print("[deps-check] WARNING: no ./.deps folder — this will be a LEAN build with NO\n"
               "             generate-by-ear / sync-by-listening / wrong-lyrics-reject. To ship\n"
-              "             the full app, vendor the stack first:\n"
-              "                 pip install --target .deps faster-whisper\n"
+              "             the full app, vendor the PINNED stack first:\n"
+              "                 pip install --target .deps -r requirements-deps.txt\n"
               "             (set LEAN_BUILD=1 to silence this and build lean on purpose.)")
         return 0  # a lean build is a valid choice, just a loud one
 
@@ -144,7 +151,7 @@ def main() -> int:
         for d in dupes:
             print("    " + d)
         print("\n  Rebuild .deps from scratch:\n"
-              "      rmdir /s /q .deps  &&  pip install --target .deps faster-whisper\n")
+              "      rmdir /s /q .deps  &&  pip install --target .deps -r requirements-deps.txt\n")
         return 1
 
     if missing:
@@ -162,7 +169,7 @@ def main() -> int:
         for s in skews:
             print("    " + s)
         print("  If the post-build --selftest fails, rebuild .deps clean:\n"
-              "      rmdir /s /q .deps  &&  pip install --target .deps faster-whisper\n"
+              "      rmdir /s /q .deps  &&  pip install --target .deps -r requirements-deps.txt\n"
               "  (dist-info can also just be stale after a partial copy — --selftest is authoritative.)")
         return 0
 
