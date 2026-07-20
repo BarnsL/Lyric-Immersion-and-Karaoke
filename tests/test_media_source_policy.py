@@ -49,6 +49,38 @@ class TestMediaSourceEligible(unittest.TestCase):
         self.assertFalse(ok, why)
         self.assertIn("no now-playing evidence", why)
 
+    def test_observed_hermes_session_is_rejected(self):
+        # GROUND TRUTH, captured from a live GET /source on 2026-07-20 while the
+        # app was misbehaving. Every other fixture in this file is reconstructed
+        # or invented; this one is exactly what Windows reported, and it differs
+        # from `_INCIDENT` in the field that matters most: the publisher id was
+        # NOT empty. The original ticket was written without ever seeing it, so
+        # the "hermes" deny entry was an educated guess that happened to be
+        # right. Pinning the real string means a future rename of the deny hint
+        # (or a tightening of the substring match) fails here instead of in the
+        # field, on the exact session class that prompted the ticket.
+        observed = dict(source_app="com.nousresearch.hermes", title="Hermes",
+                        artist="", album="", duration=9.056, url="")
+        ok, why = media_source_eligible(**observed)
+        self.assertFalse(ok, why)
+        # It must be caught by the DENY tier, not merely by the evidence floor.
+        # Both would reject it today (0 of 4 signals, and 9s is under the 30s
+        # floor), so asserting only "rejected" would keep passing if the deny
+        # entry were removed — and then a longer TTS clip carrying an album tag
+        # would sail through.
+        self.assertIn("not a media application", why)
+        self.assertFalse(is_known_media_app("com.nousresearch.hermes"))
+
+    def test_tts_blip_denied_even_if_it_looks_like_a_track(self):
+        # The failure the deny tier actually protects against: a text-to-speech
+        # or notification session that happens to carry enough metadata to clear
+        # the two-signal evidence bar. Without the deny entry this passes.
+        ok, why = media_source_eligible(
+            "com.nousresearch.hermes", "Placeholder Title",
+            artist="Placeholder Artist", album="Placeholder Album", duration=600.0)
+        self.assertFalse(ok, why)
+        self.assertIn("not a media application", why)
+
     def test_agent_app_rejected_even_with_evidence(self):
         # The deny tier is absolute: an app that is never a media source stays
         # out even when it publishes a full-looking, long session.
