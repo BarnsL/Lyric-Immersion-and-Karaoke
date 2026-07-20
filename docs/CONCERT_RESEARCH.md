@@ -373,10 +373,17 @@ Ranked P0 → P3. Each has a rough "signal" (what happens when it lands), an "im
 
 ### P1 — Unlabeled MC / silence-segment gate *(all 5 concerts benefit)*
 
+> **PROPOSAL ONLY. NOT IMPLEMENTED.** Everything in this section is a design
+> sketch. The knobs `mc_min_s`, `mc_vocal_ratio_ceiling`, `mc_speech_cadence_hz`
+> and the state field `_in_mc_segment` **do not exist in main.py**. They are
+> names this proposal suggests, not names you can use. Nothing reads them, `/tune`
+> does not list them, and setting them has no effect. Do not write code, docs, or
+> harness config that assumes any of them is available.
+
 - **What.** Dedicated primitive that produces `is_mc_segment(t) → bool` from a rolling window of RMS + vocal-band ratio + speech-vs-song classifier (talk cadence vs sustained pitch). While True: hold the last-shown song, do NOT commit new offsets, do NOT accept new lyric fetches, escalate boundary-decide-by-ear only after the segment ends. Metric: seconds-of-drift-per-MC-segment.
 - **Signal.** MC drift stops on C5 (Nirvana banter), C3 (YOASOBI ikura MC), C4 (After Talk 19:52). Fewer wrong-song strike storms during dead segments.
 - **Impact.** All 5 concerts (MC drift is universal).
-- **Size.** Medium. Reuses `songchange.py` primitives + `_check_applause_gap`; new state field `_in_mc_segment` + tick-level policy; new tune knobs `mc_min_s / mc_vocal_ratio_ceiling / mc_speech_cadence_hz`. Requires labeling MC intervals in the corpus (~5-10 per concert × 5 concerts = 50 anchors).
+- **Size.** Medium. Would reuse `songchange.py` primitives + `_check_applause_gap`; would add a state field (`_in_mc_segment` is the proposed name) + tick-level policy, and would introduce tune knobs (proposed names: `mc_min_s / mc_vocal_ratio_ceiling / mc_speech_cadence_hz`). None of these exist yet. Requires labeling MC intervals in the corpus (~5-10 per concert × 5 concerts = 50 anchors).
 - **Auto-tune duel candidate.** `--a defaults --b mc-gate-on --corpus concerts` scoring the new `mc_drift_s_total` metric.
 - **Status.** *Not started.*
 

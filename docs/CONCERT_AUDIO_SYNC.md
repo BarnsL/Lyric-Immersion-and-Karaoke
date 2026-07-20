@@ -72,13 +72,29 @@ installed by `_apply_concert_plan`:
   anchors each song to the plan's **vocal onset** (`offset = -onset`) instead of
   the raw chapter start, and a confident offline id **overrides a generic chapter
   label** (the `La La La → Melt` correction) while a *distinctive* human-authored
-  label (`Face It`) is kept over a stray slice mis-ID. By-ear/decision-engine
-  correction still has the final say either way — the plan is a strong default,
-  not a lock, so it stays **correctable**.
+  label (`Face It`) is kept over a stray slice mis-ID. "Confident" here means the
+  segment's `id_conf` clears **`chapter_override_min_score`** (`main.py:6750`), a
+  **tunable knob** defaulting to 0.70, not a constant. It was hardcoded before
+  v1.1.64 and became a knob so the harness can calibrate it against the corpus.
+  By-ear/decision-engine correction still has the final say either way — the plan
+  is a strong default, not a lock, so it stays **correctable**.
 - **When the video had no usable chapters**, the energy-derived segments *become*
   the setlist (`_apply_concert_plan` synthesises `_concert_setlist` from the
   plan), each labelled by its offline id, and the existing per-song tick drives
-  loading.
+  loading. Only segments the fingerprint actually named are used; an unnamed
+  segment gets no synthesized title, so no blind "Song N" fetch happens.
+
+  **Known code/knob inconsistency on this path.** The synthesis filter at
+  `main.py:6570-6571` uses a **hardcoded** `id_conf >= 0.70` and a **hardcoded**
+  minimum segment length of **8.0s**. It reads neither `chapter_override_min_score`
+  nor `concert_audio_min_song_s`, so:
+  - Lowering `chapter_override_min_score` does **nothing** to the chapterless path.
+    That knob only governs the chaptered override at `main.py:6750`.
+  - The 8.0s floor here is unrelated to the 45s `concert_audio_min_song_s` used
+    during segmentation, and cannot be tuned.
+
+  Tuning the chapterless path currently requires a code change. Anyone calibrating
+  concert behaviour should know the two paths do not share thresholds.
 
 Songs Shazam can't place (VTuber originals not in its DB) stay unlabelled and
 fall through to the existing per-chapter by-ear generation — but now with the
@@ -100,7 +116,8 @@ song live-Shazam kept missing at -748s).
 | `concert_audio_on` | 1 | master switch for the offline pass |
 | `concert_audio_identify` | 1 | fingerprint each segment (offline Shazam) |
 | `concert_audio_max_dur_s` | 4800 | reject videos longer than this (not one concert) |
-| `concert_audio_min_song_s` | 45 | min sustained song length (energy/no-chapter mode) |
+| `concert_audio_min_song_s` | 45 | min sustained song length during *segmentation* (energy/no-chapter mode). Note: the chapterless setlist *synthesis* filter uses its own hardcoded 8.0s floor, not this knob. |
+| `chapter_override_min_score` | 0.70 | min offline-id confidence to override a generic chapter label. Chaptered path only; the chapterless path hardcodes 0.70. |
 | `concert_audio_floor_frac` | 0.40 | vocal floor as a fraction of the loud (p90) level |
 | `concert_audio_id_slice_s` | 12 | seconds fingerprinted per segment |
 

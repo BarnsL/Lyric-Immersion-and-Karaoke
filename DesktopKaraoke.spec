@@ -71,6 +71,12 @@ hiddenimports = [
     # local modules imported lazily inside functions — pin them so the
     # frozen build always includes them.
     "appdata", "version", "updater", "songchange", "align", "api", "character", "recognize", "fetch_lyrics", "gpu_setup", "metrics",
+    # TICKET-212: the per-knob documentation served by GET /tune. Imported inside
+    # the request handler (so a missing/corrupt docs module degrades to no
+    # tooltips rather than a dead endpoint), which means the analyzer would not
+    # find it. Without this pin the console shows 235 undocumented knobs in the
+    # packaged build while looking perfect from source.
+    "tune_docs",
     # TICKET-184: the out-of-process Whisper worker. Only imported inside the
     # `--whisper-worker` argv branch, so pin it — without this the frozen app
     # can't spawn its own crash-isolated child.

@@ -33,13 +33,65 @@ That installs the build tools, produces the app in **`dist\DesktopKaraoke\`**
 Python needed to run it), and — if [Inno Setup](https://jrsoftware.org/isdl.php)
 is installed — also **`dist\Lyric-Immersion-and-Karaoke-Setup.exe`**, the one-click installer.
 
+It also resolves `py -3.12` itself and runs all four build guards (below), which a
+hand-run PyInstaller does not. Prefer this path.
+
+### ⚠️ The interactive prompt: answer **N**
+
+`build.bat` stops on a `choice /C YN` prompt, *"Bundle faster-whisper (recommended)?"*.
+Answering **Y** does exactly one thing:
+
+```bat
+%PY% -m pip install "faster-whisper>=1.0"
+```
+
+That is an **unpinned install into the build environment**, and it is the precise
+version-skew vector described under TICKET-177 below. `.deps` pins `faster-whisper==1.2.1`
+and `av==18.0.0`; this line asks for whatever is newest, so it can leave the env holding a
+different `faster-whisper` (and, transitively, a different PyAV) than the vendored `.deps`.
+`collect_all` then bundles a mix of the two and `import av` dies at runtime, taking every
+listen feature with it, silently. Note also that cmd parses the unquoted `>` as a
+**redirect**, so the actual command run is `pip install faster-whisper` with stdout sent to
+a file named `=1.0`: the `>=1.0` floor is not applied at all. (`build.bat` has been bitten
+by this same `>` parsing before; see its v1.1.62 comment.)
+
+The prompt's wording is also misleading. Whether whisper gets bundled is decided by
+`WHISPER = os.path.isdir(".deps")` in the spec, not by this answer, so answering N does
+**not** produce a lean build when `.deps` is present.
+
+**Answer N.** Vendor the stack into `.deps` from `requirements-deps.txt` instead (see
+"Sync by listening" below), which is the pinned, known-good set. Answer Y only if you
+have no `.deps` and are deliberately installing whisper into the env, and then re-pin
+`requirements-deps.txt` and rebuild `.deps` before shipping.
+
 ## Manual steps
 
 ```bat
-pip install pyinstaller -r requirements.txt
-pyinstaller --noconfirm DesktopKaraoke.spec     :: -> dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe
-iscc installer.iss                              :: -> dist\Lyric-Immersion-and-Karaoke-Setup.exe
+py -3.12 -m pip install pyinstaller -r requirements.txt
+py -3.12 scripts\check_build_deps.py             :: REQUIRED pre-build guard
+py -3.12 scripts\check_av_dlls.py                :: REQUIRED pre-build guard
+py -3.12 -m PyInstaller --noconfirm DesktopKaraoke.spec   :: -> dist\DesktopKaraoke\...exe
+py -3.12 scripts\check_av_dlls.py --internal dist\DesktopKaraoke   :: REQUIRED post-build
+dist\DesktopKaraoke\Lyric-Immersion-and-Karaoke.exe --selftest --out check.txt  :: REQUIRED
+iscc installer.iss                               :: -> dist\Lyric-Immersion-and-Karaoke-Setup.exe
 ```
+
+**Name the interpreter.** The build Python is **3.12** and `.deps` is cp312, but the
+bare `python` on the Windows build box is a 3.11 agent venv. The spec refuses an ABI
+mismatch outright (TICKET-196), so with a cp312 `.deps` present, `pyinstaller ...` or
+`python -m PyInstaller ...` aborts rather than building the broken bundle it used to.
+(That check compares ABI tags only, and it fails open when `.deps` has no tagged
+modules, so it is a backstop and not a substitute for the guards below.)
+
+**The four guard steps are not optional.** Each catches a different failure, and only
+`build.bat` runs all of them for you:
+
+| Step | What it is | What it catches |
+|---|---|---|
+| `scripts/check_build_deps.py` (pre-build) | Version-consistency check across the native stack (faster-whisper, ctranslate2, PyAV, tokenizers) between `.deps` and the active env | Fails on unambiguous corruption: a foreign CPython ABI tag in `.deps`, or duplicate dist-info dirs (two versions of one package). A plain version difference is a WARNING, because dist-info metadata can lag the real module files. |
+| `scripts/check_av_dlls.py` (pre-build) | PE-import-table parse of every `av/*.pyd`, asserting each FFmpeg DLL it imports exists in `av.libs` | The direct detector. Version checks are only a proxy; the real failure is DLL **file identity** (delvewheel mangles a per-build hash into `avformat-62-<hash>.dll`). Stdlib `struct` only, so a missing `pefile` can never silently skip it. |
+| `scripts/check_av_dlls.py --internal dist\DesktopKaraoke` (post-build) | The same PE check against the **shipped bundle** | A PyInstaller collection that mixed sources even though the environment was clean. Runs without launching the exe, so it names the missing DLL instead of returning a bare exit code. |
+| `<exe> --selftest --out FILE` (post-build) | The finished exe imports the whole AI stack before any GUI shows, writes a one-line verdict, and exits 0/1 | The definitive gate. Anything the static checks missed. `build.bat` refuses to package on a non-zero exit. |
 
 ## Why a **onedir** build (a folder, not a single .exe)
 
@@ -189,11 +241,11 @@ clean generated lyric — needs **faster-whisper** (above) plus **`yt-dlp`** and
 runtime** (YouTube otherwise 403s the audio download). To ship it in the portable build:
 
 ```bat
-pip install --target .deps yt-dlp        :: vendor it alongside faster-whisper
+py -3.12 -m pip install --target .deps yt-dlp   :: vendor it alongside faster-whisper
 :: then place a JS runtime next to the .exe so yt-dlp finds it on PATH:
 ::   - Node:  copy node.exe into the app folder, OR
 ::   - Deno:  copy the single deno.exe into the app folder (smaller, ~40 MB)
-pyinstaller --noconfirm DesktopKaraoke.spec
+py -3.12 -m PyInstaller --noconfirm DesktopKaraoke.spec
 ```
 
 `deep_transcribe.available()` is just `import yt_dlp`, and `_download_audio` only enables

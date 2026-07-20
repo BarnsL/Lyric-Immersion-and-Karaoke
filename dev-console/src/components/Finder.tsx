@@ -74,7 +74,7 @@ function OcrPane({ insight }: { insight: InsightPayload }) {
               </span>
             </div>
           ) : (
-            <div className="stat-row"><span>Accepted</span><span className="empty">nothing cleared {ocr.accept_at.toFixed(2)}</span></div>
+            <div className="stat-row"><span>Accepted</span><span className="empty-inline">nothing cleared {ocr.accept_at.toFixed(2)}</span></div>
           )}
 
           {ocr.pending_2nd && (
@@ -214,13 +214,13 @@ function SourcesPane({ insight }: { insight: InsightPayload }) {
     <div className="card">
       <div className="card-heading"><Radio size={15} /> Identification sources</div>
       {row("Media session (SMTC)",
-        s.smtc.title ? <strong>{s.smtc.title}</strong> : <span className="empty">none</span>,
+        s.smtc.title ? <strong>{s.smtc.title}</strong> : <span className="empty-inline">none</span>,
         s.smtc.artist ? <span className="pill">{s.smtc.artist}</span> : null)}
       {row("Heard by sound (Shazam)",
-        s.shazam.heard ? <strong>{s.shazam.heard}</strong> : <span className="empty">nothing yet</span>,
+        s.shazam.heard ? <strong>{s.shazam.heard}</strong> : <span className="empty-inline">nothing yet</span>,
         s.shazam.corroborated ? <span className="pill ok">corroborated</span> : null)}
       {row("Loaded body",
-        s.loaded.title ? <strong>{s.loaded.title}</strong> : <span className="empty">none</span>,
+        s.loaded.title ? <strong>{s.loaded.title}</strong> : <span className="empty-inline">none</span>,
         <>
           {s.loaded.source && <span className="pill">{s.loaded.source}</span>}
           <span className={s.loaded.lines > 0 && s.loaded.lines < 8 ? "pill warn" : "pill"}

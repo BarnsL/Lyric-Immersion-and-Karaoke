@@ -28,9 +28,20 @@ echo ?  This adds ~150 MB but enables AI lyric generation and   ?
 echo ?  sync-by-listening out of the box for end users.         ?
 echo ????????????????????????????????????????????????????????????
 choice /C YN /M "Bundle faster-whisper (recommended)?"
+REM TICKET-225: the requirement specifier in the install below MUST stay QUOTED.
+REM Unquoted, cmd parses the greater-than sign as a redirection operator, so the
+REM line silently became a plain "pip install faster-whisper" with its output sent
+REM to a junk file named "=1.0". The version floor was never applied, meaning pip
+REM resolved whatever release it liked into the BUILD env while .deps held pinned
+REM wheels. That is exactly the version-skew vector the .deps consistency check
+REM below exists to catch, and it is how a whisper-dead bundle ships while every
+REM step reports success. See also the v1.1.62 note further down: this file has
+REM been bitten by an unescaped redirect before.
+REM This comment deliberately spells the character out rather than typing it,
+REM because cmd honours redirection inside a REM line too.
 if %errorlevel%==1 (
     echo Installing faster-whisper for bundling...
-    %PY% -m pip install faster-whisper>=1.0 || echo [!] Warning: faster-whisper install failed - build will continue without it.
+    %PY% -m pip install "faster-whisper>=1.0" || echo [!] Warning: faster-whisper install failed - build will continue without it.
 )
 
 echo.

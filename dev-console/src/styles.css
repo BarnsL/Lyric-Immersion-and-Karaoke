@@ -3,6 +3,38 @@
   color: #edf0fa;
   background: #0a0c12;
   font-synthesis: none;
+
+  /* ── TICKET-209: the spacing scale ────────────────────────────────────
+     Every spacing value in this file used to be hardcoded, which is how the
+     console ended up with four different "cards side by side" gaps (16 / 14 /
+     12 / 10px) and two different card paddings (22px, and 18px for knob
+     groups). Two tiers, deliberately — they are different relationships and
+     should NOT collapse to one number:
+
+       --card-gap   between CARDS. Uniform everywhere, no exceptions.
+       --tile-gap   between small tiles INSIDE a card (metrics, resource
+                    cards, status chips). Tighter on purpose: these read as
+                    one dense block, not as separate panels.
+
+     Change a value here, not at the use site. */
+  --card-gap: 16px;
+  --tile-gap: 12px;
+  --card-pad: 22px;
+  --tile-pad: 14px;
+
+  --radius-card: 14px;
+  --radius-tile: 10px;
+  --radius-control: 9px;
+
+  /* These three were referenced via var() in the tree-ladder block but never
+     defined anywhere, so they silently resolved to their inline fallbacks.
+     Declared here at exactly those fallback values: no visual change, but the
+     tokens are now real and greppable. NOTE --card is the TREE NODE background
+     (styles.css `.tree-node`), NOT the .card class — the names collide and the
+     colours differ. Do not "fix" it to match .card. */
+  --line: #2a3346;
+  --accent: #7c9cff;
+  --card: #131a2a;
 }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 1080px; min-height: 100vh; background: #0a0c12; }
@@ -56,7 +88,9 @@ a:hover { color: #c8c5ff; }
 .status-dot.off { background: #8b3547; }
 
 .workspace { padding: 34px clamp(28px, 4vw, 60px) 60px; overflow: hidden; }
-.page-grid { display: grid; gap: 16px; max-width: 1500px; margin: 0 auto; }
+/* Uses the scale token, not a repeated literal — this was the last hardcoded
+   16px left over from TICKET-209, and it is the gap every stacked view relies on. */
+.page-grid { display: grid; gap: var(--card-gap); max-width: 1500px; margin: 0 auto; }
 .topbar {
   display: flex; justify-content: space-between; align-items: flex-end; gap: 20px;
   max-width: 1500px; margin: 0 auto 24px;
@@ -82,12 +116,18 @@ p { color: #a2a6b8; font-size: 13px; line-height: 1.55; }
 .button.quiet:hover { border-color: #41485e; color: #fff; }
 .button.tiny { min-height: 26px; padding: 0 8px; font-size: 11px; }
 .card {
-  border: 1px solid #252938; border-radius: 14px;
+  border: 1px solid #252938; border-radius: var(--radius-card);
   background: linear-gradient(145deg, rgba(31, 34, 48, .92), rgba(19, 22, 32, .95));
   box-shadow: 0 15px 45px rgba(0, 0, 0, .12);
-  padding: 22px;
+  padding: var(--card-pad);
 }
-.card + .card { margin-top: 16px; }
+/* TICKET-209: card separation for views that stack cards as bare siblings
+   (Parameters, Resources, Runtime map, AutoResearch). */
+.card + .card { margin-top: var(--card-gap); }
+/* ...but NOT inside .page-grid, which already supplies the same gap. Both used
+   to apply, so Overview/Finder/Decisions/Activity sat at 32px between cards
+   while the fragment views sat at 16px — the visible unevenness. */
+.page-grid > .card + .card { margin-top: 0; }
 .card-heading {
   display: flex; justify-content: space-between; align-items: start; margin-bottom: 20px;
   color: #9f9aef;
@@ -95,11 +135,13 @@ p { color: #a2a6b8; font-size: 13px; line-height: 1.55; }
 .card-heading .eyebrow { margin-bottom: 5px; }
 .card-heading h2 { color: #fbfbff; }
 
-.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; }
-.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 14px; }
-.grid-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; }
+/* TICKET-209: grid-2/grid-3 hold CARDS, so they use the card gap (were 14px). */
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: var(--card-gap); }
+.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: var(--card-gap); }
+/* ...these hold small TILES inside a card, so they use the tighter tile gap. */
+.grid-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: var(--tile-gap); }
 .metric {
-  padding: 14px; border: 1px solid #2a2e40; border-radius: 10px;
+  padding: var(--tile-pad); border: 1px solid #2a2e40; border-radius: var(--radius-tile);
   background: linear-gradient(135deg, #1c1f30, #151825);
 }
 .metric strong { display: block; color: #e5e2ff; font-size: 22px; letter-spacing: -.03em; margin-bottom: 2px; }
@@ -209,11 +251,38 @@ p { color: #a2a6b8; font-size: 13px; line-height: 1.55; }
 
 .boot-screen { display: grid; place-items: center; min-height: 100vh; color: #c6c3f8; }
 
+/* `.empty` is the BLOCK empty-state panel: a full-width dashed box that stands in
+   for a card's missing content. It only works on a block-level element. */
 .empty {
   padding: 22px; border: 1px dashed #42475a; border-radius: 12px; text-align: center;
   color: #8a8fa4; font-size: 13px;
 }
 .empty small { display: block; margin-top: 4px; color: #6d7286; font-size: 11px; }
+
+/* TICKET-219 — the "dotted lines overlapping the text" in Identification sources.
+   There was never a leader line. `.empty` (above) was being applied to inline
+   <span>s inside `.stat-row`, and `.empty` never sets `display`. On a
+   non-replaced INLINE box, vertical padding and borders are painted but do NOT
+   contribute to line-box height, so that 22px padding + 1px dashed border
+   rendered a ~62px-tall dashed rectangle inside a ~16px row: it bled up and down
+   across the neighbouring rows and their hairlines, and its 44px of horizontal
+   padding shoved the value toward the card edge (`.grid-2` uses minmax(0, 1fr),
+   so the column cannot widen to absorb it). What looked like a stray dotted
+   leader was the top and bottom edges of that oversized box cutting through
+   adjacent text.
+
+   `display: inline-flex` is the load-bearing part: it makes the box atomic
+   inline-level, so padding and border finally participate in layout and it can
+   no longer escape its row. The rest matches `.pill`, which is the visual
+   register these short inline values belong in. Fixing it as a separate class
+   rather than by overriding `.empty` inside `.stat-row` keeps the two intents
+   distinct, so the next inline use does not silently inherit the panel styling
+   and reintroduce this. */
+.empty-inline {
+  display: inline-flex; align-items: center;
+  padding: 3px 9px; border: 1px dashed #42475a; border-radius: 999px;
+  color: #8a8fa4; font-size: 11px; white-space: nowrap;
+}
 
 /* ── decision tree (TICKET-190) ──────────────────────────────────────────────
    A vertical gate ladder. The path that actually executed is lit; steps the
@@ -284,7 +353,10 @@ p { color: #a2a6b8; font-size: 13px; line-height: 1.55; }
 }
 .stat-row:last-child { border-bottom: 0; }
 .stat-row > span:first-child { color: #82889c; }
-.stat-row > span:last-child { text-align: right; color: #e2e0f8; }
+/* min-width:0 lets a flex item shrink below its content size; without it a long
+   value pushes the row wider than the card instead of wrapping (not the cause of
+   TICKET-219, but the same class of escape and free to close here). */
+.stat-row > span:last-child { text-align: right; color: #e2e0f8; min-width: 0; overflow-wrap: anywhere; }
 .stat-row strong { color: #f1f0ff; font-weight: 650; }
 
 /* A block whose data describes a PREVIOUS video. Visibly demoted rather than
@@ -554,6 +626,70 @@ p { color: #a2a6b8; font-size: 13px; line-height: 1.55; }
 .gap-warn { color: #f0c782; }
 .gap-bad  { color: #ffc0ce; font-weight: 600; }
 
+/* TICKET-207: the note a user attaches to one event. Indented under the event
+   it belongs to, and quiet until hovered, so a log of 80 events does not turn
+   into 80 competing input boxes. */
+.event-note { margin-top: 6px; }
+.event-note-add { opacity: .55; }
+.event-row:hover .event-note-add, .event-note-add:focus-visible { opacity: 1; }
+.event-note-edit { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+.event-note-edit input { flex: 1; min-width: 0; font-size: 11.5px; }
+.event-note-list { margin: 0 0 4px; padding: 0; list-style: none; }
+.event-note-list li {
+  display: flex; gap: 5px; align-items: baseline;
+  padding: 3px 7px; margin-bottom: 3px; border-radius: 4px;
+  border-left: 2px solid #7d72f1; background: rgba(125, 114, 241, .07);
+  color: #bdbad4; font-size: 11.5px;
+}
+.event-note-msg { margin: 5px 0 0; font-size: 11px; }
+
+/* TICKET-208: the language chooser. A plain wrap so 13 short codes stay one
+   scannable block rather than a dropdown that hides the current value. */
+.lang-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+
+/* TICKET-212: the per-knob help affordance. Deliberately low-contrast until
+   hovered or focused — 235 of these are on screen at once and a bright icon on
+   every row would out-shout the values themselves. */
+.knob-help {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; margin-left: 7px;
+  border: 1px solid #3a3f55; border-radius: 999px;
+  color: #7d8299; background: #191d29;
+  font-size: 9px; font-weight: 700; cursor: help; vertical-align: middle;
+}
+.knob-help:hover, .knob-help:focus-visible {
+  border-color: #7d72f1; color: #cfcbff; background: #23203a; outline: 0;
+}
+/* An undocumented knob is a defect (probe_tune_docs.py fails the build on one),
+   so it is styled as a warning rather than blending in with the help icons. */
+.knob-help.undocumented { border-color: #7a4250; color: #ffc0ce; background: #2a1a20; }
+
+/* TICKET-205: the before → after of a sync correction. Kept visually distinct
+   from the other meta chips because it is the one the eye should land on when
+   scanning the log for "when did the lyrics actually move?". */
+.event-move {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: rgba(125, 114, 241, 0.09);
+  border: 1px solid rgba(125, 114, 241, 0.22);
+  color: #9a94d8;
+}
+
+.event-move em {
+  font-style: normal;
+  font-weight: 600;
+  color: #c3bdf5;
+}
+
+.toast-meta .event-move {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.16);
+  color: inherit;
+}
+
 /* ── Wrong Song + title picker ─────────────────────────────── */
 .wrong-song-card { border-color: #3a3548; }
 
@@ -639,4 +775,99 @@ p { color: #a2a6b8; font-size: 13px; line-height: 1.55; }
 .custom-title input:focus {
   outline: none;
   border-color: #7d72f1;
+}
+
+/* ── Concerts view (TICKET-218) ───────────────────────────────────────────────
+   The concert panel shows a mechanism, its live state, and the knobs that steer
+   it, in that order, per card. These are the shared primitives that pattern
+   needs. Everything is scoped so it cannot leak into the other views.
+
+   Reuses the existing spacing scale rather than introducing new magic numbers:
+   see --card-gap / --tile-gap at the top of this file. */
+
+/* Explanatory paragraph under a card heading. Deliberately not `.muted`: this
+   text is meant to be READ, so it keeps normal contrast and only steps down in
+   size. It carries the "why does this mechanism exist" sentence that turns a
+   row of numbers into something diagnosable. */
+.lede {
+  margin: -8px 0 14px; color: #a8adc4; font-size: 12px; line-height: 1.55;
+  max-width: 76ch;
+}
+
+/* Numeric / secondary detail inside a row. Tabular figures so a live-updating
+   value does not make the row jitter as digit widths change. */
+.mono-dim {
+  color: #82889c; font-size: 11px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A button that reads as a value, used for click-to-edit. Resets the UA button
+   box so it sits on the text baseline like the static value it replaces —
+   without this the row height changes the moment a knob becomes editable. */
+.linkish {
+  background: none; border: 0; padding: 0; margin: 0 0 0 6px;
+  color: #a5a2f7; font: inherit; cursor: pointer; text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.linkish:hover { color: #c8c5ff; }
+.linkish:disabled { color: #6d7286; cursor: default; text-decoration: none; }
+
+.ck-name {
+  color: #82889c;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+}
+.ck-input {
+  max-width: 120px; height: 26px; padding: 0 8px; font-size: 12px; text-align: right;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.ck-group + .ck-group { margin-top: 18px; }
+.ck-group-title {
+  margin: 0 0 4px; color: #9f9aef; font-size: 11px; font-weight: 650;
+  text-transform: uppercase; letter-spacing: .06em;
+}
+
+/* Chapter and plan lists. Capped and scrollable because a festival setlist can
+   run to 40 entries and would otherwise push every card below it off-screen.
+   The cap is in rows, not pixels, so it holds at any font size. */
+.scroll-list { max-height: 320px; overflow-y: auto; overflow-x: hidden; }
+.scroll-list .stat-row:last-child { border-bottom: 0; }
+
+/* The row the playhead is currently inside. A left rule rather than a fill:
+   the list is scannable at a glance, and the marker survives a dark/light
+   background without fighting the `.pill` beside it. */
+.row-current {
+  background: rgba(125, 114, 241, .07);
+  box-shadow: inset 2px 0 0 #7d72f1;
+  border-radius: 0 6px 6px 0;
+}
+.row-current > span:first-child { color: #c8c5ff; }
+
+/* A caveat attached to a panel: what this mechanism cannot see. */
+.note-inline {
+  display: flex; align-items: flex-start; gap: 6px;
+  margin: 12px 0 0; padding: 9px 11px; border-radius: var(--radius-tile);
+  background: #21243a; color: #a8adc4; font-size: 11px; line-height: 1.5;
+}
+.note-inline svg { flex: 0 0 auto; margin-top: 2px; color: #f0c782; }
+
+/* Applause accumulator against its arm threshold. A bar rather than two printed
+   numbers because the question being asked is "is this close to firing", which
+   a proportion answers instantly and a pair of decimals does not. */
+.meter-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.meter {
+  flex: 1 1 auto; min-width: 0; height: 8px; border-radius: 999px;
+  background: #21243a; overflow: hidden;
+}
+.meter-fill {
+  height: 100%; border-radius: 999px; background: #7d72f1;
+  /* Matches the 2.5s poll so the bar glides between samples instead of
+     stepping. Slightly under the poll interval so it always settles. */
+  transition: width 2.2s linear, background-color .2s ease;
+}
+.meter-fill-armed { background: #f0c782; }
+
+@media (prefers-reduced-motion: reduce) {
+  .meter-fill { transition: none; }
 }

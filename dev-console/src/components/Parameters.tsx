@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Check, Cog, RefreshCw, Search, X } from "lucide-react";
-import { getTune, setTune } from "../api";
+import { getTune, setTune, tuneError } from "../api";
 import { KNOB_GROUPS } from "../manifest";
 import type { TuneValue } from "../models";
 
@@ -15,6 +15,38 @@ interface Groups {
 }
 
 const OTHER: Groups = { title: "Other", hint: "Uncategorised knobs — add a matcher in manifest.ts to fold these into a group.", entries: [] };
+
+/**
+ * TICKET-212 — the knob name, its type, and its documentation.
+ *
+ * Every one of the ~235 tunables used to render as a bare key and a number.
+ * `deadband` and `energy_lift_floor` are not self-describing, so adjusting them
+ * was guesswork, and a guess that made the overlay worse was hard to attribute
+ * afterwards. The prose comes from the engine (`GET /tune` → `docs`, generated
+ * from `tune_docs.py`), never from a copy kept here — a duplicated description
+ * would drift from the knob it describes and there would be nothing to catch it.
+ *
+ * The help icon carries the text in a native `title`, which is what the rest of
+ * this console uses for explanatory prose. It is keyboard-reachable and needs no
+ * popover machinery; the trade-off is the OS hover delay, which is acceptable
+ * for reference text nobody reads twice.
+ */
+function KnobName({ k, type, doc }: { k: string; type: string; doc?: string }) {
+  return (
+    <>
+      <code>{k}</code>
+      <span className={`knob-type ${type}`}>{type}</span>
+      {doc ? (
+        <span className="knob-help" title={doc} tabIndex={0} role="note"
+              aria-label={`${k}: ${doc}`}>?</span>
+      ) : (
+        // Undocumented is a defect, not a normal state — probe_tune_docs.py
+        // fails the build on it. Shown so it is obvious if one ever slips out.
+        <span className="knob-help undocumented" title={`No documentation for ${k}. This is a bug — see scripts/probe_tune_docs.py`}>!</span>
+      )}
+    </>
+  );
+}
 
 // ─── Type inference & validation ────────────────────────────────────────────
 type KnobType = "boolean" | "integer" | "float" | "string";
@@ -64,6 +96,10 @@ function group(values: Record<string, TuneValue>): Groups[] {
 
 export function Parameters({ online }: Props) {
   const [values, setValues] = useState<Record<string, TuneValue> | null>(null);
+  // TICKET-212: per-knob documentation, shipped alongside the values by
+  // GET /tune. Kept as engine-supplied data rather than a local constant so it
+  // cannot drift from the knobs it describes.
+  const [docs, setDocs] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
   const [q, setQ] = useState("");
   const [editing, setEditing] = useState<Record<string, string>>({});
@@ -74,7 +110,11 @@ export function Parameters({ online }: Props) {
     let cancelled = false;
     setErr(null);
     getTune()
-      .then((t) => { if (!cancelled) setValues(t.tune ?? {}); })
+      .then((t) => {
+        if (cancelled) return;
+        setValues(t.tune ?? {});
+        setDocs(t.docs ?? {});
+      })
       .catch((e) => { if (!cancelled) setErr(String(e?.message ?? e)); });
     return () => { cancelled = true; };
   }, [tick]);
@@ -99,9 +139,29 @@ export function Parameters({ online }: Props) {
     setSaving(k);
     setErr(null);
     try {
-      await setTune(k, out);
-      // Optimistic update — the server refreshes on the next poll anyway.
-      setValues((prev) => (prev ? { ...prev, [k]: out } : prev));
+      const r = await setTune(k, out);
+      // TICKET-220. Two bugs lived in these three lines.
+      //
+      // 1. The call was awaited but its RESULT was never checked. `j()` only
+      //    throws on an HTTP-level failure, and a knob the engine REFUSES comes
+      //    back HTTP 200 with `ok: false` — so a rejected write fell straight
+      //    through to the optimistic update below and the console displayed a
+      //    value the engine had never accepted.
+      // 2. The old comment here claimed "the server refreshes on the next poll
+      //    anyway". Nothing polls /tune; api.py even says so at the GET handler
+      //    ("this view is loaded on demand, not polled"). So the optimistic
+      //    value was not provisional, it was permanent until a manual refresh.
+      //
+      // Both are closed by reading what the server actually returns: it sends
+      // the full coerced `tune` dict back, so the row can show the value the
+      // engine STORED rather than the one that was typed. That difference is
+      // the whole point for a clamped knob.
+      const msg = tuneError(r, `the engine refused ${k}`);
+      if (msg) { setErr(`Set ${k} failed: ${msg}`); return; }
+      setValues((prev) => {
+        if (r.tune) return r.tune;                 // authoritative, post-coercion
+        return prev ? { ...prev, [k]: out } : prev;
+      });
       const next = { ...editing };
       delete next[k];
       setEditing(next);
@@ -180,8 +240,7 @@ export function Parameters({ online }: Props) {
                     return (
                       <tr key={k} className="knob-row">
                         <td>
-                          <code>{k}</code>
-                          <span className="knob-type">bool</span>
+                          <KnobName k={k} type="bool" doc={docs[k]} />
                         </td>
                         <td className="val">
                           <label className="switch" title={busy ? "saving…" : (on ? "on" : "off")}>
@@ -200,8 +259,7 @@ export function Parameters({ online }: Props) {
                   return (
                     <tr key={k} className={`knob-row${isEditing ? " editable" : ""}`}>
                       <td>
-                        <code>{k}</code>
-                        <span className={`knob-type ${t}`}>{t}</span>
+                        <KnobName k={k} type={t} doc={docs[k]} />
                       </td>
                       <td className="val">
                         {isEditing ? (

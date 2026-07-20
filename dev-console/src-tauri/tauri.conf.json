@@ -22,7 +22,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8765; script-src 'self'"
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8765; script-src 'self'",
+      "devCsp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8765 ws://127.0.0.1:1421 http://127.0.0.1:1421; script-src 'self'"
     }
   },
   "bundle": {

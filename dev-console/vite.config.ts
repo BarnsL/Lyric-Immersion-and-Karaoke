@@ -3,8 +3,13 @@ import react from "@vitejs/plugin-react";
 
 // Tauri 2 dev-server contract:
 //  - fixed port 1420 (matches tauri.conf.json.build.devUrl)
-//  - listen on 0.0.0.0 so the WebView can reach it via a stable host
-//  - HMR uses a secondary port so it doesn't conflict with Tauri's own IPC
+//  - bind 127.0.0.1 (loopback only). The comment here used to say 0.0.0.0, which
+//    was never what the code did and would have exposed the dev server to the
+//    local network.
+//  - HMR uses a secondary port so it doesn't conflict with Tauri's own IPC.
+//    That port MUST also be listed in tauri.conf.json's `devCsp`, or the CSP
+//    blocks the HMR websocket and edits appear to require a full rebuild even
+//    under `npm run tauri:dev`. See docs/DEV_CONSOLE.md.
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,

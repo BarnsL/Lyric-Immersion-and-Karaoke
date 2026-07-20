@@ -8,6 +8,622 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## v1.1.92 — 2026-07-19 (TICKET-214…224 — the Concerts panel, and the numbers that were never true)
+
+### TICKET-214 — every applause gap this app has ever logged said "~0.0s"
+
+**Symptom:** in a concert the log reads `applause gap (~0.0s) in a concert →
+re-identify the next song`, and it has never read anything else. The gap length
+is the one number that separates a real inter-song pause from a 2.5s
+hair-trigger, so a re-identify that fired on nothing and one that fired on a
+30-second ovation were indistinguishable after the fact.
+
+**Root cause.** `_check_applause_gap` (`main.py:16180`) integrates
+loud-but-non-vocal time into `self._applause_for`, then on the vocals-are-back
+branch it reset the integrator and logged. In that order:
+
+    self._applause_for, self._applause_armed = 0.0, False
+    if self._live_mode:
+        log.info("applause gap (~%.1fs) in a concert → …", self._applause_for)
+    else:
+        log.info("applause gap (~%.1fs) ended, vocals back → …", self._applause_for)
+
+Both `log.info` calls read `self._applause_for` one line after it was cleared,
+so every message printed the post-reset `0.0`. Latent since the detector shipped
+(TICKET-061 / TICKET-063). What made it invisible is that `0.0` is a plausible
+reading for a mechanism whose job is to notice short pauses: the message looks
+like a measurement, not like a bug, and nothing else in the app ever reported
+the same quantity for comparison.
+
+**Fix.** The gap is captured into a local `gap` **before** the reset
+(`main.py:16240`) and both log lines print that. The measurement is also
+retained on the engine rather than discarded: `_applause_last_gap_s`,
+`_applause_last_t`, `_applause_last_action` and a `_applause_gaps` run counter
+(declared at `main.py:3798`, written at `main.py:16242`), which is what lets the
+Concerts panel report the last real gap and what the detector did about it
+(`get_concert`, `main.py:11927`).
+
+**Guard:** section 3 of `scripts/probe_concert.py` asserts the integrator
+surfaces with a non-zero last gap and a stated action.
+
+---
+
+### TICKET-215 — `insight.setlist.chapters` was empty for every concert, always
+
+**Symptom:** the console's setlist panel said "no setlist parsed for this
+video" on concerts whose chapters the engine had parsed correctly and was
+actively using to drive song changes. A genuine parse failure and a working
+setlist rendered identically.
+
+**Root cause.** `_concert_setlist` entries are dicts (`{"start": float, "title":
+str}`) from both producers, the native/description chapter reader and the
+offline-plan synthesis, and `_concert_setlist_tick` reads them that way. The
+`get_insight` reader indexed them as tuples:
+
+    chapters.append({"start": round(float(ch[0]), 1), "title": _s(ch[1], 60)})
+
+`ch[0]` on a dict raises `KeyError: 0`, so the first iteration threw. The `try`
+wrapped the whole **loop** rather than each entry, so that one exception aborted
+the rest and `chapters` returned `[]`. Unconditionally, on every concert, since
+the feature shipped. Two things hid it: an empty list is not an error, and the
+console had a legitimate empty state for exactly that value, so the failure
+rendered as a plausible-looking answer instead of as a crash.
+
+**Fix.** A shared module-level helper `_chapter_fields(ch)` (`main.py:1023`)
+returns `(start, title)` for either shape, dict or the legacy tuple that still
+reaches the app from the per-session `_setlist_query_cache`, and returns
+`(0.0, None)` for an entry it cannot use so callers can skip it. The reader
+(`main.py:11640`) now has a per-entry `try`, so one malformed chapter cannot
+blank the rest, and each chapter also carries a `skip` flag marking the non-song
+segments from `_SETLIST_SKIP`. Centralising the shape check is the actual fix:
+`_live_hearing_corroborated` already handled both shapes defensively and this
+reader did not, which is the class of drift a second reader always reintroduces.
+
+**Guard:** section 2 of `scripts/probe_concert.py` feeds both shapes in and
+asserts the chapters come back with real content, not merely that nothing
+raised. That distinction is the ticket.
+
+---
+
+### TICKET-216 — `mv_intro_timeout` was documented and defaulted at 75s, and had been 20s
+
+The registered default in the tune dict is `20.0` (`main.py:3414`). The in-code
+fallback read `self._tune.get("mv_intro_timeout", 75.0)` and a comment above it
+stated "default 75 s". The 75 was historical, sized off a track with a ~70s
+intro, and both copies were left behind when the registered default moved.
+
+No runtime effect: the knob is always present in the tune dict, so the fallback
+never fired and 20.0 was always the real value. The cost was diagnostic. Anyone
+reading the source to work out why the intro card released early got a number
+that was wrong by 55 seconds, from the two places you would naturally check.
+
+**Fix.** Fallback and comment corrected to 20.0 (`main.py:9456`, `main.py:9500`),
+with the history recorded so the 75 is not reintroduced as a "fix". Worth
+knowing: this knob also governs the concert **between-songs hold**, which is why
+the Concerts panel groups it under "Between-songs hold" (`main.py:12064`) rather
+than leaving it filed as an MV-only tunable.
+
+---
+
+### TICKET-217 — the concert verdict had no provenance
+
+**Symptom:** a video is being driven as a concert (sound-only identification, no
+title matching) or it is not, and when that call is wrong there was no way to
+ask why. `is_live_or_compilation` returned a bare bool. The reason existed only
+in a log line, which is gone by the time anyone is looking at the console.
+
+**Fix.** `explain_live_or_compilation(title, duration)` (`main.py:1846`) returns
+`(verdict, rule, detail)`, produced by the same branch that decides, with `rule`
+a short stable tag and `detail` the human-readable specifics (the matched
+keyword, the measured duration). `is_live_or_compilation` (`main.py:1886`) is now
+a thin wrapper returning element 0, so the verdict and its stated reason cannot
+drift apart. Re-deriving the reason in a second reader is exactly what would have
+drifted.
+
+The rules, in evaluation order: `loop-veto` (a looped or endurance upload of one
+song, checked first so it beats duration), `duration` (over 10 minutes),
+`no-cue`, `aside-veto` (the live cue sits in a parenthetical aside),
+`single-song-veto` (a named song heads the title before the event), and
+`keyword`. Three more are recorded at the other assignment sites where the
+verdict is changed after the fact: `subs-demote` (`main.py:4331`),
+`category-flip` (`main.py:6291`), `nonmusic-demote` (`main.py:14580`). All land
+on `self._live_why`, which the API strips of its wall-clock before serving.
+
+**Separately, `self._live_arr_why`** (`main.py:4212`) records which of the three
+live-arrangement inputs fired. This matters more than it looks: the third input
+is "this is a COVER", and a cover sets `_live_arrangement` true with no live cue
+in the title at all. That is deliberate (a cover's timing differs from the studio
+original much as a live take does, so follow the offset rather than resetting
+it), but it means the badge is frequently on for a studio-quality cover and the
+live sync profile is silently in force. The panel now says so instead of leaving
+the reader to assume the title must have said "LIVE" somewhere.
+
+**Guard:** sections 7 to 9 of `scripts/probe_concert.py` check six title cases
+against both the explainer and the bool wrapper and assert they never disagree,
+assert `loop-veto` beats the duration rule, assert every rule leaves a non-empty
+detail, and assert the cover case is stated rather than implied.
+
+---
+
+### TICKET-218 — the Concerts panel
+
+Concert handling is the least observable part of the app: an applause integrator
+that is silent until it fires, a chapter setlist that suppresses the entire OCR
+pipeline when present, an offline vocal-onset pass, two watchdogs and a
+three-tier resync cadence. New engine accessor `App.get_concert()`
+(`main.py:11880`), new endpoint `GET /concert` (`api.py:387`), new console view
+`dev-console/src/components/Concerts.tsx` wired into `App.tsx` nav as
+`concerts`.
+
+What it surfaces, and why each one earned a place:
+
+- The mode verdict **and the rule behind it** (TICKET-217), plus which of the
+  three sync profiles is in force. The concert column of that three-way split is
+  the one people forget exists.
+- The applause integrator drawn as a live meter against its arm threshold, with
+  the last completed gap (TICKET-214). It is the only view of a mechanism that
+  shows nothing at all until the moment it acts.
+- Chapters with non-song segments marked, and a stated limitation: MC, talk,
+  intermission, encore and credits are recognised **by title only**, from the
+  skip list. There is no audio-based MC detector, so a talk block with a
+  song-like chapter name will not be caught.
+- The offline vocal-onset plan, per segment, including segments where no onset
+  was measured and the chapter mark is used instead.
+- The between-songs hold, its elapsed time and its release deadline.
+- The pending-switch watchdog (an unconfirmed hearing awaiting its second read,
+  escalating at 15s with nothing on screen and 90s with lyrics already up) and
+  the stale-song watchdog (a concert song still showing after 6.5 minutes).
+- The live-resync cadence tier with its current gap.
+- Banner OCR status **with the reason it is blocked**. This is the single most
+  misunderstood part of concert handling: OCR is fully suppressed the moment a
+  chapter setlist exists, so on a chaptered concert the whole documented OCR
+  pipeline never runs. An idle panel would leave the reader to infer that; the
+  panel says which of the four reasons applies.
+- Every steering knob, grouped by the mechanism it steers rather than
+  alphabetically, editable inline, with its TICKET-212 documentation as a
+  tooltip.
+
+**Guard:** `scripts/probe_concert.py`, nine sections and 47 assertions over 14
+stub scenarios. It pulls the functions out of `main.py` with `ast` and execs
+only those, so importing the module (which builds a Tk app) is never needed.
+Every case runs against a deliberately hostile stub: missing attributes, a
+half-initialised engine, chapters in the legacy tuple shape, a plan entry with a
+null onset. For a diagnostics accessor the failure that matters is not "wrong
+number" but "raised, and took `/concert` down with it".
+
+---
+
+### TICKET-219 — the "dotted lines overlapping the text" in the Song finder
+
+**Report:** dotted lines cutting across the text in the Identification sources
+card, looking like a leader line rendered on top of the values.
+
+**Root cause.** There was never a leader line. `.empty` (`styles.css:256`) is a
+**block** empty-state panel: 22px padding, 1px dashed border, centred text. It
+was being applied to inline `<span>`s inside `.stat-row`, and `.empty` never
+sets `display`. On a non-replaced inline box, vertical padding and borders are
+painted but do **not** contribute to line-box height, so a ~62px dashed
+rectangle rendered inside a ~16px row: it bled up and down across the
+neighbouring rows and their hairlines, and its 44px of horizontal padding shoved
+the value toward the card edge (`.grid-2` uses `minmax(0, 1fr)`, so the column
+cannot widen to absorb it). What looked like a stray dotted leader was the top
+and bottom edges of that oversized box cutting through adjacent text.
+
+**Fix.** A separate `.empty-inline` class (`styles.css:281`): `display:
+inline-flex`, pill geometry matching `.pill`, which is the visual register these
+short inline values belong in. `inline-flex` is the load-bearing part, since it
+makes the box atomic inline-level so padding and border finally participate in
+layout. The five inline call sites moved to it: four in `Finder.tsx` (lines 77,
+217, 220, 223) and one in `Now.tsx` (line 94).
+
+Fixed as a new class rather than by overriding `.empty` inside `.stat-row`, so
+the two intents stay distinct and the next inline use cannot silently inherit
+the panel styling and reintroduce this.
+
+---
+
+### TICKET-220 — `setTune` lied about its return shape, and two callers believed it
+
+**Symptom:** a knob the engine **refused** appeared in the console as if it had
+been set. And when a write did fail visibly, the message was a generic "could
+not set", never the engine's actual reason.
+
+**Root cause.** `dev-console/src/api.ts` declared the return as `{ok, msg?}`.
+`api.py` (`api.py:641`) actually returns:
+
+    {"ok": all(...), "results": [{"key", "ok", "msg"}], "tune": {…every knob…}}
+
+with no top-level `msg` at all. Two silent bugs followed from the one wrong
+type:
+
+* `Library.tsx` read `r.msg`, which is always `undefined`, and fell through to a
+  generic error string. The real per-key reason sitting in `results[0].msg` was
+  discarded.
+* `Parameters.tsx` awaited the call and never checked `r.ok`. A rejected write
+  comes back **HTTP 200** with `ok: false`, so `j()` does not throw and the
+  refusal fell straight through to the optimistic local update. The old comment
+  claimed the server would refresh it on the next poll, but nothing polls
+  `/tune` (`api.py` says so at its GET handler), so the wrong value stood until a
+  manual refresh.
+
+**Fix.** `SetTuneResult` corrected to the real shape (`api.ts:44`), plus a
+`tuneError(r, fallback)` helper (`api.ts:60`) that pulls the reason out of the
+per-key results array, centralised because every caller was reaching for the
+`msg` that does not exist. `Parameters.tsx` now bails on a refusal and, on
+success, adopts the authoritative coerced `tune` dict the server already returns
+(`Parameters.tsx:159`) rather than the value that was typed. For a clamped knob
+that difference is the entire point.
+
+---
+
+### TICKET-221 — the Library view's optional-components panel was functionally dead
+
+**Symptom:** the simulate-missing switches (TICKET-211) did nothing. Toggling one
+moved it and then snapped back, which reads as a broken control rather than a
+stale one.
+
+**Root cause.** The panel renders from `insight.components`, but `App.tsx`'s
+`pollInsight` view list omitted `library`. Navigating straight to Library left
+`insight` null and the panel never rendered at all; arriving via Activity left it
+frozen at whatever the last poll had produced. The switches are **controlled**
+inputs bound to that stale object, so a toggle POSTed successfully, the engine
+accepted it, and the next render reset the switch from the object that was never
+refreshed. Success looked like failure.
+
+**Fix.** `library` added to the poll list (`App.tsx:72`).
+
+---
+
+### TICKET-222 — "app not running", directly above the song that is not playing
+
+**Symptom:** when the engine dies, the sidebar shows the offline dot and "app not
+running", and immediately below it a `now: <title>` line still naming the last
+song it saw.
+
+**Root cause.** The catch branch on the health poll cleared `health` and `diag`
+and returned early, but left `status` and `insight` holding their last successful
+values. The early return is correct (there is no point polling the rest of an
+engine that just failed its health check), but it meant every other panel kept
+displaying pre-death state with nothing marking it as stale.
+
+**Fix.** The offline branch now clears `status` and `insight` as well
+(`App.tsx:83`).
+
+---
+
+### TICKET-223 — the tray's focus-an-existing-console guard could be silently disabled
+
+`main.py._DEVCONSOLE_TITLE` (`main.py:19719`) is how the tray finds an
+already-open console so it can focus it instead of spawning a second one. It is
+matched against the live window title, which is set in
+`dev-console/src-tauri/tauri.conf.json`. Two files, two languages, nothing tying
+them together: rename the window and the guard fails with no error, no log entry
+and no symptom other than the tray quietly no longer focusing.
+
+`scripts/check_devconsole.py` gained `check_title_mirror`, which reads the title
+out of the config and the constant out of `main.py` and fails the check when they
+differ, naming both values.
+
+---
+
+### TICKET-224 — `_seed_bundled_lyrics()` deleted, not unhooked
+
+`_seed_bundled_lyrics()` copied lyric JSON shipped inside the app into the
+user's runtime cache, to paper over songs whose providers always missed.
+TICKET-124 retired that approach: `bundled_lyrics/` was removed from the repo
+and `DesktopKaraoke.spec` asserts no bundled lyrics ship. The function had had
+no caller since, so it was inert, and it still worked perfectly.
+
+Inert is not the same as harmless. This app is prepared for commercial release
+and lyric bodies are third-party content, so a working copy-lyrics-into-the-cache
+routine sitting in the source is a loaded footgun: the next person looking for
+"how do I make this one stubborn song work" finds a ready-made bake-in path and
+a docstring recommending it. The code is gone; a comment at `main.py:168`
+records why, and says to fix the provider lookup or let the by-ear path handle
+it instead.
+
+---
+
+### Live edit was blocked by CSP (no ticket)
+
+Edits under `npm run tauri:dev` appeared to need a full rebuild. The production
+`csp` in `tauri.conf.json` does not list the Vite HMR websocket
+(`ws://127.0.0.1:1421`, configured at `vite.config.ts:20`), and Tauri injects the
+production `csp` into dev builds when no `devCsp` is present, so the HMR socket
+was refused and nothing hot-reloaded.
+
+`tauri.conf.json` now carries a `devCsp` that adds the HMR origin for **dev
+only**. The shipped `csp` is untouched.
+
+---
+
+### Single instance is guaranteed twice (no ticket, worth recording)
+
+Two independent mechanisms enforce one console (TICKET-198), and both are worth
+knowing about before debugging either:
+
+* `tauri-plugin-single-instance`, registered **first** in
+  `dev-console/src-tauri/src/lib.rs` because the plugin decides during init
+  whether this process is the primary and anything registered ahead of it does
+  setup work in a process about to exit. Its callback un-minimises, shows and
+  focuses the existing window, in that order, because a minimised window
+  silently refuses `set_focus`.
+* `main.py.launch_dev_console` does its own check and calls
+  `_focus_dev_console_window` (`main.py:19721`), which is the guard TICKET-223
+  protects.
+
+**The trap is that the plugin is keyed on the bundle identifier**
+(`com.barnsl.lyric-immersion.devconsole`), not on the executable. A
+`npm run tauri:dev` instance and a deployed console therefore collide as the
+same instance: starting the dev build while a deployed console is open makes the
+**dev** process hand off to the deployed window and exit. It looks like the dev
+build launched and instantly died. It is the guard working as designed. Close
+the deployed console first.
+
+**Status:** 🟢 fixed (v1.1.92).
+
+---
+
+## v1.1.91 — 2026-07-19 (TICKET-206…213 — correctable identification, a documented console)
+
+### TICKET-206 — the title reducer picked the anime, not the song
+
+**Report:** the console showed the song as `PSYCHO-PASS`, which is the anime the
+song was written for. The actual song is `名前のない怪物` (Namae No Nai Kaibutsu).
+
+**Root cause.** `clean_title` chose among bracketed candidates by bracket TYPE,
+in a fixed cascade: any `「…」` anywhere in the string won outright, and the
+`『…』` branch was only reachable when no `「」` existed at all. The real EGOIST
+upload is titled
+
+    EGOIST 『名前のない怪物』 Music Video (TVアニメ「PSYCHO-PASS サイコパス」ep1-11 エンディングテーマ)
+
+so the anime, sitting inside a trailing credit parenthetical, beat the song at
+the head of the title. The docstring asserted the convention "song in 「」, work
+in 『』"; this upload uses the opposite one, and bracket type alone cannot tell
+them apart. The `『』` branch did have a tie-in guard, but it was never reached,
+and no guard of any kind was applied to the `「」` candidate.
+
+A second failure shared the cause: a LEADING tie-in (`TVアニメ『Work』ED Artist
+『Song』`) matched the first `『』`, saw the tag, and gave up entirely rather than
+looking at the next bracket.
+
+**Fix.** Judge each bracket on CONTEXT, and fall through when one is rejected.
+`_is_tiein_bracket` demotes a bracket that (1) sits inside a parenthetical
+containing tie-in vocabulary, (2) is immediately preceded by it, or (3) is
+immediately followed by it. Only signal 3 existed before, which is exactly why
+a trailing tag was handled and a leading one was not. `_pick_song_bracket` then
+returns the first surviving candidate, so the anime can be skipped and the song
+still found.
+
+**Guard:** 7 new cases in `scripts/probe_clean_title.py` (17/17), covering all
+four failure shapes plus three where the song is legitimately in `「」` and must
+still win.
+
+---
+
+### TICKET-207 — you can now annotate any event, and the notes are a corpus
+
+Free text can be attached to any narrated event from the Activity view. Each note
+is appended to `event_notes.jsonl` with a snapshot of the event and the
+surrounding context (player title, loaded title, source, language, app version).
+
+Nothing reads this back to change behaviour, deliberately. The point is to
+accumulate human-labelled incidents so a later pass can look for what the bad
+ones have in common. One note explains one bug; a few hundred show which bugs
+share a cause.
+
+**Required a real fix first:** events had **no stable id**. They were addressable
+only by list position and `(t, kind)` — but the ring evicts oldest-first, so an
+index went stale on the next append, and `t` collides for two events in the same
+tick. Neither can carry a note reliably. `_note_event` now stamps a monotonic
+`id`. The API returns `matched: false` when the target has already aged out; the
+note is still recorded and the console says so, rather than silently accepting a
+note that landed nowhere.
+
+---
+
+### TICKET-208 — the detected language is now correctable
+
+Language was display-only everywhere in the app. That is disproportionate to what
+it controls: romanisation (furigana + romaji vs pinyin), whether a translation
+lane is generated at all, the overlay font, which lyric providers are tried, and
+a wrong-language check that **deletes a cached body**. A wrong verdict was
+expensive and uncorrectable.
+
+`override_language` applies a correction live and appends it to
+`language_corrections.jsonl`. Two details worth recording:
+
+* It is re-stamped inside `load()`, not at the override site. `load()` runs again
+  on every re-fetch and swap within a track, and each would otherwise restore the
+  detected value the user just rejected.
+* It deliberately does **not** rewrite the cache file. The cache keys on title
+  alone, so a body shared by several songs must not inherit one song's override.
+
+---
+
+### TICKET-210 — the lyric cache is visible and clearable
+
+New **Library** view lists every cached body and can wipe the lot, so
+fresh-install behaviour is testable without touching the filesystem.
+
+Metadata only: title, artist, language, source, line COUNT, size, mtime. The
+endpoint does not return lyric text at all — `lines[*].jp` (body), `.rm`
+(romanisation) and `.en` (translation) are third-party content, and excluding
+them at the source is the control, not hiding them in the UI.
+
+`purge_cache` already existed but filters by language or source, and the API
+strips empty filters to `None`, so "all of it" was unreachable. `clear_lyric_cache`
+is separate and requires an explicit `confirm`, rather than widening `purge_cache`
+whose selective semantics other callers depend on.
+
+---
+
+### TICKET-211 — simulate a missing component instead of deleting 4 GB
+
+Availability of the optional heavy pieces was decided purely by "is it on disk",
+so exercising the without-it paths meant deleting ~4 GB and re-downloading it.
+Four `sim_missing_*` knobs now force the corresponding probe to report False.
+
+`get_components` reports `real` and `effective` side by side: a console showing
+only the effective verdict would be indistinguishable from a genuinely broken
+install, which is the confusion this is meant to prevent. The `--selftest` build
+gate and `/diag.whisper` deliberately ignore the simulation and keep reporting
+reality — a knob must never be able to make a broken bundle pass a build check.
+
+**Also fixed:** `jank_backoff_unverified_cap_s` was read at two call sites but
+never declared in the tune dict, so `set_tune` rejected it as unknown and any
+saved override was dropped at startup. It looked like a knob and was inert.
+
+---
+
+### TICKET-212 — every one of the 235 tunables is documented
+
+The Parameters view rendered each knob as a bare key and a number. `deadband` and
+`energy_lift_floor` are not self-describing, so tuning was guesswork and a guess
+that made things worse was hard to attribute later.
+
+`tune_docs.py` carries one entry per knob, each stating what it controls, the
+effect of raising it, the effect of lowering it, a sensible range with the
+default, and which subsystem reads it. A separate module rather than inline
+comments because the frozen build has no source to parse at runtime.
+
+**The 1:1 mapping is enforced, not trusted:** `scripts/probe_tune_docs.py` parses
+the tune dict out of `main.py` with `ast` and fails when a knob has no doc or a
+doc outlives its knob. It earned its keep immediately by catching the five knobs
+added by TICKET-211 later the same day.
+
+Three knobs are documented as having **no reader** — `continuous_recal_ms`,
+`live_resync_s`, `yt_description_cache_days`. They are registered but nothing
+consumes them. Saying so is more useful than inventing an effect.
+
+---
+
+### TICKET-213 — the tray showed the committed offset but hid the queued one
+
+Both tray sync labels read `ov.offset`, the true committed value, never the eased
+display value. That part was already correct. What they did not show is that a
+nudge may be **queued**: `_smooth_offset` defers most corrections to the end of
+the current lyric line, so for up to one line the label kept reporting the old
+number and the menu read as though the click had been ignored. It now appends the
+pending target: `+1.20s → +2.20s pending`.
+
+---
+
+### Console (TICKET-209) — one spacing scale
+
+`.page-grid` supplied `gap: 16px` **and** `.card + .card` added `margin-top:
+16px`, so cards in Overview/Finder/Decisions/Activity sat 32px apart while
+Parameters/Resources/Runtime map/AutoResearch sat at 16px. Card gaps were also
+declared at four different values (16/14/12/10px) and card padding at two
+(22px, and 18px for knob groups).
+
+`:root` now carries a two-tier scale: `--card-gap` between cards, uniformly, and
+`--tile-gap` for small tiles inside a card, which is a genuinely different
+relationship and should stay tighter. Three phantom tokens (`--line`, `--accent`,
+`--card`) that were referenced via `var()` but never defined are now declared at
+their existing fallback values. Note `--card` is the **tree-node** background,
+not the `.card` class; the names collide and the colours differ.
+
+**Status:** 🟢 fixed (v1.1.91).
+
+---
+
+## v1.1.90 — 2026-07-19 (TICKET-205 — the sync corrections nobody was told about)
+
+### TICKET-205 — a song came into sync mid-play with no notification and no log entry
+
+**Report:** "i see there was a sync event. i didnt see a dev console notification
+nor was it in the log. it started off out of sync and got in sync some time in
+but wasnt logged nor was i notified." Observed on `BANG!!! (cover)` /
+音乃瀬奏, with the Activity log open and showing `SONG CHANGE` and
+`LYRICS LOADED` entries either side of the silent correction.
+
+**Root cause — narration lived in the callers, and almost none of them did it.**
+
+`_note_event` (the narrative ring behind the console's toasts and Activity log)
+was called from ten hand-picked places. Sync has **seventeen** call sites into
+`_smooth_offset`, the function every automatic correction goes through, and
+exactly **two** of them narrated: the OCR caption reader's apply and revert
+paths. The other fifteen moved the lyrics on screen and told the console
+nothing:
+
+| reason | subsystem |
+|---|---|
+| `energy-align` | audio-energy correlator |
+| `sync-tier` | two-read verification tier |
+| `sync-confirmed`, `sync-fast-lock`, `sync-micro-nudge` | Shazam |
+| `sync(live)-concert-first`, `sync(live)-follow` | live-set tracking |
+| `sync-ambiguous-reset`, `sync-audio0-reset` | listen-read fallbacks |
+| `vocal-onset-cover` | vocal onset detector |
+| `fine-tune-rewind`, `fine-tune-catchup` | fine-tuner |
+| `align-by-ear` | by-ear transcription |
+| `manual-nudge`, `manual-reset` | the user's own tray/API nudges |
+
+`_apply_energy_align` and `_tier_commit` make this especially clear: both call
+`self._hint(...)` to put "🎤 Auto-synced (+3.4s)" on the overlay, so the engine
+already knew it had done something a human should be told about. It told the
+overlay and not the console.
+
+**Two further defects found while fixing it.**
+
+*Reporting intent, not outcome.* The two paths that did narrate called
+`_note_event` **before** `_smooth_offset`, announcing a correction that had not
+happened yet. `_smooth_offset` can still discard it under `sync_apply_min_s`
+(0.22s, or `sync_apply_min_s_scroll` 0.25s in a scroll layout), and the OCR path
+queues its call onto the Tk thread with `root.after`, so the announcement was
+always at least one hop ahead of the result.
+
+*Deferred corrections narrated at queue time.* `_smooth_offset` defers most
+corrections to the next line boundary. A queued correction is not a fact: the
+line-timing-change path (`_pending_offset = None`) cancels it outright, and a
+track change drops it. Both produced "sync moved" entries for moves that never
+occurred.
+
+**Fix — narrate from the funnel, not the callers.**
+
+* `_SYNC_CAUSE` (module level) maps each `reason` tag to an English clause, so
+  all seventeen call sites get readable narration without being touched. An
+  unmapped reason falls back to the raw tag rather than going silent.
+* `_note_sync` composes `<what happened> because <why> · <evidence> · <outcome>`
+  and is called **only** from `_smooth_offset` and the deferred-commit site —
+  points where the outcome is already settled. Callers now pass evidence
+  (`why="matched line 12 at 0.87 confidence"`) instead of prose.
+* Deferred corrections stash their narration in `_pending_note` and narrate at
+  the real commit; every cancellation path clears it.
+* `notable_sync_min_s` defaults to **0.0**: every correction that actually
+  applied is narrated. `sync_apply_min_s` already filtered the sub-deadband
+  wobble, and that floor is the "is this worth doing" test — an extra floor here
+  would recreate this bug in miniature.
+* New `sync-ignored` event: a correction repeatedly proposed and discarded under
+  the apply floor. One is noise, so it fires on the Nth in a row
+  (`notable_sync_ignored_streak`, default 5) — that pattern means the lyrics are
+  visibly wrong and the engine cannot act.
+
+**Also fixed:** `_smooth_offset` read `sync_apply_min_s_scroll` with a fallback
+of `1.0` while `/syncdiag` read the same knob with `0.25`. Harmless today (the
+defaults dict always supplies 0.25) but the two would have diverged the moment
+it did not. Aligned to 0.25.
+
+**Console:** `sync-ignored` added to `KIND_META`; every sync event now renders
+its actual move as `moved +0.00s → +3.40s (Δ +3.40s)` — "wanted" instead of
+"moved" for a discard, because labelling a discard as a move is the exact class
+of lie this ticket is about. The runtime map gains a `_smooth_offset()` node:
+the analyzers were on the map but the thing that arbitrates between them was
+not, which made it impossible to see why two subsystems agreeing still moved
+nothing.
+
+**Guard:** `scripts/probe_sync_narration.py` execs the real funcs against a stub
+and checks behaviour (applied / big-jump / manual / deferred / cancelled /
+discard-streak), then walks the AST to assert **every** `reason=` at a
+`_smooth_offset` call site has a `_SYNC_CAUSE` entry and vice versa, and that no
+`sync-*` `_note_event` exists outside the funnel. Adding a sync path without a
+cause phrase now fails the probe instead of silently narrating a machine tag.
+
+**Status:** 🟢 fixed (v1.1.90).
+
+---
+
 ## v1.1.89 — 2026-07-19 (TICKET-201…204 — the runaway, the blank songs, the narrated console)
 
 ### TICKET-201 — hololive Unchained: OCR sync ran away to +56s and never recovered

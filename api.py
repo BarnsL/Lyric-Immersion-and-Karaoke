@@ -69,8 +69,17 @@ _ROUTES = {
         "/display": "GET: current display mode + connected monitors + overlay bounds. POST: switch it — ?mode=primary|span|mirror|cycle or ?mode=monitor&index=1 (or &id=<stable device id>)",
         "/import/status": "current playlist import state: state, done, total, ok, skipped, failed_count",
         "/yt-meta": "TICKET-112: full parsed YouTube description metadata for the current track (credits, raw description, lyrics_block) — useful when debugging which disambiguators the fetch_lrc call did or didn't get",
+        "/lyric_cache": "TICKET-210: the cached lyric library as METADATA ONLY (title, artist, language, source, line COUNT, bytes, mtime) — never the lyric text. ?limit=500. Use with POST /clear_cache to test fresh-install behaviour",
+        "/components": "TICKET-211: which optional pieces are actually installed (faster-whisper, model weights, CUDA, yt-dlp, node) vs which are being SIMULATED absent via the sim_missing_* knobs, with both the real and the effective verdict",
+        "/syncdiag": "the sync-event ring buffer (raw telemetry; the narrated counterpart is /insight.notable)",
+        "/concert": "TICKET-218: concert/live introspection — the mode verdict plus the RULE that produced it (duration vs which title keyword vs category flip), the applause integrator mid-count with its arm threshold, chapters with non-song (MC/intermission/encore) segments marked, the offline vocal-onset plan, the between-songs hold, the pending-switch and stale-song watchdogs, the live-resync cadence tier, and every knob that steers any of it",
+        "/overlay": "compact render state for the Tauri overlay client",
     },
     "POST": {
+        # /display accepts POST as well as GET; its combined description lives in
+        # the GET map above. Repeated here so an agent enumerating _ROUTES["POST"]
+        # to discover available ACTIONS does not miss it.
+        "/display": "switch display mode — ?mode=primary|span|mirror|cycle or ?mode=monitor&index=1 (see the GET entry for the full contract)",
         "/identify": "re-identify by sound now",
         "/wrong": "mark current lyrics wrong → re-identify + re-fetch",
         "/override_title": "user picked the correct title (re-fetch with override)",
@@ -88,6 +97,13 @@ _ROUTES = {
         "/import/csv": "start a playlist CSV import: ?path=C:\\path\\to\\file.csv [&translate=1] [&force=1]",
         "/retranslate": "TICKET-115: force a translation backfill of the currently loaded track (de/fr/it/pt/ru/es/ja-romaji + CJK)",
         "/subtitles": "toggle/apply subtitle preset, adjust subtitle settings, or patch/replace subtitle lines with JSON",
+        "/override_language": "TICKET-208: user corrects the detected song language — JSON {lang: 'ja'} or ?lang=ja. Re-runs romanisation + translation live and appends to language_corrections.jsonl",
+        "/event_note": "TICKET-207: attach free text to one narrated event — JSON {event_id: N, note: '...'}. Returns matched=false if the event has already aged out of the ring (the note is still recorded)",
+        "/clear_cache": "TICKET-210: delete the WHOLE cached lyric library for fresh-install testing. Requires ?confirm=1; add ?keep_current=1 to spare the loaded song. /purgecache is the selective one (by language or source)",
+        "/purgecache": "delete cached lyric JSONs selectively: ?current=1, ?lang=ko, ?source=syncedlyrics",
+        "/font": "live font scale: ?scale=1.25",
+        "/scroll": "scroll mode: ?dir=rl|lr|tb|bt|off",
+        "/position": "overlay anchor: ?y=center&x=center",
     },
 }
 
@@ -251,6 +267,35 @@ def make_handler(app, log_file, token):
             """Marshal a mutation onto the Tk thread (so it's thread-safe)."""
             app.root.after(0, fn)
 
+        def _run_result(self, fn, timeout=5.0):
+            """Marshal onto the Tk thread and WAIT for the return value.
+
+            For mutations whose outcome the caller has to know — "was that event
+            still in the ring?", "how many files did you actually delete?" — as
+            opposed to the fire-and-forget `_run` above, which can only ever
+            answer "the request was accepted". Extracted from the copy that was
+            inlined in /retranslate so the three TICKET-207/208/210 endpoints
+            don't each grow their own.
+
+            The bounded wait matters: the Tk thread renders every frame, so a
+            wedged UI must fail this call rather than hang an API worker forever.
+            Returns (result_dict, timed_out).
+            """
+            box, done = {}, threading.Event()
+
+            def _do():
+                try:
+                    box.update(fn() or {})
+                except Exception as e:
+                    box.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
+                finally:
+                    done.set()
+
+            self._run(_do)
+            if not done.wait(timeout=timeout):
+                return {}, True
+            return box, False
+
         # ── verbs ──
         def do_OPTIONS(self):                 # CORS preflight
             self._send(204, {})
@@ -287,7 +332,17 @@ def make_handler(app, log_file, token):
                     self._send(200, {"ok": True, "lines": lines[-n:]})
                 elif path == "/tune":
                     try:
-                        self._send(200, {"ok": True, "tune": app.get_tune()})
+                        # TICKET-212: ship the per-knob documentation alongside the
+                        # values so the console can show a real tooltip instead of
+                        # a bare key name. Sent with the values rather than from a
+                        # second endpoint because the two are useless apart, and
+                        # this view is loaded on demand, not polled.
+                        try:
+                            from tune_docs import TUNE_DOC as _docs
+                        except Exception:
+                            _docs = {}
+                        self._send(200, {"ok": True, "tune": app.get_tune(),
+                                         "docs": _docs})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/diag":
@@ -303,6 +358,43 @@ def make_handler(app, log_file, token):
                     # views; previously all of this was log-only and rate-limited.
                     try:
                         self._send(200, {"ok": True, **app.get_insight()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/lyric_cache":
+                    # TICKET-210: the cached lyric library as METADATA ONLY —
+                    # title, artist, language, source, line COUNT, size, mtime.
+                    # Never the bodies: `lines[*].jp/rm/en` are third-party
+                    # content. GET /lyrics exposes those deliberately for the
+                    # overlay; this one must not, because it is a browsable list.
+                    # Its own endpoint rather than a block on /insight: it grows
+                    # with the library and /insight is polled every 2.5s.
+                    try:
+                        lim = int((q.get("limit", ["500"])[0]) or 500)
+                    except Exception:
+                        lim = 500
+                    try:
+                        self._send(200, {"ok": True,
+                                         **app.list_lyric_cache(max(1, min(2000, lim)))})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/components":
+                    # TICKET-211: which optional pieces are really installed, and
+                    # which are being SIMULATED absent for fresh-install testing.
+                    try:
+                        self._send(200, {"ok": True, **app.get_components()})
+                    except Exception as e:
+                        self._err(500, f"{type(e).__name__}: {e}")
+                elif path == "/concert":
+                    # TICKET-218: the whole concert/live picture in one payload —
+                    # the mode verdict AND the rule that produced it, the applause
+                    # integrator mid-count, chapters with non-song segments marked,
+                    # the offline onset plan, the between-songs hold, both
+                    # watchdogs, the resync cadence tier, and every knob that
+                    # steers any of it. Its own endpoint rather than riding on
+                    # /insight: the chapter and plan lists are unbounded in
+                    # principle, and only one view needs them.
+                    try:
+                        self._send(200, {"ok": True, **app.get_concert()})
                     except Exception as e:
                         self._err(500, f"{type(e).__name__}: {e}")
                 elif path == "/syncdiag":
@@ -415,6 +507,61 @@ def make_handler(app, log_file, token):
                 elif path == "/wrong":
                     self._run(app.refetch)
                     self._send(200, {"ok": True, "action": "re-identifying + re-fetching"})
+                elif path == "/override_language":
+                    # TICKET-208: the detected language drives romanisation,
+                    # translation, font choice, provider order AND the
+                    # wrong-language cache rejection that DELETES a body. A wrong
+                    # verdict was previously uncorrectable by the user.
+                    if body:
+                        try:
+                            parsed = json.loads(body.decode("utf-8") or "{}")
+                        except Exception as e:
+                            return self._err(400, f"bad JSON body: {e}")
+                        lang = (parsed.get("lang") or "").strip()
+                    else:
+                        lang = (q.get("lang", [""])[0] or "").strip()
+                    if not lang:
+                        return self._err(400, "lang required (JSON body {lang: ...} or ?lang=...)")
+                    res, hung = self._run_result(
+                        lambda: app.override_language(lang, reason="dev-console"))
+                    if hung:
+                        return self._err(503, "UI thread did not respond within 5s")
+                    self._send(200 if res.get("ok") else 409, res)
+                elif path == "/event_note":
+                    # TICKET-207: the user's own words against one narrated event.
+                    # Returns a real result because the event may have aged out of
+                    # the ring, and a note that silently went nowhere is worse
+                    # than an error.
+                    if not body:
+                        return self._err(400, "JSON body {event_id: N, note: '...'} required")
+                    try:
+                        parsed = json.loads(body.decode("utf-8") or "{}")
+                    except Exception as e:
+                        return self._err(400, f"bad JSON body: {e}")
+                    res, hung = self._run_result(
+                        lambda: app.add_event_note(parsed.get("event_id"),
+                                                   parsed.get("note"),
+                                                   author=parsed.get("author") or "dev-console"))
+                    if hung:
+                        return self._err(503, "UI thread did not respond within 5s")
+                    self._send(200 if res.get("ok") else 400, res)
+                elif path == "/clear_cache":
+                    # TICKET-210: delete the WHOLE lyric library, for fresh-install
+                    # testing. Guarded by an explicit confirm so a bare POST can
+                    # never wipe it. Distinct from /purgecache, which filters by
+                    # language or source and cannot express "all".
+                    confirm = (q.get("confirm", ["0"])[0] or "").lower() in ("1", "true", "yes")
+                    keep = (q.get("keep_current", ["0"])[0] or "").lower() in ("1", "true", "yes")
+                    if not confirm:
+                        return self._err(400, "refusing to clear the cache without ?confirm=1")
+                    # Deleting a few hundred small files can outrun the default
+                    # 5s window on a cold disk, so allow longer here.
+                    res, hung = self._run_result(
+                        lambda: app.clear_lyric_cache(confirm=True, keep_current=keep),
+                        timeout=30.0)
+                    if hung:
+                        return self._err(503, "UI thread did not respond within 30s")
+                    self._send(200 if res.get("ok") else 400, res)
                 elif path == "/override_title":
                     # TICKET-204: user picked the correct title from what the
                     # engine saw. Forces a re-fetch under the override. The bad

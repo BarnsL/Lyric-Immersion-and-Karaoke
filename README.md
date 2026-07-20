@@ -247,6 +247,28 @@ to a slow safety heartbeat (much less CPU/network across a long compilation).
 Toggle it from the tray (**Fast song-change detect**); a *crossfaded* compilation
 with no gap falls back to that heartbeat.
 
+### Concerts and long live videos
+A two-hour concert upload is a single "song" as far as your player is concerned,
+so the app runs a different profile for it. If the upload has **chapters**, they
+become the setlist and drive the song changes. **Applause** between numbers is
+read as the boundary into the next song rather than as a moment to re-sync. And
+an offline pass over the audio measures where the singing actually starts in each
+segment, so the lyrics anchor past the applause and the intro instead of to the
+chapter mark.
+
+When one of these videos misbehaves, open the **Concerts** view in the developer
+console (tray → *Developer Console* → **Concerts**). It answers the question you
+actually have, which is *why*: the verdict for the current video (**concert**,
+**live arrangement**, **non-music video**, or **studio**) together with the rule
+that produced it (its length, which word in the title matched, or a category
+check that reversed an earlier call), the applause detector counting in real time
+against the gap length that arms it, the parsed chapters with the non-song
+segments (MC, talk, intermission, encore, credits) marked, the between-songs
+hold, and whether banner OCR is running plus the reason when it isn't (chapters,
+where they exist, switch it off completely). Every knob that steers any of this
+sits next to the mechanism it affects and is editable live, with its own
+documentation on hover. The same data is on the API as `GET /concert`.
+
 ### Sync by listening (optional) — match the lyrics to what's *heard*
 When Shazam can't identify the exact thing playing (a fan MV, a remix, an
 "anniversary special ver." with a longer intro), there's no catalog anchor and the
@@ -352,6 +374,37 @@ Toggle it from the tray (**Generate lyrics by ear…**). Tier 1 needs faster-whi
 (bundled in the portable build); Tier 2 also needs **yt-dlp + a JS runtime** (Node
 or Deno — see the [feature table](#-what-you-need-for-each-feature)). Both degrade
 gracefully — if Tier 2 can't run, the Tier 1 best effort stands.
+
+### When it gets the wrong song, or the wrong language
+
+Both are now correctable from the **developer console** (tray → *Developer
+Console* → **Activity**), and both are worth correcting rather than working
+around, because each correction is recorded.
+
+**Wrong song.** Usually the video title was reduced to the wrong string before
+the search ever ran. A title like
+
+> `EGOIST 『名前のない怪物』 Music Video (TVアニメ「PSYCHO-PASS サイコパス」…)`
+
+contains two bracketed names: the song, and the anime it was written for. Click
+**Pick correct title** to see every string the engine considered and choose the
+right one; the bad string and the good one are both logged.
+
+**Wrong language.** The detected language is not cosmetic. It selects the
+romanisation (furigana + romaji for Japanese, pinyin for Chinese), decides
+whether a translation is generated at all, picks the overlay font, orders which
+lyric providers are tried, and drives a check that can delete a wrongly-matched
+cached body. If it is wrong, correct it in the **Language** panel and the romaji
+and translation lanes rebuild immediately.
+
+**Anything else.** Every notable decision the engine makes appears in the
+Activity log, and you can attach a note to any of them explaining what you
+actually saw. These notes are collected locally in `event_notes.jsonl` alongside
+a snapshot of the decision. Nothing acts on them yet, by design: they are being
+pooled so that once there are enough labelled incidents, the common traits
+between them can be found, instead of each one being re-diagnosed from scratch.
+
+Corrections and notes never leave your machine.
 
 For a *known* missing song you'd rather supply exactly, find or make a timed
 `.lrc` (a fan wiki, the video description, or a tool like QuickLRC) and add it —
@@ -480,6 +533,15 @@ route schema — so it's safe and predictable to drive from an agent.
 | `POST /reindex` | rescan the local library |
 | `POST /import/csv?path=…` | start a background CSV import from an Exportify file at `path` |
 | `GET /import/status` | current import job state: `state`, `done`, `total`, `ok`, `skipped`, `failed_count` |
+| `GET /tune` | every live-tunable knob **plus a written description of each one** (what it does, what raising or lowering it does, a sensible range, which subsystem reads it) |
+| `POST /tune?key=…&value=…` | change any knob live, no rebuild. Add `?persist=1` to keep it across restarts |
+| `GET /lyric_cache` | the cached lyric library as **metadata only** (title, artist, language, source, line *count*, size). Never lyric text |
+| `POST /clear_cache?confirm=1` | delete the whole lyric cache, to test fresh-install behaviour. `?keep_current=1` spares the playing song |
+| `GET /components` | which optional pieces are installed (faster-whisper, model weights, CUDA, yt-dlp, node) and which are being simulated as missing |
+| `GET /concert` | the whole concert / live picture: the mode verdict **and the rule that produced it**, the applause detector's live count against its arm threshold, the chapters with non-song segments flagged, the offline vocal-onset plan, the between-songs hold, both watchdogs, the resync cadence, banner OCR status, and every knob that steers them |
+| `POST /override_title` | tell it the correct song title when the video title was reduced badly |
+| `POST /override_language` | tell it the correct language when detection got it wrong |
+| `POST /event_note` | attach a diagnostic note to a decision it made, for later analysis |
 
 ```bash
 curl http://127.0.0.1:8765/status

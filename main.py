@@ -109,6 +109,37 @@ LOG_FILE = _DATA / "karaoke.log"
 # own per-instance counters.
 _TITLE_STATS = {"hit": 0, "miss": 0}
 
+# ── TICKET-205: what each sync correction MEANS, in English ────────────────
+# Every auto-sync correction in the app funnels through `_smooth_offset(new_off,
+# reason=...)`. The `reason` is a machine tag — fine for /syncdiag, useless in a
+# console notification. This maps each tag to the clause a human needs to know
+# WHY the lyrics just moved.
+#
+# Keep this in sync with the `_smooth_offset` call sites. An unmapped reason is
+# NOT an error: `_note_sync` falls back to the raw tag, so a new sync path still
+# narrates (badly-worded, but visible) instead of going silent. Silence is the
+# failure mode this whole ticket exists to kill — a correction the user watched
+# happen on screen but that appeared in no notification and no log.
+_SYNC_CAUSE = {
+    "energy-align":            "the audio-energy correlator re-aligned the lyrics to the music",
+    "sync-tier":               "two independent listen-and-match reads agreed on a new position",
+    "sync-confirmed":          "a Shazam read confirmed where the track really is",
+    "sync-fast-lock":          "an early Shazam read locked on to the track position",
+    "sync-micro-nudge":        "a Shazam read came back slightly off the current position",
+    "sync-ambiguous-reset":    "the listen reads disagreed, so sync fell back to zero",
+    "sync-audio0-reset":       "the audio matched the very start, so sync reset to zero",
+    "sync(live)-concert-first": "the first song of the live set was located by ear",
+    "sync(live)-follow":       "the live set moved on, so sync followed to the new song",
+    "vocal-onset-cover":       "the first vocal onset was detected in this cover",
+    "ocr-sync":                "the screen reader matched an on-screen caption line",
+    "ocr-sync-revert":         "a bad screen-reader correction was backed out",
+    "align-by-ear":            "the by-ear transcription anchored the lyrics",
+    "fine-tune-rewind":        "the fine-tuner pulled the lyrics back",
+    "fine-tune-catchup":       "the fine-tuner let the lyrics catch up",
+    "manual-nudge":            "you nudged the sync by hand",
+    "manual-reset":            "you reset the sync by hand",
+}
+
 # ── Logging ──────────────────────────────────────────────────────────
 # A rolling log of what the app is doing — track changes, title vs. sound
 # matches, swaps, sync corrections, errors — so a human OR an automated agent
@@ -134,33 +165,22 @@ def _resource(name):
     return Path(getattr(sys, "_MEIPASS", BASE)) / name
 
 
-def _seed_bundled_lyrics():
-    """Copy lyrics SHIPPED with the app (bundled_lyrics/) into the runtime cache so
-    songs whose providers ALWAYS fail are baked in and reliably available.
-
-    feelingradation (ReGLOSS) is the case: the app searches under the verbose
-    channel 'hololive DEV_IS ReGLOSS' and every provider misses, so it fell back to
-    a poor Whisper transcription. The real synced LRC exists under 'ReGLOSS', so we
-    ship a properly furigana'd / romaji'd / translated copy and seed it here. It
-    OVERWRITES a weaker (generated/transcribed) cache of the same song; an identical
-    already-seeded copy is left alone. Best-effort; any failure is ignored."""
-    import shutil
-    try:
-        src_dir = _resource("bundled_lyrics")
-        if not src_dir.is_dir():
-            return
-        LYRICS_DIR.mkdir(exist_ok=True)
-        for src in src_dir.glob("*.json"):
-            dst = LYRICS_DIR / src.name
-            try:
-                if dst.exists() and dst.read_bytes() == src.read_bytes():
-                    continue                       # already seeded, identical
-                shutil.copyfile(src, dst)
-                log.info("seeded bundled lyrics: %s", src.name)
-            except Exception:
-                pass
-    except Exception:
-        pass
+# TICKET-224 — `_seed_bundled_lyrics()` was removed here, not merely unhooked.
+#
+# It copied lyric JSON shipped inside the app (`bundled_lyrics/`) into the user's
+# runtime cache, to paper over songs whose providers always missed. TICKET-124
+# retired that approach: `bundled_lyrics/` was deleted from the repo and
+# DesktopKaraoke.spec asserts no bundled lyrics ship. The function had had no
+# caller since, so it was inert.
+#
+# Inert is not the same as harmless. This app is prepared for COMMERCIAL release,
+# and lyric bodies are third-party content. Leaving a working copy-lyrics-into-
+# the-cache routine in the source is a loaded footgun: the next person looking
+# for "how do I make this one stubborn song work" finds a ready-made bake-in path
+# and a docstring that recommends it. Deleting the code removes the invitation.
+#
+# If a song genuinely cannot be sourced, fix the provider lookup or let the
+# by-ear path handle it. Do not ship the words.
 
 
 def _load_settings():
@@ -1000,6 +1020,109 @@ def _is_generic_title(s):
     return bool(compact) and bool(_GENERIC_TITLE_RE.fullmatch(compact))
 
 
+def _chapter_fields(ch):
+    """Return `(start_seconds, title)` for one `_concert_setlist` entry.
+
+    Chapters are DICTS today (`{"start": float, "title": str}`) from every live
+    producer, but a `(start, title)` TUPLE shape predates them and still reaches
+    us from the per-session `_setlist_query_cache`, which persists across track
+    changes within one run. `_live_hearing_corroborated` already handled both
+    defensively; the console's reader did not, which is what TICKET-215 was.
+    Centralising the shape check means the next reader cannot get it wrong.
+
+    Returns `(0.0, None)` for an unusable entry so callers can skip it.
+    """
+    try:
+        if isinstance(ch, dict):
+            return float(ch.get("start") or 0.0), (ch.get("title") or "")
+        if isinstance(ch, (tuple, list)) and len(ch) >= 2:
+            return float(ch[0] or 0.0), (ch[1] or "")
+    except Exception:
+        pass
+    return 0.0, None
+
+
+# ── TICKET-206: telling the SONG bracket from the WORK it was written for ───
+# Vocabulary that marks a bracket as a tie-in CREDIT ("the anime this song was
+# the ending theme for") rather than the song's own name. Deliberately wider
+# than _GENERIC_TITLE_RE above: that one asks "is this string ENTIRELY a tag",
+# which only catches a bracket containing nothing else. This one is used to
+# judge the TEXT AROUND a bracket, where the tag sits next to the work's name.
+_TIEIN_WORD_RE = re.compile(
+    r"(?:tv\s*)?(?:アニメ|anime|映画|劇場版|ドラマ|drama|ゲーム|game|"
+    r"op|ed|opening|ending|insert\s*song|挿入歌|主題歌|テーマ|theme|"
+    r"character\s*song|キャラクターソング|イメージソング|"
+    r"オープニング|エンディング|ost|soundtrack|サントラ)",
+    re.I,
+)
+
+
+def _is_tiein_bracket(text, m):
+    """True if the bracket matched at `m` names the WORK a song was written for,
+    not the song itself.
+
+    The reported failure (TICKET-206) was the real EGOIST upload:
+
+        EGOIST 『名前のない怪物』 Music Video (TVアニメ「PSYCHO-PASS サイコパス」…)
+
+    `clean_title` searched 「」 first, unconditionally, and anywhere in the
+    string — so the ANIME, sitting inside a trailing credit parenthetical, beat
+    the SONG in the leading 『』 purely because 「」 outranks 『』 by bracket type.
+    The app then searched for and displayed lyrics under the anime's name.
+
+    That upload is not malformed; it simply uses the opposite convention to the
+    one the old code assumed ("song in 「」, work in 『』"). Bracket type alone
+    cannot tell them apart, so this looks at CONTEXT instead — three signals,
+    any one of which demotes the bracket:
+
+      1. it sits inside a parenthetical that contains tie-in vocabulary
+         — '(TVアニメ「X」 エンディングテーマ)'
+      2. tie-in vocabulary immediately precedes it  — 'TVアニメ『X』'
+      3. tie-in vocabulary immediately follows it   — '『X』OPテーマ'
+
+    Signal 3 alone was the old `md.group(2)` lookahead, which is why a trailing
+    tag was handled and a leading one was not.
+    """
+    try:
+        # 1. enclosed by a parenthetical that reads as a credit
+        for pm in re.finditer(r"[\(（]([^\)）]*)[\)）]", text):
+            if pm.start() < m.start() and m.end() <= pm.end():
+                if _TIEIN_WORD_RE.search(pm.group(1) or ""):
+                    return True
+        # 2. tie-in wording immediately before the opening bracket. Bounded to a
+        #    short lookbehind so an unrelated 'anime' earlier in a long title
+        #    cannot condemn a bracket at the far end of the string.
+        before = text[max(0, m.start() - 24):m.start()]
+        if re.search(_TIEIN_WORD_RE.pattern + r"[\s　:：・\-–—]*$", before, re.I):
+            return True
+        # 3. ...or immediately after the closing bracket
+        after = text[m.end():m.end() + 24]
+        if re.match(r"[\s　:：・\-–—]*" + _TIEIN_WORD_RE.pattern, after, re.I):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _pick_song_bracket(t):
+    """The first bracketed candidate that survives the tie-in and generic guards.
+
+    Tries 「」 before 『』 (the common Japanese convention still holds for most
+    uploads), but unlike the old cascade a REJECTED candidate falls through to
+    the next one instead of ending the search. That fall-through is the fix: it
+    lets the anime in 「」 be skipped so the song in 『』 can win, and it also
+    rescues 'TVアニメ『Work』ED Artist 『Song』', where the old code matched the
+    first 『』, saw the tie-in tag, and gave up entirely rather than looking on.
+    """
+    for pat in (r"「([^」]+)」", r"『([^』]+)』"):
+        for m in re.finditer(pat, t):
+            cand = (m.group(1) or "").strip()
+            if not cand or _is_generic_title(cand) or _is_tiein_bracket(t, m):
+                continue
+            return cand
+    return None
+
+
 # A 歌ってみた / cover upload: its lyrics are the ORIGINAL song's, so the fetch
 # looks the song up by TITLE and ignores the covering channel as the "artist".
 _COVER_RE = re.compile(
@@ -1449,13 +1572,13 @@ def clean_title(title, source="", artist=""):
             song = head
         mq = None                                    # consumed: don't extract the event
     if not song:
-        if mq:
-            song = mq.group(1)
-        else:
-            md = re.search(r"『([^』]+)』(\s*(?:tv|アニメ|anime|op|ed|opening|ending|主題歌|テーマ)\b)?",
-                           t, flags=re.I)
-            if md and not md.group(2) and not _is_generic_title(md.group(1)):
-                song = md.group(1)
+        # TICKET-206: was `if mq: song = mq.group(1)` — the FIRST 「」 anywhere in
+        # the string, taken unconditionally, with the 『』 branch reachable only
+        # when no 「」 existed at all. That handed the anime name to the lyric
+        # search whenever an upload put the work in 「」 and the song in 『』
+        # (the real EGOIST 『名前のない怪物』 upload does exactly this). Now every
+        # bracket is judged on its context and a rejected one falls through.
+        song = _pick_song_bracket(t)
     # VTuber/idol uploads also wrap the song in straight/smart quotes, e.g.
     # "ReGLOSS 'サクラミラージュ' Performance Video" → サクラミラージュ. Require a real
     # PAIR around ≥2 chars so an apostrophe ("Don't") isn't taken for a quote.
@@ -1720,30 +1843,56 @@ def _has_single_song_at_event(title):
     return bool(head and not _is_generic_title(head))
 
 
+def explain_live_or_compilation(title, duration=None):
+    """The concert verdict AND the reason for it: `(verdict, rule, detail)`.
+
+    TICKET-217. `is_live_or_compilation` used to return a bare bool, so the only
+    record of WHY a video was judged a concert was a log line. That is fine until
+    the verdict is wrong, which is precisely when you need to know whether it was
+    the >10-minute duration rule or a title keyword that fired, and which keyword.
+    The Concerts panel needs that provenance live, so the reason is produced HERE,
+    by the same branch that decides, rather than being re-derived by a second
+    reader that would inevitably drift out of step with this one.
+
+    `rule` is a short stable tag for code/UI to switch on; `detail` is the
+    human-readable specifics (the matched keyword, the measured duration).
+    """
+    t = title or ""
+    # A single song LOOPED/EXTENDED into a long video is NOT a concert — load its
+    # lyrics + follow the offset, even though it's long. (Stops the >10-min rule
+    # misfiring on "Seamless 30min Ver" / "作業用" / "N時間耐久" → wrong song.)
+    ml = _LOOP_VER_RE.search(t)
+    if ml:
+        return False, "loop-veto", f"title says {ml.group(0)!r} — a looped single song, not a concert"
+    if duration and duration > 10 * 60:      # >10 min ⇒ concert/compilation (multi-song) in practice
+        return True, "duration", f"{duration / 60.0:.1f} min is over the 10 min concert threshold"
+    m = _LIVE_RE.search(t)
+    if not m:
+        return False, "no-cue", ("under 10 min and no live/concert keyword in the title"
+                                 if duration else "no live/concert keyword in the title")
+    # A single song performed at a concert — '<song> (from … ONE-MAN LIVE「Event」)'
+    # (parenthetical aside) OR '「言葉」from V.W.P 4th ONE-MAN LIVE「現象Ⅳ」' (the head song
+    # + an event reference) — is NOT a multi-song event. Leave it to is_live_arrangement
+    # (FOLLOW the offset, trust the title, fetch lyrics/captions), not sound-only.
+    if _live_cue_is_parenthetical_aside(t, m):
+        return False, "aside-veto", (f"{m.group(0)!r} sits in a parenthetical aside — "
+                                     f"one song performed at an event, not the event")
+    if _has_single_song_at_event(t):
+        return False, "single-song-veto", (f"a named song heads the title before {m.group(0)!r} — "
+                                           f"one song performed at an event, not the event")
+    return True, "keyword", f"title keyword {m.group(0)!r}"
+
+
 def is_live_or_compilation(title, duration=None):
     """True for a long video, or one whose title says 'live / concert / festival /
     medley / 3D LIVE / メドレー' — almost always MANY songs under one title, where
     the title names the EVENT, not the song. Such videos must be driven by SOUND:
     title-matching them is what makes a whole concert show one (wrong) song's
-    lyrics, with no way for Shazam to override a title that's a real song name."""
-    t = title or ""
-    # A single song LOOPED/EXTENDED into a long video is NOT a concert — load its
-    # lyrics + follow the offset, even though it's long. (Stops the >10-min rule
-    # misfiring on "Seamless 30min Ver" / "作業用" / "N時間耐久" → wrong song.)
-    if _LOOP_VER_RE.search(t):
-        return False
-    if duration and duration > 10 * 60:      # >10 min ⇒ concert/compilation (multi-song) in practice
-        return True
-    m = _LIVE_RE.search(title or "")
-    if not m:
-        return False
-    # A single song performed at a concert — '<song> (from … ONE-MAN LIVE「Event」)'
-    # (parenthetical aside) OR '「言葉」from V.W.P 4th ONE-MAN LIVE「現象Ⅳ」' (the head song
-    # + an event reference) — is NOT a multi-song event. Leave it to is_live_arrangement
-    # (FOLLOW the offset, trust the title, fetch lyrics/captions), not sound-only.
-    if _live_cue_is_parenthetical_aside(title or "", m) or _has_single_song_at_event(t):
-        return False
-    return True
+    lyrics, with no way for Shazam to override a title that's a real song name.
+
+    Thin wrapper over `explain_live_or_compilation` so the verdict and its stated
+    reason can never disagree — see the note there."""
+    return explain_live_or_compilation(title, duration)[0]
 
 
 # Music-video / MV uploads — these often open with a cinematic or instrumental
@@ -3456,6 +3605,28 @@ class Overlay:
             "ocr_sync_single_shot_max":     4.0,
             "notable_events_enabled":         1,  # narrative event ring (console log panel)
             "notable_events_size":          120,
+            # TICKET-205: 0.0 = narrate EVERY sync correction that actually applied.
+            # sync_apply_min_s(_scroll) already filtered out the sub-deadband wobble,
+            # so anything reaching the narrator moved the lyrics on screen and is by
+            # definition worth a line. Raise this only to make the console quieter.
+            "notable_sync_min_s":           0.0,
+            # ...and how many consecutive DISCARDED corrections before saying so.
+            # One dropped sub-deadband correction is noise; five in a row means the
+            # lyrics are visibly off and the engine keeps failing to fix them.
+            "notable_sync_ignored_streak":    5,
+            # TICKET-211: pretend an optional component is absent, so the
+            # fresh-install code paths can be exercised without deleting ~4 GB
+            # and re-downloading it. 1 = act as if it is not installed.
+            "sim_missing_whisper":            0,  # the faster-whisper library
+            "sim_missing_model":              0,  # the whisper model weights
+            "sim_missing_gpu":                0,  # the CUDA/GPU libraries
+            "sim_missing_ytdlp":              0,  # yt-dlp (deep generation, captions)
+            # TICKET-211 (found while auditing): this was READ at two call sites
+            # (the identify jank backoff) but never declared here, so `set_tune`
+            # rejected it as an unknown key and any saved override was dropped at
+            # startup by the `if _k in self._tune` guard. It was untunable by
+            # every documented route while looking like a knob.
+            "jank_backoff_unverified_cap_s": 12.0,
             "offset_defer_cap_s":           3.0,
             "overlay_heartbeat_stale_s":    6.0,
             "pos_stale_thresh_s":           1.5,
@@ -3576,6 +3747,7 @@ class Overlay:
         # appears under the new offset. Less jarring than a mid-line snap.
         self._pending_offset = None   # queued new offset; commits when current line ends
         self._pending_offset_t = 0.0  # when it was queued (capped so it can't stall forever)
+        self._pending_note = None     # TICKET-205: narration context for that queued offset
         # TICKET-111: deferred WHOLE-LYRICS swap (SWITCH/REGEN/wrong-song/user-wrong).
         # Dict: kind, source_site, artist, title, cover, queued_t, hint,
         # fetch_token, lines, meta, lyrics_path, force_ai_gen, max_s, set_gate.
@@ -3614,11 +3786,19 @@ class Overlay:
         self._drift_monotonic_since = 0.0           # wall-time a one-directional drift streak began (0=none)
         self._idx_minus_one_since = 0.0  # wall-time of the first tick idx hit -1 (for instrumental-gap boundary)
         self._live_arrangement = False  # LIVE/short/alt version → FOLLOW the offset, don't reset
+        self._live_arr_why = ""       # TICKET-217: which of the three inputs set it (cover counts)
         # Concert applause/cheering-pause detection (TICKET-061): a live cut pauses
         # for applause while the player clock runs on, drifting the lyrics ahead.
         self._applause_for = 0.0      # accumulated loud-but-non-vocal (applause) time
         self._applause_t = 0.0        # last applause-check timestamp
         self._applause_armed = False  # a real gap was seen → resync when singing returns
+        self._applause_check_t = 0.0  # 0.3s poll throttle (was getattr-defaulted only)
+        # TICKET-214: the last COMPLETED gap, kept so the Concerts panel and the log
+        # can both report a real measurement instead of the post-reset 0.0.
+        self._applause_last_gap_s = 0.0
+        self._applause_last_t = 0.0
+        self._applause_last_action = ""
+        self._applause_gaps = 0       # completed gaps this run
         self._align_tpvr_active = False  # the pending align is an applause two-point resync
         self._align_tpvr = None       # 1st-read offset awaiting a 2nd confirming read
         self._align_tpvr_until = 0.0  # deadline for the 2nd confirming read
@@ -3703,6 +3883,10 @@ class Overlay:
         self._fast_calib = 0          # remaining quick re-locks after a song change
         self._recal_after = None      # pending recalibrate timer id
         self._live_mode = False       # concert/compilation → sound-only, no title-match
+        self._live_why = {}           # TICKET-217: {rule, detail, by, title, duration, at}
+        self._concert_song_path = None  # lyrics path the 6.5-min stale-song watchdog is timing
+        self._concert_song_t = 0.0      # when that path started showing
+        self._last_forced_reid_t = 0.0  # cooldown stamp for the pending-switch escalation
         self._mv_mode = False         # MV/cinematic title → expect a dead-space intro
         self._chapter_intro_hold = False  # concert chapter just fired → hold lyrics until vocals
         self._chapter_intro_pos0 = 0.0    # video position when the chapter hold engaged (backstop)
@@ -3713,7 +3897,8 @@ class Overlay:
         # TICKET-124: NO hardbaked lyrics shipped — this is a sellable product, so every
         # lyric must be FOUND BY CODE (providers / YouTube captions / OCR of burned-in
         # lyrics / by-ear generation), never copyrighted text baked into the app. The old
-        # _seed_bundled_lyrics() bake-in is removed; bundled_lyrics/ no longer ships.
+        # No bundled-lyrics bake-in (TICKET-124/224): bundled_lyrics/ no longer
+        # ships, and the seeding function itself is gone, not just unhooked.
         self.index = LyricsIndex()
         self.media = MediaWatcher()
         # TICKET-117: push the persisted pin into the watcher so the very first
@@ -3869,6 +4054,9 @@ class Overlay:
         self._source_priority = "agree"
         self._pending_corr = 1e9   # drop any pending large-offset confirmation
         self._pending_offset = None  # drop any deferred sync-offset commit from prev track
+        self._pending_note = None    # TICKET-205: and its narration, so it can't be
+                                     # attributed to the song that just started
+        self._ignored_streak = 0     # TICKET-205: streaks are per-song
         # TICKET-201: the OCR-sync confirmation state is per-song. A held correction
         # or a "we committed this" marker carried into the next track would let the
         # PREVIOUS video's caption confirm a jump in THIS one.
@@ -3895,6 +4083,14 @@ class Overlay:
             self._title_override = None
             self._seen_title_strings = []
             self._title_id_log = []
+        # TICKET-208: the language override gets the same treatment, and for the
+        # same reason — it is per-song, but the act of applying it must not be
+        # what throws it away. Note self.meta (and therefore meta["lang"]) is
+        # reset separately below; _apply_lang_override re-stamps it after load().
+        if getattr(self, "_keep_lang_override", False):
+            self._keep_lang_override = False
+        else:
+            self._lang_override = None
         # TICKET-111: a real new track invalidates any in-flight swap target
         # (those lyrics are for the OLD song). Cancel; the new track's flow
         # below will run through the normal load/_start_fetch path.
@@ -4001,10 +4197,24 @@ class Overlay:
         # song live video ran in studio/MV-intro mode: one fixed offset pinned a
         # 244s studio LRC to a 433s live arrangement, and correct lyrics surfaced
         # at wildly wrong moments (read as "wrong lyrics").
-        self._live_arrangement = (is_live_arrangement(title)
-                                  or is_live_arrangement(
-                                      getattr(self, "_last_raw_title", "") or "")
-                                  or bool(getattr(self, "_is_cover", False)))
+        # THREE inputs, and the third surprises people: any COVER counts as a live
+        # arrangement, with no live/short/acoustic cue anywhere in the title. That
+        # is deliberate (a cover's timing differs from the studio original exactly
+        # like a live take does, so FOLLOW the offset rather than resetting it), but
+        # it means the "live arrangement" badge is frequently on for a studio-quality
+        # cover, and it silently swaps in the live sync profile. TICKET-217 records
+        # WHICH input fired so the Concerts panel can say so instead of leaving the
+        # reader to assume the title must have said "LIVE" somewhere.
+        _la_clean = is_live_arrangement(title)
+        _la_raw = is_live_arrangement(getattr(self, "_last_raw_title", "") or "")
+        _la_cover = bool(getattr(self, "_is_cover", False))
+        self._live_arrangement = _la_clean or _la_raw or _la_cover
+        self._live_arr_why = (
+            "the cleaned title carries a live/short/acoustic cue" if _la_clean else
+            "the RAW player title carries a live cue that title cleanup had stripped" if _la_raw else
+            "this is a COVER — covers follow the offset like a live take, "
+            "even with no live cue in the title" if _la_cover else
+            "no live-arrangement cue")
         self._sync_event("mode_change", title=title, cover=getattr(self, "_is_cover", False),
                          live_arrangement=self._live_arrangement,
                          live_mode=getattr(self, "_live_mode", False))
@@ -4074,7 +4284,11 @@ class Overlay:
                 _live_dur = float((self.media.get() or {}).get("duration") or 0.0) or None
             except Exception:
                 _live_dur = None
-        self._live_mode = is_live_or_compilation(title, _live_dur)
+        # TICKET-217: keep the REASON alongside the verdict so the Concerts panel
+        # can show which rule fired instead of leaving it buried in the log.
+        self._live_mode, _lw_rule, _lw_detail = explain_live_or_compilation(title, _live_dur)
+        self._live_why = {"rule": _lw_rule, "detail": _lw_detail, "by": "title+duration",
+                          "title": title, "duration": _live_dur, "at": time.time()}
         if self._live_mode and not (duration and duration > 600):
             log.info("live/concert mode via VIDEO LENGTH %.0fs (%.1f min) — %r",
                      _live_dur or 0.0, (_live_dur or 0.0) / 60.0, title)
@@ -4114,6 +4328,11 @@ class Overlay:
                          "subtitles, not a concert/song-detection target "
                          "(background Music-category check may flip it back)")
                 self._live_mode = False
+                self._live_why = {"rule": "subs-demote", "by": "subtitles toggle",
+                                  "detail": "subtitles are ON, so this long video is "
+                                            "treated as a subtitle target, not a concert "
+                                            "(the background Music-category probe may flip it back)",
+                                  "title": title, "duration": _live_dur, "at": time.time()}
                 subs_owns_long_video = True     # applied after the per-track reset below
                 # (the category probe is spawned AFTER the stale-URL guard below
                 # — review finding: reading _now_url before the guard could
@@ -6069,6 +6288,12 @@ class Overlay:
         if seq != self._track_seq:
             return
         self._live_mode = True
+        self._live_why = {"rule": "category-flip", "by": "YouTube category probe",
+                          "detail": "the video is categorised Music (or its canonical "
+                                    "title carries a concert cue), so the subtitle demote "
+                                    "was reversed and the concert pipeline re-armed",
+                          "title": (self._track or ("", ""))[1] or "",
+                          "duration": None, "at": time.time()}
         self._live_video_nonmusic = False
         # Cancel in-flight SUBTITLE work (review finding): the bootstrap's
         # whole-video caption fetch / episode Whisper would otherwise land
@@ -7034,6 +7259,7 @@ class Overlay:
                         self._title_locked_at = time.time()
                         self.offset = 0.0                 # direct write, NOT _smooth_offset
                         self._pending_offset = None
+                        self._pending_note = None         # TICKET-205
                         self._pending_corr = 1e9
                         self._drift_integral = 0.0
                         self._drift_integral_t = 0.0
@@ -7632,7 +7858,7 @@ class Overlay:
             return
         try:
             import align
-            ok = align.available()
+            ok = self._feat_ok("whisper", align.available())
         except Exception:
             ok = False
         if not ok:
@@ -7691,7 +7917,7 @@ class Overlay:
         # that looks hung) and give the stall watchdog a longer deadline.
         model_missing = False
         try:
-            model_missing = not align.model_ready()
+            model_missing = not self._feat_ok("model", align.model_ready())
         except Exception:
             pass
         if model_missing:
@@ -7780,7 +8006,7 @@ class Overlay:
             import deep_transcribe
         except Exception:
             return
-        if not (self.generate_on and deep_transcribe.available()):
+        if not (self.generate_on and self._feat_ok("ytdlp", deep_transcribe.available())):
             return
         from fetch_lyrics import slugify
         slug = slugify(title)
@@ -8409,6 +8635,15 @@ class Overlay:
 
     def load(self, path, keep_idx=False):
         self.meta, self.lines = load_lyrics(path)
+        # TICKET-208: a user language correction outranks whatever the cache file
+        # claims. Re-stamped HERE rather than at the override site because load()
+        # runs again on every re-fetch and swap within the same track, and each
+        # of those would otherwise quietly restore the detected value the user
+        # just told us was wrong. Deliberately does NOT rewrite the file on disk:
+        # the correction is per-play, and a cached body shared by several songs
+        # (the cache keys on title alone) must not inherit one song's override.
+        if getattr(self, "_lang_override", None) and isinstance(self.meta, dict):
+            self.meta["lang"] = self._lang_override
         # Guard (アイドル → idol.json): a provider LRC whose 'original' text EQUALS its
         # English translation is a TRANSLATION mislabeled as the body — English shown
         # where the Japanese + romaji should be. Catch it when the RAW video title is
@@ -9218,8 +9453,16 @@ class Overlay:
         # (_vocals_active_now — the reliable primary), (2) the one-shot
         # _on_vocal_onset / _on_song_onset events (band-energy rise / music after a
         # quiet stretch), (3) Shazam aligning (sets _sound_song). The tunable
-        # `mv_intro_timeout` (default 75 s) is a last-ditch backstop for a very long
-        # or oddly-mastered intro where none fire — Grimes "Genesis" has a ~70 s intro.
+        # `mv_intro_timeout` (default 20 s, registered at the tune dict above) is a
+        # last-ditch backstop for an intro where none of the three fire. It was 75 s
+        # historically, sized off Grimes "Genesis" and its ~70 s intro, and this
+        # comment plus the in-code fallback below both still said 75 long after the
+        # registered default moved to 20 (TICKET-216). The knob is always present in
+        # `_tune`, so the fallback is unreachable and 20 has been the real value the
+        # whole time; a short hold is deliberate (see the note at the registration:
+        # a false "waiting for vocals" over a song that is already singing is worse
+        # than briefly running into a genuine long intro). Note the CHAPTER intro
+        # hold reuses this same knob, so this is also the concert between-songs wait.
         # LIVE ARRANGEMENT intro hold: a concert clip like YOASOBI「アイドル」from
         # 『… DOME LIVE 2024』opens with applause, MC, crowd noise. The studio LRC
         # starts at lyric time 0 = the first sung word, but the video's time 0 is
@@ -9254,7 +9497,7 @@ class Overlay:
                     # MV / live-arrangement: release even when calibration
                     # was skipped (matches pre-chapter-hold behavior).
                     self._intro_anchored = True
-            mv_to = float(self._tune.get("mv_intro_timeout", 75.0))
+            mv_to = float(self._tune.get("mv_intro_timeout", 20.0))
             if not self._intro_anchored:
                 # Backstop timeout — release the hold if vocals never fire.
                 # For MV / live-arrangement mode the reference is the track
@@ -9303,13 +9546,25 @@ class Overlay:
                 self._pending_offset = None
                 log.info("sync: deferred commit %+.2fs → %+.2fs (line ended)",
                          self.offset, new_off)
+                # TICKET-205: narrate HERE, where the deferred correction really
+                # lands, using the context stashed when it was queued. Measure
+                # the delta against the offset in force right now, not the one
+                # at queue time — anything else could have moved it since.
+                _pn = getattr(self, "_pending_note", None) or {}
+                self._pending_note = None
                 # TICKET-088: route through atomic _commit_offset helper. Use
                 # reset_display=False so the eased display offset KEEPS gliding
                 # toward the new target (matches pre-088 behavior) — the snap
                 # fixes are in _eased_offset's per-frame fraction cap.
+                _delta = new_off - self.offset
                 self._commit_offset(new_off, reset_display=False)
                 self.idx = -1
                 self._drift_integral = 0.0
+                self._note_sync(
+                    _pn.get("kind") or ("sync-jump" if abs(_delta) > float(
+                        self._tune.get("sync_immediate_commit_s", 5.0)) else "sync-nudge"),
+                    _pn.get("reason", ""), _delta, new_off, why=_pn.get("why", ""),
+                    outcome="applied at the end of the line, so it did not cut mid-lyric")
         # ── TICKET-111: deferred whole-lyrics swap consumer ──────────────────
         # Placed RIGHT AFTER the _pending_offset consumer so TICKET-088 same-
         # tick ordering still holds (offset commits first; then the swap
@@ -10494,6 +10749,10 @@ class Overlay:
         the same delta separately so the ramp continues smoothly.
         """
         self.offset = new_off
+        # TICKET-205: any real commit ends an ignored-correction streak. Reset
+        # here rather than in _smooth_offset because this is the single atomic
+        # point BOTH the immediate and the deferred path pass through.
+        self._ignored_streak = 0
         if reset_display:
             self._display_offset = new_off
             self._display_offset_t = time.time()
@@ -10504,7 +10763,7 @@ class Overlay:
         except Exception:
             pass
 
-    def _smooth_offset(self, new_off, reason=""):
+    def _smooth_offset(self, new_off, reason="", why="", kind=None):
         """Queue an auto-sync correction for the NEXT line boundary instead of
         snapping it in mid-line (TICKET-078). User-perceived effect: whatever
         line is on screen finishes naturally, then the following line is picked
@@ -10512,7 +10771,32 @@ class Overlay:
         continuous-scroll modes, and corrections taken when no line is showing
         commit immediately to the target clock, while the displayed clock still
         glides unless the change is seek-sized. A safety cap commits a stale queued offset regardless,
-        so a stuck idx can't strand a pending correction forever."""
+        so a stuck idx can't strand a pending correction forever.
+
+        TICKET-205 — this is also THE NARRATION POINT for every sync change.
+
+        Narration used to live in the callers, and only three of the eighteen
+        ever did it (the `_ocr_assisted_sync` paths). A correction from the
+        energy correlator, the sync tier, Shazam, the vocal-onset detector, the
+        fine-tuner or a manual nudge moved the lyrics on screen and told the
+        console NOTHING — the reported symptom was a song that visibly came
+        into sync mid-play with no notification and no log entry.
+
+        Narrating from the funnel rather than the callers is the whole fix: a
+        new sync path cannot forget to report, because reporting is not its job.
+
+        It also fixes a subtler lie. The callers narrated BEFORE calling here,
+        so they announced an intention, not a result — and this function can
+        still drop a correction below `apply_min`, defer it (where the timing-
+        change path may cancel it outright), or have a track change discard it.
+        The console reported all three as done. Every narration below fires at a
+        point where the outcome is already decided.
+
+          why    caller-supplied evidence clause ("matched line 12 at 0.87
+                 confidence"), appended after the mapped `_SYNC_CAUSE` phrase
+          kind   override the narrative kind when the caller is doing something
+                 more specific than a jump/nudge (the revert path uses this)
+        """
         new_off = round(new_off, 2)
         if new_off == self.offset and self._pending_offset is None:
             return
@@ -10529,14 +10813,34 @@ class Overlay:
         # 0.0 floor above; real re-anchors (> this) and big seeks still apply.
         if (not str(reason).startswith("manual")
                 and self._effective_scroll() in ("lr", "rl", "tb", "bt")):
+            # TICKET-205: fallback aligned to the defaults dict (0.25). It read 1.0
+            # here and 0.25 at the /syncdiag reporter, so the two disagreed about
+            # the same knob — harmless today because the dict always supplies it,
+            # but the console would have reported a floor the engine wasn't using
+            # the moment that stopped being true.
             apply_min = max(apply_min,
-                            float(self._tune.get("sync_apply_min_s_scroll", 1.0)))
+                            float(self._tune.get("sync_apply_min_s_scroll", 0.25)))
         if abs(delta) < apply_min and self._pending_offset is None:
             self._sync_event("offset_skip_small", reason=reason or "auto",
                              to=round(new_off, 2), frm=round(self.offset, 2),
                              delta=round(delta, 3))
             log.info("sync: ignoring tiny correction %+.2fs → %+.2fs (Δ=%+.2fs, %s)",
                      self.offset, new_off, delta, reason or "auto")
+            # TICKET-205: a DISCARDED correction is a decision too, but a single
+            # one is noise — sub-deadband wobble is constant and narrating each
+            # would bury the real events. A STREAK is the signal: a subsystem
+            # that keeps proposing the same fix and keeps having it dropped means
+            # the lyrics are visibly off and the engine cannot act. Narrate on
+            # the Nth in a row, and again every N after, so a stuck correction
+            # surfaces without a per-wobble stream.
+            self._ignored_streak = getattr(self, "_ignored_streak", 0) + 1
+            _every = max(1, int(self._tune.get("notable_sync_ignored_streak", 5)))
+            if self._ignored_streak % _every == 0:
+                self._note_sync(
+                    "sync-ignored", reason, delta, new_off, why=why, force=True,
+                    outcome=f"proposed {self._ignored_streak} times in a row and "
+                            f"discarded each time — every one landed under the "
+                            f"{apply_min:.2f}s minimum this layout applies")
             return
         big_jump = abs(delta) > float(self._tune.get("sync_immediate_commit_s", 5.0))
         no_line = self.idx < 0 or not self.lines
@@ -10557,6 +10861,10 @@ class Overlay:
             self._sync_event("offset_commit", reason=reason or "auto",
                              to=round(new_off, 2), frm=round(old_off, 2),
                              immediate=True, no_line=bool(no_line), big_jump=bool(big_jump))
+            self._note_sync(kind or ("sync-jump" if big_jump else "sync-nudge"),
+                            reason, delta, new_off, why=why,
+                            outcome=("applied straight away — no line was on screen"
+                                     if no_line else "applied straight away — too big to defer"))
             return
         # TICKET-081: reset the timestamp on EVERY new queue so the 8s safety
         # cap measures "how long has this CURRENT correction been waiting,"
@@ -10565,6 +10873,14 @@ class Overlay:
         # mid-line, defeating the deferral.
         self._pending_offset = new_off
         self._pending_offset_t = time.time()
+        # TICKET-205: carry the narration context to the DEFERRED commit site.
+        # Deliberately not narrated here: a queued correction has not happened
+        # yet and may never — the line-timing-change path clears _pending_offset
+        # outright, and a track change drops it. Narrating on queue would report
+        # moves the user never saw. `_pending_note` is consumed (and cleared) by
+        # whichever of those wins.
+        self._pending_note = {"reason": reason, "why": why, "kind": kind,
+                              "frm": round(self.offset, 2)}
         self._sync_event("offset_defer", reason=reason or "auto", to=round(new_off, 2),
                          frm=round(self.offset, 2), idx=self.idx)
         log.info("sync: deferring %+.2fs → %+.2fs until current line ends (%s)",
@@ -10651,7 +10967,14 @@ class Overlay:
                 lyric_t = round(float(ln.start), 2) if ln is not None else None
             except Exception:
                 lyric_t = None
+            # TICKET-207: a STABLE id. Events were addressable only by list
+            # position and (t, kind) — and the ring evicts from the front, so any
+            # index a client held became wrong on the next append, while `t`
+            # alone collides for two events in the same tick. Neither can carry a
+            # user's note reliably. A monotonic counter can.
+            self._notable_seq = getattr(self, "_notable_seq", 0) + 1
             ev = {
+                "id": self._notable_seq,
                 "t": round(time.time(), 2),
                 "kind": kind,
                 "sev": sev,
@@ -10677,6 +11000,418 @@ class Overlay:
                 del ring[:len(ring) - cap]
         except Exception:
             pass
+
+    def _note_sync(self, kind, reason, delta, target, why="", outcome="", force=False):
+        """TICKET-205 — narrate ONE sync correction, in the words a human would use.
+
+        Called only from `_smooth_offset` and the deferred-commit site, i.e. only
+        at points where the outcome is already settled. Composes:
+
+            <what happened> because <why the engine did it>. <evidence>. <outcome>.
+
+        e.g. "Moved the lyrics +3.40s (sync now +3.40s) because the audio-energy
+        correlator re-aligned the lyrics to the music. Applied at the end of the
+        line, so it did not cut mid-lyric."
+
+        `notable_sync_min_s` defaults to 0.0 — every correction that ACTUALLY
+        APPLIED is narrated, deliberately. `_smooth_offset` has already run each
+        one past `sync_apply_min_s` (0.22, or `sync_apply_min_s_scroll` 0.25 in a
+        scroll layout), and that floor IS the "is this worth doing" test: if the
+        engine judged a move big enough to shift the lyrics on screen, the user
+        is entitled to see why. An extra floor here would recreate the reported
+        bug in miniature — a real, visible move that appears in no notification
+        and no log. The knob exists for anyone who wants it quieter.
+
+        `force` bypasses the floor. Used by the ignored-streak path, whose deltas
+        are by definition sub-deadband but whose repetition is the whole point.
+
+        Never raises: diagnostics must not be able to break playback.
+        """
+        try:
+            floor = float(self._tune.get("notable_sync_min_s", 0.0))
+            if not force and abs(delta) < floor:
+                return
+            cause = _SYNC_CAUSE.get(str(reason), str(reason or "an automatic check"))
+            manual = str(reason).startswith("manual")
+            big = abs(delta) > float(self._tune.get("sync_immediate_commit_s", 5.0))
+            if kind == "sync-ignored":
+                sev = "info"
+                head = (f"Held the lyrics still: a {delta:+.2f}s correction was "
+                        f"proposed because {cause}")
+            else:
+                sev = "good" if manual else ("warn" if big else "info")
+                head = (f"Moved the lyrics {delta:+.2f}s (sync now {target:+.2f}s) "
+                        f"because {cause}")
+            parts = [head + "."]
+            if why:
+                parts.append(str(why).rstrip(".") + ".")
+            if outcome:
+                parts.append(str(outcome)[:1].upper() + str(outcome)[1:].rstrip(".") + ".")
+            self._note_event(
+                kind, sev=sev, detail=" ".join(parts),
+                delta=round(float(delta), 2), to=round(float(target), 2),
+                frm=round(float(target) - float(delta), 2), cause=str(reason or "auto"))
+        except Exception:
+            pass
+
+    # ── TICKET-207: the user's own words, attached to a specific event ────────
+    # The diagnostics corpus this feeds is deliberately append-only and local.
+    # Nothing reads it back to change behaviour today: the point is to build a
+    # pool of human-labelled incidents so a later pass (or a later agent) can
+    # look for common traits across many songs. A single note explains one bug;
+    # two hundred notes reveal which bugs share a cause.
+    _EVENT_NOTES_FILE = "event_notes.jsonl"
+
+    def add_event_note(self, event_id, note, author="dev-console"):
+        """Attach free text to one narrated event, in the ring AND on disk.
+
+        Returns a dict, because unlike the fire-and-forget overrides the caller
+        needs to know whether the event was still in the ring: it is capped at
+        `notable_events_size` and evicts oldest-first, so a note typed against an
+        event that has just aged out must not silently vanish. In that case the
+        note is still WRITTEN (with whatever context we have), and `matched` is
+        False so the console can say so.
+        """
+        out = {"ok": False, "matched": False, "id": None}
+        try:
+            note = (note or "").strip()
+            if not note:
+                return {"ok": False, "error": "empty note"}
+            note = note[:1000]
+            try:
+                eid = int(event_id)
+            except Exception:
+                return {"ok": False, "error": "event_id must be an integer"}
+
+            ring = getattr(self, "_notable", None) or []
+            target = next((e for e in ring if e.get("id") == eid), None)
+            if target is not None:
+                # Notes accumulate rather than overwrite: a second thought about
+                # the same event is evidence too, and silently replacing the
+                # first would lose it.
+                notes = list(target.get("notes") or [])
+                notes.append({"t": round(time.time(), 2), "note": note})
+                target["notes"] = notes[-8:]
+                out["matched"] = True
+
+            rec = {
+                "t": round(time.time(), 2),
+                "event_id": eid,
+                "note": note,
+                "author": str(author)[:40],
+                # Snapshot the event so the note stays meaningful after the ring
+                # has evicted it. Lyric TEXT is never included — only timings,
+                # kinds and titles (copyright: the corpus must stay shippable as
+                # a diagnostic, and it is gitignored either way).
+                "event": ({k: v for k, v in (target or {}).items()
+                           if k in ("id", "t", "kind", "sev", "detail", "title",
+                                    "pos", "lyric_t", "gap", "offset",
+                                    "delta", "to", "frm", "cause",
+                                    "source", "lines", "late_s", "line", "ratio")}
+                          if target is not None else None),
+                "matched": out["matched"],
+                # Context the event itself does not carry, but which a
+                # cross-song analysis will want.
+                "player_title": (self.media.get() or {}).get("title", "")[:200],
+                "loaded_title": (self.meta or {}).get("title", "")[:200],
+                "loaded_source": (self.meta or {}).get("source", "")[:60],
+                "loaded_lang": (self.meta or {}).get("lang", "")[:20],
+                "version": version.__version__,
+            }
+            try:
+                with open(Path(_DATA) / self._EVENT_NOTES_FILE, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception as e:
+                log.info("event-note: could not record the note: %s", e)
+                return {"ok": False, "error": f"could not write the note: {e}"}
+
+            log.info("EVENT NOTE on #%d (%s): %s", eid,
+                     (target or {}).get("kind", "aged-out"), note[:120])
+            out.update(ok=True, id=eid)
+            return out
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    def list_lyric_cache(self, limit=500):
+        """TICKET-210 — every cached lyric body, as METADATA ONLY.
+
+        Copyright is the whole design constraint here. A cache file's `lines[*]`
+        hold the lyric text (`jp`), its romanisation (`rm`) and its translation
+        (`en`) — all three are derived third-party content and none of them may
+        cross the API, appear in the console, or reach a log. This returns only
+        what is factual metadata: title, artist, language, provenance, line
+        COUNT, duration, file size and mtime. `GET /lyrics` does expose bodies,
+        by design, for the overlay; this endpoint deliberately does not.
+
+        Sorted newest-first so "what did the app just cache?" is the top row,
+        which is the question this exists to answer during a fresh-install test.
+        """
+        out, total_bytes = [], 0
+        try:
+            paths = sorted(LYRICS_DIR.glob("*.json"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+        except Exception:
+            paths = []
+        for p in paths:
+            try:
+                st = p.stat()
+                total_bytes += st.st_size
+                if len(out) >= int(limit):
+                    continue
+                data = json.loads(p.read_text("utf-8"))
+                meta = data.get("meta") or {}
+                out.append({
+                    "file": p.name,
+                    "title": str(meta.get("title") or "")[:200],
+                    "artist": str(meta.get("artist") or "")[:120],
+                    "lang": str(meta.get("lang") or "")[:20],
+                    "source": str(meta.get("source") or "")[:60],
+                    "subtitle": bool(meta.get("subtitle")),
+                    "lines": len(data.get("lines") or []),
+                    "duration": meta.get("duration"),
+                    "bytes": st.st_size,
+                    "mtime": round(st.st_mtime, 2),
+                    "loaded": bool(self._lyrics_path and Path(self._lyrics_path) == p),
+                })
+            except Exception as e:
+                # A corrupt or half-written file must not hide the rest of the
+                # list; surface it as an entry so it can be seen and deleted.
+                out.append({"file": p.name, "title": "", "artist": "",
+                            "lang": "", "source": f"UNREADABLE: {type(e).__name__}",
+                            "subtitle": False, "lines": 0, "duration": None,
+                            "bytes": 0, "mtime": 0.0, "loaded": False})
+        return {"dir": str(LYRICS_DIR), "count": len(paths),
+                "bytes": total_bytes, "shown": len(out), "entries": out}
+
+    def clear_lyric_cache(self, confirm=False, keep_current=False):
+        """TICKET-210 — delete EVERY cached lyric body, for fresh-install testing.
+
+        `purge_cache` already existed but cannot express this: it filters on
+        language or source, and the API layer strips empty filters to None, so
+        "all of it" was unreachable. Rather than widen purge_cache (whose
+        selective semantics other callers rely on), this is a separate, explicit
+        operation that requires `confirm=True` — an unguarded "delete the whole
+        library" reachable by a bare POST is not something to leave lying around.
+
+        Returns the count and the freed bytes. The index is refreshed and the
+        current song re-fetched afterwards, so the app lands in the same state a
+        genuinely fresh install would be in.
+        """
+        if not confirm:
+            return {"ok": False, "error": "confirm=1 required to clear the cache"}
+        removed, freed, failed = [], 0, []
+        cur = Path(self._lyrics_path) if self._lyrics_path else None
+        try:
+            for p in list(LYRICS_DIR.glob("*.json")):
+                if keep_current and cur and p == cur:
+                    continue
+                try:
+                    freed += p.stat().st_size
+                    p.unlink()
+                    removed.append(p.name)
+                except Exception as e:
+                    failed.append(f"{p.name}: {type(e).__name__}")
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        log.info("CACHE CLEARED: %d file(s), %.1f KB freed%s",
+                 len(removed), freed / 1024.0,
+                 f", {len(failed)} failed" if failed else "")
+        self._note_event(
+            "cache-cleared", sev="warn",
+            detail=f"Cleared the lyric cache: {len(removed)} file(s), "
+                   f"{freed / 1024.0:.0f} KB freed. The app will now behave like a "
+                   f"fresh install and re-fetch everything as it plays."
+                   + (f" {len(failed)} could not be deleted." if failed else ""),
+            removed=len(removed), freed_kb=round(freed / 1024.0, 1))
+        try:
+            self.root.after(0, self.index.refresh)
+            if not keep_current:
+                self.root.after(120, self.refetch)
+        except Exception:
+            pass
+        return {"ok": True, "removed": len(removed), "freed_bytes": freed,
+                "failed": failed, "files": removed[:200]}
+
+    # ── TICKET-211: pretend an optional component is missing ──────────────────
+    # Availability of the heavy optional pieces (the faster-whisper library, its
+    # model weights, the CUDA libs, yt-dlp, a JS runtime) is decided purely by
+    # "is it on disk". That makes the fresh-install code paths — the hints, the
+    # graceful degradations, the provider fallbacks — almost impossible to
+    # exercise on a developer machine without deleting ~4 GB and re-downloading
+    # it afterwards.
+    #
+    # These knobs force the corresponding probe to report False. They simulate
+    # ABSENCE, which is the branch worth testing; they do not simulate the
+    # first-run DOWNLOAD path, which still needs the real thing to be missing.
+    _SIM_MISSING = {
+        "sim_missing_whisper": "the faster-whisper library",
+        "sim_missing_model":   "the whisper model weights",
+        "sim_missing_gpu":     "the CUDA/GPU libraries",
+        "sim_missing_ytdlp":   "yt-dlp",
+    }
+
+    def _sim_missing(self, what):
+        """True if the user has asked us to pretend `what` is not installed."""
+        try:
+            return bool(int(self._tune.get(f"sim_missing_{what}", 0)))
+        except Exception:
+            return False
+
+    def _feat_ok(self, what, real):
+        """TICKET-211 — the gate every USER-FACING feature check goes through:
+        genuinely available AND not currently being simulated away.
+
+        Two callers deliberately do NOT use this and must keep seeing reality:
+        `--selftest` (a build gate: a simulation knob must never be able to make
+        a broken bundle pass) and `_diag_whisper` (which reports what is actually
+        installed). `get_components` reports both sides side by side."""
+        return bool(real) and not self._sim_missing(what)
+
+    def get_components(self):
+        """TICKET-211 — what optional pieces are present, and what we're faking.
+
+        `real` is what the on-disk probe says; `effective` is what the app will
+        actually act on once the simulation knobs are applied. Reporting both is
+        the point: a console that showed only `effective` would look identical to
+        a genuinely broken install, which is exactly the confusion this is meant
+        to prevent.
+        """
+        # align / deep_transcribe are imported lazily throughout main.py (they
+        # pull in the heavy native stack), so keep that pattern here.
+        def _p(fn):
+            try:
+                return bool(fn())
+            except Exception:
+                return False
+
+        real, err, gpu_status = {}, None, "unknown"
+        try:
+            import align
+            real["whisper"] = _p(align.available)
+            real["model"] = _p(align.model_ready)
+            if not real["whisper"]:
+                err = str(getattr(align, "_last_error", None))
+        except Exception as e:
+            real["whisper"] = real["model"] = False
+            err = f"{type(e).__name__}: {e}"
+        try:
+            real["gpu"] = _p(gpu_setup.gpu_ready)
+            gpu_status = gpu_setup.status()
+        except Exception:
+            real["gpu"] = False
+        try:
+            import deep_transcribe
+            real["ytdlp"] = _p(deep_transcribe.available)
+        except Exception:
+            real["ytdlp"] = False
+        try:
+            import shutil as _sh
+            real["node"] = bool(_sh.which("node") or _sh.which("deno"))
+        except Exception:
+            real["node"] = False
+
+        sim = {k[len("sim_missing_"):]: self._sim_missing(k[len("sim_missing_"):])
+               for k in self._SIM_MISSING}
+        effective = {k: (v and not sim.get(k, False)) for k, v in real.items()}
+        return {
+            "real": real,
+            "simulated_missing": sim,
+            "effective": effective,
+            "gpu_status": gpu_status,
+            "whisper_error": err,
+            "any_simulated": any(sim.values()),
+            "labels": dict(self._SIM_MISSING),
+        }
+
+    def get_language_identification(self):
+        """TICKET-208 — what the app thinks this song's language is, and why.
+
+        The language is not a cosmetic label: it picks the romanisation (furigana
+        and romaji vs pinyin), decides whether a translation lane is generated at
+        all, chooses the overlay font, gates which lyric providers are even
+        tried, and drives the wrong-language cache rejection that DELETES a
+        cached body. A wrong verdict is therefore expensive and, until now,
+        completely uncorrectable by the user.
+        """
+        meta = self.meta or {}
+        return {
+            "lang": (meta.get("lang") or "")[:20],
+            "overridden": bool(getattr(self, "_lang_override", None)),
+            "override_lang": getattr(self, "_lang_override", None),
+            "cover_lang": (getattr(self, "_cover_lang", None) or "")[:20],
+            "gen_lang": (getattr(self, "_gen_lang", None) or "")[:20],
+            "source": (meta.get("source") or "")[:60],
+            "title": (meta.get("title") or "")[:200],
+            # What the user may choose. Kept short and concrete rather than a
+            # full ISO list: these are the ones the romaniser, the translator
+            # and the provider gates actually branch on.
+            "choices": ["ja", "ja-romaji", "en", "ko", "zh", "es", "de",
+                        "fr", "it", "pt", "ru", "el", "other"],
+        }
+
+    def override_language(self, lang, reason="dev-console"):
+        """TICKET-208 — user says the detected language is wrong. Apply it live.
+
+        Mirrors `override_title`: record first, then mutate. The override is
+        sticky for the track (`_keep_lang_override` survives the re-render the
+        way `_keep_title_override` survives a re-fetch) and is appended to
+        `language_corrections.jsonl` so a later pass can look for patterns in
+        WHICH songs get misdetected, not just fix them one at a time.
+        """
+        try:
+            lang = (lang or "").strip().lower()[:20]
+            if not lang:
+                self._hint("Pick a language first")
+                return {"ok": False, "error": "empty language"}
+            was = (self.meta or {}).get("lang") or ""
+            if lang == was:
+                return {"ok": True, "action": f"already {lang}", "changed": False}
+
+            rec = {
+                "t": round(time.time(), 2),
+                "bad_lang": was[:20],
+                "good_lang": lang,
+                "title": ((self.meta or {}).get("title") or "")[:200],
+                "artist": ((self.meta or {}).get("artist") or "")[:120],
+                "source": ((self.meta or {}).get("source") or "")[:60],
+                "player_title": (self.media.get() or {}).get("title", "")[:200],
+                "reason": str(reason)[:40],
+                "version": version.__version__,
+            }
+            try:
+                with open(Path(_DATA) / "language_corrections.jsonl", "a",
+                          encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception as e:
+                log.info("language-override: could not record the correction: %s", e)
+
+            log.info("LANGUAGE OVERRIDE: %r -> %r (%s)", was, lang, reason)
+            self._note_event(
+                "language-override", sev="good",
+                detail=f"You corrected the language: '{was or 'unknown'}' -> '{lang}'. "
+                       f"Re-running romanisation and translation under the new language.",
+                bad_lang=was[:20], good_lang=lang)
+
+            self._lang_override = lang
+            self._keep_lang_override = True
+            if isinstance(self.meta, dict):
+                self.meta["lang"] = lang
+            # _gen_lang is read by the by-ear generator and is NOT reset per
+            # track (see TICKET-208 notes); leaving it stale would let the old
+            # language win the next time generation runs on this song.
+            self._gen_lang = lang
+            try:
+                self._maybe_translate()
+            except Exception:
+                pass
+            try:
+                self.render()
+            except Exception:
+                pass
+            return {"ok": True, "action": f"language set to {lang}", "changed": True}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     def get_title_identification(self):
         """TICKET-204 — everything the title engine has seen for this video, so the
@@ -10891,12 +11626,27 @@ class Overlay:
         except Exception:
             pass
 
+        # TICKET-215: `_concert_setlist` entries are DICTS ({"start","title"}),
+        # built that way by both producers (native/description chapters and the
+        # offline-plan synthesis) and read that way by `_concert_setlist_tick`.
+        # This block indexed them as tuples (`ch[0]`/`ch[1]`), so the very first
+        # iteration raised KeyError: 0 — and because the `try` wrapped the whole
+        # LOOP rather than each entry, the exception aborted everything and
+        # `chapters` returned `[]`. Unconditionally. On every concert, since the
+        # feature shipped. The console's "no setlist parsed for this video"
+        # empty-state was therefore indistinguishable from a real parse failure,
+        # which is exactly the kind of lie a diagnostics panel must not tell.
+        # Per-entry try now, so one malformed chapter cannot blank the rest.
         chapters = []
-        try:
-            for ch in (getattr(self, "_concert_setlist", None) or ())[:40]:
-                chapters.append({"start": round(float(ch[0]), 1), "title": _s(ch[1], 60)})
-        except Exception:
-            pass
+        for ch in (getattr(self, "_concert_setlist", None) or ())[:40]:
+            try:
+                start, title = _chapter_fields(ch)
+                if title is None:
+                    continue
+                chapters.append({"start": round(start, 1), "title": _s(title, 60),
+                                 "skip": title.strip().lower() in self._SETLIST_SKIP})
+            except Exception:
+                continue
 
         sources = {
             # The media dict carries `status` (a PlaybackStatus enum), NOT `playing`
@@ -11105,6 +11855,265 @@ class Overlay:
             # Built by get_title_identification() rather than inline: the override
             # endpoint needs the same view, and two copies would drift.
             "title_id": self.get_title_identification(),
+            # TICKET-208/211: both are small, fixed-size dicts, so they ride along
+            # on the existing 2.5s /insight poll rather than needing their own
+            # endpoint. The lyric CACHE listing deliberately does NOT — it grows
+            # with the library and would bloat every poll, so it has its own
+            # on-demand GET /lyric_cache.
+            "language_id": self.get_language_identification(),
+            "components": self.get_components(),
+        }
+
+    # ── TICKET-218: the Concerts panel feed ──────────────────────────────────
+    # Concert handling is the most stateful thing the app does and, until this
+    # method, almost none of it was visible. `get_insight()` exposed the live
+    # flag and a (broken, TICKET-215) chapter list; everything that actually
+    # decides what happens during a concert — the applause integrator, the
+    # between-songs hold, the two watchdogs, the offline audio plan, the resync
+    # cadence tier — was reachable only by reading the log, and one of the two
+    # applause log lines was printing 0.0 (TICKET-214). This assembles all of it
+    # in one place so the panel never has to re-derive engine state.
+    #
+    # Every read is defensive. A diagnostics accessor that can raise is worse
+    # than one that returns a gap, because it takes down the endpoint the user
+    # is trying to diagnose WITH.
+    def get_concert(self):
+        """Everything that drives concert / live-arrangement behaviour, plus the
+        live status of each mechanism. Feeds `GET /concert` and the console's
+        Concerts view."""
+        now = time.time()
+        t = self._tune
+
+        def _f(name, default=0.0):
+            try:
+                return float(getattr(self, name, default) or default)
+            except Exception:
+                return default
+
+        def _k(key, default=None):
+            try:
+                return t.get(key, default)
+            except Exception:
+                return default
+
+        pos = 0.0
+        try:
+            pos = float((self.media.get() or {}).get("position") or 0.0)
+        except Exception:
+            pass
+
+        # ── the verdict, and why ──────────────────────────────────────────────
+        live_mode = bool(getattr(self, "_live_mode", False))
+        live_arr = bool(getattr(self, "_live_arrangement", False))
+        why = dict(getattr(self, "_live_why", None) or {})
+        why.pop("at", None)                       # wall-clock is noise in the UI
+        if not why:
+            # No track has been evaluated yet this run. Say that plainly: an
+            # empty reason renders as a dash, which reads like the provenance
+            # feature is broken rather than like there is simply nothing to
+            # explain yet.
+            why = {"rule": "not evaluated", "by": "nothing playing",
+                   "detail": "No track has been judged yet this run. The verdict and "
+                             "the rule behind it are recorded when a track starts."}
+        mode = ("concert" if live_mode else
+                "live arrangement" if live_arr else
+                "non-music video" if getattr(self, "_live_video_nonmusic", False) else
+                "studio")
+
+        # ── applause integrator ───────────────────────────────────────────────
+        appl_min = float(_k("applause_min_s", 2.5) or 2.5)
+        appl_for = _f("_applause_for")
+        applause = {
+            "accumulating_s": round(appl_for, 2),
+            "arm_at_s": round(appl_min, 2),
+            # How close the CURRENT gap is to arming, as a 0..1 fraction. The
+            # panel draws this as a meter: it is the one number that shows the
+            # detector working in real time, on a mechanism that is otherwise
+            # silent until it fires.
+            "progress": round(min(1.0, appl_for / appl_min), 3) if appl_min > 0 else 0.0,
+            "armed": bool(getattr(self, "_applause_armed", False)),
+            "gaps_this_run": int(getattr(self, "_applause_gaps", 0) or 0),
+            "last_gap_s": round(_f("_applause_last_gap_s"), 2),
+            "last_action": getattr(self, "_applause_last_action", "") or "",
+            "last_ago_s": (round(now - _f("_applause_last_t"), 1)
+                           if _f("_applause_last_t") else None),
+            # The two-point verification that gates an applause resync: a first
+            # offset is HELD and only applied if a second listen agrees.
+            "tpvr_active": bool(getattr(self, "_align_tpvr_active", False)),
+            "tpvr_held_offset": (round(float(self._align_tpvr), 2)
+                                 if getattr(self, "_align_tpvr", None) is not None else None),
+            "tpvr_expires_in_s": (round(_f("_align_tpvr_until") - now, 1)
+                                  if _f("_align_tpvr_until") > now else None),
+            # In a CONCERT an applause gap means "next song"; in a single LIVE
+            # arrangement it means "mid-song pause, resync". Same detector, two
+            # completely different consequences, so the panel states which.
+            "on_gap": ("re-identify the next song" if live_mode else
+                       "two-point resync by ear" if live_arr else "nothing (not a live cut)"),
+            "running": bool((live_mode or live_arr) and self.lines and not self._aligning),
+        }
+
+        # ── chapters, and which of them are non-song segments ────────────────
+        chapters, mc_segments = [], []
+        for i, ch in enumerate(getattr(self, "_concert_setlist", None) or ()):
+            start, title = _chapter_fields(ch)
+            if title is None:
+                continue
+            skip = title.strip().lower() in self._SETLIST_SKIP
+            row = {"i": i, "start": round(start, 1), "title": _s(title, 80),
+                   "skip": skip, "current": (i == getattr(self, "_setlist_idx", None))}
+            chapters.append(row)
+            if skip:
+                mc_segments.append(row)
+
+        # ── the offline audio plan (segment boundaries + measured vocal onsets) ─
+        plan, plan_cur = [], None
+        for seg in (getattr(self, "_concert_plan", None) or ()):
+            try:
+                row = {"start": round(float(seg.get("start") or 0.0), 1),
+                       "end": round(float(seg.get("end") or 0.0), 1),
+                       "onset": (round(float(seg["onset"]), 1)
+                                 if seg.get("onset") is not None else None),
+                       "title": _s(seg.get("title"), 80), "artist": _s(seg.get("artist"), 60),
+                       "source": _s(seg.get("source"), 24),
+                       "id_conf": round(float(seg.get("id_conf") or 0.0), 2)}
+            except Exception:
+                continue
+            if row["start"] - 1.0 <= pos < row["end"]:
+                plan_cur = len(plan)
+            plan.append(row)
+
+        # ── the between-songs hold (the closest thing to intermission handling) ─
+        hold_on = bool(getattr(self, "_chapter_intro_hold", False))
+        intro_to = float(_k("mv_intro_timeout", 20.0) or 20.0)
+        hold_elapsed = (now - _f("_chapter_intro_t0")) if (hold_on and _f("_chapter_intro_t0")) else 0.0
+        between_songs = {
+            "holding": hold_on,
+            "anchored": bool(getattr(self, "_intro_anchored", True)),
+            "elapsed_s": round(hold_elapsed, 1) if hold_on else None,
+            "releases_at_s": round(intro_to, 1),
+            "why": ("waiting for vocals before showing the next song's lyrics"
+                    if hold_on else "not holding"),
+        }
+
+        # ── the two concert watchdogs ────────────────────────────────────────
+        pend = getattr(self, "_pending_switch", None)
+        pend_age = (now - _f("_pending_switch_t")) if pend is not None else None
+        watchdogs = {
+            # An unconfirmed hearing waiting on its second read. Escalates fast
+            # when nothing is on screen (15s) and slowly when lyrics are already
+            # up (90s), because a blank overlay is the worse state.
+            "pending_switch": (_s(pend[0], 60) if pend else None),
+            "pending_age_s": round(pend_age, 1) if pend_age is not None else None,
+            "pending_escalates_at_s": (15.0 if not self.lines else 90.0),
+            # A concert song still showing after 6.5 min almost certainly changed
+            # and the boundary was missed.
+            "same_song_for_s": (round(now - _f("_concert_song_t"), 1)
+                                if _f("_concert_song_t") else None),
+            "stale_song_forces_reid_at_s": 390.0,
+        }
+
+        # ── live resync cadence tier ─────────────────────────────────────────
+        cadence = {
+            "in_sync_streak": int(_f("_live_sync_streak")),
+            "gap_s": round(_f("_live_resync_gap"), 1) or None,
+            "inflight": bool(getattr(self, "_live_resync_inflight", False)),
+            "relax_after_n": _k("live_resync_relax_n", 3),
+            "tiers_s": {"fast": _k("live_resync_fast_gap_s", 1.0),
+                        "mid": _k("live_resync_mid_gap_s", 6.0),
+                        "slow": _k("live_resync_slow_gap_s", 14.0)},
+        }
+
+        # ── banner OCR, and the reason it is or is not running ───────────────
+        # This is the single most misunderstood part of concert handling: OCR is
+        # fully suppressed the moment a chapter setlist exists, so on a chaptered
+        # concert the entire documented OCR pipeline never runs. Say so, rather
+        # than showing an idle panel the reader has to interpret.
+        ocr_blocked = ("chapters are present, so the setlist drives song changes"
+                       if getattr(self, "_concert_setlist", None) else
+                       "the video is not a concert" if not live_mode else
+                       "this video was judged non-music" if getattr(self, "_live_video_nonmusic", False) else
+                       "banner OCR is switched off" if not self.concert_ocr else "")
+        ocr = {
+            "enabled": bool(self.concert_ocr),
+            "running": bool(live_mode and not getattr(self, "_concert_setlist", None)
+                            and not getattr(self, "_live_video_nonmusic", False)
+                            and self.concert_ocr),
+            "blocked_because": ocr_blocked,
+            "accept_at": 0.85,
+            "poll_s": 6.0,
+            "last_read_ago_s": (round(now - _f("_last_ocr_t"), 1) if _f("_last_ocr_t") else None),
+        }
+
+        # ── the knobs that move any of the above ─────────────────────────────
+        # Grouped by the mechanism they steer so the panel can render them next
+        # to the thing they affect, instead of as a flat alphabetical wall.
+        knob_groups = {
+            "Applause detection": ["applause_min_s"],
+            "Setlist and chapters": ["concert_setlist_on", "ocr_setlist_gate",
+                                     "setlist_gen_deadline_s", "chapter_override_min_score",
+                                     "chapter_no_song_reject", "concert_pool_scoped",
+                                     "concert_pool_prefetch_max"],
+            "Offline audio analysis": ["concert_audio_on", "concert_audio_identify",
+                                       "concert_audio_max_dur_s", "concert_audio_min_song_s",
+                                       "concert_audio_floor_frac", "concert_audio_id_slice_s"],
+            "Live sync thresholds": ["agree_live", "live_max_jump_s", "live_song_max_s",
+                                     "concert_tpvr_gap_s", "live_tpvr_gap_s", "tpvr_gap_s",
+                                     "concert_single_shot_max_s", "live_single_shot_max_s",
+                                     "single_shot_max_s", "concert_first_read_max_s",
+                                     "sync_live_follow_alpha"],
+            "Live resync cadence": ["live_resync_listen_s", "live_resync_fast_gap_s",
+                                    "live_resync_mid_gap_s", "live_resync_slow_gap_s",
+                                    "live_resync_relax_n"],
+            "Live energy correlator": ["live_energy_apply_min", "live_energy_lift_floor",
+                                       "live_energy_peak_margin", "live_sync_match_min",
+                                       "energy_max_offset_live"],
+            "Banner OCR": ["ocr_sync_in_live", "ocr_sync_min", "ocr_sync_min_live",
+                           "ocr_sync_single_shot_max", "ocr_when_gaming"],
+            "Between-songs hold": ["mv_intro_timeout", "onset_max_intro_s"],
+        }
+        knobs = {}
+        for group, keys in knob_groups.items():
+            rows = []
+            for k in keys:
+                try:
+                    if k in t:
+                        rows.append({"key": k, "value": t[k]})
+                except Exception:
+                    continue
+            if rows:
+                knobs[group] = rows
+
+        return {
+            "mode": mode,
+            "live_mode": live_mode,
+            "live_arrangement": live_arr,
+            "live_arrangement_why": getattr(self, "_live_arr_why", "") or "",
+            "mv_mode": bool(getattr(self, "_mv_mode", False)),
+            "nonmusic": bool(getattr(self, "_live_video_nonmusic", False)),
+            "why": why,
+            "position_s": round(pos, 1),
+            # Which of the three sync profiles is in force. The concert column of
+            # the three-way split is easy to forget exists.
+            "sync_profile": ("concert" if live_mode else "live" if live_arr else "studio"),
+            "applause": applause,
+            "chapters": chapters,
+            "chapter_idx": getattr(self, "_setlist_idx", None),
+            "mc_segments": mc_segments,
+            "mc_note": ("Non-song chapters (MC, talk, intermission, encore, credits) are "
+                        "recognised by TITLE only, from the exact skip list. There is no "
+                        "audio-based MC detector: a talk block with a song-like chapter "
+                        "name, or an unchaptered concert, will not be caught."),
+            "plan": plan,
+            "plan_current": plan_cur,
+            "plan_note": ("The offline pass downloads the audio once and measures each "
+                          "segment's true vocal ONSET, so lyrics anchor past the applause "
+                          "and intro rather than to the chapter mark."),
+            "between_songs": between_songs,
+            "watchdogs": watchdogs,
+            "cadence": cadence,
+            "ocr": ocr,
+            "candidates": len(getattr(self, "_concert_candidates", None) or ()),
+            "knobs": knobs,
         }
 
     def get_sync_diag(self):
@@ -13576,6 +14585,11 @@ class Overlay:
                 _t = (self._track or ("", ""))[1] or ""
                 if not is_live_or_compilation(_t, None):
                     self._live_mode = False
+                    self._live_why = {"rule": "nonmusic-demote", "by": "subtitles turned on mid-video",
+                                      "detail": "no concert cue in the title once duration is "
+                                                "ignored, and this is not a music-app source, so "
+                                                "the video is treated as non-music",
+                                      "title": _t, "duration": None, "at": time.time()}
                     self._live_video_nonmusic = True
                     try:
                         threading.Thread(target=self._subs_music_category_check,
@@ -14909,7 +15923,7 @@ class Overlay:
         different upload whose intro length (and thus caption timing) differs."""
         try:
             import deep_transcribe
-            if not deep_transcribe.available():
+            if not self._feat_ok("ytdlp", deep_transcribe.available()):
                 if not silent:
                     self._hint("YouTube captions need yt-dlp — see the README")
                 # SUBTITLES: no yt-dlp still must not dead-end the mode — the
@@ -15225,20 +16239,30 @@ class Overlay:
             if self._applause_for >= self._tune.get("applause_min_s", 2.5):
                 self._applause_armed = True
         elif self._applause_armed and lv.get("vocal_detected_now"):
+            # TICKET-214: capture the gap length BEFORE the reset. Both log lines
+            # below print it, and the two resets used to run first — so every
+            # applause message in every log this app has ever written said
+            # "~0.0s". The one number that says whether the detector measured a
+            # real pause or a 2.5s hair-trigger was destroyed at the exact moment
+            # it was reported, and the Concerts panel could not recover it either.
+            gap = self._applause_for
             self._applause_for, self._applause_armed = 0.0, False
+            self._applause_last_gap_s = gap
+            self._applause_last_t = now
+            self._applause_gaps = getattr(self, "_applause_gaps", 0) + 1
             if self._live_mode:
                 # CONCERT compilation: an applause gap is almost always a SONG BOUNDARY,
                 # not a mid-song pause → RE-IDENTIFY the next song (sound + a forced
                 # OCR-banner read), don't resync the old one (TICKET-063).
-                log.info("applause gap (~%.1fs) in a concert → re-identify the next song",
-                         self._applause_for)
+                self._applause_last_action = "re-identify the next song"
+                log.info("applause gap (~%.1fs) in a concert → re-identify the next song", gap)
                 self._last_ocr_t = 0.0                 # force an immediate banner read
                 self._fast_calib = max(self._fast_calib, 2)
                 self._start_identify(seconds=5, attempts=2)
             else:
                 # single LIVE arrangement: mid-song applause → two-point resync (TICKET-061)
-                log.info("applause gap (~%.1fs) ended, vocals back → two-point resync by ear",
-                         self._applause_for)
+                self._applause_last_action = "two-point resync by ear"
+                log.info("applause gap (~%.1fs) ended, vocals back → two-point resync by ear", gap)
                 self._align_tpvr, self._align_tpvr_active = None, True
                 self._align_tpvr_until = now + 14.0
                 self.align_by_listening(silent=True)
@@ -15309,7 +16333,7 @@ class Overlay:
             return
         try:
             import align
-            if not align.available():
+            if not self._feat_ok("whisper", align.available()):
                 self._hint("Force Sync needs the AI add-on (faster-whisper) — see the README")
                 return
         except Exception:
@@ -15480,7 +16504,7 @@ class Overlay:
                         and self._vocals_active_now()):
                     try:
                         import align
-                        if align.available():
+                        if self._feat_ok("whisper", align.available()):
                             log.info("live resync: vocals active → following live timing (good-streak %d)",
                                      self._live_sync_streak)
                             self._live_resync_inflight = True
@@ -16524,6 +17548,8 @@ class Overlay:
         # under it, so its target is meaningless against the new lines.
         if self._pending_offset is not None:
             self._pending_offset = None
+            self._pending_note = None    # TICKET-205: never narrate a correction
+                                         # that was cancelled before it applied
         # 8. Clear pending state BEFORE the log so /diag reflects committed.
         self._pending_swap = None
         self._pending_swap_t = 0.0
@@ -16639,7 +17665,7 @@ class Overlay:
             return
         try:
             import align
-            if not align.available():
+            if not self._feat_ok("whisper", align.available()):
                 return
         except Exception:
             return
@@ -17350,15 +18376,18 @@ class Overlay:
                     log.info("ocr-sync: %d far reads in a row while holding an OCR offset "
                              "of %+.2fs — that commit is the thing that is wrong, reverting to 0",
                              self._ocr_far_streak, self.offset)
-                    self._note_event(
-                        "sync-revert", sev="warn",
-                        detail=f"Backed out a bad OCR correction: {self.offset:+.2f}s "
-                               f"reverted to 0.00s after {self._ocr_far_streak} reads "
-                               f"landed far outside the {_off_cap:.0f}s cap.",
-                        line=idx, ratio=round(ratio, 2))
                     self._ocr_sync_applied = None
                     self._ocr_sync_pending = None
-                    self.root.after(0, lambda: self._smooth_offset(0.0, "ocr-sync-revert"))
+                    # TICKET-205: narrate from the funnel, not here. This used to
+                    # _note_event immediately and then queue the revert onto the Tk
+                    # thread — announcing a reset that _smooth_offset could still
+                    # discard. `kind` keeps it labelled a revert rather than a
+                    # generic jump once it genuinely commits.
+                    _why = (f"{self._ocr_far_streak} screen reads in a row landed outside "
+                            f"the {_off_cap:.0f}s cap, so the held correction was the "
+                            f"thing that was wrong")
+                    self.root.after(0, lambda w=_why: self._smooth_offset(
+                        0.0, "ocr-sync-revert", why=w, kind="sync-revert"))
                 return
             self._ocr_far_streak = 0
             self._last_ocr_sync = {"matched": True, "line": idx, "ratio": round(ratio, 2),
@@ -17427,14 +18456,14 @@ class Overlay:
             self._ocr_sync_applied = target
             log.info("ocr-sync(%s): LRC line %d ratio %.2f → offset %.2fs (was %.2f)",
                      reason, idx, ratio, target, self.offset)
-            _delta = target - self.offset
-            self._note_event(
-                "sync-jump" if abs(_delta) > _one_shot else "sync-nudge",
-                sev="warn" if abs(_delta) > _one_shot else "info",
-                detail=f"Moved sync {_delta:+.2f}s (to {target:+.2f}s): the screen reader "
-                       f"matched lyric line {idx + 1} at {ratio:.2f} confidence.",
-                line=idx, ratio=round(ratio, 2), reason=reason)
-            self.root.after(0, lambda o=target: self._smooth_offset(o, "ocr-sync"))
+            # TICKET-205: hand the EVIDENCE to the funnel and let it narrate once
+            # the outcome is settled. This used to _note_event right here, before
+            # the correction was even queued onto the Tk thread — so it announced
+            # moves that _smooth_offset's apply_min floor could discard, and that
+            # a track change or a line-timing change could cancel while queued.
+            self.root.after(0, lambda o=target, w=(
+                f"the screen reader matched lyric line {idx + 1} at "
+                f"{ratio:.2f} confidence"): self._smooth_offset(o, "ocr-sync", why=w))
         except Exception as e:
             log.info("ocr-sync error: %s", e)
 
@@ -17826,7 +18855,7 @@ class Overlay:
             return                                  # caption timing is already exact
         try:
             import align
-            if not align.available():
+            if not self._feat_ok("whisper", align.available()):
                 return
         except Exception:
             return
@@ -17985,7 +19014,7 @@ class Overlay:
             return
         try:
             import align
-            if not align.available():
+            if not self._feat_ok("whisper", align.available()):
                 return                               # no Whisper → nothing to fine-tune with
         except Exception:
             return
@@ -18054,7 +19083,7 @@ class Overlay:
             return
         try:
             import align
-            if not align.available():
+            if not self._feat_ok("whisper", align.available()):
                 self._fine_exit("align-unavailable")
                 return
         except Exception:
@@ -18635,8 +19664,17 @@ class Overlay:
     # the tray item is here so a developer can jump into it from any session,
     # and it gracefully hints if the exe hasn't been built yet.
     def _dev_console_exe(self):
-        """Locate the built dev-console exe. Prefers release, then debug, then
-        the LYRIC_DEVCONSOLE_EXE env override. Returns Path or None."""
+        """Locate the built dev-console exe. Returns Path or None.
+
+        Search order, highest priority first (this docstring used to list it
+        BACKWARDS, claiming the env override was consulted last):
+          1. the LYRIC_DEVCONSOLE_EXE env override, so a developer can point at
+             any build without touching the tree;
+          2. the frozen app's bundled copy (_internal/dev-console/);
+          3. a sibling dev-console/ next to main.py;
+          4. the cargo target/release build;
+          5. the cargo target/debug build.
+        """
         env = (os.environ.get("LYRIC_DEVCONSOLE_EXE") or "").strip()
         if env and Path(env).is_file():
             return Path(env)
@@ -18670,8 +19708,22 @@ class Overlay:
                     pass
         return None
 
-    # The dev-console's own window title, from dev-console/src-tauri/tauri.conf.json.
-    # Used to find an EXISTING console that this process did not spawn.
+    # The dev-console's own window title, from dev-console/src-tauri/tauri.conf.json
+    # (`app.windows[0].title`). Used to find an EXISTING console that this process
+    # did not spawn, so the tray focuses it instead of opening a second window.
+    #
+    # TICKET-223: this is a HARDCODED MIRROR of a value that lives in another file,
+    # in another language, with no build-time check tying them together. Renaming
+    # the window in tauri.conf.json silently disables this whole guard: no error,
+    # no log, the match just stops succeeding and the tray starts spawning a
+    # second console. The Rust `tauri-plugin-single-instance` still holds the line
+    # (it keys on the bundle IDENTIFIER, not the title), so the duplicate exits
+    # immediately rather than opening — but the user sees a flash and no focus
+    # change, which reads as "the tray item is broken".
+    #
+    # `scripts/check_devconsole.py` now asserts these two strings match, so the
+    # drift is caught at check time rather than in the field. If you change the
+    # title, change it in BOTH places.
     _DEVCONSOLE_TITLE = "Lyric Immersion — Developer Console"
 
     def _focus_dev_console_window(self):
@@ -19600,6 +20652,25 @@ def main():
         pystray.MenuItem("Back up now", _backup_now),
     )
 
+    def _off_label(ov, dp=2):
+        """TICKET-213 — the sync offset as the tray should state it.
+
+        `ov.offset` is the TRUE COMMITTED offset (the eased/displayed value lives
+        in `_display_offset` and is deliberately not used here). But a nudge does
+        not necessarily commit when you click it: `_smooth_offset` defers most
+        corrections to the end of the current lyric line so the line on screen
+        finishes cleanly. For up to one line the label therefore showed the old
+        number, and the menu read as though the click had been ignored.
+
+        Appending the queued target makes the deferral visible instead of looking
+        like a bug: "+1.20s → +2.20s pending".
+        """
+        cur = f"{ov.offset:+.{dp}f}s"
+        pend = getattr(ov, "_pending_offset", None)
+        if pend is None or abs(float(pend) - float(ov.offset)) < 0.005:
+            return cur
+        return f"{cur} → {float(pend):+.{dp}f}s pending"
+
     def _font_item(pct):
         v = pct / 100
         return pystray.MenuItem(f"{pct}%", _set_font(v), radio=True,
@@ -19617,7 +20688,13 @@ def main():
         pystray.MenuItem("⏩  Lyrics later  −2.0s", _nudge(-2.0)),
         pystray.MenuItem("⏩  Lyrics later  −5.0s", _nudge(-5.0)),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(lambda i: f"Reset  (now {ov.offset:+.2f}s)", _reset),
+        # TICKET-213: both sync labels read ov.offset, the TRUE COMMITTED offset,
+        # never the eased display value — that part was already right. What they
+        # did not show is that a nudge may be QUEUED: _smooth_offset defers most
+        # corrections to the end of the current line, so for up to one line the
+        # label kept reporting the old number and the menu looked like it had
+        # ignored the click. Show the pending target when one is waiting.
+        pystray.MenuItem(lambda i: f"Reset  (now {_off_label(ov, 2)})", _reset),
     )
 
     # ── Updates ──────────────────────────────────────────────────────
@@ -19736,7 +20813,7 @@ def main():
             _source_menu_items),
         pystray.Menu.SEPARATOR,
         # 3. SYNC BEHAVIOR ────────────────────────────────────────────────
-        pystray.MenuItem(lambda i: f"Sync timing  ({ov.offset:+.1f}s)", sync_menu),
+        pystray.MenuItem(lambda i: f"Sync timing  ({_off_label(ov, 1)})", sync_menu),
         pystray.MenuItem("Auto re-sync by sound", recal_menu),
         pystray.Menu.SEPARATOR,
         # 4. VISUAL / DISPLAY ─────────────────────────────────────────────

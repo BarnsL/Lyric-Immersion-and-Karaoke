@@ -1,11 +1,23 @@
 # Concert test corpus — machine-readable mirror of docs/CONCERT_RESEARCH.md §2.
 #
+# WHAT THIS IS: a hand-maintained research corpus / test fixture describing real
+# concert videos (setlists, chapter markers, MC and intermission structure). It
+# exists so humans and the auto-tune harness can reason about concert behaviour
+# against known-good ground truth.
+#
+# THE APP DOES NOT READ THIS FILE. There is no `import yaml` in main.py, no
+# safe_load, and zero references to concerts.yaml anywhere in the runtime code.
+# No code path loads it, at any point, for any video. In particular it is NOT a
+# manual-override fallback for setlist resolution: main.py._load_concert_setlist
+# pulls YouTube CHAPTERS via yt-dlp (by URL, else a title search) and knows
+# nothing about this corpus. An earlier version of this header claimed otherwise;
+# that claim was never true. Do not wire logic against a fallback that does not
+# exist, and do not assume editing an entry here changes runtime behaviour.
+#
 # Consumed by:
 #   - The auto-tune harness (D:\Lyric-Immersion-Auto\auto\concerts_corpus.py) for
 #     concert-specific scoring against known setlists.
-#   - main.py._load_concert_setlist as a MANUAL-OVERRIDE fallback when neither
-#     YouTube chapters, description-embedded timestamps, nor
-#     parse_song_candidates yields a usable setlist for a given URL.
+#   - Humans, as the reference corpus behind docs/CONCERT_RESEARCH.md.
 #
 # start_s values come from cross-verified sources (setlist.fm / Wikipedia /
 # official releases / YouTube chapter markers). Where a time is estimated,

@@ -18,6 +18,17 @@ vs `Artist/Song`), so any change here needs all of them re-run.
 """
 import ast, re, sys, unicodedata
 
+# These cases are Japanese by nature, so the probe prints CJK. On Windows the
+# default console codepage is cp1252 and `print` raises UnicodeEncodeError
+# before a single assertion runs — the probe "fails" for a reason that has
+# nothing to do with the code under test. Force UTF-8 on our own streams so the
+# result does not depend on which shell happened to launch it.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 SRC = open(r"D:\Desktop-Karaoke\main.py", encoding="utf-8-sig").read()
 tree = ast.parse(SRC)
 
@@ -66,6 +77,27 @@ CASES = [
     # --- unrelated shapes still fine ------------------------------------------
     ("【MV】Unchained【hololive English -Advent- Original Song】",
      "hololive English", "Unchained"),
+
+    # --- TICKET-206: the tie-in bracket beat the song bracket ------------------
+    # The reported failure. The song is in 『』 at the head; the ANIME is in 「」
+    # inside a trailing credit parenthetical. The old cascade searched 「」 first,
+    # unconditionally and anywhere in the string, so bracket TYPE outranked
+    # position and the app fetched lyrics for the anime's name.
+    ("EGOIST 『名前のない怪物』 Music Video (TVアニメ「PSYCHO-PASS サイコパス」ep1-11 エンディングテーマ)",
+     "EGOIST", "名前のない怪物"),
+    ("EGOIST 『Namae No Nai Kaibutsu』 Music Video (TV anime 「PSYCHO-PASS」 ep1-11 Ending theme)",
+     "EGOIST", "Namae No Nai Kaibutsu"),
+    # same-bracket-type variant: both in 『』, tie-in one inside the parenthetical
+    ("EGOIST 『Namae No Nai Kaibutsu』 Music Video (TV anime 『PSYCHO-PASS』 ep1-11 Ending theme)",
+     "EGOIST", "Namae No Nai Kaibutsu"),
+    # LEADING tie-in: the old code matched the first 『』, saw the tag, and gave
+    # up entirely instead of looking at the next bracket.
+    ("TVアニメ『PSYCHO-PASS』ED EGOIST 『名前のない怪物』", "EGOIST", "名前のない怪物"),
+    # --- TICKET-206 must NOT regress: the song legitimately in 「」 ------------
+    ("ヨルシカ 「花に亡霊」 Music Video", "ヨルシカ", "花に亡霊"),
+    ("YOASOBI「アイドル」 Official Music Video", "YOASOBI", "アイドル"),
+    # the ORIGINAL convention the old code assumed: song 「」, work 『』+tag
+    ("「群青」/ YOASOBI 『アニメ』OPテーマ", "YOASOBI", "群青"),
 ]
 
 fails = 0

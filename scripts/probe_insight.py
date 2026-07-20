@@ -90,6 +90,18 @@ class Stub:
                 "artist": "", "overridden": False, "override_title": None,
                 "seen_strings": []}
 
+    def get_language_identification(self):
+        # TICKET-208. Shape-only stub, same rationale as the title one above.
+        return {"lang": "ja", "overridden": False, "override_lang": None,
+                "cover_lang": "", "gen_lang": "", "source": "", "title": "",
+                "choices": ["ja", "en"]}
+
+    def get_components(self):
+        # TICKET-211. Shape-only stub.
+        return {"real": {}, "simulated_missing": {}, "effective": {},
+                "gpu_status": "none", "whisper_error": None,
+                "any_simulated": False, "labels": {}}
+
     def _autoresearch_state(self): return {"exists": False}
 
 

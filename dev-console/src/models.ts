@@ -56,6 +56,13 @@ export interface TunePayload {
   // GET /tune returns `{"ok": True, "tune": {...}}` — key is `tune`, not
   // `values` (verified against api.py:288). Adapters live in api.ts.
   tune: Record<string, TuneValue>;
+  /**
+   * TICKET-212 - per-knob documentation, keyed by knob name, generated from
+   * `tune_docs.py` and shipped with the values. `scripts/probe_tune_docs.py`
+   * enforces a 1:1 mapping against the engine's tune dict, so a missing entry
+   * here is a build failure rather than a silently undocumented control.
+   */
+  docs?: Record<string, string>;
 }
 
 // Rich diagnostics snapshot — mirrors main.py.get_diag() (~80 fields). Only
@@ -124,10 +131,99 @@ export type ViewKey =
   | "finder"
   | "decisions"
   | "activity"
+  | "concerts"
   | "diagram"
   | "parameters"
   | "autoresearch"
+  | "library"
   | "resources";
+
+/* ── TICKET-218: GET /concert ──────────────────────────────────────────────────
+   Concert handling is the most stateful part of the engine and was nearly
+   invisible before this payload: the applause integrator, the between-songs
+   hold, the two watchdogs and the offline onset plan were all log-only. Field
+   names mirror `App.get_concert()` in main.py exactly; `scripts/probe_concert.py`
+   pins the shape on the engine side. */
+
+export interface ConcertChapter {
+  i: number;
+  start: number;
+  title: string;
+  /** In the engine's `_SETLIST_SKIP` set: MC, talk, intermission, encore, credits. */
+  skip: boolean;
+  current: boolean;
+}
+
+export interface ConcertPlanSeg {
+  start: number;
+  end: number;
+  /** Measured first-vocal time, so lyrics anchor past applause/intro. Null = not measured. */
+  onset: number | null;
+  title: string;
+  artist: string;
+  source: string;
+  id_conf: number;
+}
+
+export interface ConcertApplause {
+  accumulating_s: number;
+  arm_at_s: number;
+  /** 0..1 toward arming — the only live view of a mechanism that is otherwise silent. */
+  progress: number;
+  armed: boolean;
+  gaps_this_run: number;
+  last_gap_s: number;
+  last_action: string;
+  last_ago_s: number | null;
+  tpvr_active: boolean;
+  tpvr_held_offset: number | null;
+  tpvr_expires_in_s: number | null;
+  /** What a completed gap will DO: differs between a concert and a single live take. */
+  on_gap: string;
+  running: boolean;
+}
+
+export interface ConcertPayload {
+  ok?: boolean;
+  mode: string;
+  live_mode: boolean;
+  live_arrangement: boolean;
+  /** Which of the three inputs set it. A COVER counts, with no live cue in the title. */
+  live_arrangement_why: string;
+  mv_mode: boolean;
+  nonmusic: boolean;
+  why: { rule?: string; detail?: string; by?: string; title?: string; duration?: number | null };
+  position_s: number;
+  sync_profile: string;
+  applause: ConcertApplause;
+  chapters: ConcertChapter[];
+  chapter_idx: number | null;
+  mc_segments: ConcertChapter[];
+  mc_note: string;
+  plan: ConcertPlanSeg[];
+  plan_current: number | null;
+  plan_note: string;
+  between_songs: {
+    holding: boolean; anchored: boolean; elapsed_s: number | null;
+    releases_at_s: number; why: string;
+  };
+  watchdogs: {
+    pending_switch: string | null; pending_age_s: number | null;
+    pending_escalates_at_s: number; same_song_for_s: number | null;
+    stale_song_forces_reid_at_s: number;
+  };
+  cadence: {
+    in_sync_streak: number; gap_s: number | null; inflight: boolean;
+    relax_after_n: unknown; tiers_s: { fast: unknown; mid: unknown; slow: unknown };
+  };
+  ocr: {
+    enabled: boolean; running: boolean; blocked_because: string;
+    accept_at: number; poll_s: number; last_read_ago_s: number | null;
+  };
+  candidates: number;
+  /** Knobs grouped by the mechanism they steer, so the UI can put each next to its effect. */
+  knobs: Record<string, { key: string; value: unknown }[]>;
+}
 
 // ── GET /insight (TICKET-190) ────────────────────────────────────────────────
 // Song-finder introspection. Every field here was previously log-only: the OCR
@@ -305,6 +401,10 @@ export interface InsightPayload {
    * only - no lyric body text (keeps the repo clear of copyright material).
    */
   title_id: TitleIdentification | null;
+  /** TICKET-208 - detected language + any user correction. */
+  language_id?: LanguageIdentification | null;
+  /** TICKET-211 - real vs simulated availability of the optional components. */
+  components?: ComponentsPayload | null;
 }
 
 /**
@@ -331,6 +431,94 @@ export interface NotableEvent {
   line?: number;
   ratio?: number;
   reason?: string;
+  /**
+   * TICKET-205 - set on every sync event (`sync-jump` / `sync-nudge` /
+   * `sync-revert` / `sync-ignored`), which now come from the funnel in
+   * main.py `_smooth_offset` rather than from individual callers.
+   *
+   * `delta` is how far the lyrics actually moved and `frm`/`to` are the offset
+   * either side of it. Rendered as "+0.00s -> +3.40s" so the move can be read
+   * without doing arithmetic. `cause` is the raw machine reason tag
+   * ("energy-align", "sync-tier", ...) kept alongside the English prose in
+   * `detail` for filtering and for matching entries against karaoke.log.
+   */
+  delta?: number;
+  to?: number;
+  frm?: number;
+  cause?: string;
+  /**
+   * TICKET-207 - a stable, monotonic id. Events used to be addressable only by
+   * list position and (t, kind); the ring evicts oldest-first, so an index went
+   * stale on the next append and `t` alone collides within a tick. Neither can
+   * carry a user note reliably.
+   */
+  id?: number;
+  /** TICKET-207 - notes the user typed against this event. Appended, not replaced. */
+  notes?: { t: number; note: string }[];
+}
+
+/**
+ * TICKET-208 - the detected song language and whether the user has corrected it.
+ * Language is load-bearing: it selects romanisation (furigana+romaji vs pinyin),
+ * gates translation, picks the overlay font, orders the lyric providers, and
+ * drives a wrong-language cache rejection that deletes a cached body.
+ */
+export interface LanguageIdentification {
+  lang: string;
+  overridden: boolean;
+  override_lang: string | null;
+  cover_lang: string;
+  gen_lang: string;
+  source: string;
+  title: string;
+  choices: string[];
+}
+
+/**
+ * TICKET-211 - optional components. `real` is what the on-disk probe says;
+ * `effective` is what the app will act on after the sim_missing_* knobs are
+ * applied. Both are reported deliberately: a console showing only `effective`
+ * would be indistinguishable from a genuinely broken install.
+ */
+export interface ComponentsPayload {
+  ok: boolean;
+  real: Record<string, boolean>;
+  simulated_missing: Record<string, boolean>;
+  effective: Record<string, boolean>;
+  gpu_status: string;
+  whisper_error: string | null;
+  any_simulated: boolean;
+  labels: Record<string, string>;
+}
+
+/**
+ * TICKET-210 - one cached lyric file, METADATA ONLY.
+ *
+ * There is deliberately no field for lyric text here and there must never be
+ * one: `lines[*].jp` (body), `.rm` (romanisation) and `.en` (translation) are
+ * all derived third-party content. `lines` below is a COUNT, not the lines.
+ */
+export interface LyricCacheEntry {
+  file: string;
+  title: string;
+  artist: string;
+  lang: string;
+  source: string;
+  subtitle: boolean;
+  lines: number;
+  duration: number | null;
+  bytes: number;
+  mtime: number;
+  loaded: boolean;
+}
+
+export interface LyricCachePayload {
+  ok: boolean;
+  dir: string;
+  count: number;
+  bytes: number;
+  shown: number;
+  entries: LyricCacheEntry[];
 }
 
 /**

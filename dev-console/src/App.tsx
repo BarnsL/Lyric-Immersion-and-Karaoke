@@ -12,6 +12,8 @@ import {
   Bell,
   BookOpen,
   ExternalLink,
+  Database,
+  Clapperboard,
 } from "lucide-react";
 import { getDiag, getHealth, getInsight, getStatus, openExternal } from "./api";
 import { Overview } from "./components/Overview";
@@ -22,6 +24,12 @@ import { DiagramView } from "./components/Diagram";
 import { Parameters } from "./components/Parameters";
 import { AutoResearch } from "./components/AutoResearch";
 import { Resources } from "./components/Resources";
+// TICKET-218: concert/live introspection. Polls /concert on its own, because
+// its payload carries unbounded chapter and plan lists that have no business
+// riding on the shared /insight poll every other view depends on.
+import { Concerts } from "./components/Concerts";
+// Aliased: `Library` is already bound to the lucide icon used in the nav above.
+import { Library as LibraryView } from "./components/Library";
 import { DOCS, RESOURCES } from "./manifest";
 import type { DiagPayload, Health, InsightPayload, StatusPayload, ViewKey } from "./models";
 
@@ -30,9 +38,13 @@ const NAV: { key: ViewKey; label: string; icon: JSX.Element }[] = [
   { key: "finder",       label: "Song finder",   icon: <Eye size={16} /> },
   { key: "decisions",    label: "Decisions",     icon: <GitBranch size={16} /> },
   { key: "activity",     label: "Activity",       icon: <Bell size={16} /> },
+  { key: "concerts",     label: "Concerts",      icon: <Clapperboard size={16} /> },
   { key: "diagram",      label: "Runtime map",   icon: <Workflow size={16} /> },
   { key: "parameters",   label: "Parameters",    icon: <Cog size={16} /> },
   { key: "autoresearch", label: "AutoResearch",  icon: <GitBranch size={16} /> },
+  // TICKET-210/211: the lyric cache + the optional components, together because
+  // both exist to make fresh-install behaviour testable without a fresh install.
+  { key: "library",      label: "Library",       icon: <Database size={16} /> },
   { key: "resources",    label: "Resources",     icon: <Library size={16} /> },
 ];
 
@@ -50,12 +62,29 @@ export function App() {
     // Only pull /diag while the Overview tab is visible — no reason to burn
     // cycles polling the sync FSM while the user is on Resources.
     const pollDiag = view === "overview";
-    const pollInsight = view === "finder" || view === "decisions" || view === "activity" || view === "autoresearch";
+    // TICKET-221: `library` was missing here. The Library view renders its
+    // optional-components panel from `insight.components`, so arriving there
+    // directly from Overview left `insight` null and the panel never appeared
+    // at all; arriving via Activity showed it frozen at the last poll. Worse,
+    // its simulate-missing switches are CONTROLLED inputs bound to that stale
+    // object, so toggling one POSTed successfully and then snapped back — the
+    // feature read as broken rather than as stale.
+    const pollInsight = view === "finder" || view === "decisions" || view === "activity"
+      || view === "autoresearch" || view === "library";
     async function tick() {
       try {
         const h = await getHealth();
         if (!cancelled) { setHealth(h); setAppOnline(true); }
-      } catch { if (!cancelled) { setAppOnline(false); setHealth(null); setDiag(null); return; } }
+      } catch {
+        // TICKET-222: clear STATUS and INSIGHT too. Clearing only health and
+        // diag left the sidebar showing "app not running" directly above a
+        // "now: <title>" line still naming the song from before it died.
+        if (!cancelled) {
+          setAppOnline(false); setHealth(null); setDiag(null);
+          setStatus(null); setInsight(null);
+          return;
+        }
+      }
       try {
         const s = await getStatus();
         if (!cancelled) setStatus(s);
@@ -147,9 +176,11 @@ export function App() {
         {view === "finder"       && <Finder insight={insight} online={appOnline} />}
         {view === "decisions"    && <Decisions insight={insight} online={appOnline} />}
         {view === "activity"     && <Activity insight={insight} online={appOnline} />}
+        {view === "concerts"     && <Concerts online={appOnline} />}
         {view === "diagram"      && <DiagramView />}
         {view === "parameters"   && <Parameters online={appOnline} />}
         {view === "autoresearch" && <AutoResearch insight={insight} />}
+        {view === "library"      && <LibraryView insight={insight} online={appOnline} />}
         {view === "resources"    && <Resources />}
       </main>
     </div>

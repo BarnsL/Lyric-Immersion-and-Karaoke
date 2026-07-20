@@ -20,10 +20,15 @@ echo │  Enables: ✦ Generate lyrics by ear (AI transcription)    │
 echo │           ✦ Sync by listening (match lyrics to audio)    │
 echo │  Without it: these features show a hint and skip.        │
 echo └──────────────────────────────────────────────────────────┘
+REM TICKET-225: version specifiers below are QUOTED deliberately. Unquoted, cmd
+REM parses the greater-than sign as a redirection operator, which silently drops
+REM the version floor and writes pip output to a junk file instead of the console.
+REM Keep the quotes. Note this comment avoids the character it describes, because
+REM cmd still honours redirection inside a REM line.
 choice /C YN /M "Install faster-whisper?"
 if %errorlevel%==1 (
     echo Installing faster-whisper...
-    python -m pip install faster-whisper>=1.0 || (
+    python -m pip install "faster-whisper>=1.0" || (
         echo [!] Failed to install faster-whisper. Check your Python/pip.
         echo     You can retry manually: pip install faster-whisper
     )
@@ -46,7 +51,7 @@ echo └────────────────────────
 choice /C YN /M "Install yt-dlp?"
 if %errorlevel%==1 (
     echo Installing yt-dlp...
-    python -m pip install yt-dlp>=2024.0 || (
+    python -m pip install "yt-dlp>=2024.0" || (
         echo [!] Failed to install yt-dlp.
         echo     You can retry manually: pip install yt-dlp
     )

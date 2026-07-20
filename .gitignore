@@ -89,6 +89,18 @@ priconfig.xml
 # user's own runtime data — it stays on their machine and never ships.
 title_corrections.jsonl
 
+# TICKET-206/207/208: the rest of the runtime diagnostics corpus — language
+# corrections and the free-text notes the user types against an event in the dev
+# console. The note field is FREE TEXT, so unlike the files above it could contain
+# anything the user pastes, lyric lines included. That makes ignoring it a
+# copyright control, not just tidiness: these must never reach a public remote.
+# The glob is deliberately broad so a future diagnostics file is ignored by
+# default rather than by remembering to add it here.
+language_corrections.jsonl
+event_notes.jsonl
+*_corrections.jsonl
+*_notes.jsonl
+
 # Local 3h-watch + release packaging artifacts
 _monitor.py
 _monitor*.jsonl

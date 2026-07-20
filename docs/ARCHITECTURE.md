@@ -13,10 +13,24 @@ Doc map:
 - **ISSUES.md** - numbered behaviour tickets (matching / sync / rendering).
 - **PERFORMANCE.md** - rendering / CPU / audio-stutter tickets (PERF-###).
 - **RESEARCH.md** - background research that informed the design.
-- **docs/** - deep dives (CONCERT_DETECTION.md, GENERATION.md).
+- **DEPLOYMENT.md** - repo layout, the module map, build → deploy → run.
+- **BUILD.md** - producing the packages and the build guards.
+- **README.md** - the index of every doc in this folder.
 
-The app is ONE process: a Tkinter transparent overlay (`main.py:Overlay`) plus
-background worker threads, with a local HTTP API (`api.py`) for inspection.
+The app is a **main Python process** (a Tkinter transparent overlay,
+`main.py:Overlay`, plus background worker threads, with a local HTTP API in
+`api.py` for inspection) that **spawns child processes** for the work that must
+not be able to take the overlay down with it:
+
+| Child process | Spawned by | When | Why it is separate |
+|---|---|---|---|
+| `overlay/lyric-overlay.exe` (Tauri GPU overlay) | `main.py` (`subprocess.Popen`, `_tauri_child`) | when the Tauri renderer is enabled | GPU rendering; polls `GET /overlay`. Tk stays visible until this child proves it is painting, and the watchdog restores Tk if it dies. |
+| `recognize.py --child` (identify worker) | `main.py` (`_identify_proc`) | per sound-ID attempt | Loopback capture plus fingerprinting is GIL-heavy. Run at IDLE priority with no window, and killable on timeout without touching the overlay. |
+| `whisper_worker.py` (`--whisper-worker`) | `align.py` (`start()`, over a loopback socket with a per-run token) | per Whisper listen | Crash firewall (TICKET-184). A CTranslate2 CUDA fault throws on a native worker thread and calls `abort()`, which Python cannot catch, so the model runs somewhere that is allowed to die. Pinned as a hidden import in `DesktopKaraoke.spec`. |
+| dev-console exe (`dev-console/`) | `main.py` (`_devconsole_child`), from the tray | when the user opens the Developer Console | A separate Tauri desktop app that reads the localhost API. See **DEV_CONSOLE.md**. |
+
+Only the main process is always present. The others come and go, and none of
+them is required for the overlay to keep rendering.
 
 ```
 play audio ─▶ MediaWatcher (winsdk)  ─┐
@@ -42,13 +56,20 @@ The player title is a HINT; **sound is the authority**. Methods → confidence:
 | **Title cleaning** | clean_title/clean_artist, `extract_cover_original` | pulls the real song out of MV/cover/bilingual titles; covers route to the ORIGINAL artist (incl. "Song / Artist covered by X") |
 | **Language confidence** | `confidence.language_confidence` (`_ALWAYS_JA`/`_KNOWN_JA`) | the artist's usual language (Suisei/ReGLOSS → full JA) rejects an English same-title collision |
 | **Decide-by-ear / library match** | `align.transcribe_vocals`+`score_candidates`, `_decide_by_ear` | transcribe the live vocals (faster-whisper *small*) + rapidfuzz-match against the WHOLE cached library — identifies the song from what's SUNG when title+Shazam fail (MMD/cover cuts). Waveform-gated to vocal-active windows |
-| **Bundled (baked) lyrics** | `bundled_lyrics/`, `_seed_bundled_lyrics` | shipped LRCs for songs that always fail to fetch; AUTHORITATIVE — a `source: bundled` song can't be overridden by a sound mis-ID |
+
+> **No lyrics ship with the app (TICKET-124).** This is a sellable product, so every
+> lyric must be FOUND BY CODE at runtime (providers, YouTube captions, OCR, by-ear),
+> never copyrighted text baked into the build. `bundled_lyrics/` was removed from the
+> repo and `DesktopKaraoke.spec` ships nothing in its place. The `source: bundled`
+> handling still exists in `main.py` (it treats such a cache as authoritative and
+> exempt from the reject guards), but nothing seeds it in a shipped build, so it is
+> unreachable in practice. Do not document it as a lyric source.
 
 **Reconciliation:** in `_consume_async`, a heard song matching the loaded lyrics →
 calibrate timing; a heard *different* song needs a 2nd confirming read to switch; a
 `_title_locked` distinctive title ignores a one-off Shazam mis-ID of a same-artist
 track, BUT hearing the same other song **5× breaks the lock** (`wrong_song_strikes`)
-and switches; a `source: bundled` song ignores sound entirely. ~20 s in, `_decide_by_ear`
+and switches. ~20 s in, `_decide_by_ear`
 verifies the loaded lyrics actually match the singing and corrects from the library if
 not. Reels/site audio (bare site name, no artist) → suppressed (`is_non_music_source`).
 

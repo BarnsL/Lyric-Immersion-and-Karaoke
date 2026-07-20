@@ -150,6 +150,46 @@ real time: the runaway showed `pos=16.6` with `lyric_t=72.6` — a 56s gap that
 was invisible until someone read `karaoke.log` by hand. The Activity view shows
 that gap as a red number on a sliding toast the moment it happens.
 
+#### Every sync correction, whoever made it (TICKET-205)
+
+Sync narration comes from **one place**: `_smooth_offset` in `main.py`, the
+funnel all seventeen correction paths go through. Fifteen of those are automatic
+(the energy correlator, the OCR sync, the tier and fine-tune paths, align-by-ear,
+the live-follow and reset paths, and so on). The other two are the tray's manual
+`nudge` and `reset_offset`, deliberately routed through the same funnel so a hand
+correction glides like an automatic one and is narrated like one.
+
+Narration used to come from the callers, and only two of them bothered, so a song
+that visibly came into sync mid-play produced no toast and no log row. Reporting
+from the funnel means a new sync path cannot forget, because reporting is not its
+job.
+
+Each sync row reads as *what happened → why → evidence → outcome*:
+
+> **Sync nudge** — Moved the lyrics +3.40s (sync now +3.40s) because the
+> audio-energy correlator re-aligned the lyrics to the music. Applied at the end
+> of the line, so it did not cut mid-lyric.
+> `video 1:12` `lyric 1:15` `gap +3.4s` `moved +0.00s → +3.40s (Δ +3.40s)`
+
+The `moved A → B` chip is the offset either side of the change, so you never
+have to do the arithmetic. Corrections are narrated **when they actually land** —
+a deferred correction waits for the line boundary and is reported there, and one
+that gets cancelled first is never reported at all.
+
+**Sync held back** (`sync-ignored`) is the other new event, and the one worth
+understanding. `_smooth_offset` drops corrections below `sync_apply_min_s`
+(0.22s, or `sync_apply_min_s_scroll` 0.25s in a scroll layout). A single dropped
+correction is meaningless wobble, so this fires only when the same fix has been
+proposed and discarded **five times in a row**
+(`notable_sync_ignored_streak`) — which means the lyrics are visibly off and
+nothing in the engine is able to correct them. Its chip says `wanted A → B`, not
+`moved`, because nothing moved.
+
+Every correction that *applied* is narrated, with no additional threshold:
+`sync_apply_min_s` has already filtered the noise, and if the engine judged a
+move big enough to shift the lyrics on screen then it is big enough to explain.
+Set `notable_sync_min_s` above 0.0 if you want it quieter.
+
 The **Wrong Song** panel at the bottom of the Activity view lets you correct a
 title the engine reduced badly. It shows the raw video title, what `clean_title`
 reduced it to, and any active override. Click **Pick correct title** to see
@@ -163,6 +203,126 @@ material.
 > `IA & ONE` — the artist, not the song. Every downstream panel looked healthy.
 > The Wrong Song panel would show that reduction in one line, and picking the
 > correct title from the seen-strings list would re-fetch immediately.
+
+### Concerts — *the whole live pipeline in one page*
+New in v1.1.92 (TICKET-218). Concert handling is the most stateful thing the engine
+does, and almost none of it used to be observable: the mode verdict was a bare
+boolean whose reason lived only in a log line, the applause integrator counted in
+silence, and the chapter list was hard-wired to come back empty. A concert that
+behaved oddly gave you a blank panel and no way to tell a real parse failure from a
+bug.
+
+The organising principle is **mechanism, live state and its knobs together**. A
+threshold means nothing without the value currently being measured against it, which
+is why applause is drawn as a meter rather than printed as two numbers. It polls on
+the usual 2.5s cadence, and it reads `/concert` directly rather than `/insight`.
+
+**Mode** *(live)* — the verdict, and the rule that produced it. Four outcomes:
+`concert` (the title names the **event**, so the title is refused outright and songs
+are found by sound and by setlist), `live arrangement` (the title is still trusted,
+but the timing differs from the studio cut, so the offset is **followed** instead of
+reset to zero), `non-music video`, and `studio`. Two rows carry the provenance:
+*Verdict came from* gives the decider and its rule tag, *Because* gives the
+specifics. Rules are `duration` (over 10 minutes), `keyword` (and it names which
+title keyword matched), the three vetoes `loop-veto` (a looped or extended single
+song, so long but not a concert), `aside-veto` and `single-song-veto` (one song
+performed at an event, not the event itself), `no-cue`, plus `subs-demote`,
+`category-flip` and `nonmusic-demote` recorded when something later in the run
+overturns the first reading.
+
+> **The one that surprises people.** Any **cover** sets live-arrangement mode, with
+> no live, short or acoustic cue anywhere in the title. That is deliberate: a
+> cover's timing differs from the studio original exactly as a live take's does, so
+> following the offset is right. But it means the badge is frequently lit on a
+> studio-quality cover, and it quietly swaps in the `live` sync profile. The *Live
+> arrangement because* row names which of the three inputs actually fired (cleaned
+> title, raw player title, or cover), so you never have to assume the title said
+> "LIVE" somewhere.
+
+**Applause** *(live)* — a live cut pauses for applause while the player clock keeps
+running, so the lyrics drift ahead by the length of the pause. The detector looks for
+audio that is loud but **not** tonal singing, and acts when the singing returns. The
+meter is the current gap accumulating toward `applause_min_s`; at 100% it arms, and
+the pill goes `idle` → `watching` → `armed`. *When a gap completes* is the row to
+read, because the same detector has two completely different consequences: in a
+concert a gap means **re-identify the next song**, in a single live arrangement it
+means **two-point resync by ear**. *Last gap* reports the measured length of the last
+one; before TICKET-214 that value was reset one line before it was logged, so every
+applause message in the app's history claimed `~0.0s`. If a resync is being confirmed
+by a second listen, the two-point row shows the held offset and when it expires.
+
+**Setlist** *(event)* — chapters, from the video's own chapter marks or from
+timestamps parsed out of its description. When they exist they drive song changes
+deterministically: entering a song chapter fetches that title and anchors the offset
+to the chapter start, or to the measured vocal onset if the offline pass found one.
+The currently playing chapter is highlighted, and non-song chapters are badged.
+Empty means no chapters, which is a real and common state, not a fault: songs then
+come from banner OCR and by ear.
+
+**MC, talk and intermissions** *(event)* — the chapters treated as non-song segments.
+The engine does not fetch lyrics for these, and the previous song's lyrics stay up
+until the next real song chapter starts. **Read the caveat on this card carefully:**
+these are recognised by chapter **title** only, against a fixed skip list (intro,
+outro, MC, talk, opening, ending, encore, intermission, break, credits, staff roll
+and their Japanese equivalents). There is no audio-based MC detector, so a talk block
+with a song-like chapter name will be missed, and an **unchaptered concert cannot
+report non-song segments at all**. An empty card means "none identified", never "none
+present".
+
+**Between songs** *(live)* — the hold. When a new chapter starts and the offline pass
+has no measured onset for it, the lyrics are held back until vocals are actually
+heard, so they do not run during the applause and the introduction. The card shows
+whether it is holding, whether the offset has been anchored past the intro yet, how
+long the hold has run, and the point at which it releases regardless. That release
+timeout is `mv_intro_timeout`, which is **20.0s**; a stale comment and in-code
+fallback claimed 75s until TICKET-216, and were never the real value because the knob
+is always registered.
+
+**Offline audio plan** *(event)* — the offline pass downloads the audio once and
+measures each segment's true vocal **onset**, so lyrics anchor past the applause and
+intro rather than to the chapter mark. Each segment shows `onset` with the measured
+time, or `no onset` meaning the chapter start is used instead. The segment covering
+the current position is highlighted.
+
+**Watchdogs** *(live)* — two backstops for the characteristic concert failure, where
+the video moved on and the overlay did not.
+
+- **Unconfirmed switch**: a song heard but not yet confirmed by a second read.
+  It escalates after 15s when nothing is on screen and 90s when lyrics are already
+  up, because a blank overlay is the worse state to sit in.
+- **Same song showing for**: a concert song still up after 6.5 minutes (390s) almost
+  certainly changed and the boundary was missed, so a re-identify is forced.
+
+**Live resync cadence** *(live)* — a live arrangement drifts continuously, so the
+engine re-listens on a loop and backs off as confidence grows: fast while it is still
+catching up, slow once it has been in sync for several passes running. The card shows
+the in-sync streak, how many passes it takes to relax, the current gap between
+listens, and the three tier values.
+
+**Banner OCR** *(event)* — many concert streams caption the current song on screen,
+and the engine reads that banner as an identification source. The important row is
+**why it is blocked**, because this is the most misunderstood part of concert
+handling. OCR is suppressed entirely, in this order of precedence:
+
+| shown reason | meaning |
+|---|---|
+| chapters are present | a chapter setlist exists, so it drives song changes instead. The whole documented OCR pipeline never runs on a chaptered concert |
+| the video is not a concert | studio or live-arrangement mode; OCR is concert-only |
+| this video was judged non-music | the non-music demotion fired |
+| banner OCR is switched off | the `concert_ocr` toggle is off |
+
+For what the reader actually *read*, and how each line was judged, use **Song
+finder → What the screen reader sees**. This card answers only whether it is running.
+
+**Knobs that steer concert behaviour** — every concert-relevant knob, grouped by the
+mechanism it steers (applause detection, setlist and chapters, offline audio
+analysis, live sync thresholds, resync cadence, the live energy correlator, banner
+OCR, the between-songs hold) rather than as a flat alphabetical wall. Click a value
+to edit it, hover the name for its registered documentation. Same contract as
+**Parameters**: immediate, runtime-only, gone on restart. A knob the engine
+*refuses* now says so inline instead of appearing to have been accepted (TICKET-220).
+
+Validated by `scripts/probe_concert.py` (20 checks).
 
 ### Runtime map
 Static architecture diagram — how audio, metadata, lyric sourcing and rendering fit
@@ -180,6 +340,54 @@ installed. If it says *has never run*, it has never run.
 
 See [AUTORESEARCH.md](AUTORESEARCH.md) for the runner (`scripts/autoresearch.py`) and,
 importantly, the list of metrics that are **not** safe to optimise against.
+
+### Library — *making a fresh install testable*
+Added in v1.1.91. Both halves exist for the same reason: a developer machine has
+already cached everything and has every optional component installed, which is
+exactly the machine on which first-run bugs are invisible.
+
+**Lyric cache** (TICKET-210) — every lyric body the app has saved, with the count and
+the bytes on disk. Each row gives the title, artist, language, source, line **count**,
+file size and how long ago it was written; the currently loaded song is badged
+`playing`, and a show transcript is badged `subtitle`. Filter by title, artist or
+filename. **Refresh** re-reads the directory.
+
+**Clear cache** asks first, then offers **Delete all** or **Keep current** (everything
+except the song playing right now). Clearing makes the next play of each song go
+through the full find-and-fetch path, which is the only way to see what a new user
+sees. Cached lyrics come back automatically as songs play, but anything that was
+generated by ear has to be regenerated by listening again, so that is the one
+genuinely expensive thing to throw away.
+
+> **Copyright.** The table shows metadata and a line count, never lyric text. That is
+> enforced at the engine, not here: `/lyric_cache` excludes the body, romanisation and
+> translation fields outright rather than the console merely declining to render them.
+
+**Optional components** (TICKET-211) — the heavy optional pieces, and what the app
+would do without each. Availability is decided purely by "is it on disk", so
+exercising the without-it paths used to mean deleting several gigabytes and
+re-downloading them. The switch makes the engine **act** as though a piece is missing.
+
+| component | what its absence changes |
+|---|---|
+| `whisper` | generate-by-ear, sync-by-listening and the wrong-lyrics reject path all decline with a hint. The single biggest difference between a lean install and a full one |
+| `model` | the weights (about 2 GB) download on first use, so simulating absence shows the first-run download message and a longer stall timeout, not a failure |
+| `gpu` | the CUDA and cuBLAS libraries (about 1.9 GB). Everything still works on the CPU, just slower, and full-episode subtitle transcription is skipped |
+| `ytdlp` | deep generation quietly does nothing, and pulling a video's caption track shows a needs-yt-dlp hint |
+| `node` | a JS runtime on PATH, which yt-dlp needs to get past YouTube's anti-bot checks on audio downloads. **Detected only**, not simulatable |
+
+A component that is genuinely not installed is badged `absent` and its switch is
+disabled, since there is nothing to pretend about. One being simulated is badged
+`simulated missing`, and the card header shows `simulating a lean install` so you
+cannot forget the machine is lying to you. The row also reports real GPU status and
+any whisper import error. Simulating absence does not re-run the first-time download.
+
+Note that these switches are **controlled** inputs bound to `/insight`. Until
+TICKET-221 the view was not on the insight poll list at all, so arriving here
+directly left the panel unrendered, and arriving via Activity showed it frozen:
+toggling a switch POSTed successfully and then snapped back, which read as broken
+rather than stale. If you ever see that again, the poll list in `App.tsx` is the
+place to look.
 
 ### Resources
 Links to worktrees, docs, corpora and the API endpoints.
@@ -265,6 +473,12 @@ sidebar and close the older. A stale copy also used to linger at
 `D:\DesktopKaraoke\dev-console\` beside the real one in `_internal\dev-console\`;
 `scripts/deploy_local.py` now refreshes both.
 
+**`npm run tauri:dev` starts and immediately exits**
+The same guard, seen from the other side. A deployed console is already open, and it
+shares a bundle identifier with the dev build, so the dev process hands off to the
+existing window and quits. Close the deployed console and run it again. See
+[Editing the frontend live](#editing-the-frontend-live).
+
 **A view looks empty, but a song is playing**
 Check the *now* strip at the top first — if the playhead is moving, the console is live
 and you are looking at an **event panel** that simply has no event yet. See
@@ -304,6 +518,46 @@ The app finds the exe at `_internal/dev-console/` in a frozen build, else
 `dev-console/src-tauri/target/release/`. It also checks a sibling
 `dev-console/` directory — keep that in step or delete it, because a stale exe there
 is indistinguishable from the real one once it is on screen.
+
+### Editing the frontend live
+
+The two ways of running the console behave completely differently when you change a
+`.tsx` file, and mistaking one for the other wastes a lot of time.
+
+- **`npm run tauri:dev`** loads the frontend from the Vite dev server at
+  `127.0.0.1:1420`, so an edit hot-reloads in place. This is how to work on a view.
+- **The packaged console** bakes the built frontend into the exe via `frontendDist`.
+  Nothing is loaded from disk at runtime, so a `.tsx` change is invisible until you
+  run `npm run tauri:build` and redeploy. There is no way to patch a deployed
+  console's UI in place, and no error to tell you that you tried.
+
+HMR needs the websocket on the secondary port `127.0.0.1:1421` (set in
+`vite.config.ts`), and Tauri's CSP has to permit it. The shipped `csp` deliberately
+does not, and Tauri injects the production `csp` into dev builds when no `devCsp` is
+declared, so HMR was silently blocked and edits appeared to need a full rebuild even
+under `tauri:dev`. `tauri.conf.json` now carries a **`devCsp`** that adds the HMR
+origin for **dev only**, leaving the shipped CSP unweakened. If HMR stops working,
+check that pair first: any port change in `vite.config.ts` has to be mirrored there.
+
+**The single-instance trap.** Only one console can exist at a time, guaranteed twice
+over: `tauri-plugin-single-instance` in `src-tauri/src/lib.rs` (a second launch
+un-minimises, shows and focuses the existing window instead of opening its own), and
+the app's own check in `launch_dev_console`, which finds an already-open console by
+window title and focuses it.
+
+The trap is that the plugin keys on the **bundle identifier**, which a dev build and
+a deployed build share. They therefore count as *the same instance*. So starting
+`npm run tauri:dev` while a deployed console is already open makes the **dev**
+process hand off to the deployed window and exit: your dev build appears to launch,
+do nothing, and die, while the console on screen stubbornly shows the old UI. Close
+the deployed console first. It is a healthy guard behaving exactly as designed, and
+it looks precisely like a broken toolchain.
+
+That title-based half has its own fragility: the tray matches
+`main.py._DEVCONSOLE_TITLE` against the window title in
+`src-tauri/tauri.conf.json`. Two files, two languages, nothing structurally tying
+them together, so renaming the window would silently disable the guard.
+`scripts/check_devconsole.py` now asserts the two strings match (TICKET-223).
 
 ### Deploying
 

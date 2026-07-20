@@ -91,7 +91,7 @@ export function NowPane({ insight }: { insight: InsightPayload }) {
       <div className="now-head">
         <div className="now-title">
           <h2 title={n.player_title ?? ""}>
-            {n.player_title || <span className="empty">nothing playing</span>}
+            {n.player_title || <span className="empty-inline">nothing playing</span>}
           </h2>
           <div className="now-sub">
             {n.player_artist || "unknown artist"}

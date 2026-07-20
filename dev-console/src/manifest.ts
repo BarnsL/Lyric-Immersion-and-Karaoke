@@ -1,7 +1,8 @@
 import type { DiagramEdge, DiagramNode, KnobGroup, Resource } from "./models";
 
 // ─── Runtime diagram (mirrors docs/REPO_ORGANIZATION.md flowchart) ──────────
-// 5-column layered layout so an SVG grid can position without overlaps.
+// 8-column layered layout (Diagram.tsx `COLS`) so an SVG grid can position
+// without overlaps. This said 5 for a long time while nodes used col: 0..7.
 // Kept small on purpose — the goal is orientation, not exhaustive detail.
 export const DIAGRAM_NODES: DiagramNode[] = [
   { id: "player",   label: "Media apps",         sub: "Spotify · YouTube · Games", col: 0, row: 0, kind: "input" },
@@ -20,6 +21,14 @@ export const DIAGRAM_NODES: DiagramNode[] = [
   // wrong song. A map that goes straight from the player to the providers hides the
   // single most consequential transformation in the whole identification path.
   { id: "clean",    label: "clean_title()",      sub: "credits → search title",     col: 2, row: 3, kind: "analyzer" },
+  // TICKET-205: every sync correction in the app — energy correlator, sync tier,
+  // Shazam, vocal onset, OCR caption reader, fine-tuner, manual nudge — converges
+  // on this ONE function, which decides whether it applies now, waits for the end
+  // of the line, or is dropped under the apply floor. It is also where the
+  // correction gets narrated to this console. The map showed the analyzers but
+  // not the thing that arbitrates between them, which made it impossible to see
+  // why two subsystems agreeing still moved nothing.
+  { id: "sync",     label: "_smooth_offset()",   sub: "one funnel · all corrections", col: 3, row: 2, kind: "decision" },
 
   { id: "overlay",  label: "main.py Overlay",    sub: "state + settings + clock",   col: 3, row: 0, kind: "decision" },
   { id: "decision", label: "confidence.py",      sub: "TRUST · CAUTION · SWITCH",   col: 3, row: 1, kind: "decision" },
@@ -27,6 +36,7 @@ export const DIAGRAM_NODES: DiagramNode[] = [
   { id: "prov",     label: "fetch_lyrics",       sub: "LRCLIB · syncedlyrics",      col: 4, row: 0, kind: "source" },
   { id: "caps",     label: "deep_transcribe",    sub: "YouTube captions (yt-dlp)",  col: 4, row: 1, kind: "source" },
   { id: "ocr",      label: "concert_ocr",        sub: "burned-in title / lines",    col: 4, row: 2, kind: "source" },
+  { id: "concert",  label: "concert setlist",    sub: "chapters · onsets · applause", col: 4, row: 3, kind: "decision" },
   { id: "gen",      label: "generate by ear",    sub: "Whisper fallback",           col: 4, row: 3, kind: "source" },
 
   { id: "annot",    label: "annotate",           sub: "furigana · romaji · en",     col: 5, row: 1, kind: "annotate" },
@@ -56,6 +66,18 @@ export const DIAGRAM_EDGES: DiagramEdge[] = [
   { from: "sc",       to: "decision" },
   { from: "align",    to: "decision" },
   { from: "overlay",  to: "decision" },
+
+  // TICKET-205: the sync funnel's inputs, and its single output back to the clock.
+  { from: "recog",    to: "sync" },
+  { from: "sc",       to: "sync" },
+  { from: "align",    to: "sync" },
+  { from: "ocr",      to: "sync", dashed: true },
+  // TICKET-218: the concert path. Chapters and the offline onset plan drive song
+  // changes deterministically, and the applause detector feeds the same sync
+  // funnel. Dashed into sync because it only contributes in a live/concert cut.
+  { from: "concert",  to: "sync", dashed: true },
+  { from: "concert",  to: "decision" },
+  { from: "sync",     to: "overlay" },
 
   { from: "decision", to: "prov" },
   { from: "decision", to: "caps" },
@@ -145,7 +167,7 @@ export const RESOURCES: Resource[] = [
   { kind: "worktree", title: "autoresearch",         location: "D:\\Lyric-Immersion-AR",    path: "D:\\Lyric-Immersion-AR",    detail: "Landing zone for `uditgoenka/autoresearch` loops. Never merge into master." },
 
   // Runtime deploy
-  { kind: "worktree", title: "deployed app",         location: "D:\\DesktopKaraoke",        path: "D:\\DesktopKaraoke",        detail: "Where the running v1.1.66 lives. `robocopy dist\\DesktopKaraoke` mirrors here." },
+  { kind: "worktree", title: "deployed app",         location: "D:\\DesktopKaraoke",        path: "D:\\DesktopKaraoke",        detail: "Where the running build lives. `robocopy dist\\DesktopKaraoke` mirrors here." },
 
   // Docs
   { kind: "doc", title: "HANDOVER-2026-07-04.md",  location: "master · handover",        path: "D:\\Desktop-Karaoke\\HANDOVER-2026-07-04.md",     detail: "Baseline handover (v1.1.63); consult before sync / chapter / auto-game / gaming-preset / clean_title / build.bat work." },
