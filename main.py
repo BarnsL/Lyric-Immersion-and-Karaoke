@@ -369,6 +369,147 @@ def is_non_music_source(title, artist):
     return bool(t in _NON_MUSIC_TITLES and not (artist or "").strip())
 
 
+# ── TICKET-226: SMTC source-eligibility policy ───────────────────────────────
+# WHY (2026-07-19 incident): an agent/chat desktop app published a Windows SMTC
+# session for a ~15-second notification/TTS blip — title only, no artist, no
+# album, no URL. Nothing in the intake path questioned it: _pick() ranked every
+# enumerated session by pinned > loudest > sticky > first-playing and never
+# asked whether the publisher was a media application at all, and the one intake
+# filter (is_non_music_source) only recognises a hard-coded set of WEBSITE names
+# with an empty artist. So the blip became a "track change", and in Subtitles
+# mode its bare app name was handed to a title search that returned an unrelated
+# video's caption track, which then sat on screen over other apps.
+#
+# The gate below is POSITIVE-first, mirroring the design already used by
+# window_titles.py (narrow process allowlist + a required music marker; anything
+# else is never read). A session is followed when the publisher is a known media
+# application; an UNKNOWN publisher must instead present real now-playing
+# evidence. The deny tier exists because a browser ENGINE is not a browser —
+# a WebView2/Electron shell can carry a browser substring in its AUMID and would
+# otherwise pass the allowlist. Matching is on the source app id only, never on
+# the title, so a song legitimately named after one of these apps still plays.
+_VIDEO_APP_HINTS = (
+    "vlc", "mpc-hc", "mpc-be", "mpchc", "potplayer", "mpv", "kodi", "plex",
+    "jellyfin", "emby", "video.ui", "films", "movies", "wmplayer",
+    "netflix", "primevideo", "disney", "hulu",
+)
+# Publishers that are never a music/video source, even when a hint above also
+# matches (deny is checked FIRST). Ourselves, agent/chat desktop apps, embedded
+# browser runtimes, terminals and editors. Generic words carry the ".exe" so
+# they cannot collide with an unrelated AUMID.
+_NEVER_MEDIA_APP_HINTS = (
+    # self — the overlay must never follow its own audio
+    "lyric-immersion", "lyric_immersion", "lyricimmersion", "desktopkaraoke",
+    # agent / chat / assistant desktop apps (the 2026-07-19 publisher class)
+    "hermes", "claude", "chatgpt", "copilot", "cursor", "ollama", "lmstudio",
+    # embedded browser runtimes — an app shell, not a browser
+    "msedgewebview2", "webview2", "electron.exe",
+    # terminals
+    "windowsterminal", "wt.exe", "powershell", "pwsh", "cmd.exe", "conhost",
+    "alacritty", "wezterm", "mintty", "putty",
+    # editors / IDEs
+    "vscode", "code.exe", "devenv.exe", "jetbrains", "pycharm", "idea64",
+    "sublime_text", "notepad++", "notepad.exe",
+)
+MEDIA_MIN_DURATION_S = 30.0   # default for the media_min_duration_s tune knob
+
+
+def _app_hint_match(source_app, hints):
+    """Substring-match an SMTC source_app / AUMID against a hint tuple."""
+    s = (source_app or "").strip().lower()
+    return bool(s) and any(h in s for h in hints)
+
+
+def is_known_media_app(source_app):
+    """TICKET-226: True when the publisher is a RECOGNISED media application —
+    a browser, a music player, a video player, or one of our own synthetic
+    sources, which already passed a positive gate of their own (window_titles
+    requires an allowlisted process AND a music-marker suffix; discord_rpc reads
+    a declared listening activity). The deny tier is checked first, so an app
+    shell that merely embeds a browser engine does not qualify."""
+    src = (source_app or "").strip().lower()
+    if not src or _app_hint_match(src, _NEVER_MEDIA_APP_HINTS):
+        return False
+    if src.startswith("window-title:") or src.startswith("discord-rpc:"):
+        return True
+    return bool(_app_hint_match(src, BROWSER_HINTS)
+                or _app_hint_match(src, _MUSIC_APP_HINTS)
+                or _app_hint_match(src, _VIDEO_APP_HINTS))
+
+
+def media_source_eligible(source_app, title, artist="", album="", duration=0.0,
+                          url="", min_duration_s=MEDIA_MIN_DURATION_S):
+    """TICKET-226: may this media session be treated as something we play lyrics
+    for? Returns (ok, reason) — the reason is logged once and surfaced in /diag
+    so a legitimate-but-unknown player is discoverable, not silently dropped.
+
+    Order: no title -> no. Deny-listed publisher -> no. Known media app
+    (browser / music player / video player) -> yes. UNKNOWN publisher -> yes
+    only with at least two independent now-playing signals out of {artist,
+    album, duration >= min_duration_s, a browser-pushed URL}. The 2026-07-19
+    incident session had none of the four.
+
+    A duration of 0 counts as no evidence rather than as disqualifying: real
+    livestreams legitimately report 0/None.
+
+    `url` is accepted for callers that know the browser-pushed URL (the Overlay
+    does; MediaWatcher._pick does not) — browser sources already pass on the
+    allowlist, so _pick omitting it costs nothing.
+    """
+    if not (title or "").strip():
+        return False, "no title"
+    src = (source_app or "").strip().lower()
+    if _app_hint_match(src, _NEVER_MEDIA_APP_HINTS):
+        return False, "publisher is not a media application"
+    if is_known_media_app(src):
+        return True, "known media app"
+    evidence = []
+    if (artist or "").strip():
+        evidence.append("artist")
+    if (album or "").strip():
+        evidence.append("album")
+    try:
+        dur = float(duration or 0.0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if dur >= float(min_duration_s or 0.0):
+        evidence.append("duration")
+    if (url or "").strip():
+        evidence.append("url")
+    if len(evidence) >= 2:
+        return True, "unknown app with now-playing evidence: " + "+".join(evidence)
+    return False, ("unknown app with no now-playing evidence" if not evidence
+                   else "unknown app, only one now-playing signal: " + evidence[0])
+
+
+def captions_body_overrun(lines, duration, factor=3.0):
+    """TICKET-226: how far a caption/subtitle body outruns the item it claims to
+    caption. Returns (body_end_s, overruns: bool). A body that runs many times
+    longer than the track is captioning something else — in the 2026-07-19
+    incident a 15-second session was bound to a 31-minute transcript.
+
+    A duration of 0/None means "not reported" (live streams do this), and a
+    factor of 0 disables the check; both return overruns=False.
+    """
+    try:
+        dur = float(duration or 0.0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    try:
+        fac = float(factor or 0.0)
+    except (TypeError, ValueError):
+        fac = 0.0
+    body_end = 0.0
+    try:
+        t = ((lines or [])[-1] or {}).get("t") or []
+        body_end = float(t[-1]) if t else 0.0
+    except Exception:
+        body_end = 0.0
+    if dur <= 0 or fac <= 0:
+        return body_end, False
+    return body_end, bool(body_end > dur * fac)
+
+
 # Social / short-video FEED hosts. A Reel or Short there plays background music
 # that Windows SMTC reports as a real song (title + artist), so is_non_music_source
 # — which keys off a bare site-name title — can't catch it, and lyrics get slapped
@@ -611,6 +752,15 @@ class MediaWatcher:
         self._audible_threshold = 0.005
         self._last_pick_reason = "init"
         self._last_audible_scores: dict = {}
+        # TICKET-226: source-eligibility gate (see media_source_eligible). The
+        # minimum duration an UNKNOWN publisher's session needs before duration
+        # counts as now-playing evidence; mirrored from the media_min_duration_s
+        # tune knob by set_media_min_duration(). _rejected_sessions is the last
+        # poll's ineligible set, surfaced in /diag so a real player that lands
+        # here can be found and pinned instead of silently disappearing.
+        self._min_media_dur_s = MEDIA_MIN_DURATION_S
+        self._rejected_sessions: list = []
+        self._rejected_logged: set = set()
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
@@ -787,6 +937,12 @@ class MediaWatcher:
             self._last_pick_reason = "pinned-missing"
             return None
 
+        # TICKET-226 (2026-07-19 incident): before ANY ranking, drop sessions
+        # whose publisher is not a media application. This runs after the pin
+        # check on purpose — an explicit pin is the user's escape hatch for a
+        # niche player the policy does not know, and must still win absolutely.
+        sessions = self._filter_eligible(sessions)
+
         def sid(s):
             return s["source"]
 
@@ -886,6 +1042,41 @@ class MediaWatcher:
         self._last_pick_reason = "none"
         return None
 
+    def _filter_eligible(self, sessions):
+        """TICKET-226: keep only sessions that pass media_source_eligible.
+
+        Rejections are recorded for /diag and logged ONCE per (session, reason)
+        — this loop runs ~7x/second, so logging every poll would bury the log
+        the incident was reconstructed from. The remembered set is pruned to the
+        ids still present so a re-appearing session logs again.
+        """
+        eligible, rejected = [], []
+        with self._lock:
+            min_dur = self._min_media_dur_s
+        for s in sessions:
+            try:
+                ok, why = media_source_eligible(
+                    s.get("source"), s.get("title"), s.get("artist"),
+                    s.get("album"), s.get("duration"), min_duration_s=min_dur)
+            except Exception:
+                ok, why = True, "policy error - allowed"
+            if ok:
+                eligible.append(s)
+                continue
+            rejected.append({"id": s.get("id") or "", "source": s.get("source") or "",
+                             "title": s.get("title") or "", "reason": why})
+            key = (s.get("id") or "", why)
+            if key not in self._rejected_logged:
+                self._rejected_logged.add(key)
+                log.info("media source ignored: %r (app %r) - %s. Pin it from the "
+                         "tray Source menu if this really is a player.",
+                         s.get("title") or "", s.get("source") or "?", why)
+        live = {(r["id"], r["reason"]) for r in rejected}
+        self._rejected_logged &= live
+        with self._lock:
+            self._rejected_sessions = rejected
+        return eligible
+
     def _score_sessions_by_audio(self, sessions):
         """TICKET-118: map {session_id: peak_amplitude} by substring-matching
         each session's source_app (e.g. 'app.brave.brave') against the list
@@ -968,6 +1159,22 @@ class MediaWatcher:
         """TICKET-117: (pinned_id, pinned_app) tuple under lock."""
         with self._lock:
             return self._pinned_id, self._pinned_app
+
+    def set_media_min_duration(self, seconds):
+        """TICKET-226: mirror the media_min_duration_s tune knob into the
+        watcher thread. Thread-safe; read by _pick on the next poll."""
+        try:
+            v = float(seconds)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            self._min_media_dur_s = max(0.0, v)
+
+    def list_rejected_sessions(self):
+        """TICKET-226: sessions the eligibility gate refused on the last poll,
+        each {id, source, title, reason}. Diag only — cached, no WinRT call."""
+        with self._lock:
+            return [dict(s) for s in self._rejected_sessions]
 
     def set_audible_pref(self, on, threshold=None):
         """TICKET-118: enable/disable the audible-session tiebreaker. Called
@@ -3582,6 +3789,12 @@ class Overlay:
             # session's source_app.
             "prefer_audible_session":       1,    # 1 = use Core Audio peak as a tiebreaker, 0 = pre-118 sticky-only
             "prefer_audible_threshold":     0.005,  # peak below this is 'silent' (~-46 dBFS)
+            # ── TICKET-226: source-eligibility gate (see media_source_eligible) ──
+            # How long an UNKNOWN publisher's session must be before duration
+            # counts as one of the two now-playing signals it needs. Known
+            # players (browsers / music / video apps) skip the check entirely.
+            "media_min_duration_s":        30.0,  # shorter unknown-app sessions are notification blips, not tracks
+            "captions_max_overrun_factor":  3.0,  # reject a caption body longer than duration x this (0 = off)
             # ── v1.1.53: previously inline-only knobs, now REGISTERED so every
             # weight / TPVR / OCR-sync / decision setting is live-adjustable via
             # POST /tune with no rebuild. set_tune() only accepts registered keys
@@ -3918,6 +4131,13 @@ class Overlay:
             )
         except Exception:
             pass
+        # TICKET-226: mirror the source-eligibility duration floor too, so the
+        # very first _pick already uses the user's value.
+        try:
+            self.media.set_media_min_duration(
+                self._tune.get("media_min_duration_s", MEDIA_MIN_DURATION_S))
+        except Exception:
+            pass
         self.character = Character(self.root, _DATA)
         if self.character_on:
             self.character.set_enabled(True)
@@ -4223,7 +4443,12 @@ class Overlay:
         self._live_sync_streak = 0          # new song → resync aggressively again (~8×/min)
         self._live_resync_gap = None
         self._live_resync_inflight = False
-        log.info("track change: %r / %r (dur %s)%s%s", title, artist, duration,
+        # TICKET-226: log the PUBLISHING app too. The 2026-07-19 incident had to
+        # be reconstructed by inference precisely because this line recorded only
+        # title/artist/duration — the one field that identifies who published the
+        # session was never written down.
+        log.info("track change: %r / %r (dur %s) [app %s]%s%s", title, artist, duration,
+                 (self._last_src or "?"),
                  " [live-arrangement]" if self._live_arrangement else "",
                  " [cover]" if getattr(self, "_is_cover", False) else "")
         # No explicit `title=`: `title` here is the CLEANED name, while every other
@@ -13114,7 +13339,15 @@ class Overlay:
             "pinned_grace_s": self._pinned_grace_s(),
             "pinned_grace_remaining_s": 0.0,
             "available": [],
+            # TICKET-226: sessions the eligibility gate refused, with the reason.
+            # A legitimate but unrecognised player shows up here instead of just
+            # vanishing, and can then be pinned from the tray Source menu.
+            "ignored": [],
         }
+        try:
+            out["ignored"] = self.media.list_rejected_sessions()
+        except Exception:
+            pass
         try:
             sessions = self.media.list_sessions()
         except Exception:
@@ -13722,6 +13955,12 @@ class Overlay:
                     int(self._tune.get("prefer_audible_session", 1) or 0),
                     float(self._tune.get("prefer_audible_threshold", 0.005)),
                 )
+            except Exception:
+                pass
+        # TICKET-226: same for the source-eligibility duration floor.
+        if key == "media_min_duration_s":
+            try:
+                self.media.set_media_min_duration(new)
             except Exception:
                 pass
         # M2: a /tune flip of gpu_renderer_on starts or stops the GL child
@@ -14459,6 +14698,22 @@ class Overlay:
                 self._gen_token += 1
                 self._deep_token += 1
                 self._generating = False
+                # TICKET-226 (2026-07-19 incident): the token bumps cancel work
+                # still IN FLIGHT, but an ALREADY-APPLIED subtitle body was left
+                # rendered — it survived the toggle and sat over other apps for
+                # forty minutes. A subtitle body is ephemeral by definition (it is
+                # saved unindexed, meta.subtitle True), so drop it here the same
+                # way _subs_no_captions_fallback drops a non-caption body.
+                try:
+                    if self.lines and isinstance(self.meta, dict) and self.meta.get("subtitle"):
+                        log.info("subtitles off — clearing the transcript body (%d lines)",
+                                 len(self.lines))
+                        self.lines, self._lyrics_path, self.idx, self._kara = [], None, -1, []
+                        self.cv.delete("all")
+                        self._clear_stream()
+                        self._hint("")
+                except Exception:
+                    pass
             self._set_subtitle_active(False, "menu-off")
             # The setter early-returns when the flag was already False (e.g.
             # inside the per-track bootstrap gap) — restore the user's music
@@ -15976,6 +16231,20 @@ class Overlay:
         artist, title = self._track
         # exact video URL (param > browser-pushed) beats a fuzzy title search
         query = url or self._now_url or self._last_raw_title or title
+        # TICKET-226 (2026-07-19 incident): when `query` is not a URL, the fetcher
+        # turns it into an unbounded `ytsearch1:` web search, and the fallback
+        # chain above degrades to the bare window/app title. That is how an app
+        # name became a search term and an unrelated video's caption track ended
+        # up on screen. A title search is only meaningful for a source that plays
+        # video — require a real URL, or a browser/video publisher.
+        if not re.match(r"https?://", str(query or "")):
+            _src = (self._last_src or "").lower()
+            if not is_known_media_app(_src):
+                log.info("captions: no video URL and %r is not a recognised media "
+                         "source - not searching the web by title", _src or "?")
+                if not silent:
+                    self._hint("No video to pull captions from")
+                return
         lang = self.meta.get("lang", "ja")
         # Guard by _track_seq (bumped ONLY on a real song change), NOT _deep_token
         # — generation / a title re-report bump _deep_token mid-fetch and would
@@ -16147,6 +16416,18 @@ class Overlay:
         if lang in _BAD_CAPTIONS_LANGS and is_jp_vagency(title, artist, strict=(lang == "zh")):
             log.info("captions: rejected %s track for JP-act %r / %r — wrong-language collision",
                      lang, title, artist)
+            return
+        # TICKET-226 (2026-07-19 incident): a caption body that runs vastly longer
+        # than the thing it is supposed to caption is not that thing's captions —
+        # a 15-second session was bound to a 31-minute transcript pulled from an
+        # unrelated video. Last line of defense, after every gate upstream.
+        # Duration 0/None is skipped on purpose: livestreams legitimately report it.
+        _factor = self._tune.get("captions_max_overrun_factor", 3.0)
+        _body_end, _overruns = captions_body_overrun(lines, self._cur_duration, _factor)
+        if _overruns:
+            log.info("captions: rejected — body runs %.1fs but the track is only "
+                     "%.1fs (over %sx); these captions belong to something else",
+                     _body_end, float(self._cur_duration or 0.0), _factor)
             return
         try:
             out = LYRICS_DIR / f"{slugify(title)}.json"

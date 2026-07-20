@@ -8,6 +8,105 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
+## v1.1.93 — 2026-07-19 (TICKET-226 — a desktop app's notification blip became "the song")
+
+### TICKET-226 — the overlay read another application's window as a track, then captioned it
+
+**Symptom:** a line of unrelated English text appeared over the desktop and stayed
+there for ~40 minutes, on top of other applications, surviving screenshots and the
+Subtitles toggle being switched off. `/status` reported `matched_title: "Hermes"` —
+the name of an agent desktop application that was running, not anything the user
+had played.
+
+**What actually happened**, from `karaoke.log`:
+
+    21:59:45  track change: 'Hermes' / '' (dur 15.424)
+    21:59:45  subtitle toggle on -> captions/transcript pipeline only
+    22:00:17  captions: no manual track - retrying with YouTube auto-captions ['en']
+    22:00:26  captions: 1377 en lines from YouTube auto-captions for 'Hermes'
+    22:00:26  captions: applied 1377 lines -> hermes.json (subtitle body, unindexed)
+    22:18:55  subtitle mode OFF (menu-off)          <- body stayed on screen
+    22:25:32  same song re-reported ('Hermes') - keeping sync, no reset
+
+A desktop application published a Windows SMTC session for a ~15-second
+notification/speech blip. The app followed it, and in Subtitles mode searched the
+web for that name, landing on an unrelated video whose auto-caption track (31
+minutes of prose) was bound to a 15-second "track".
+
+Neither OCR nor audio identification was involved — the OCR path is gated on a
+browser source plus an anime host and never ran in this window.
+
+**Root causes — four independent gaps, each sufficient on its own:**
+
+1. **No source policy.** `MediaWatcher._pick` ranked every enumerated session by
+   pinned > loudest > sticky > first-playing and never asked whether the publisher
+   was a media application. `source_app_user_model_id` was captured and then unused
+   for eligibility. The only intake filter, `is_non_music_source`, recognises a
+   hard-coded set of WEBSITE names with an empty artist — an arbitrary application
+   name is not one, so the blip passed as a track.
+2. **No evidence gate.** Everything that screamed "not media" was ignored: empty
+   artist, empty album, 15.4-second duration, no browser URL. Zero of four.
+3. **A title became a web search.** With no URL, `load_youtube_captions` degraded
+   its query to the bare window/app title, and `deep_transcribe.fetch_captions_only`
+   turns any non-URL string into `ytsearch1:`. The auto-caption retry then makes
+   almost any word return 1000+ lines of prose.
+4. **A subtitle body outlived its mode.** Turning Subtitles off bumped the
+   generation tokens (cancelling in-flight work) but never dropped an
+   already-applied body, so it rendered indefinitely.
+
+**Fix — positive gate first, mirroring `window_titles.py`:**
+
+- **`media_source_eligible(source_app, title, artist, album, duration, url)`**
+  (`main.py:441`) with `is_known_media_app` (`main.py:423`). A session is followed
+  when the publisher is a RECOGNISED media application — browser
+  (`BROWSER_HINTS`), music player (`_MUSIC_APP_HINTS`), video player (new
+  `_VIDEO_APP_HINTS`), or one of our own synthetic sources (`window-title:`,
+  `discord-rpc:`), which already passed positive gates of their own. An UNKNOWN
+  publisher must present at least two independent now-playing signals from
+  {artist, album, duration >= `media_min_duration_s`, browser-pushed URL}. A
+  reported duration of 0 counts as no evidence rather than as disqualifying,
+  because live streams legitimately report it.
+- **Deny tier** `_NEVER_MEDIA_APP_HINTS` (`main.py:400`), checked FIRST: ourselves,
+  agent/chat/assistant applications, embedded browser runtimes (a WebView2 or
+  Electron shell can carry a browser substring in its AUMID and would otherwise
+  pass the allowlist), terminals, editors. Matching is on the publishing
+  application id only, never on the title — a song legitimately NAMED after one of
+  these applications still plays.
+- **Enforced in `MediaWatcher._pick`** via `_filter_eligible` (`main.py:1046`),
+  before any ranking. Deliberately AFTER the pin check: an explicit pin is the
+  user's escape hatch for a player the policy does not know, and still wins
+  absolutely. Rejections are logged once per session (the loop runs ~7x/second)
+  and surfaced as `/diag.sessions.ignored`, so an unrecognised real player is
+  discoverable and pinnable rather than silently gone.
+- **Search-query gate** (`main.py:16235`): a non-URL caption query is only handed
+  to the web when the publisher is a recognised media source.
+- **Body/track consistency gate** — `captions_body_overrun` (`main.py:486`), applied
+  in `_apply_captions`. A caption body running more than
+  `captions_max_overrun_factor` times the reported track length is rejected as
+  belonging to something else. Skipped when duration is 0/None.
+- **Persistence fix** (`main.py:14702`): Subtitles on->off now drops an
+  already-applied ephemeral body (`meta.subtitle`), the same way
+  `_subs_no_captions_fallback` drops a non-caption body.
+- **Diagnostic** (`main.py:4451`): the `track change` line now records the
+  publishing application. Its absence is why this incident had to be reconstructed
+  by inference — the one field identifying the publisher was never written down.
+
+**Tune knobs:** `media_min_duration_s` (default 30.0),
+`captions_max_overrun_factor` (default 3.0, 0 disables).
+
+**Scope:** the gate sits in the Windows SMTC path (`_loop_win32` -> `_pick`). The
+Linux MPRIS loop (`_loop_mpris`) fills `_state` directly and is NOT gated yet —
+the policy would transfer cleanly to a D-Bus bus name, but it needs a run against
+the mock-player CI test before it goes in.
+
+**Guard:** `tests/test_media_source_policy.py` — 21 tests, no live media session
+needed. Covers the incident tuple, deny-tier absoluteness, browser/music/video and
+synthetic sources, the two-signal rule, the pinned-unknown-player escape hatch,
+log-once behaviour, and the caption overrun check including the live-stream
+(duration 0) exemption.
+
+---
+
 ## v1.1.92 — 2026-07-19 (TICKET-214…224 — the Concerts panel, and the numbers that were never true)
 
 ### TICKET-214 — every applause gap this app has ever logged said "~0.0s"

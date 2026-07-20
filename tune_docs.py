@@ -155,6 +155,17 @@ TUNE_DOC = {
         "audio locks are protected, so captions are used less. Lower it and "
         "captions take over more often. Typical 0.1 to 1.0, default 0.4. Read by "
         "the apply caption re-time step.",
+    "captions_max_overrun_factor":
+        "How many times longer than the playing item a downloaded caption or "
+        "subtitle track may run before it is rejected as belonging to something "
+        "else. A track that lasts a few seconds cannot honestly carry half an hour "
+        "of captions, and that mismatch is the last chance to notice the wrong "
+        "video was fetched. Raise it to accept looser matches, at the risk of "
+        "showing unrelated text. Lower it to be stricter, at the risk of rejecting "
+        "a genuine track whose reported length is wrong. Set 0 to switch the check "
+        "off. Items with no reported length, such as live streams, are never "
+        "checked. Typical 2 to 10, default 3.0. Read by the caption apply step in "
+        "main.py.",
     "chapter_no_song_reject":
         "Set 1 to enable, 0 to disable. With 1, and only when a concert song list "
         "has been parsed, a chapter whose title matches neither that list nor "
@@ -901,6 +912,16 @@ TUNE_DOC = {
         "memory, accepting more repeated measuring work. Typical 1024 to 16384, "
         "default 4096. Read once at startup by the shared measurement cache in "
         "main.py, so a change needs a restart.",
+    "media_min_duration_s":
+        "How long a media session published by an UNRECOGNISED program must be, in "
+        "seconds, before its length counts as evidence that something is really "
+        "playing. Recognised players such as browsers, music apps and video players "
+        "skip this check. An unknown program needs two independent signals from "
+        "artist, album, length and web address before the app will follow it, which "
+        "is what stops a short notification or speech blip from being treated as a "
+        "song. Raise it to be stricter with unusual players. Lower it to accept very "
+        "short clips. Typical 10 to 120, default 30.0. Read by the media source "
+        "eligibility gate in main.py.",
     "mv_intro_timeout":
         "A backstop, in seconds, after which the waiting for vocals intro card "
         "releases even if no vocal has been detected. The normal release comes from "
