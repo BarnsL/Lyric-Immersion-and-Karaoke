@@ -253,6 +253,26 @@ py -3.12 -m PyInstaller --noconfirm DesktopKaraoke.spec
 best-effort generation stands and the deep pass quietly no-ops. (The lyric library backup
 and the personal music DB are kept in a **private** repo, never the public one.)
 
+## Linux and macOS builds
+
+Linux and macOS packages are **not built on the Windows dev box**. They are produced by
+GitHub Actions from the same `DesktopKaraoke.spec` and uploaded to the release:
+
+```bash
+# Push the release tag; CI builds and attaches Linux/macOS assets automatically.
+git tag -a vX.Y.Z -m "Release vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+The workflow is `.github/workflows/release.yml`. It runs on `push` of a `v*.*.*` tag and
+also supports `workflow_dispatch` for back-filling Linux/macOS assets after a manual
+Windows-only release.
+
+Local cross-platform builds are not practical from Windows: the native stack
+(`winsdk`, soundcard, PyAV FFmpeg DLLs, `av.libs`, etc.) is platform-specific, and
+PyInstaller's `onedir` collection differs by OS. Always let CI produce the Linux
+(`*-linux-x86_64.tar.gz`) and macOS (`*-macos.zip`) artifacts.
+
 ## Notes
 
 - `Lyric-Immersion-and-Karaoke.exe` is windowed (no console) and bundles Python and every
