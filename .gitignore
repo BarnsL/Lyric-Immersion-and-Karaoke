@@ -1,0 +1,110 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Build / logs / one-off scratch
+*.log
+preload.log
+build*.exit
+build*.log
+build*.err
+_batch_fetch*
+*.done
+
+# Spotify auth — local secrets / tokens, never commit
+spotify_config.json
+.spotify_cache
+
+# Cached song lyrics are copyrighted third-party content — not redistributed.
+# Run `python preload.py` (or just play music) to build your own local library.
+# Ignore EVERYTHING under lyrics/ (the cache, any nested private backup repo's
+# .git, and the personal library DB) except the .gitkeep placeholder — so none of
+# that copyrighted/personal data can ever leak into this public repo.
+lyrics/*
+!lyrics/.gitkeep
+
+# Baked-in fallback lyrics shipped with the app are copyrighted third-party
+# content. Kept LOCALLY (so YOUR own builds can still bundle them via the spec's
+# optional include) but never committed — a clean clone, and any public/sold
+# build made from it, ships with NONE baked in.
+bundled_lyrics/
+
+# Sales / business planning notes are LOCAL-ONLY — never commit to the public repo.
+docs/SALES_CONSIDERATIONS.md
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local UI preferences
+settings.json
+
+# Personal listening telemetry (metrics.py writes it to the repo root when
+# running from source) — titles + play outcomes, never commit.
+metrics.json
+
+# Icon-generation scratch / previews
+_icon_preview.png
+_preview_cur.png
+_exe_icon.png
+
+# Optional "sync by listening" runtime (faster-whisper) + downloaded ASR models
+# — vendored locally, never committed (heavy, machine-specific).
+.deps/
+.deps-ship/
+deps/
+models/
+
+# Local agent tooling (Claude Code skills/launch config) — machine-local, not product
+.claude/
+
+# Dev-console (Tauri) build outputs — sources ARE committed, artifacts are not
+dev-console/node_modules/
+dev-console/dist/
+dev-console/src-tauri/target/
+
+# Build artifacts
+build/
+dist/
+dist-live/
+*.exe
+*.msix
+*.msixupload
+*.spec.bak
+lyrics/*.tmp
+lyrics/*.json.tmp
+
+# MSIX packaging outputs (build_msix.ps1 writes these under dist/, but guard
+# against running make_assets.py from the repo root)
+/Assets/
+priconfig.xml
+
+# TICKET-204: the "Wrong song" title-correction diagnostics the app appends at
+# runtime. Titles and artist names only (never lyric text), but it is still the
+# user's own runtime data — it stays on their machine and never ships.
+title_corrections.jsonl
+
+# TICKET-206/207/208: the rest of the runtime diagnostics corpus — language
+# corrections and the free-text notes the user types against an event in the dev
+# console. The note field is FREE TEXT, so unlike the files above it could contain
+# anything the user pastes, lyric lines included. That makes ignoring it a
+# copyright control, not just tidiness: these must never reach a public remote.
+# The glob is deliberately broad so a future diagnostics file is ignored by
+# default rather than by remembering to add it here.
+language_corrections.jsonl
+event_notes.jsonl
+*_corrections.jsonl
+*_notes.jsonl
+
+# Local 3h-watch + release packaging artifacts
+_monitor.py
+_monitor*.jsonl
+_zip_release.py
+DesktopKaraoke-portable.zip
+DesktopKaraoke-portable.zip.sha256
+*.bak

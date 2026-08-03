@@ -1,0 +1,150 @@
+# Cross-platform release builder (PORTING.md). PyInstaller can't cross-compile,
+# so each OS binary is built on its own GitHub-hosted runner and uploaded to the
+# release for the tag.
+#
+#   • push a tag  vX.Y.Z          → build Windows + Linux + macOS, attach all.
+#   • Actions ▸ Run workflow      → build Linux + macOS ONLY (backfill an
+#     existing release without touching a hand-built Windows asset), input=tag.
+#
+# Windows also builds the Inno one-click Setup.exe. Linux ships an onedir
+# tarball; macOS ships a zipped .app (UNSIGNED / not notarized — Gatekeeper
+# right-click-Open on first launch; see docs/PORTING.md).
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach Linux+macOS builds to (e.g. v1.1.74)"
+        required: true
+
+permissions:
+  contents: write        # create/upload release assets
+
+env:
+  PY: "3.12"
+
+jobs:
+  # ── Windows: onedir → Inno Setup.exe + portable zip ─────────────────────
+  windows:
+    if: github.event_name == 'push'          # dispatch = Linux/macOS backfill only
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller -r requirements.txt
+      - name: Build (onedir)
+        run: python -m PyInstaller --noconfirm DesktopKaraoke.spec
+      - name: Inno Setup installer
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+      - name: Package portable zip + sha256
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path version.py -Pattern '"([0-9][0-9.]*)"').Matches[0].Groups[1].Value
+          $zip = "dist/Lyric-Immersion-and-Karaoke-$v.zip"
+          Compress-Archive -Path dist/DesktopKaraoke/* -DestinationPath $zip -Force
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() | Set-Content "$zip.sha256" -NoNewline
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/Lyric-Immersion-and-Karaoke-Setup.exe
+            dist/Lyric-Immersion-and-Karaoke-*.zip
+            dist/Lyric-Immersion-and-Karaoke-*.zip.sha256
+
+  # ── Linux: onedir → tar.gz + sha256 ─────────────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: System libraries (soundcard/PulseAudio + AppIndicator tray + GTK)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpulse0 gir1.2-appindicator3-0.1 \
+            libgirepository1.0-dev gir1.2-gtk-3.0 libcairo2-dev
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller -r requirements.txt
+      - name: Build (onedir)
+        run: python -m PyInstaller --noconfirm DesktopKaraoke.spec
+      - name: Package tarball + sha256
+        run: |
+          V=$(grep -oE '"[0-9][0-9.]*"' version.py | head -1 | tr -d '"')
+          TAR="Lyric-Immersion-and-Karaoke-${V}-linux-x86_64.tar.gz"
+          tar czf "dist/$TAR" -C dist DesktopKaraoke
+          ( cd dist && sha256sum "$TAR" | awk '{print $1}' > "$TAR.sha256" )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/Lyric-Immersion-and-Karaoke-*-linux-*.tar.gz
+            dist/Lyric-Immersion-and-Karaoke-*-linux-*.tar.gz.sha256
+
+  # ── macOS: .app BUNDLE → zip + sha256 (unsigned) ────────────────────────
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller -r requirements.txt
+      - name: Build (.app bundle)
+        run: |
+          export LI_VERSION=$(grep -oE '"[0-9][0-9.]*"' version.py | head -1 | tr -d '"')
+          python -m PyInstaller --noconfirm DesktopKaraoke.spec
+      - name: Package .app zip + sha256 (ditto preserves bundle perms)
+        run: |
+          V=$(grep -oE '"[0-9][0-9.]*"' version.py | head -1 | tr -d '"')
+          APP="dist/Lyric Immersion and Karaoke.app"
+          ZIP="dist/Lyric-Immersion-and-Karaoke-${V}-macos.zip"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+          ( cd dist && shasum -a 256 "Lyric-Immersion-and-Karaoke-${V}-macos.zip" | awk '{print $1}' > "Lyric-Immersion-and-Karaoke-${V}-macos.zip.sha256" )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist/Lyric-Immersion-and-Karaoke-*-macos.zip
+            dist/Lyric-Immersion-and-Karaoke-*-macos.zip.sha256
+
+  # ── attach every built artifact to the release for the tag ──────────────
+  publish:
+    needs: [windows, linux, macos]
+    if: ${{ always() && !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: assets }
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload to release (create if missing)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+                 --title "$TAG" --notes "Automated cross-platform build."
+          find assets -type f -print0 | xargs -0 gh release upload "$TAG" \
+            -R "$GITHUB_REPOSITORY" --clobber

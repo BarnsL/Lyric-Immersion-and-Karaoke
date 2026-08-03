@@ -1,0 +1,59 @@
+pystray>=0.19
+Pillow>=10.0
+pykakasi>=2.2
+# Japanese morphological analyzer (accurate furigana + romaji; pykakasi fallback)
+fugashi>=1.3
+unidic-lite>=1.0.8
+cutlet>=0.4
+jaconv>=0.3
+# Windows Media Transport Controls (now-playing metadata + position). Windows-only
+# wheel; on Linux the MPRIS provider (media_mpris.py) fills the same contract.
+winsdk>=1.0.0b10; sys_platform == "win32"
+# Linux now-playing: MPRIS2 over the D-Bus session bus (see docs/PORTING.md, L1).
+dbus-next>=0.2; sys_platform == "linux"
+syncedlyrics>=1.0
+deep-translator>=1.11
+spotipy>=2.23
+pypinyin>=0.49
+# Cantonese jyutping (Cantopop gets jyutping, not Mandarin pinyin). Pure-Python,
+# own trie. Optional: _zh_jyutping() falls back to pinyin if missing.
+ToJyutping>=3.2
+# Chinese word segmentation for grouped pinyin (行业 as one word, not 行+业).
+# Optional: romanize() falls back to per-character lazy_pinyin if missing.
+jieba>=0.42
+hangul-romanize>=0.1.0
+soundcard>=0.4.3
+shazamio>=0.4
+# TICKET-118: per-process Core Audio peak meters → audible-session preference
+# (picks the AUDIBLE SMTC session when multiple tabs publish to SMTC and one
+# is muted). Windows-only; lazy-imported so non-Windows dev boxes are fine.
+# comtypes is already a transitive dep via pystray's COM stack.
+pycaw>=20240210; sys_platform == "win32"
+# Python 3.13 removed the stdlib `audioop` module (PEP 594) that pydub (via
+# shazamio) imports; this backport restores it. No-op on <=3.12.
+audioop-lts>=0.2; python_version >= "3.13"
+
+# BUILD DEP (PyInstaller freeze): setuptools 71+ vendors `jaraco` under
+# setuptools/_vendor as a PEP-420 namespace PyInstaller can't collect, yet the
+# frozen app's MANDATORY pkg_resources startup hook (pyi_rth_pkgres) imports
+# jaraco.text. Without a real TOP-LEVEL jaraco the built .exe hangs on an
+# (invisible) modal "No module named 'jaraco'" dialog at launch. Pin it so
+# build.bat's `pip install -r requirements.txt` always provides it. See
+# DesktopKaraoke.spec for the matching collect_all("jaraco.*") wiring.
+jaraco.text>=3.12
+
+# OPTIONAL — "Sync by listening": transcribes the live vocals and aligns the
+# cached lyrics to the heard audio (fixes timing when Shazam can't ID the exact
+# cut). Heavy, so it's NOT installed or bundled by default. Enable it with:
+#     pip install faster-whisper        (when running from source)
+# or vendor it into the app's `deps/` folder (see README → Sync by listening).
+# faster-whisper>=1.0
+#
+# OPTIONAL — high-quality OFFLINE lyric generation (deep_transcribe.py): when a
+# song has NO synced lyrics anywhere, download the source audio and transcribe the
+# WHOLE file with the large model, replacing the rough realtime best-effort and
+# caching it for next time. Needs faster-whisper (above) + yt-dlp, plus a JS
+# runtime on PATH for yt-dlp (node or deno) so YouTube audio downloads don't 403.
+# Degrades gracefully if absent. See docs/GENERATION.md.
+#     pip install yt-dlp
+# yt-dlp>=2024.0

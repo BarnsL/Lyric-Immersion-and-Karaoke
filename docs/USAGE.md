@@ -1,0 +1,99 @@
+# Desktop Karaoke — Usage & Settings
+
+Everything lives in the **system-tray icon (a purple microphone)** — right-click it. Settings save
+instantly to `settings.json` (next to the app) and persist across restarts.
+
+## Quick start
+
+1. Launch the portable `Lyric-Immersion-and-Karaoke.exe`, or run `pythonw main.py` from source.
+2. Play a song anywhere — Spotify, YouTube in a browser, any media app.
+3. Lyrics appear over your screen. That's it.
+
+The overlay is fully **click-through** and never steals focus — your mouse and
+keyboard pass straight through to the game/app underneath, so it never interferes.
+
+## Presets (start here)
+
+| Preset | What it's for | What it sets |
+|--------|---------------|--------------|
+| 🎮 **Gaming** | Passive language learning while playing | 45% opacity · top · slide-in left · 100% font · Performance |
+| 🎤 **Karaoke** | Big flowing lyrics for a room | 100% opacity · bottom · scroll-through ← · 150% font · Smooth · auto re-sync on |
+| 📺 **Subtitles** | Shows, interviews, long videos, and concerts | Subtitle mode on · 45% opacity · 100% font · stationary bottom-center · native/romaji/English layers on |
+
+All three are just starting points — tweak anything afterward. Subtitles are an
+explicit toggle/preset, not site-name auto-detection; after applying it,
+**Opacity** and **Font size** still change subtitle mode live.
+
+## Tray menu reference
+
+| Item | Does |
+|------|------|
+| **Presets** | One-click Gaming / Karaoke / Subtitles setups (above). |
+| **Subtitles** | Toggle subtitle mode, choose stationary vs scrolling subtitles, and show/hide native text, romanization, or English translation layers. This menu sits next to **Presets** because the Subtitles preset visibly changes these settings. |
+| **⚑ Wrong lyrics — fix this song** | Bin the current match and re-identify by sound. |
+| **🎧 Identify by sound** | Force an immediate Shazam listen. |
+| **Generate lyrics by ear when none found** | On/off (on by default). When **no** lyric provider has the song, transcribes the audio with Whisper into timed Japanese + furigana + romaji + a likely translation — **each line ends with `***`** to flag it's AI-generated, not official. Builds up over the song and saves it (a replay is instant + synced). First pass lags ~20 s and is imperfect; needs faster-whisper (bundled in the portable build). **Then, in the background, a *deep* pass downloads the source audio and re-transcribes the whole song with a larger model for a clean, complete result — replacing the rough version and deleting the audio. The deep pass also needs `yt-dlp` + a JS runtime (Node/Deno); see [docs/GENERATION.md](docs/GENERATION.md).** |
+| **🎤 Sync by listening** | Transcribes a few seconds of the live vocals and matches them to the loaded lyrics to fix the timing — for when Shazam can't identify the exact cut (a fan MV, remix, "special ver." with a different intro). Opt-in/on-demand. Powered by **faster-whisper** — **bundled in the portable build**; from source, `pip install faster-whisper`. Shows a hint if it isn't available. The ASR model downloads once on first use. |
+| **Fast song-change detect (compilations)** | On/off (on by default). Listens for the near-silent gap between tracks in a multi-song video ("openings 1-26", album upload, DJ set) and re-identifies the *instant* a new song starts — seamless switching. Because it's event-driven, it also lets the auto re-sync poll relax (lower CPU). A crossfaded video with no gaps falls back to the re-sync poll. |
+| **Auto re-sync by sound** | Re-listen on an interval (Off / 20s / 30s / 60s) to keep timing locked and to catch a new song inside a concert/live video. |
+| **Library backup (Git)** | *Auto-push new songs* (opt-in) and *Back up now* — see below. |
+| **Sync timing** | Nudge the offset ±0.5s / ±2.0s; shows the current offset. |
+| **Opacity** | 25–100%. Low = unobtrusive over games or videos (background stays transparent). Also applies while Subtitles mode is on. |
+| **Font size** | 25–200% in 25% steps. Scales text, layout and window. |
+| **Position** | Top or bottom of the screen. |
+| **Scroll-in** | Stationary · Slide from left/right · **Scroll-through →/←** (continuous ticker). |
+| **Scroll-through speed** | Slow / Medium / Fast / Very fast (continuous mode only). |
+| **Performance** | *Smooth* (60fps, full outline) or *Performance* (30fps, light outline). |
+| **Dancing character** | On/off. A small companion themed to the current song's artist that dances while music plays. Drag to move it; click it to make it hop. Drop a `characters/<artist>.png` next to the app to use your own image for that artist. |
+| **Local API (agent control)** | On/off. A localhost-only HTTP server on `127.0.0.1:8765` so an agent or script can read what's playing and drive it (`/status`, `/logs`, `/identify`, `/wrong`, `/display`, `/subtitles`). Never exposed to the network. See the README's *Automation* section and [`SUBTITLES_MODEL_API.md`](SUBTITLES_MODEL_API.md). |
+| **Start with Windows** | Launch automatically at login. |
+| **Check for updates / ⬆ Install update vX** | The app quietly checks GitHub for a newer release on launch and shows **⬆ Install update** here when one exists (Microsoft Store installs update themselves). Clicking it downloads the new build over **verified HTTPS**, checks its **SHA-256**, and swaps it in — keeping your lyric library and settings. Nothing is downloaded or applied unless you click. |
+| **Show / Hide**, **Re-fetch lyrics**, **Quit** | Self-explanatory. |
+
+## How detection & sync work
+
+- **Position** comes from Windows media controls (works for any player).
+- **Song identity** is title/artist first (instant), then **Shazam confirms by
+  ear** and overrides if the title was wrong (covers, mislabeled uploads).
+- **Timing** is auto-calibrated to Shazam's reported song offset, and
+  re-checked on the *Auto re-sync* interval — this fixes MV intros, drift and
+  seeks, and follows song changes inside **concert / live videos**.
+
+## Languages
+
+Detected per song: **Japanese** (furigana + romaji), **Chinese** (pinyin),
+**Korean** (romaja), **Spanish** (line + English). English/other songs show the
+synced line. English translation fills in on first play and is cached.
+
+## Building your library
+
+- It builds itself as you listen — every identified song is cached to
+  `lyrics/*.json` **next to the app** and never fetched again.
+- Seed a big set: `python scripts/preload.py` (ReGLOSS/hololive/V.W.P/J-pop/K/C-pop/
+  corridos/classic anime…).
+- Pull your playlists: `python sync_playlists.py` (Spotify) /
+  `python youtube_music.py` (YouTube Music).
+
+## Optional: back your library up to Git
+
+Off by default. The app is **portable** — its whole folder (exe + `lyrics/` +
+`settings.json`) can be a git repo. One-time:
+
+```bat
+cd <the Desktop Karaoke folder>
+git init && git add -A && git commit -m "my library"
+git remote add origin <your-own-repo-url>   # your repo, not the public code one
+```
+
+Then in the tray, **Library backup (Git) → Auto-push new songs** commits & pushes
+each new song automatically (or use **Back up now**). Lyrics are third-party
+copyrighted content — push only to **your own** repo and keep it private if in
+doubt.
+
+## Files (all in one folder — portable)
+
+```
+Lyric-Immersion-and-Karaoke.exe   the app (or main.py from source)
+lyrics/              cached, annotated, timed lyrics  (your growing library)
+settings.json        your tray preferences
+```
