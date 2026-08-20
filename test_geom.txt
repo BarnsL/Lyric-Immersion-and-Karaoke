@@ -1,0 +1,3 @@
+geometry=2048x1104+0+0
+winfo=2048x1104
+winfo_x=0 winfo_y=0
