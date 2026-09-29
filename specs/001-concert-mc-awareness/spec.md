@@ -231,9 +231,9 @@ on Linux. Nothing downloaded is committed.
 |---|---|---|---|
 | SC-001 | 3/3 → 0/3 onsets on talk | 0/3 | met |
 | SC-002 | one segment per song | 1 → 3 segments (song, instrumental, song) | met |
-| SC-003 recall | ≥ 85 % in normal conditions | 92-93 % (dry, hall, crowd, BGM −20/−14 dB) | met |
-| SC-003 false MC | ≤ 1.5 % of song time | 1.2 % per song (59.5 s of 4880 s); 1.7 % (82.5 s of 4747 s) when the same songs are one Opus file | met per song, **missed on the concatenated file** |
-| SC-004 | ≤ 300 MiB peak | ~295 MiB (partial plan ~14 s, total ~15 s with fingerprinting stubbed) | met |
+| SC-003 recall | ≥ 85 % in normal conditions | 92 % (dry, hall, crowd, BGM −20/−14 dB) | met |
+| SC-003 false MC | ≤ 1.5 % of song time | 1.2 % per song (59.5 s of 4880 s); 1.7 % (82 s of 4747 s) when the same songs are one Opus file | met per song, **missed on the concatenated file** |
+| SC-004 | ≤ 300 MiB peak | ~275 MiB (partial plan ~15 s, total ~16 s with fingerprinting stubbed) | met |
 | SC-005 | User Story 2 cases pass | `tests/test_concert_sync.py` | met |
 | SC-006 | tests and probes in CI | Linux CI steps added | met (pending the first CI run) |
 

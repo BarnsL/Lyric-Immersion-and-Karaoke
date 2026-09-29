@@ -106,10 +106,10 @@ committed:
 
 | | Result |
 |---|---|
-| Talk flagged, normal mixes (dry, hall with cheers, loud crowd, music bed at −20 / −14 dB) | **92-93 %** |
+| Talk flagged, normal mixes (dry, hall with cheers, loud crowd, music bed at −20 / −14 dB) | **92 %** |
 | Talk flagged, music bed at −8 dB / string bed at −14 dB / extreme arena reverb | 81 % / 70 % / 28 % (misses fall back to today's behaviour) |
 | False MC inside 23 real songs (79 min, 3 rap tracks) | **59.5 s = 1.2 %**; rap **0 s** (Silero alone: 498 s) |
-| The same songs back to back as one 79-min Opus file | 82.5 s = 1.7 % — the same two songs; the edges shift with the codec and framing |
+| The same songs back to back as one 79-min Opus file | 82 s = 1.7 % — the same two songs; the edges shift with the codec and framing |
 | Strict acoustic fallback | **0 s** false MC, ~60 % recall on clean talk |
 | Songs / applause / instrumentals in the mini-concert | **0 %** |
 
@@ -122,9 +122,9 @@ Measured on a 79-minute Opus/WebM file (a YouTube-like format) on Linux:
 
 | | Before | After |
 |---|---|---|
-| Peak RSS of the offline pass | **946 MiB** (decode 801 + a 586 MiB float64 copy) | **~295 MiB**, of which ~225 MiB is interpreter + speech model + the int16 PCM itself |
+| Peak RSS of the offline pass | **946 MiB** (decode 801 + a 586 MiB float64 copy) | **~275 MiB**, of which ~225 MiB is interpreter + speech model + the int16 PCM itself |
 | Decode | 12 s | 9-10 s |
-| Onsets and MC available to the runtime | only after fingerprinting | **~14 s** after the download (partial plan) |
+| Onsets and MC available to the runtime | only after fingerprinting | **~15 s** after the download (partial plan) |
 
 ## How the engine uses the plan
 

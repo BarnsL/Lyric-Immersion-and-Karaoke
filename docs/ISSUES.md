@@ -8,7 +8,7 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
-## v1.1.94 (pending build) — 2026-09-29 (TICKET-227…237 — concerts: MC awareness, concert-relative sync, a lighter offline pass)
+## v1.1.94 (pending build) — 2026-09-29 (TICKET-227…239 — concerts: MC awareness, concert-relative sync, a lighter offline pass)
 
 Spec: [`specs/001-concert-mc-awareness`](../specs/001-concert-mc-awareness/spec.md) ·
 design: [`docs/CONCERT_AUDIO_SYNC.md`](CONCERT_AUDIO_SYNC.md) · evaluation:
@@ -52,7 +52,7 @@ than singing (0.53 vs 0.48). Nothing at runtime knew the host was talking.
 - A chapter measured as mostly talk is a non-song segment.
 
 **Measured:**
-- 92-93 % of talk flagged in normal mixes; 81 % under a −8 dB music bed.
+- 92 % of talk flagged in normal mixes; 81 % under a −8 dB music bed.
 - 1.2 % false MC over 79 min of real songs, and 0 s on rap.
 - 0/3 onsets on talk (was 3/3).
 - 3 segments instead of 1.
@@ -138,7 +138,7 @@ anchors like the others. Chapter entry clears a stale deferred correction.
 chapter. The distinctive branch clears `lines` and refetches. The cached branch
 cleared the hold without re-anchoring.
 
-**Fix:** the plan now arrives as partial (onsets + MC, in ~14 s), then final
+**Fix:** the plan now arrives as partial (onsets + MC, in ~15 s), then final
 (ids). Installation:
 - re-anchors a held chapter to its measured onset;
 - re-ticks only when nothing is loaded or in flight;
@@ -169,7 +169,7 @@ into float64 for RMS (+586 MiB).
 **Fix:** a streaming PyAV int16 decode, bit-identical, with `decode_audio` as the
 fallback, and a pre-sized buffer. Every stage is blockwise.
 
-**Measured:** 946 → about 295 MiB peak. The floor is about 225 MiB of
+**Measured:** 946 → about 275 MiB peak. The floor is about 225 MiB of
 interpreter, speech model and int16 PCM.
 
 Also:
@@ -186,11 +186,78 @@ concert watchdogs, so TICKET-171's blank-overlay escalation branch was dead code
 **Fix:** the `not self.lines` test moved after the watchdogs. The 6.5 min
 stale-song watchdog now requires lyrics on screen, which is what it measures.
 
+**Behaviour change, intended:** this changes behaviour whatever the knobs say.
+While a concert holds an unconfirmed first hearing with nothing on screen (for
+example ad music that TICKET-171 holds for a second read), the watchdog now
+forces a 5 s × 2 re-identify every 20 s until the switch confirms or is
+replaced. That is TICKET-171's "a blank overlay is the worst state" design. It
+pauses during MC talk, and it never runs with lyrics showing sooner than 90 s.
+
 ### TICKET-237 — AGENTS.md's "verify your changes" command failed on master 🟢
 
 `main.py` starts with a UTF-8 BOM, and the documented
 `ast.parse(open(f, encoding='utf-8').read())` raises on it. It now reads with
 `utf-8-sig` and also parses `concert_audio.py` and `align.py`.
+
+### TICKET-238 — Findings of an independent review of TICKET-227…237 🟢
+
+Three reviewers covered sync, the MC gate, and the analyzer. Each reproduced
+its findings with a test before anything was fixed. Every fix has a regression
+test that failed on the reviewed version.
+
+**Sync**
+- A "Sync by listening" result was dropped as "lyrics changed" when the SAME
+  song reloaded mid-capture (a translation backfill builds a new list). This
+  was the one regression outside concerts. The check now compares timings
+  (`_same_timing`), not list identity.
+- A chapter hold that engages late (a resume or seek into the chapter, or a
+  TICKET-232 re-evaluation) with the singing already going read its first
+  frame as the onset, and timed the song up to 90 s late. It now keeps the
+  anchor. The plan's measured onset may still replace a chapter-start anchor
+  that nothing has refined since.
+- An onset heard while the lyrics were still being fetched is recorded, so it
+  is no longer the moment the fetch landed.
+- A generation run that spanned a chapter change put the previous song's lines
+  back, on the next song's clock. Generation is cancelled on a new or non-song
+  chapter, and when the clock jumps by more than 30 s.
+- A concert switch that has to fetch now clears the old song's lines, instead
+  of leaving them scrolling on the new clock.
+
+**MC gate**
+- Generation's talk filter ignored the `concert_mc_gate` knob. It now honours it.
+- Automatic "wrong lyrics" callers ran their identify as a user action, which
+  bypassed the talk gate. They now run it as a background identify.
+- The MC card overwrote every other card on the next frame. It now waits 4 s.
+- Talk edges are judged by interval value, so a plan replace no longer fires a
+  fake exit and enter mid-talk.
+- A gate released without an exit edge still runs the exit bookkeeping.
+- A user identify that arrives while a background read is in flight is parked
+  and run, instead of being lost.
+- A social-page title clears the concert's talk intervals.
+- The TICKET-236 cadence is documented above.
+
+**Analyzer**
+- Title normalisation keeps the letters and digits of every script. Hangul and
+  Cyrillic titles used to reduce to "", which merged different songs and voted
+  conflicts as corroborated.
+- Decoding is per packet, so one corrupt packet no longer ends it: 233.6 s of
+  233.6 s decoded, where `decode_audio` gets 76.4 s.
+- With MC detection off, segments are never merged, which matches the
+  pre-spec-001 output.
+- The speech model is fed ≤ 30 s blocks from the int16 source: 229 → 29 MiB on
+  30 min of continuous talk. It also gets a copy of its input, because it
+  zeroes 64 samples of whatever it is given.
+- `mc_total_s` is recomputed after a merge.
+- CI installs the optional audio stack, so the decoder and speech-model tests
+  run.
+
+### TICKET-239 — The first onnxruntime session would have logged Windows telemetry 🟢
+
+MC detection is the app's first onnxruntime session: whisper runs with
+`vad_filter=False`. Microsoft's official Windows builds of onnxruntime emit
+usage telemetry (ETW) by default. `concert_audio._vad_model` now calls
+`onnxruntime.disable_telemetry_events()` before creating the session, per
+AGENTS.md's "No telemetry".
 
 ### Open — noted, not changed (needs a UX decision)
 
@@ -201,6 +268,12 @@ stale-song watchdog now requires lyrics on screen, which is what it measures.
   line still persists. Changing that for every song alters the look of breaks, so
   it is left for a decision.
 - **Force Sync and OCR-assisted sync still assume absolute offsets** in concerts.
+- **The energy auto-align ignores the current offset in its time mapping.** It
+  measures the ABSOLUTE offset and then adds it to the current one. This was
+  found by the TICKET-238 review and verified with a synthetic probe: a studio
+  song already in sync at −3 s gets −6 s proposed. In a concert its expected-
+  lyrics mask is empty, so nothing is ever applied. This predates spec 001 and
+  also changes studio sync, so it is left for its own change.
 - **The GPU/Tauri renderer has no hint channel**, so the MC card is Tk-only (as
   are all hints).
 

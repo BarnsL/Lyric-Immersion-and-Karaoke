@@ -33,7 +33,7 @@
 - [x] T010 [US4] Parallel, playhead-first, early-exit 3-probe majority vote (`concert_audio_id_workers`)
 - [x] T011 [US4] `analyze_concert(... on_partial, pos_now, speech_fn, identify_fn, audio_path)`, plus the `analyze()` wrapper
 - [x] T012 [P] [US4] Tests: envelope parity / int16 / memory bound, voting, ordering, partial→final, legacy wrapper, decode parity
-- [x] T013 [US4] Profile the 79-minute Opus file (peak RSS ≤ 300 MiB) — measured ~295 MiB
+- [x] T013 [US4] Profile the 79-minute Opus file (peak RSS ≤ 300 MiB) — measured ~275 MiB
 
 ## Phase 5: User Story 2 — Songs late in a concert stay synced (P1)
 
@@ -60,8 +60,8 @@
 - [x] T028 [P] `scripts/eval_concert_mc.py` (a reproducible before/after table)
 - [x] T029 [P] Docs: CONCERT_AUDIO_SYNC, CONCERT_RESEARCH (P1 landed, plus the −748 s hypothesis), ISSUES tickets, scripts README
 - [x] T030 [P] Obsidian vault and mind-map canvas (`docs/obsidian-vault/`)
-- [ ] T031 Adversarial review of the full diff; fix the findings
-- [ ] T032 Commit (logical commits), push, open a draft PR, and watch CI
+- [x] T031 Adversarial review of the full diff; fix the findings (TICKET-238: 3 reviewers, every finding reproduced then fixed with a regression test)
+- [x] T032 Commit (logical commits), push, open a draft PR, and watch CI (draft PR open; CI jobs were not started by GitHub: account billing lock)
 
 ## Dependencies & Execution Order
 

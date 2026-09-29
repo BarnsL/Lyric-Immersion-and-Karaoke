@@ -10,5 +10,5 @@ Fused rule per 0.5 s frame:
 → majority vote, ≥ 10 s runs, join gaps < 4 s. Fallback without the model: strict
 acoustic rule (0 s false MC, ~60 % recall).
 
-Measured: 92-93 % talk recall; 1.2 % false MC on 79 min of real songs; rap 0 s.
+Measured: 92 % talk recall; 1.2 % false MC on 79 min of real songs; rap 0 s.
 Evaluated by `scripts/eval_concert_mc.py` ([[Testing and Probes]]).
