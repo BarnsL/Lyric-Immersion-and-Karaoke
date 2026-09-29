@@ -3989,6 +3989,7 @@ class Overlay:
             "concert_mc_hint_margin_s":     3.0,  # no MC card this close to an expected line
             "concert_mc_chapter_skip_frac": 0.80, # chapter this much talk = non-song
             "concert_relative_sync":          1,  # concert offsets are relative (A/B/D fixes)
+            "concert_energy_align":           1,  # energy auto-align on the concert song clock
         }
         # v1.1.53 — PERSISTED live-tune overrides. POST /tune?persist=1 writes the
         # changed key into settings.json under "tune_overrides"; re-apply them here at
@@ -7202,6 +7203,31 @@ class Overlay:
         if anchor is not None:
             return round(-float(anchor), 2), "anchor"
         return round(-pos, 2), "now"
+
+    def _concert_baseline_offset(self):
+        """The baseline offset for the current song when concert-relative sync
+        applies, else None.
+
+        In a concert it is minus the song's anchor in the video: the offline
+        plan's vocal onset, else the chapter start. That is what studio code
+        calls "0": the offset a song has before any correction. When no anchor
+        covers the playhead it is the offset in force. It is None outside a
+        concert or with ``concert_relative_sync`` off, where callers keep 0.0.
+
+        Force Sync, OCR-assisted sync and the energy auto-align use it. They
+        used to reset to, or measure from, 0.0, which in a concert is raw video
+        time: the song's lyrics sit minutes away and nothing shows (spec 001)."""
+        if not (self._live_mode and int(self._tune.get("concert_relative_sync", 1))):
+            return None
+        st = self.media.get() or {}
+        try:
+            pos = float(st.get("position") or 0.0)
+        except Exception:
+            pos = 0.0
+        anchor = self._concert_anchor_for(pos)
+        if anchor is None:
+            return round(float(self.offset or 0.0), 2)
+        return round(-float(anchor), 2)
 
     def _drop_old_body_for_switch(self, why):
         """spec 001 (review): a CONCERT switch re-times the display to the NEW
@@ -13036,7 +13062,7 @@ class Overlay:
                                     "live_resync_relax_n"],
             "Live energy correlator": ["live_energy_apply_min", "live_energy_lift_floor",
                                        "live_energy_peak_margin", "live_sync_match_min",
-                                       "energy_max_offset_live"],
+                                       "energy_max_offset_live", "concert_energy_align"],
             "Banner OCR": ["ocr_sync_in_live", "ocr_sync_min", "ocr_sync_min_live",
                            "ocr_sync_single_shot_max", "ocr_when_gaming"],
             "Between-songs hold": ["mv_intro_timeout", "onset_max_intro_s"],
@@ -17492,16 +17518,20 @@ class Overlay:
             self._hint("Force Sync needs the AI add-on (faster-whisper)")
             return
         self._fine_exit("force-sync")              # force-sync owns the offset cleanly
-        log.info("FORCE SYNC engaged: offset → 0, then try ranked matches until one holds %d× over %.0fs",
-                 int(self._tune.get("force_sync_streak", 3)),
+        # spec 001: in a CONCERT the "clean baseline" is the song's anchor in the
+        # video, not 0.0 (raw video time: the lyrics would sit minutes away).
+        _base = self._concert_baseline_offset()
+        self._fs_ref = 0.0 if _base is None else float(_base)
+        log.info("FORCE SYNC engaged: offset → %+.2f, then try ranked matches until one holds %d× over %.0fs",
+                 self._fs_ref, int(self._tune.get("force_sync_streak", 3)),
                  float(self._tune.get("force_sync_span_s", 16.0)))
-        self.offset = 0.0                       # set sync timing to 0 as the first resort
+        self.offset = self._fs_ref              # set sync timing to the baseline as the first resort
         # TICKET-088: snap the EASED display offset in parallel so _eased_offset
         # doesn't try to glide from the previous offset to 0 — the user just
         # asked for a nuclear resync, the glide here would look like a snap
         # anyway (huge delta) and the per-frame fraction cap would draw the
         # ramp out over many frames. Set both to the same value atomically.
-        self._display_offset = 0.0
+        self._display_offset = self._fs_ref
         self._display_offset_t = time.time()
         self.idx = -1
         # TICKET-090: a manual Force Sync means the user is overruling our current
@@ -17533,13 +17563,14 @@ class Overlay:
         secs = float(self._tune.get("force_sync_listen_s", 8.0))
         top_n = int(self._tune.get("force_sync_top_n", 6))
         pos0 = self._align_pos()                 # capture-start position (drives the confirm span)
+        ref = float(getattr(self, "_fs_ref", 0.0) or 0.0)   # spec 001: concert baseline
 
         def work():
             ranked = []
             try:
                 import align
                 ranked = align.rank_offsets(lines, lang=lang, get_pos=self._align_pos,
-                                            seconds=secs, top_n=top_n) or []
+                                            seconds=secs, top_n=top_n, ref_offset=ref) or []
             except Exception as e:
                 log.info("force-sync listen error: %s", e)
             self.root.after(0, lambda: self._force_sync_apply(ranked, pos0))
@@ -17550,6 +17581,12 @@ class Overlay:
         self._aligning = False
         if not self._force_sync_active:
             return
+        # spec 001: hints show the correction from the baseline (the song's
+        # concert anchor), not a raw "-1803.2s"; for a studio track it is 0.
+        _ref = float(getattr(self, "_fs_ref", 0.0) or 0.0)
+
+        def _shown(o):
+            return o - _ref
         need   = int(self._tune.get("force_sync_streak", 3))
         agree  = float(self._tune.get("force_sync_agree_s", 1.0))
         span_s = float(self._tune.get("force_sync_span_s", 16.0))
@@ -17559,7 +17596,8 @@ class Overlay:
 
         if not cands:                            # silence / instrumental / no confident match
             self._fs_empties += 1
-            tag = f"{self._fs_current:+.1f}s" if self._fs_current is not None else f"{self.offset:+.1f}s"
+            tag = (f"{_shown(self._fs_current):+.1f}s" if self._fs_current is not None
+                   else f"{_shown(self.offset):+.1f}s")
             log.info("force-sync: no usable match (try %d, empty %d) — holding %s",
                      self._fs_tries, self._fs_empties, tag)
             self._hint(f"🚀 Force Sync — listening… ({tag})")
@@ -17575,7 +17613,7 @@ class Overlay:
             self._fs_line_lo = self._fs_line_hi = pos0
             self.offset = self._fs_current; self.idx = -1
             log.info("force-sync: try #1 %+.2fs (match %.2f, %d cands)", off, ratio, len(cands))
-            self._hint(f"🚀 Force Sync — trying {off:+.1f}s…")
+            self._hint(f"🚀 Force Sync — trying {_shown(off):+.1f}s…")
             self._force_sync_after = self.root.after(1000, self._force_sync_tick)
             return
 
@@ -17596,9 +17634,9 @@ class Overlay:
                 self._force_sync_active = False
                 log.info("FORCE SYNC LOCKED at %+.2fs (%d confirms over %.0fs)",
                          self.offset, self._fs_confirms, span)
-                self._hint(f"✅ Force Sync locked ({self.offset:+.1f}s)")
+                self._hint(f"✅ Force Sync locked ({_shown(self.offset):+.1f}s)")
                 return
-            self._hint(f"🚀 Force Sync {self._fs_confirms}/{need} ({self.offset:+.1f}s)…")
+            self._hint(f"🚀 Force Sync {self._fs_confirms}/{need} ({_shown(self.offset):+.1f}s)…")
             self._force_sync_after = self.root.after(1000, self._force_sync_tick)
             return
 
@@ -17607,7 +17645,7 @@ class Overlay:
         if self._fs_misses < 2:                  # one noisy read → hold, give it another chance
             log.info("force-sync: %+.2fs missed once — holding (grace), confirms stay %d",
                      self._fs_current, self._fs_confirms)
-            self._hint(f"🚀 Force Sync {self._fs_confirms}/{need} ({self.offset:+.1f}s)…")
+            self._hint(f"🚀 Force Sync {self._fs_confirms}/{need} ({_shown(self.offset):+.1f}s)…")
             self._force_sync_after = self.root.after(1000, self._force_sync_tick)
             return
         # missed twice → the lyrics have run past it: it was a trap. Blacklist & advance.
@@ -17621,7 +17659,8 @@ class Overlay:
         self.offset = self._fs_current; self.idx = -1
         log.info("force-sync: %+.2fs ran past (chorus trap) — blacklisted; now trying %+.2fs (match %.2f)",
                  bad, nxt[0], nxt[1])
-        self._hint(f"🚀 Force Sync — {bad:+.1f}s missed, trying {self._fs_current:+.1f}s…")
+        self._hint(f"🚀 Force Sync — {_shown(bad):+.1f}s missed, "
+                   f"trying {_shown(self._fs_current):+.1f}s…")
         self._force_sync_after = self.root.after(1000, self._force_sync_tick)
 
     def _track_start_auto_align(self, track_seq):
@@ -19551,7 +19590,13 @@ class Overlay:
             target = round(self.lines[idx].start - raw_pos, 2)
             _off_cap = (float(self._tune.get("energy_max_offset_live", 120.0))
                         if _live_ocr else float(self._tune.get("energy_max_offset", 30.0)))
-            if abs(target) > _off_cap:
+            # spec 001: the range check is against the song's BASELINE — 0 for a
+            # normal track, minus its anchor in the video in a concert. An
+            # absolute cap rejected every concert read past ~2 min, and the
+            # TICKET-201 revert below reset the song to raw video time (blank).
+            _base = self._concert_baseline_offset()
+            _base = 0.0 if _base is None else float(_base)
+            if abs(target - _base) > _off_cap:
                 # TICKET-201: an out-of-range read is EVIDENCE, not a no-op. It says
                 # "the caption I can see is nowhere near where we think we are". If a
                 # previous OCR commit put us here, that commit is what is wrong — and
@@ -19564,8 +19609,8 @@ class Overlay:
                 if (self._ocr_far_streak >= 2
                         and getattr(self, "_ocr_sync_applied", None) is not None):
                     log.info("ocr-sync: %d far reads in a row while holding an OCR offset "
-                             "of %+.2fs — that commit is the thing that is wrong, reverting to 0",
-                             self._ocr_far_streak, self.offset)
+                             "of %+.2fs — that commit is the thing that is wrong, reverting to "
+                             "the baseline %+.2fs", self._ocr_far_streak, self.offset, _base)
                     self._ocr_sync_applied = None
                     self._ocr_sync_pending = None
                     # TICKET-205: narrate from the funnel, not here. This used to
@@ -19576,8 +19621,8 @@ class Overlay:
                     _why = (f"{self._ocr_far_streak} screen reads in a row landed outside "
                             f"the {_off_cap:.0f}s cap, so the held correction was the "
                             f"thing that was wrong")
-                    self.root.after(0, lambda w=_why: self._smooth_offset(
-                        0.0, "ocr-sync-revert", why=w, kind="sync-revert"))
+                    self.root.after(0, lambda w=_why, b=_base: self._smooth_offset(
+                        b, "ocr-sync-revert", why=w, kind="sync-revert"))
                 return
             self._ocr_far_streak = 0
             self._last_ocr_sync = {"matched": True, "line": idx, "ratio": round(ratio, 2),
@@ -19668,9 +19713,24 @@ class Overlay:
         before applying, so noisy or sparse vocals don't yank the offset."""
         if not self._boundary or not self.lines:
             return
+        if self._mc_gate_active():          # spec 001: talk is not the song's vocals
+            return
         st = self.media.get()
         if not (st and st.get("status") == PLAYING):
             return
+        # spec 001: in a CONCERT correlate on the SONG clock (video position +
+        # the offset in force). The video clock put the audio minutes away from
+        # every lyric line, so this never found anything in a concert.
+        off_snap = None
+        if (self._live_mode and int(self._tune.get("concert_relative_sync", 1))
+                and int(self._tune.get("concert_energy_align", 1))):
+            off_snap = float(self.offset or 0.0)
+            _mcs = getattr(self, "_concert_mc", ()) or ()
+            if _mcs and int(self._tune.get("concert_mc_gate", 1)):
+                _p = float(st.get("position") or 0.0)
+                if _mc_overlap(_mcs, _p - 30.0, _p) > 0.1:
+                    log.info("energy-align: the last 30 s overlap MC talk — skipped")
+                    return
         try:
             history = self._boundary.vocal_history(30.0)
         except Exception:
@@ -19696,7 +19756,7 @@ class Overlay:
         def work():
             try:
                 self._aligning = True
-                self._run_energy_correlation(history, st)
+                self._run_energy_correlation(history, st, off_snap)
             except Exception as e:
                 log.info("energy-align error: %s", e)
             finally:
@@ -19704,8 +19764,13 @@ class Overlay:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _run_energy_correlation(self, history, st_snap):
-        """The actual correlation work (runs in a background thread)."""
+    def _run_energy_correlation(self, history, st_snap, off_snap=None):
+        """The actual correlation work (runs in a background thread).
+
+        ``off_snap`` (spec 001) is the offset in force when the history was
+        taken, passed only for concert-relative sync. The audio is then placed on
+        the SONG clock, so the best shift is a CORRECTION to that offset. Without
+        it (every normal track) the historical video-clock mapping is kept."""
         import numpy as np
         # Report this check's verdict to the adaptive tier (on the Tk thread). A
         # clear in-tolerance peak = "insync"; a flat/ambiguous/rejected read =
@@ -19720,6 +19785,8 @@ class Overlay:
         # we're aligning the displayed lyric time, not the absolute clock).
         now_wall = history[-1][0]
         now_song = float(st_snap.get("position") or 0.0)
+        if off_snap is not None:
+            now_song += float(off_snap)          # spec 001: the concert song clock
         # Build the audio mask: per-block "are vocals active right now?".
         # ADAPTIVE threshold (per-window), not an absolute floor: the vocal-band
         # ratio's absolute level varies hugely by song (bass-heavy electronic vs
@@ -19841,14 +19908,17 @@ class Overlay:
         # best_shift is the offset to ADD to audio_t so the audio mask aligns
         # to the LRC. Since the displayed song-time = player_pos + self.offset,
         # the new offset becomes (current offset + best_shift).
-        new_off = round(self.offset + best_shift, 2)
+        new_off = round((self.offset if off_snap is None else float(off_snap))
+                        + best_shift, 2)
         # TICKET-167: a LIVE arrangement legitimately needs a much larger
         # offset than a studio cut (crowd intro + MC + slower tempo — the
         # YOASOBI live 祝福 runs 247s against a 181s studio LRC). Use the
         # live-specific cap there; studio songs keep the tight one.
         _off_cap = (float(self._tune.get("energy_max_offset_live", 120.0))
                     if live_sync else float(self._tune.get("energy_max_offset", 60.0)))
-        if abs(new_off) > _off_cap:
+        # spec 001: on the concert song clock the cap bounds the CORRECTION
+        # (the offset itself is minutes: minus the song's start in the video).
+        if abs(best_shift if off_snap is not None else new_off) > _off_cap:
             log.info("energy-align: candidate offset %+.1fs out of range (cap %.0fs) — skipped",
                      new_off, _off_cap)
             verdict("inconclusive")

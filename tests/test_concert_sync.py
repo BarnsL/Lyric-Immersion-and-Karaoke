@@ -872,3 +872,195 @@ def test_junk_page_title_drops_the_concert_talk_intervals():
     assert e._concert_mc == () and e._mc_cur is None
     e._mc_update(e.media.get(), time.time())
     assert not e._mc_gate_active()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Force Sync, OCR-assisted sync and the energy auto-align in a concert
+# (spec 001 follow-ups: all three assumed a baseline offset of 0.0, which in a
+# concert is raw VIDEO time — the song's lyrics sit minutes away)
+# ════════════════════════════════════════════════════════════════════════════
+CONCERT_2 = [{"start": 0.0, "title": "Opening Theme Song"},
+             {"start": 1790.0, "title": "Distinctive Second Song"}]
+
+
+def _wait_for(pred, timeout=3.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_rank_offsets_judges_the_correction_not_the_offset(monkeypatch):
+    monkeypatch.setattr(align, "_ensure_deps_path", lambda: None)
+    monkeypatch.setattr(align, "_capture", lambda seconds: object())
+    monkeypatch.setattr(align, "_transcribe", lambda audio, lang: ["seg"])
+    line = main.Line(start=12.0, end=15.0, jp="placeholder")
+    monkeypatch.setattr(align, "_rank_anchors",
+                        lambda segs, lines, top_n=12: [(1.0, line, 0.80)])
+    lines = [line]
+    # 30 min into a concert the true offset is about 12 - (1800 + 1) = -1789
+    assert align.rank_offsets(lines, get_pos=lambda: 1800.0) == []        # old behaviour
+    got = align.rank_offsets(lines, get_pos=lambda: 1800.0, ref_offset=-1790.0)
+    assert got and got[0][0] == pytest.approx(-1789.0)
+    assert align.rank_offsets(lines, get_pos=lambda: 12.0) == [(-1.0, 0.8, 12.0)]  # studio
+
+
+def _force_sync_engine(**kw):
+    e = engine(lines=L((10, 14), (15, 20)), offset=-37.0, _display_offset=-37.0,
+               _concert_setlist=list(CONCERT_2), meta={"lang": "ja"}, **kw)
+    e.media.state["position"] = 1800.0
+    e._feat_ok = lambda what, real: True
+    e.ticks_fs = []
+    e._force_sync_tick = lambda: e.ticks_fs.append(True)
+    return e
+
+
+def test_force_sync_in_a_concert_starts_from_the_song_anchor():
+    e = _force_sync_engine()
+    e.force_sync()
+    assert e._fs_ref == -1790.0 and e.offset == -1790.0 and e._display_offset == -1790.0
+    e._force_sync_apply([(-1793.0, 0.80, 12.0)], 1800.0)
+    assert e.offset == -1793.0
+    assert "-3.0s" in e.hints[-1]                   # the correction, not "-1793.0s"
+
+
+def test_force_sync_studio_still_starts_from_zero():
+    e = _force_sync_engine(_live_mode=False)
+    e.force_sync()
+    assert e._fs_ref == 0.0 and e.offset == 0.0
+    e._force_sync_apply([(-1.5, 0.80, 12.0)], 30.0)
+    assert e.offset == -1.5 and "-1.5s" in e.hints[-1]
+
+
+def test_force_sync_listens_with_the_concert_baseline(monkeypatch):
+    seen = {}
+
+    def fake_rank(lines, lang="ja", get_pos=None, seconds=8.0, top_n=6, ref_offset=0.0):
+        seen["ref"] = ref_offset
+        return []
+
+    monkeypatch.setattr(align, "rank_offsets", fake_rank)
+    e = _force_sync_engine(_force_sync_active=True, _fs_ref=-1790.0, _fs_tries=0)
+    e._align_pos = lambda: 1800.0
+    main.Overlay._force_sync_tick(e)
+    assert _wait_for(lambda: "ref" in seen) and seen["ref"] == -1790.0
+
+
+def _ocr_engine(monkeypatch, offset, ocr_text):
+    import ocr_lyrics
+    monkeypatch.setattr(ocr_lyrics, "available", lambda: True)
+    monkeypatch.setattr(ocr_lyrics, "read_lyric_lines", lambda **k: [ocr_text])
+    lines = [main.Line(start=10.0, end=14.0, jp="placeholder alpha words"),
+             main.Line(start=15.0, end=20.0, jp="placeholder beta words"),
+             main.Line(start=200.0, end=204.0, jp="placeholder gamma words")]
+    e = engine(lines=lines, offset=offset, _concert_setlist=list(CONCERT_2),
+               meta={"source": "lrclib/get"}, _last_src="chrome", _last_ocr_sync_t=0.0)
+    e.media.state["position"] = 1805.0
+    e._ocr_gpu_safe = lambda: True
+    e._source_window_hwnd = lambda: None
+    e.root.after = lambda ms, fn=None, *a: fn() if fn else None
+    return e
+
+
+def test_ocr_sync_in_a_concert_measures_from_the_song_anchor(monkeypatch):
+    """Read line 2 (starts at song time 15) at video 1805: offset -1790, 2 s
+    from the current -1792. The absolute 120 s cap threw this away."""
+    e = _ocr_engine(monkeypatch, -1792.0, "placeholder beta words")
+    e._ocr_assisted_sync("test")
+    assert e.smooth_calls == [(-1790.0, "ocr-sync")]
+
+
+def test_ocr_sync_revert_goes_to_the_song_anchor_not_zero(monkeypatch):
+    """TICKET-201's revert: two reads far from the baseline while an OCR commit
+    is in force back that commit out — to the song's anchor, not to 0.0."""
+    e = _ocr_engine(monkeypatch, -1600.0, "placeholder gamma words")
+    e._ocr_sync_applied = -1600.0                   # a wrong OCR commit is in force
+    # line 3 (200 s) read at video 1805 implies -1605: 185 s from the -1790 anchor
+    for _ in range(2):
+        e._last_ocr_sync_t = 0.0
+        e._ocr_assisted_sync("test")
+    assert e.smooth_calls == [(-1790.0, "ocr-sync-revert")]
+
+
+class _Boundary:
+    def __init__(self, hist):
+        self._h = hist
+
+    def vocal_history(self, secs):
+        return list(self._h)
+
+
+def _vocal_history(lines, offset_true, video_now, n=150):
+    import numpy as np
+    rng = np.random.default_rng(5)
+    now_wall = time.time()
+    hist = []
+    for k in range(n):                              # 0.2 s blocks, newest last
+        t = now_wall - (n - 1 - k) * 0.2
+        song = video_now - (now_wall - t) + offset_true
+        on = any(ln.start <= song < ln.end for ln in lines)
+        hist.append((t, (0.6 if on else 0.15) + float(rng.normal(0, 0.03))))
+    return hist
+
+
+def _aperiodic_lines():
+    import numpy as np
+    rng = np.random.default_rng(3)
+    spans, t0 = [], 10.0
+    while t0 < 70.0:
+        d = float(rng.uniform(1.0, 2.5))
+        spans.append((t0, t0 + d))
+        t0 += d + float(rng.uniform(1.5, 4.0))
+    return L(*spans)
+
+
+def test_energy_align_in_a_concert_corrects_on_the_song_clock():
+    lines = _aperiodic_lines()
+    e = engine(offset=-1800.0, lines=lines, _last_audio_off=None, _last_audio_off_t=0.0)
+    applied = []
+    e._apply_energy_align = lambda new_off, score, lift: applied.append(new_off)
+    e._note_energy_verdict = lambda v: None
+    e.root.after = lambda ms, fn=None, *a: fn() if fn else None
+    e._energy_reason = "test"
+    video_now = 50.0 + 1803.0                        # song time 50 s now, true offset -1803
+    hist = _vocal_history(lines, -1803.0, video_now)
+    st = {"position": video_now, "status": PLAYING}
+    e._run_energy_correlation(hist, st, -1800.0)
+    assert applied == [pytest.approx(-1803.0, abs=0.21)]
+    applied.clear()
+    e._run_energy_correlation(hist, st)             # the old video-clock mapping: nothing
+    assert applied == []
+
+
+def _energy_caller(**kw):
+    lines = _aperiodic_lines()
+    e = engine(offset=-1800.0, lines=lines, **kw)
+    e._boundary = _Boundary(_vocal_history(lines, -1800.0, 1850.0))
+    e.media.state["position"] = 1850.0
+    e.calls = []
+    e._run_energy_correlation = lambda h, st, off=None: e.calls.append(off)
+    return e
+
+
+def test_energy_align_caller_passes_the_concert_offset_and_respects_talk():
+    e = _energy_caller()
+    e._auto_align_by_energy("test")
+    assert _wait_for(lambda: e.calls) and e.calls == [-1800.0]
+    k = _energy_caller()
+    k._tune["concert_energy_align"] = 0             # knob off: historical mapping
+    k._auto_align_by_energy("test")
+    assert _wait_for(lambda: k.calls) and k.calls == [None]
+    s = _energy_caller(_live_mode=False)            # a normal track: unchanged
+    s._auto_align_by_energy("test")
+    assert _wait_for(lambda: s.calls) and s.calls == [None]
+    m = _energy_caller(_concert_mc=((1830.0, 1845.0),))
+    m._auto_align_by_energy("test")                 # the last 30 s overlap talk
+    time.sleep(0.05)
+    assert m.calls == []
+    t = _energy_caller(_concert_mc=((1840.0, 1900.0),))
+    t._mc_update(t.media.get(), time.time())        # inside talk right now
+    t._auto_align_by_energy("test")
+    time.sleep(0.05)
+    assert t.calls == []

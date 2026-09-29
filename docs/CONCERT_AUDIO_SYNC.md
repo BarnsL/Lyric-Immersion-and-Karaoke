@@ -189,6 +189,9 @@ of the fixes below sit behind `concert_relative_sync` (default 1).
 | **D** Shazam / OCR / decide-by-ear switch | wrote `offset = 0.0`, i.e. raw video time, so a correctly identified song was **blank**, and the absolute sync-read cap discarded every Shazam read that could have fixed it | `_set_switch_offset`: Shazam's own timing when plausible, else the plan onset or chapter start, else "starting now"; the cap is relative; a hit during a hold anchors in one read |
 | **E** chapter tick | a chapter entered during the 90 s sound-lock hold was **skipped forever** | re-evaluated once the lock ages out, unless it is already the loaded song |
 | Generation | stamped lines in VIDEO time while the display ran on the song clock, so **generated concert lyrics never showed** | lines stamped on the display clock (`position + offset`) |
+| Force Sync | reset the offset to 0.0 (video time: blank), and `align.rank_offsets` rejected `abs(offset) > 600`, so it **could never lock after minute 10** | starts from the song's anchor (`_concert_baseline_offset`); `rank_offsets(ref_offset=)` guards the correction; hints show the correction, not "-1803 s" |
+| OCR-assisted sync | the out-of-range cap was absolute (120 s), so **every concert read past minute 2 was discarded**, and the TICKET-201 revert went to 0.0 | the range is measured from the song's anchor, and a revert goes back to it |
+| Energy auto-align | placed the audio on the VIDEO clock, minutes from every lyric line, so it **never corrected anything** in a concert | correlates on the song clock (`position + offset`), caps the correction, pauses during talk and skips reads that overlap talk (`concert_energy_align`) |
 
 **Hypothesis, not proven.** The `drift = -748s` *Melt* read in the Offkai
 log is what Bug D produces: a song switched in at video ≈ 12:40 with offset
@@ -215,7 +218,8 @@ log is what Bug D produces: a song switched in at video ≈ 12:40 with offset
 | `concert_mc_edge_s` | 2.0 | shrink each MC interval by this much per side |
 | `concert_mc_hint_margin_s` | 3.0 | no MC card this close to an expected line |
 | `concert_mc_chapter_skip_frac` | 0.80 | a chapter this much talk is a non-song segment |
-| `concert_relative_sync` | 1 | concert-relative offsets (A / B / D / generation fixes) |
+| `concert_relative_sync` | 1 | concert-relative offsets (A / B / D, generation, Force Sync, OCR sync) |
+| `concert_energy_align` | 1 | energy auto-align on the concert song clock |
 
 ## Cost and privacy
 

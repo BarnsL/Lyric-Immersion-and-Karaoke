@@ -308,12 +308,22 @@ TUNE_DOC = {
     "concert_relative_sync":
         "Set 1 to enable, 0 to disable. In a concert the sync offset is roughly "
         "minus where the current song starts in the video, often hundreds of "
-        "seconds. With 1, resync by listening, the vocal-onset release of the "
-        "between-songs hold and Shazam song switches treat that offset as a "
-        "reference instead of as an error. With 0 they revert to their "
-        "pre-spec-001 behaviour, which disabled them after minute 10 of a "
-        "concert. Default 1. Read by align_by_listening, _apply_align, "
-        "_on_vocal_onset and _consume_async in main.py.",
+        "seconds. With 1, resync by listening, Force Sync, screen-reading (OCR) "
+        "sync, the vocal-onset release of the between-songs hold and Shazam song "
+        "switches treat that offset as a reference instead of as an error. With "
+        "0 they revert to their pre-spec-001 behaviour, which disabled them "
+        "after minute 10 of a concert. Default 1. Read by align_by_listening, "
+        "_apply_align, force_sync, _ocr_assisted_sync, _on_vocal_onset and "
+        "_consume_async in main.py.",
+    "concert_energy_align":
+        "Set 1 to enable, 0 to disable. The whisper-free energy auto-align "
+        "compares the vocal on/off pattern of the last 30 s of audio with the "
+        "lyrics. In a concert it used to place that audio on the raw video "
+        "clock, minutes away from every lyric line, so it never corrected "
+        "anything there. With 1 it uses the song clock and the correction is "
+        "capped instead of the offset; it pauses during MC talk and skips reads "
+        "overlapping talk. Needs concert_relative_sync. Default 1. Read by "
+        "_auto_align_by_energy in main.py.",
     "concert_pool_prefetch_max":
         "How many songs from a concert's parsed song list get their lyrics "
         "downloaded in the background as soon as the concert loads. Raise it so "

@@ -8,7 +8,7 @@ lyrics** at the same playback position — not just `/status`.
 
 ---
 
-## v1.1.94 (pending build) — 2026-09-29 (TICKET-227…239 — concerts: MC awareness, concert-relative sync, a lighter offline pass)
+## v1.1.94 (pending build) — 2026-09-29 (TICKET-227…240 — concerts: MC awareness, concert-relative sync, a lighter offline pass)
 
 Spec: [`specs/001-concert-mc-awareness`](../specs/001-concert-mc-awareness/spec.md) ·
 design: [`docs/CONCERT_AUDIO_SYNC.md`](CONCERT_AUDIO_SYNC.md) · evaluation:
@@ -259,6 +259,28 @@ usage telemetry (ETW) by default. `concert_audio._vad_model` now calls
 `onnxruntime.disable_telemetry_events()` before creating the session, per
 AGENTS.md's "No telemetry".
 
+### TICKET-240 — Force Sync, OCR sync and the energy auto-align assumed a baseline of 0 in concerts 🟢
+
+All three treated 0.0 as "no correction". In a concert that is raw video time:
+the song's lyrics sit minutes away.
+
+- **Force Sync** reset the offset to 0.0, so nothing showed, and
+  `align.rank_offsets` rejected `abs(offset) > 600`, so it could never lock after
+  minute 10. It now starts from the song's anchor (`_concert_baseline_offset`:
+  the plan onset, else the chapter start). `rank_offsets(ref_offset=)` guards the
+  correction, and the hints show the correction.
+- **OCR-assisted sync** capped the absolute offset at 120 s, discarding every
+  concert read past minute 2. Its TICKET-201 revert went to 0.0. The range is now
+  measured from the song's anchor, and the revert goes back to it.
+- **The energy auto-align** put the audio on the video clock, so its
+  expected-lyrics mask was empty and it never applied a correction. For example,
+  the "post-decide" pass after a concert decide-by-ear switch did nothing. It now
+  correlates on the song clock and caps the correction. It pauses during MC talk
+  and skips reads whose 30 s window overlaps talk. Knob: `concert_energy_align`.
+
+Outside concerts, and with `concert_relative_sync` = 0, nothing changes. There
+are 8 regression tests; all fail on the previous version.
+
 ### Open — noted, not changed (needs a UX decision)
 
 - **The CPU line renderer holds the last line through the whole gap**, not for
@@ -267,13 +289,12 @@ AGENTS.md's "No telemetry".
   replaces the stale line. Outside talk (instrumental breaks, a song's tail) the
   line still persists. Changing that for every song alters the look of breaks, so
   it is left for a decision.
-- **Force Sync and OCR-assisted sync still assume absolute offsets** in concerts.
-- **The energy auto-align ignores the current offset in its time mapping.** It
-  measures the ABSOLUTE offset and then adds it to the current one. This was
-  found by the TICKET-238 review and verified with a synthetic probe: a studio
-  song already in sync at −3 s gets −6 s proposed. In a concert its expected-
-  lyrics mask is empty, so nothing is ever applied. This predates spec 001 and
-  also changes studio sync, so it is left for its own change.
+- **On normal tracks the energy auto-align still ignores the current offset in
+  its time mapping.** It measures the ABSOLUTE offset and then adds it to the
+  current one. This was found by the TICKET-238 review and verified with a
+  synthetic probe: a studio song already in sync at −3 s gets −6 s proposed.
+  Concerts are fixed (TICKET-240). The studio path predates spec 001, and
+  changing it changes studio sync, so it is left for its own change.
 - **The GPU/Tauri renderer has no hint channel**, so the MC card is Tk-only (as
   are all hints).
 
