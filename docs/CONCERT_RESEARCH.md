@@ -344,7 +344,7 @@ Recurring failure classes observed above, ranked by how many of the 5 concerts t
 
 | Class | Concerts hit | What it looks like | Existing counter-measure | Gap |
 |---|:-:|---|---|---|
-| **MC / applause drift** (last-shown lyrics linger through non-song segments) | 5 / 5 | Overlay stays on song N through 30-180 s of talk, then thrashes into song N+1 | `_check_applause_gap` (silence + broadband), 2-6 min stale heuristic, `_SETLIST_SKIP` on chapter title | No **unlabeled** MC-segment detection; no energy-envelope gate on decide-by-ear during dead segments |
+| **MC / applause drift** (last-shown lyrics linger through non-song segments) | 5 / 5 | Overlay stays on song N through 30-180 s of talk, then thrashes into song N+1 | `_check_applause_gap` (silence + broadband), 2-6 min stale heuristic, `_SETLIST_SKIP` on chapter title, **spec 001: offline MC detection + runtime MC gate + MC card** | Talk under loud music beds / extreme reverb is under-detected (falls back to the old behaviour); the GPU renderer has no hint channel; the CPU renderer still holds the last line through long instrumental gaps (see CONCERT_AUDIO_SYNC.md) |
 | **Cross-language collision** (ko/zh candidates for JP acts) | 4 / 5 | Korean-caption fan-track sneaks in for a ReGLOSS song | `fetch_lrc` jp_vagency + `_is_jp_act` on the caption/OCR paths (on `gpu-renderer` branch); confidence._KNOWN_JA table | Confidence table needs continual expansion; jp_vagency wiring on captions/OCR paths not yet on master |
 | **Wrong-song for common titles** (Mister / La La La / Blew / Polly) | 5 / 5 | Global Shazam/fingerprint returns first-hit unrelated track | Candidate pool extraction (v1.1.63) | **Candidate pool not wired to matching stage** — top-priority feature |
 | **Cover-original attribution** (VTuber sings J-pop, engine credits the VTuber) | 4 / 5 | Body-lyrics fetch under the wrong artist | `_is_cover` routes to live-FOLLOW; TICKET-149 eager captions | Robust cover→original artist resolution when the cover artist isn't in `_KNOWN_ORIGINAL_ARTISTS`; per-position chapter → cover-original hint from parsed setlist |
@@ -373,19 +373,27 @@ Ranked P0 → P3. Each has a rough "signal" (what happens when it lands), an "im
 
 ### P1 — Unlabeled MC / silence-segment gate *(all 5 concerts benefit)*
 
-> **PROPOSAL ONLY. NOT IMPLEMENTED.** Everything in this section is a design
-> sketch. The knobs `mc_min_s`, `mc_vocal_ratio_ceiling`, `mc_speech_cadence_hz`
-> and the state field `_in_mc_segment` **do not exist in main.py**. They are
-> names this proposal suggests, not names you can use. Nothing reads them, `/tune`
-> does not list them, and setting them has no effect. Do not write code, docs, or
-> harness config that assumes any of them is available.
+> **LANDED (spec 001-concert-mc-awareness, pending build).** The shipped design
+> differs from the sketch below. The sketch's names (`mc_min_s`,
+> `mc_vocal_ratio_ceiling`, `mc_speech_cadence_hz`, `_in_mc_segment`) were
+> **not** used. The real ones are the `concert_mc_*` knobs and the `_in_mc` /
+> `_mc_gate_active()` state. See
+> [CONCERT_AUDIO_SYNC.md](CONCERT_AUDIO_SYNC.md#mc--talk-detection) and
+> [specs/001-concert-mc-awareness](../specs/001-concert-mc-awareness/spec.md).
+> The sketch is kept below for history.
 
 - **What.** Dedicated primitive that produces `is_mc_segment(t) → bool` from a rolling window of RMS + vocal-band ratio + speech-vs-song classifier (talk cadence vs sustained pitch). While True: hold the last-shown song, do NOT commit new offsets, do NOT accept new lyric fetches, escalate boundary-decide-by-ear only after the segment ends. Metric: seconds-of-drift-per-MC-segment.
 - **Signal.** MC drift stops on C5 (Nirvana banter), C3 (YOASOBI ikura MC), C4 (After Talk 19:52). Fewer wrong-song strike storms during dead segments.
 - **Impact.** All 5 concerts (MC drift is universal).
 - **Size.** Medium. Would reuse `songchange.py` primitives + `_check_applause_gap`; would add a state field (`_in_mc_segment` is the proposed name) + tick-level policy, and would introduce tune knobs (proposed names: `mc_min_s / mc_vocal_ratio_ceiling / mc_speech_cadence_hz`). None of these exist yet. Requires labeling MC intervals in the corpus (~5-10 per concert × 5 concerts = 50 anchors).
 - **Auto-tune duel candidate.** `--a defaults --b mc-gate-on --corpus concerts` scoring the new `mc_drift_s_total` metric.
-- **Status.** *Not started.*
+- **Status.** ✅ **Landed (spec 001).**
+  - **Detection.** The offline MC detector fuses a speech model (Silero, bundled with faster-whisper), NO steady beat (pulse clarity; keeps rap out) and talk-like pauses.
+  - **Measured.** 92-93 % of talk flagged in normal mixes; 1.2 % false MC over 79 min of real songs, 0 s on rap.
+  - **Onsets and segments.** Onsets skip talk (0/3 on talk vs 3/3 before). Chapterless concerts split at talk (3 segments vs 1 merged blob).
+  - **Runtime.** While the playhead is in talk, identify, resync, decide-by-ear, strikes, watchdogs and generation pause, and an MC card replaces the leftover line without ever hiding an expected one.
+  - **Chapters.** A chapter that is mostly talk is a non-song segment.
+  - **Found on the way.** Spec 001 also found and fixed four concert-relative-offset bugs (A/B/D/E in CONCERT_AUDIO_SYNC.md) that disabled resync after minute 10, the vocal-onset release, Shazam song switches, and chapters skipped by the sound-lock hold.
 
 ### P2 — Chapter-corroboration threshold tuning + no-song chapter type
 
@@ -595,3 +603,4 @@ UP TO YOU
 |---|---|---|
 | 2026-07-04 | Doc v0.1 | Initial recon + 5-concert corpus + feature roadmap + AutoResearch integration plan. Baseline app version 1.1.63. |
 | 2026-07-04 | Doc v0.2 | User answered §7 open questions. Shipped in **v1.1.64**: P0 candidate-pool wiring (`concert_pool_scoped=1`, `concert_pool_prefetch_max=20`, `_prefetch_concert_candidates`, `_decide_by_ear` scoped-pool inclusion + whole-library-expansion skip when pool wins), P2 chapter-corroboration knob (`chapter_override_min_score=0.70`, tunable) + `chapter_no_song_reject=0` (opt-in) + widened `_SETLIST_SKIP`, and tray "🔖 Mark song boundary (concert)" + `Overlay.mark_concert_boundary()` writing `<data>/concert_marks.jsonl`. Machine-readable [`docs/concerts.yaml`](concerts.yaml) corpus checked in. AutoResearch worktree at `D:\Lyric-Immersion-AR` (branch `autoresearch`) + `.ckignore` + `AR_README.md`. **Still pending:** P1 MC gate; P3 Whisper fallback; auto-tune harness `concerts` subcommand + real-audio mode. |
+| 2026-09-29 | Doc v0.3 | **Spec 001-concert-mc-awareness.** P1 landed as offline MC detection (Silero + pulse + pauses; measured 92-93 % talk recall, 1.2 % false MC on 79 min of real songs, rap 0 s) + runtime MC gate + MC card + talk-dominated chapter skip. Concert-relative sync fixes: resync by listening past minute 10 (A), vocal-onset hold release (B), `/concert` NameError (C), Shazam/OCR/decide switch offset 0.0 (D), chapter skipped by the sound-lock hold (E), plan-install re-tick (F), concert generation clock. Offline pass: int16 streaming decode, 946 → ~295 MiB peak, partial plan in ~14 s, parallel playhead-first voted fingerprinting. Hypothesis recorded: the `-748s` Melt drift was Bug D, not live timing. |

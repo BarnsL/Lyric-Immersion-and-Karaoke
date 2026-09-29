@@ -5,13 +5,19 @@ purge them so they get re-fetched correctly next time the song plays.
 Detects: language mismatches (e.g. a Japanese title with non-Japanese
 lyrics), empty/too-short files, and unreadable JSON.
 
-    python validate.py            # report only
-    python validate.py --purge    # delete the bad ones
+    python scripts/validate.py            # report only
+    python scripts/validate.py --purge    # delete the bad ones
 """
 
+import os
 import sys
 
-from fetch_lyrics import validate_file, LYRICS_DIR
+# The script lives in scripts/, and fetch_lyrics is in the repo root. Put the
+# root on the path so the AGENTS.md command `python scripts/validate.py` works
+# from a clean checkout (as ci_import_gate.py does).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from fetch_lyrics import validate_file, LYRICS_DIR  # noqa: E402
 
 
 def main():

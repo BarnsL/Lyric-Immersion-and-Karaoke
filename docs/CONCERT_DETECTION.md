@@ -109,8 +109,12 @@ combine as before.
 - **OCR does not run on chaptered concerts at all** (gate at `main.py:5826-5829`).
   The whole reader is a chapterless fallback, so improvements here do not affect
   the common case.
-- **Intermissions / MC**: when no banner + no singing, the last song's lyrics linger.
-  A follow-up should clear lyrics when neither OCR nor sound finds a song.
+- **Intermissions / MC**: when no banner + no singing, the last song's lyrics used to
+  linger. Since spec 001 the offline audio pass detects MC talk. While the host talks,
+  an "MC — talk between songs" card replaces the leftover line (whenever no line is
+  due), and song recognition pauses so talk can't load a wrong song. See
+  [CONCERT_AUDIO_SYNC.md](CONCERT_AUDIO_SYNC.md#mc--talk-detection). Talk under a
+  loud music bed is under-detected and falls back to the old behaviour.
 - **Banner region** is the **top-LEFT** area today (left 60% of the width, top 26%
   of the height, starting 10% down on browser windows), deliberately cropped to
   skip the top-right hashtag and the chat panel. Per-video region learning could

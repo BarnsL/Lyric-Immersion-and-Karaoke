@@ -42,3 +42,18 @@ jobs:
       - name: MPRIS provider live test (mock player, private session bus)
         if: runner.os == 'Linux'
         run: dbus-run-session -- python scripts/test_mpris_provider.py
+      # spec 001 (constitution Principle VI): the hermetic unit tests and the
+      # ast-extraction probes. tests/ imports main, which needs a display for
+      # pystray's X backend — hence xvfb, exactly like the import gate. The
+      # probes never import main. Linux only: the configuration verified for
+      # this step (Windows/macOS can be added once they are run there once).
+      - name: Unit tests (pytest, virtual display)
+        if: runner.os == 'Linux'
+        run: |
+          pip install pytest
+          xvfb-run -a python -m pytest tests -q
+      - name: Concert + tune-doc probes
+        if: runner.os == 'Linux'
+        run: |
+          python scripts/probe_concert.py
+          python scripts/probe_tune_docs.py

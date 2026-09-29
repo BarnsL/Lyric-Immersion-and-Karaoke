@@ -108,3 +108,8 @@ _zip_release.py
 DesktopKaraoke-portable.zip
 DesktopKaraoke-portable.zip.sha256
 *.bak
+
+# Obsidian's machine-local vault state (workspace layout, plugins, trash) — the
+# notes and the .canvas mind map under docs/obsidian-vault ARE committed.
+docs/obsidian-vault/.obsidian/
+docs/obsidian-vault/.trash/
