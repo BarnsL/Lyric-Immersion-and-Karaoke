@@ -256,6 +256,18 @@ an offline pass over the audio measures where the singing actually starts in eac
 segment, so the lyrics anchor past the applause and the intro instead of to the
 chapter mark.
 
+That same pass now tells **MC talk** apart from songs (a speech model, the absence
+of a beat, and talk-like pauses, together), so the lyrics never anchor on the host
+introducing the next number, a concert without chapters splits into its real
+songs, and while the host is talking the app pauses song recognition and shows an
+*MC — talk between songs* card instead of the last song's leftover line. Songs
+later in a long concert stay synced too: resync by listening, the vocal-onset
+release and Shazam song switches all work relative to the song's own start
+rather than to the video's (they used to give up after the first ten minutes).
+The pass decodes to 16-bit audio and works block by block, so an 80-minute
+concert peaks around 300 MB instead of about 1 GB, and the per-song onsets arrive
+within seconds, before the slower song identification finishes.
+
 When one of these videos misbehaves, open the **Concerts** view in the developer
 console (tray → *Developer Console* → **Concerts**). It answers the question you
 actually have, which is *why*: the verdict for the current video (**concert**,

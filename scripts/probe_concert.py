@@ -23,7 +23,12 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-SRC = Path(r"D:\Desktop-Karaoke\main.py")
+# Repo-relative (spec 001): the hard-coded D:\ path made this probe unrunnable
+# anywhere but one machine — including CI. KARAOKE_MAIN overrides it (used to run
+# the probe against another checkout, e.g. to demonstrate a regression).
+import os
+SRC = Path(os.environ.get("KARAOKE_MAIN")
+           or Path(__file__).resolve().parent.parent / "main.py")
 tree = ast.parse(SRC.read_text(encoding="utf-8-sig"))
 
 WANT = {"get_concert", "_chapter_fields", "explain_live_or_compilation",
@@ -54,7 +59,6 @@ mod = ast.Module(body=body, type_ignores=[])
 ast.fix_missing_locations(mod)
 ns = {"re": __import__("re"), "time": __import__("time"),
       "unicodedata": __import__("unicodedata"),
-      "_s": lambda v, n=40: (str(v)[:n] if v else ""),
       "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
 exec(compile(mod, str(SRC), "exec"), ns)
 get_concert = ns["get_concert"]

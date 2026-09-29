@@ -192,10 +192,10 @@ TUNE_DOC = {
         "How many seconds of audio are fingerprinted per concert segment when "
         "working out which song it is. Raise it to give the fingerprint more to "
         "work with, which improves the chance of a match but makes the offline pass "
-        "slower. Lower it for a quicker pass with weaker matches. Two probes are "
-        "taken per segment, one at the start of the singing and one around 25 "
-        "seconds later. Typical 6 to 30, default 12. Read by the concert audio "
-        "analyser.",
+        "slower. Lower it for a quicker pass with weaker matches. Up to three "
+        "probes are taken per segment (at the start of the singing, about 25 "
+        "seconds later, and the middle) and stop once two agree. Typical 6 to "
+        "30, default 12. Read by the concert audio analyser.",
     "concert_audio_identify":
         "Set 1 to enable, 0 to disable. With 1 the offline concert pass "
         "fingerprints a slice of each segment, so a song can be named even when the "
@@ -233,6 +233,97 @@ TUNE_DOC = {
         "corrections commit on the first reading. Lower it, or set 0, and "
         "everything waits to be paired. Typical 0 to 4, default 1.8. Read by the "
         "live sync-follow branch.",
+    "concert_audio_id_workers":
+        "How many concert segments the offline pass fingerprints at the same "
+        "time. The segment under the playhead goes first, then the ones after "
+        "it. Raise it to get every song named sooner on a long concert, at the "
+        "cost of more simultaneous requests to the fingerprint service. Lower it "
+        "to be gentler on the network; 1 fingerprints one segment at a time. "
+        "Typical 1 to 4, default 3. Read by concert_audio.analyze_concert.",
+    "concert_plan_min_seg_s":
+        "Shortest offline-analysis segment, in seconds, that may become an entry "
+        "of the setlist built for a concert WITHOUT chapters. Raise it to keep "
+        "short fragments (stings, jingles) out of the setlist. Lower it to keep "
+        "very short songs. Only confidently identified segments are used either "
+        "way. Typical 5 to 60, default 8. Read by _apply_concert_plan in main.py "
+        "(was a hardcoded 8.0 before spec 001).",
+    "concert_mc_chapter_skip_frac":
+        "A chapter whose offline-measured share of MC talk is at least this "
+        "fraction is treated as a non-song segment, like a chapter titled MC or "
+        "Talk, even when its title looks like a song name. Raise it (up to 1.0) "
+        "so only chapters that are nearly all talk are skipped. Lower it to skip "
+        "chapters that are mostly talk. 1.01 disables it. Typical 0.6 to 0.95, "
+        "default 0.8. Read by _concert_setlist_tick in main.py.",
+    "concert_mc_detect":
+        "Set 1 to enable, 0 to disable. With 1 the offline concert pass finds "
+        "the stretches where the host is TALKING (MC) by combining a speech "
+        "model with the absence of a beat and talk-like pauses. Those stretches "
+        "keep lyric onsets off the talk, split chapterless concerts into songs, "
+        "and let the runtime pause identification during talk. With 0 the pass "
+        "behaves as before spec 001. Default 1. Read by concert_audio.",
+    "concert_mc_edge_s":
+        "Seconds trimmed from each end of every MC talk interval before the "
+        "runtime uses it. The offline analysis knows talk edges to about 1 to 3 "
+        "seconds, and pausing identification during the first seconds of a song "
+        "costs more than missing the last seconds of talk. Raise it to be more "
+        "conservative near song boundaries; lower it to cover more of each talk "
+        "block. Typical 0 to 5, default 2. Read by _mc_normalize via "
+        "_apply_concert_plan in main.py.",
+    "concert_mc_gate":
+        "Set 1 to enable, 0 to disable. With 1, while the playhead is inside an "
+        "MC talk interval of a concert, the app pauses background song "
+        "identification, resync by listening, decide-by-ear, the decision "
+        "engine's strikes, the applause and stale-song watchdogs and lyric "
+        "generation, so talk cannot load, delete or generate the wrong song; "
+        "user actions still run. It also shows an MC card when no lyric line "
+        "is due. With 0 none of this happens. Default 1. Read by main.py.",
+    "concert_mc_hint_margin_s":
+        "How close, in seconds, the loaded song's first or last lyric line may "
+        "be to the playhead before the MC talk card is withheld. The card only "
+        "ever appears when no line is showing; this margin also keeps it away "
+        "from lines that are about to start or just ended. Raise it to show the "
+        "card less; lower it to show it more readily. Typical 0 to 10, default "
+        "3. Read by _mc_line_expected in main.py.",
+    "concert_mc_min_s":
+        "Shortest stretch of talk, in seconds, that the offline concert pass "
+        "reports as MC. Raise it so only longer talk blocks count (fewer false "
+        "alarms from a spoken line inside a song). Lower it to also catch short "
+        "exchanges between songs. Typical 6 to 30, default 10. Read by "
+        "concert_audio._mc_intervals.",
+    "concert_mc_pulse_max":
+        "Beat clarity above which audio counts as music rather than talk, from 0 "
+        "(no steady beat) to 1 (a perfectly regular beat). Measured talk sits "
+        "near 0.1 to 0.2 and songs near 0.3 to 0.7, and this is what stops rap "
+        "from being mistaken for talk. Raise it to find more talk over rhythmic "
+        "background music, at the risk of flagging sparse songs; lower it for "
+        "fewer false alarms. Typical 0.2 to 0.4, default 0.30. Read by "
+        "concert_audio._mc_intervals.",
+    "concert_mc_speech_min":
+        "Minimum speech probability from the speech model for a moment of a "
+        "concert to count as MC talk. Raise it to flag only very clear talk; "
+        "lower it to catch talk under crowd noise or music, at the risk of more "
+        "false alarms (the beat and pause checks still apply). Typical 0.3 to "
+        "0.8, default 0.5. When the speech model is not installed a stricter "
+        "sound-only rule is used instead. Read by concert_audio._mc_intervals.",
+    "concert_relative_sync":
+        "Set 1 to enable, 0 to disable. In a concert the sync offset is roughly "
+        "minus where the current song starts in the video, often hundreds of "
+        "seconds. With 1, resync by listening, Force Sync, screen-reading (OCR) "
+        "sync, the vocal-onset release of the between-songs hold and Shazam song "
+        "switches treat that offset as a reference instead of as an error. With "
+        "0 they revert to their pre-spec-001 behaviour, which disabled them "
+        "after minute 10 of a concert. Default 1. Read by align_by_listening, "
+        "_apply_align, force_sync, _ocr_assisted_sync, _on_vocal_onset and "
+        "_consume_async in main.py.",
+    "concert_energy_align":
+        "Set 1 to enable, 0 to disable. The whisper-free energy auto-align "
+        "compares the vocal on/off pattern of the last 30 s of audio with the "
+        "lyrics. In a concert it used to place that audio on the raw video "
+        "clock, minutes away from every lyric line, so it never corrected "
+        "anything there. With 1 it uses the song clock and the correction is "
+        "capped instead of the offset; it pauses during MC talk and skips reads "
+        "overlapping talk. Needs concert_relative_sync. Default 1. Read by "
+        "_auto_align_by_energy in main.py.",
     "concert_pool_prefetch_max":
         "How many songs from a concert's parsed song list get their lyrics "
         "downloaded in the background as soon as the concert loads. Raise it so "

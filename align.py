@@ -1093,7 +1093,7 @@ def _best_anchor(segments, lines):
     return ranked[0] if ranked else None
 
 
-def rank_offsets(lines, lang="ja", get_pos=None, seconds=_CAP, top_n=6):
+def rank_offsets(lines, lang="ja", get_pos=None, seconds=_CAP, top_n=6, ref_offset=0.0):
     """Listen ONCE and return a ranked list of candidate sync offsets,
     ``[(offset, ratio, line_start), …]`` best-first, deduped so near-identical
     offsets collapse to one.
@@ -1104,9 +1104,16 @@ def rank_offsets(lines, lang="ja", get_pos=None, seconds=_CAP, top_n=6):
     SEVERAL offsets — one per occurrence in the song. Force Sync tries them in
     rank order and forward-verifies each against later reads, so a wrong
     occurrence (whose lyrics stop matching once the song moves on) is dropped in
-    favour of the one that keeps lining up."""
+    favour of the one that keeps lining up.
+
+    ``ref_offset`` is the baseline the caller measures from, as in
+    :func:`capture_and_align`: the guards bound ``offset - ref_offset``. It is
+    0.0 for a normal track. In a CONCERT it is minus the song's start in the
+    video, and an absolute guard rejected every candidate after minute 10 there,
+    so Force Sync could never lock (spec 001)."""
     if not lines:
         return []
+    ref = float(ref_offset or 0.0)
     _ensure_deps_path()
     pos_cap = float(get_pos() or 0.0) if get_pos else 0.0
     audio = _capture(seconds)
@@ -1120,16 +1127,18 @@ def rank_offsets(lines, lang="ja", get_pos=None, seconds=_CAP, top_n=6):
         if ratio < _MIN_RATIO:
             continue
         offset = round(line.start - (pos_cap + seg_t), 2)
-        if abs(offset) > 600:                        # absolute sanity guard
+        jump = offset - ref
+        if abs(jump) > 600:                          # sanity guard (vs the baseline)
             continue
         # Same jump-vs-confidence gate capture_and_align uses: a weak match that
         # implies a big correction is almost always a mis-anchor, not a real
-        # long intro, so a larger offset must clear a higher ratio bar.
-        if ratio < _MIN_RATIO + min(0.30, abs(offset) / 200.0):
+        # long intro, so a larger correction must clear a higher ratio bar.
+        if ratio < _MIN_RATIO + min(0.30, abs(jump) / 200.0):
             continue
         cands.append((offset, round(ratio, 2), line.start))
-    # Collapse near-identical offsets (keep the strongest ratio of each cluster).
-    cands.sort(key=lambda x: (-x[1], abs(x[0])))
+    # Collapse near-identical offsets (keep the strongest ratio of each cluster;
+    # ties go to the candidate closest to the baseline).
+    cands.sort(key=lambda x: (-x[1], abs(x[0] - ref)))
     deduped = []
     for off, r, ls in cands:
         if any(abs(off - d[0]) <= 1.0 for d in deduped):
@@ -1138,12 +1147,20 @@ def rank_offsets(lines, lang="ja", get_pos=None, seconds=_CAP, top_n=6):
     return deduped[:max(1, top_n)]
 
 
-def capture_and_align(lines, lang="ja", get_pos=None, seconds=_CAP):
+def capture_and_align(lines, lang="ja", get_pos=None, seconds=_CAP, ref_offset=0.0):
     """Listen, transcribe, and return the sync OFFSET (seconds) to set so the
     lyrics line up with what's heard — or None if it can't tell confidently.
 
     `get_pos()` must return the player's CURRENT position (seconds); it's read at
     capture start so we can map the heard line's cached time back to a correction.
+
+    `ref_offset` is the offset the caller is ALREADY running with. The two sanity
+    guards below bound the CORRECTION (`offset - ref_offset`), not the absolute
+    offset. For a normal track the reference is 0.0, so nothing changes. In a
+    CONCERT the offset is roughly minus where the song starts in the video (e.g.
+    -1800 for a song 30 minutes in), and judging that absolute number rejected
+    every read after minute 10 — resync by listening silently died for most of
+    every concert (spec 001, Bug A).
     """
     if not lines:
         return None
@@ -1162,7 +1179,11 @@ def capture_and_align(lines, lang="ja", get_pos=None, seconds=_CAP):
     # The heard line's real song-time is line.start; in the clip it occurred at
     # pos_cap + seg_t. The offset makes displayed (position+offset) == song time.
     offset = round(line.start - (pos_cap + seg_t), 2)
-    if abs(offset) > 600:                            # absolute sanity guard
+    try:
+        jump = offset - float(ref_offset or 0.0)     # the CORRECTION this read implies
+    except Exception:
+        jump = offset
+    if abs(jump) > 600:                              # sanity guard on the correction
         return None
     # A LARGER correction must clear a HIGHER confidence bar. A weak ASR match just
     # over the floor that implies a big jump is almost always a mis-anchor on a
@@ -1170,7 +1191,7 @@ def capture_and_align(lines, lang="ja", get_pos=None, seconds=_CAP):
     # not a real long intro — so scale the required ratio with the jump size. A
     # genuinely large offset (a cinematic intro) still passes if the match is
     # strong; a small drift correction keeps the lenient floor.
-    if ratio < _MIN_RATIO + min(0.30, abs(offset) / 200.0):
+    if ratio < _MIN_RATIO + min(0.30, abs(jump) / 200.0):
         return None
     return offset, round(ratio, 2), line.start
 

@@ -2,10 +2,16 @@
 # imports on Linux, macOS, and Windows, and live-test the Linux MPRIS
 # now-playing provider against a mock player on a private D-Bus session.
 name: ci
+# AUTOMATIC CHECKS ARE DISABLED at the owner's request (2026-09-29). GitHub
+# Actions refuses to start any job on this account (billing lock), so every
+# push and pull request only produced failed checks. The workflow still runs by
+# hand: Actions ▸ ci ▸ Run workflow. To re-enable automatic checks, add back:
+#   push:
+#     branches: [master]
+#   pull_request:
+# Until then, run the same steps locally; the commands are in scripts/README.md
+# under "Running the tests".
 on:
-  push:
-    branches: [master]
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -42,3 +48,22 @@ jobs:
       - name: MPRIS provider live test (mock player, private session bus)
         if: runner.os == 'Linux'
         run: dbus-run-session -- python scripts/test_mpris_provider.py
+      # spec 001 (constitution Principle VI): the hermetic unit tests and the
+      # ast-extraction probes. tests/ imports main, which needs a display for
+      # pystray's X backend — hence xvfb, exactly like the import gate. The
+      # probes never import main. Linux only: the configuration verified for
+      # this step (Windows/macOS can be added once they are run there once).
+      # requirements-deps.txt is the optional audio stack the app vendors into
+      # .deps (PyAV, faster-whisper + its Silero VAD, onnxruntime); installing
+      # it here lets the decoder-parity and speech-model tests run instead of
+      # skipping.
+      - name: Unit tests (pytest, virtual display)
+        if: runner.os == 'Linux'
+        run: |
+          pip install pytest -r requirements-deps.txt
+          xvfb-run -a python -m pytest tests -q
+      - name: Concert + tune-doc probes
+        if: runner.os == 'Linux'
+        run: |
+          python scripts/probe_concert.py
+          python scripts/probe_tune_docs.py

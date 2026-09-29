@@ -1,0 +1,559 @@
+{
+	"nodes": [
+		{
+			"id": "g-core",
+			"type": "group",
+			"label": "Core pipeline",
+			"x": -1130,
+			"y": -370,
+			"width": 690,
+			"height": 800
+		},
+		{
+			"id": "g-concert",
+			"type": "group",
+			"label": "Concert subsystem (spec 001)",
+			"x": -180,
+			"y": -370,
+			"width": 690,
+			"height": 800
+		},
+		{
+			"id": "g-quality",
+			"type": "group",
+			"label": "Controls & quality",
+			"x": 670,
+			"y": -370,
+			"width": 690,
+			"height": 400
+		},
+		{
+			"id": "g-shared",
+			"type": "group",
+			"label": "Shared with other projects",
+			"x": -1130,
+			"y": 530,
+			"width": 2440,
+			"height": 370
+		},
+		{
+			"id": "hub",
+			"type": "file",
+			"file": "Lyric Immersion.md",
+			"x": 0,
+			"y": -520,
+			"width": 280,
+			"height": 100,
+			"color": "6"
+		},
+		{
+			"id": "arch",
+			"type": "file",
+			"file": "concepts/Architecture Overview.md",
+			"x": -900,
+			"y": -300,
+			"width": 280,
+			"height": 100
+		},
+		{
+			"id": "media",
+			"type": "file",
+			"file": "concepts/Media Sources.md",
+			"x": -1100,
+			"y": -100,
+			"width": 280,
+			"height": 100
+		},
+		{
+			"id": "lyrics",
+			"type": "file",
+			"file": "concepts/Lyric Sourcing.md",
+			"x": -750,
+			"y": -100,
+			"width": 280,
+			"height": 100
+		},
+		{
+			"id": "decision",
+			"type": "file",
+			"file": "concepts/Decision Engine.md",
+			"x": -750,
+			"y": 100,
+			"width": 280,
+			"height": 100
+		},
+		{
+			"id": "sync",
+			"type": "file",
+			"file": "concepts/Sync Engine.md",
+			"x": -750,
+			"y": 300,
+			"width": 280,
+			"height": 100
+		},
+		{
+			"id": "concert",
+			"type": "file",
+			"file": "concepts/Concert Mode.md",
+			"x": 0,
+			"y": -300,
+			"width": 280,
+			"height": 100,
+			"color": "2"
+		},
+		{
+			"id": "offline",
+			"type": "file",
+			"file": "concepts/Offline Concert Analysis.md",
+			"x": 0,
+			"y": -100,
+			"width": 280,
+			"height": 100,
+			"color": "2"
+		},
+		{
+			"id": "mcdet",
+			"type": "file",
+			"file": "concepts/MC Talk Detection.md",
+			"x": -150,
+			"y": 100,
+			"width": 280,
+			"height": 100,
+			"color": "2"
+		},
+		{
+			"id": "setlist",
+			"type": "file",
+			"file": "concepts/Chapter Setlist Tick.md",
+			"x": 200,
+			"y": 100,
+			"width": 280,
+			"height": 100,
+			"color": "2"
+		},
+		{
+			"id": "mcgate",
+			"type": "file",
+			"file": "concepts/MC Gate.md",
+			"x": -150,
+			"y": 300,
+			"width": 280,
+			"height": 100,
+			"color": "2"
+		},
+		{
+			"id": "relsync",
+			"type": "file",
+			"file": "concepts/Concert-Relative Sync.md",
+			"x": 200,
+			"y": 300,
+			"width": 280,
+			"height": 100,
+			"color": "2"
+		},
+		{
+			"id": "tune",
+			"type": "file",
+			"file": "concepts/Tune Knobs.md",
+			"x": 700,
+			"y": -300,
+			"width": 280,
+			"height": 100,
+			"color": "3"
+		},
+		{
+			"id": "console",
+			"type": "file",
+			"file": "concepts/Dev Console.md",
+			"x": 1050,
+			"y": -300,
+			"width": 280,
+			"height": 100,
+			"color": "3"
+		},
+		{
+			"id": "tests",
+			"type": "file",
+			"file": "concepts/Testing and Probes.md",
+			"x": 700,
+			"y": -100,
+			"width": 280,
+			"height": 100,
+			"color": "3"
+		},
+		{
+			"id": "rules",
+			"type": "file",
+			"file": "concepts/Hard Rules.md",
+			"x": 1050,
+			"y": -100,
+			"width": 280,
+			"height": 100,
+			"color": "1"
+		},
+		{
+			"id": "fw",
+			"type": "file",
+			"file": "shared/faster-whisper.md",
+			"x": -1100,
+			"y": 600,
+			"width": 280,
+			"height": 100,
+			"color": "5"
+		},
+		{
+			"id": "silero",
+			"type": "file",
+			"file": "shared/Silero VAD.md",
+			"x": -750,
+			"y": 600,
+			"width": 280,
+			"height": 100,
+			"color": "5"
+		},
+		{
+			"id": "pyav",
+			"type": "file",
+			"file": "shared/PyAV.md",
+			"x": -400,
+			"y": 600,
+			"width": 280,
+			"height": 100,
+			"color": "5"
+		},
+		{
+			"id": "numpy",
+			"type": "file",
+			"file": "shared/NumPy.md",
+			"x": -50,
+			"y": 600,
+			"width": 280,
+			"height": 100,
+			"color": "5"
+		},
+		{
+			"id": "shazam",
+			"type": "file",
+			"file": "shared/Shazam.md",
+			"x": 300,
+			"y": 600,
+			"width": 280,
+			"height": 100,
+			"color": "5"
+		},
+		{
+			"id": "ytdlp",
+			"type": "file",
+			"file": "shared/yt-dlp.md",
+			"x": 650,
+			"y": 600,
+			"width": 280,
+			"height": 100,
+			"color": "5"
+		},
+		{
+			"id": "speckit",
+			"type": "file",
+			"file": "shared/Spec Kit.md",
+			"x": 1000,
+			"y": 600,
+			"width": 280,
+			"height": 100,
+			"color": "5"
+		},
+		{
+			"id": "t-shared",
+			"type": "text",
+			"text": "**Cross-project links** - notes in `shared/` use stable, project-neutral names. When another project's vault has a note with the same name, the two mind maps meet there: copy or link these notes into a shared vault to join them.",
+			"x": -1100,
+			"y": 760,
+			"width": 1100,
+			"height": 110
+		}
+	],
+	"edges": [
+		{
+			"id": "e00",
+			"fromNode": "hub",
+			"fromSide": "left",
+			"toNode": "arch",
+			"toSide": "right",
+			"toEnd": "arrow"
+		},
+		{
+			"id": "e01",
+			"fromNode": "hub",
+			"fromSide": "bottom",
+			"toNode": "concert",
+			"toSide": "top",
+			"toEnd": "arrow"
+		},
+		{
+			"id": "e02",
+			"fromNode": "hub",
+			"fromSide": "right",
+			"toNode": "tune",
+			"toSide": "left",
+			"toEnd": "arrow"
+		},
+		{
+			"id": "e03",
+			"fromNode": "arch",
+			"fromSide": "bottom",
+			"toNode": "media",
+			"toSide": "top",
+			"toEnd": "arrow"
+		},
+		{
+			"id": "e04",
+			"fromNode": "arch",
+			"fromSide": "bottom",
+			"toNode": "lyrics",
+			"toSide": "top",
+			"toEnd": "arrow"
+		},
+		{
+			"id": "e05",
+			"fromNode": "media",
+			"fromSide": "right",
+			"toNode": "lyrics",
+			"toSide": "left",
+			"toEnd": "arrow",
+			"label": "title / artist"
+		},
+		{
+			"id": "e06",
+			"fromNode": "lyrics",
+			"fromSide": "bottom",
+			"toNode": "decision",
+			"toSide": "top",
+			"toEnd": "arrow",
+			"label": "candidates"
+		},
+		{
+			"id": "e07",
+			"fromNode": "decision",
+			"fromSide": "bottom",
+			"toNode": "sync",
+			"toSide": "top",
+			"toEnd": "arrow",
+			"label": "chosen song"
+		},
+		{
+			"id": "e08",
+			"fromNode": "media",
+			"fromSide": "bottom",
+			"toNode": "sync",
+			"toSide": "top",
+			"toEnd": "arrow",
+			"label": "playback position"
+		},
+		{
+			"id": "e09",
+			"fromNode": "concert",
+			"fromSide": "bottom",
+			"toNode": "offline",
+			"toSide": "top",
+			"toEnd": "arrow",
+			"label": "long live video"
+		},
+		{
+			"id": "e10",
+			"fromNode": "offline",
+			"fromSide": "bottom",
+			"toNode": "mcdet",
+			"toSide": "top",
+			"toEnd": "arrow",
+			"label": "talk cues"
+		},
+		{
+			"id": "e11",
+			"fromNode": "offline",
+			"fromSide": "bottom",
+			"toNode": "setlist",
+			"toSide": "top",
+			"toEnd": "arrow",
+			"label": "plan: onsets + IDs"
+		},
+		{
+			"id": "e12",
+			"fromNode": "mcdet",
+			"fromSide": "bottom",
+			"toNode": "mcgate",
+			"toSide": "top",
+			"toEnd": "arrow",
+			"label": "MC intervals"
+		},
+		{
+			"id": "e13",
+			"fromNode": "mcgate",
+			"fromSide": "left",
+			"toNode": "decision",
+			"toSide": "right",
+			"toEnd": "arrow",
+			"label": "pauses strikes"
+		},
+		{
+			"id": "e14",
+			"fromNode": "mcgate",
+			"fromSide": "left",
+			"toNode": "sync",
+			"toSide": "right",
+			"toEnd": "arrow",
+			"label": "pauses resync"
+		},
+		{
+			"id": "e15",
+			"fromNode": "setlist",
+			"fromSide": "bottom",
+			"toNode": "relsync",
+			"toSide": "top",
+			"toEnd": "arrow",
+			"label": "song anchor"
+		},
+		{
+			"id": "e16",
+			"fromNode": "relsync",
+			"fromSide": "left",
+			"toNode": "sync",
+			"toSide": "right",
+			"toEnd": "arrow",
+			"label": "offset = -song start"
+		},
+		{
+			"id": "e17",
+			"fromNode": "tune",
+			"fromSide": "left",
+			"toNode": "offline",
+			"toSide": "right",
+			"toEnd": "arrow",
+			"label": "knobs"
+		},
+		{
+			"id": "e18",
+			"fromNode": "tune",
+			"fromSide": "bottom",
+			"toNode": "mcgate",
+			"toSide": "top",
+			"toEnd": "arrow",
+			"label": "knobs"
+		},
+		{
+			"id": "e19",
+			"fromNode": "console",
+			"fromSide": "left",
+			"toNode": "tune",
+			"toSide": "right",
+			"toEnd": "arrow",
+			"label": "/tune, /concert"
+		},
+		{
+			"id": "e20",
+			"fromNode": "tests",
+			"fromSide": "left",
+			"toNode": "offline",
+			"toSide": "right",
+			"toEnd": "arrow",
+			"label": "unit tests"
+		},
+		{
+			"id": "e21",
+			"fromNode": "tests",
+			"fromSide": "bottom",
+			"toNode": "relsync",
+			"toSide": "top",
+			"toEnd": "arrow",
+			"label": "unit tests + probe"
+		},
+		{
+			"id": "e22",
+			"fromNode": "rules",
+			"fromSide": "left",
+			"toNode": "lyrics",
+			"toSide": "right",
+			"toEnd": "arrow",
+			"label": "no lyric text in repo"
+		},
+		{
+			"id": "e23",
+			"fromNode": "fw",
+			"fromSide": "right",
+			"toNode": "silero",
+			"toSide": "left",
+			"toEnd": "arrow",
+			"label": "bundles"
+		},
+		{
+			"id": "e24",
+			"fromNode": "fw",
+			"fromSide": "top",
+			"toNode": "sync",
+			"toSide": "bottom",
+			"toEnd": "arrow",
+			"label": "sync by listening"
+		},
+		{
+			"id": "e25",
+			"fromNode": "silero",
+			"fromSide": "top",
+			"toNode": "mcdet",
+			"toSide": "bottom",
+			"toEnd": "arrow",
+			"label": "speech probability"
+		},
+		{
+			"id": "e26",
+			"fromNode": "pyav",
+			"fromSide": "top",
+			"toNode": "offline",
+			"toSide": "bottom",
+			"toEnd": "arrow",
+			"label": "int16 streaming decode"
+		},
+		{
+			"id": "e27",
+			"fromNode": "numpy",
+			"fromSide": "top",
+			"toNode": "offline",
+			"toSide": "bottom",
+			"toEnd": "arrow",
+			"label": "envelopes, STFT"
+		},
+		{
+			"id": "e28",
+			"fromNode": "shazam",
+			"fromSide": "top",
+			"toNode": "offline",
+			"toSide": "bottom",
+			"toEnd": "arrow",
+			"label": "segment IDs"
+		},
+		{
+			"id": "e29",
+			"fromNode": "shazam",
+			"fromSide": "left",
+			"toNode": "decision",
+			"toSide": "right",
+			"toEnd": "arrow",
+			"label": "identify"
+		},
+		{
+			"id": "e30",
+			"fromNode": "ytdlp",
+			"fromSide": "top",
+			"toNode": "offline",
+			"toSide": "bottom",
+			"toEnd": "arrow",
+			"label": "audio download"
+		},
+		{
+			"id": "e31",
+			"fromNode": "speckit",
+			"fromSide": "top",
+			"toNode": "tests",
+			"toSide": "bottom",
+			"toEnd": "arrow",
+			"label": "spec -> plan -> tasks"
+		}
+	]
+}

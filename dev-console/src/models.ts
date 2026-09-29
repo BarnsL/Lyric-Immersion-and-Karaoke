@@ -163,6 +163,23 @@ export interface ConcertPlanSeg {
   artist: string;
   source: string;
   id_conf: number;
+  /** spec 001: share (0..1) of this segment the offline pass measured as MC talk. */
+  mc_frac?: number;
+}
+
+/** spec 001: MC (host talk) intervals from the offline pass and the runtime gate. */
+export interface ConcertMcAudio {
+  /** The playhead is inside a talk interval and listening is paused right now. */
+  in_mc: boolean;
+  gate_on: boolean;
+  intervals: { start: number; end: number; current: boolean }[];
+  count: number;
+  total_s: number;
+  /** The id-bearing FINAL plan has landed (else only the early partial plan). */
+  plan_final: boolean;
+  last_exit_pos_s: number | null;
+  /** Concert offsets are treated as relative (resync / onset / switch fixes). */
+  relative_sync: boolean;
 }
 
 export interface ConcertApplause {
@@ -200,6 +217,8 @@ export interface ConcertPayload {
   chapter_idx: number | null;
   mc_segments: ConcertChapter[];
   mc_note: string;
+  /** spec 001; absent from engines older than it. */
+  mc_audio?: ConcertMcAudio;
   plan: ConcertPlanSeg[];
   plan_current: number | null;
   plan_note: string;

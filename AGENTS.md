@@ -146,6 +146,6 @@ to refresh the cached romaji. No code changes needed — it's pure data.
 ## Verify your changes
 
 ```bash
-python -c "import ast;[ast.parse(open(f,encoding='utf-8').read()) for f in ('main.py','fetch_lyrics.py')]"
+python -c "import ast;[ast.parse(open(f,encoding='utf-8-sig').read()) for f in ('main.py','fetch_lyrics.py','concert_audio.py','align.py')]"
 python scripts/validate.py
 ```
