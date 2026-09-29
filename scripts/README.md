@@ -56,7 +56,10 @@ on failure, so they can gate a build.
 ## Running the tests
 
 The suite in `tests/` runs under `pytest` (install it with `pip install
-pytest`; it is not in `requirements.txt`). CI runs exactly this on Linux:
+pytest`; it is not in `requirements.txt`). CI runs exactly this on Linux. Its
+automatic runs on push and pull request are currently **disabled** (see the note
+at the top of `.github/workflows/ci.yml`); start it by hand from the Actions tab,
+or run these steps locally:
 
 ```
 pip install pytest -r requirements-deps.txt

@@ -2,10 +2,16 @@
 # imports on Linux, macOS, and Windows, and live-test the Linux MPRIS
 # now-playing provider against a mock player on a private D-Bus session.
 name: ci
+# AUTOMATIC CHECKS ARE DISABLED at the owner's request (2026-09-29). GitHub
+# Actions refuses to start any job on this account (billing lock), so every
+# push and pull request only produced failed checks. The workflow still runs by
+# hand: Actions ▸ ci ▸ Run workflow. To re-enable automatic checks, add back:
+#   push:
+#     branches: [master]
+#   pull_request:
+# Until then, run the same steps locally; the commands are in scripts/README.md
+# under "Running the tests".
 on:
-  push:
-    branches: [master]
-  pull_request:
   workflow_dispatch:
 
 jobs:
