@@ -91,6 +91,9 @@ hiddenimports = [
     # v1.1.57 offline concert audio analysis — lazy-imported in main.py's
     # _analyze_concert_audio thread; pin so the frozen build includes it.
     "concert_audio", "faster_whisper.audio",
+    # spec 001: MC/talk detection uses the Silero VAD bundled with faster-whisper
+    # (faster_whisper.vad + its assets/*.onnx, collected with the package).
+    "faster_whisper.vad",
     # TICKET-100: Discord IPC reader (lazy-imported in main.py only when the
     # tray toggle is ON, but pin it here so the frozen build includes it).
     "discord_rpc",
