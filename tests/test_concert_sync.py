@@ -110,13 +110,16 @@ def engine(**attrs):
         e.hints.append(msg)
         e.cv.items.add("hint")
         e._hint_owner = None
+        e._hint_t = time.time()
 
     defaults = dict(
         _live_mode=True, _live_arrangement=False, _mv_mode=False, _is_cover=False,
         offset=0.0, _pending_offset=None, _pending_note=None, _display_offset=None,
         lines=[], idx=-1, meta={}, _lyrics_path=None, _track=("Band", "Concert"),
         _concert_mc=(), _in_mc=False, _mc_idx=-1, _mc_playing=False, _mc_flag_t=0.0,
-        _mc_enter_t=0.0, _mc_exit_pos=-1.0, _mc_hint_t=0.0, _hint_owner=None,
+        _mc_enter_t=0.0, _mc_exit_pos=-1.0, _hint_t=0.0, _hint_owner=None, _mc_cur=None,
+        _chapter_intro_engage_pos=None, _chapter_vocal_pos=None, _chapter_crude_off=None,
+        _identify_user_pending=None, _gen_token=0, _gen_lines=[], _pending_swap=None,
         _chapter_intro_hold=False, _chapter_intro_pos0=0.0, _chapter_intro_t0=0.0,
         _intro_anchored=True, _sound_song=None, _concert_plan=None,
         _concert_plan_seq=-1, _concert_plan_final=False, _concert_setlist=None,
@@ -258,7 +261,7 @@ def test_apply_align_drops_stale_results(case):
     e = engine(offset=-1800.0, lines=lines, _concert_mc=((1810.0, 1820.0),))
     ref, res = -1800.0, (-1803.0, 0.80, 12.0)       # heard line at video 12+1803 = 1815
     if case == "lines_changed":
-        e.lines = L((10, 14))
+        e.lines = L((30, 34))                       # a different song's timings
         e._concert_mc = ()
     elif case == "anchor_moved":
         e.offset = -1790.0
@@ -493,3 +496,379 @@ def test_get_concert_reports_mc_and_never_raises():
     assert out["plan"] and out["plan"][0]["mc_frac"] == 0.0
     assert out["watchdogs"]["pending_switch"] == "Some Song"
     assert "MC talk awareness" in out["knobs"]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Review fixes (spec 001, independent review of the first version)
+# Each test below failed on that version; the scenario is in its docstring.
+# ════════════════════════════════════════════════════════════════════════════
+class _Char:
+    def set_playing(self, v):
+        pass
+
+
+def _init_literal_defaults():
+    """Every ``self.<name> = <literal>`` in Overlay.__init__ (numbers, strings,
+    None, bools, empty containers) — the REAL starting values of the plain
+    state the frame function reads, parsed like the tune dict above."""
+    tree = ast.parse((_ROOT / "main.py").read_text(encoding="utf-8-sig"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "Overlay":
+            init = next(f for f in node.body
+                        if isinstance(f, ast.FunctionDef) and f.name == "__init__")
+            out = {}
+            for st in ast.walk(init):
+                if (isinstance(st, ast.Assign) and len(st.targets) == 1
+                        and isinstance(st.targets[0], ast.Attribute)
+                        and isinstance(st.targets[0].value, ast.Name)
+                        and st.targets[0].value.id == "self"):
+                    try:
+                        out.setdefault(st.targets[0].attr, ast.literal_eval(st.value))
+                    except Exception:
+                        pass
+            return out
+    raise AssertionError("Overlay.__init__ not found")
+
+
+INIT_DEFAULTS = _init_literal_defaults()
+
+
+def _tickable(e, title, artist="", pos=45.0):
+    """Stub what `_tick_body` touches beyond the engine, so the REAL frame
+    function can run one frame (it re-schedules itself through root.after)."""
+    for k, v in INIT_DEFAULTS.items():
+        if not hasattr(e, k):
+            setattr(e, k, v)
+    # settings-derived layout (read from settings.json in __init__); drawing
+    # itself is out of scope — record which line the frame would render
+    e.scroll_dir, e.pos_x, e.pos_y = "none", "center", "bottom"
+    e.rendered = []
+    e._render = lambda ln: e.rendered.append(ln)
+    e.media.state.update({"title": title, "artist": artist, "source": "chrome",
+                          "position": pos, "status": PLAYING})
+    for name in ("_consume_async", "_decision_engine_tick", "_check_applause_gap",
+                 "_check_game_focus", "_check_gaming_hard_drift", "_check_monitors",
+                 "_update_smtc_pause_state"):
+        setattr(e, name, lambda *a, **k: None)
+    e._trusted_duration = lambda st: None
+    e._gpu_send_song = lambda: None
+    e._cancel_pending_swap = lambda reason: None
+    e.character = _Char()
+    e._render_frame, e._last_tick_t, e._offset_hist, e._offset_hist_last = (
+        False, None, [], e.offset)
+    e._now_url, e._music_source_last_t = None, 0.0
+    e._idx_minus_one_since = 0.0
+    e._tick = lambda: None
+    e._last_raw_title, e._last_src, e._last_artist = title, "chrome", artist
+    e._clean_artist_cache, e._clean_title_cache = artist, title
+    return e
+
+
+def test_same_timing_helper():
+    a = L((10, 14), (15, 20))
+    assert main._same_timing(a, a)
+    assert main._same_timing(a, L((10, 14), (15, 20)))       # a same-song reload
+    assert not main._same_timing(a, L((10, 14), (16, 20)))
+    assert not main._same_timing(a, L((10, 14)))
+    assert not main._same_timing(a, None)
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_align_result_survives_a_same_song_reload(live):
+    """A translation backfill reloads the SAME song as a new list mid-capture
+    (load(keep_idx=True)); a studio "Sync by listening" result was dropped as
+    "lyrics changed" — the one non-concert regression the review found."""
+    lines = L((10, 14), (15, 20))
+    e = engine(_live_mode=live, offset=-1800.0 if live else 0.0, lines=lines)
+    e._auto_align_silent = False
+    e.lines = L((10, 14), (15, 20))                 # same timings, new list
+    ref = -1800.0 if live else None
+    e._apply_align(((-1802.5 if live else -2.5), 0.90, 12.0), lines=lines, ref=ref)
+    assert e.smooth_calls == [((-1802.5 if live else -2.5), "align-by-ear")]
+
+
+CH2 = [{"start": 0.0, "title": "Opening Theme Song"},
+       {"start": 1800.0, "title": "Distinctive Second Song"}]
+
+
+def _cached_engine(pos):
+    e = engine(_concert_setlist=list(CH2), _setlist_idx=None,
+               index=Index(match=Path("/nonexistent/second.json")))
+
+    def _load(p):
+        e.lines = L((10, 14), (15, 20), (21, 25))    # first line at song time 10 s
+        e._lyrics_path = p
+    e.load = _load
+    e.media.state["position"] = pos
+    return e
+
+
+def test_late_hold_keeps_the_anchor_and_the_plan_onset_still_applies():
+    """Resuming 60 s into a chapter engaged the hold with the singing already
+    going; its first held frame counted as the ONSET and re-timed the song so
+    its first line played "now" (50 s late) — and the plan's measured onset
+    could no longer repair it."""
+    e = _cached_engine(1860.0)
+    e._concert_setlist_tick(1860.0)
+    assert e._chapter_intro_hold and e.offset == -1800.0
+    e._chapter_vocal_pos = 1860.1                   # the tick's first held frame
+    e._on_vocal_onset()
+    assert e.smooth_calls == [] and e.offset == -1800.0 and e._intro_anchored
+    plan = [dict(start=1800.0, end=2100.0, onset=1812.0, title=None, id_conf=0.0,
+                 source="chapters", chapter="B", mc_frac=0.0)]
+    e._apply_concert_plan(7, plan, mc=[], partial=True)
+    assert e.smooth_calls == [(-1812.0, "concert-plan-onset")]
+    e._apply_concert_plan(7, plan, mc=[], partial=False)      # final: no double anchor
+    assert e.smooth_calls == [(-1812.0, "concert-plan-onset")]
+
+
+def test_plan_onset_never_overrides_a_refined_offset():
+    e = _cached_engine(1860.0)
+    e._concert_setlist_tick(1860.0)
+    e._chapter_vocal_pos = 1860.1
+    e._on_vocal_onset()
+    e.offset = -1803.5                              # resync refined it since
+    plan = [dict(start=1800.0, end=2100.0, onset=1812.0, title=None, id_conf=0.0,
+                 source="chapters", chapter="B", mc_frac=0.0)]
+    e._apply_concert_plan(7, plan, mc=[], partial=True)
+    assert e.smooth_calls == [] and e.offset == -1803.5
+
+
+def test_bug_e_late_reevaluation_keeps_the_anchor():
+    e = _cached_engine(1805.0)
+    e._setlist_idx, e._verified = 0, True
+    e._last_sound_lock_t = time.time()
+    e.meta = {"title": "Opening Theme Song"}
+    e._concert_setlist_tick(1805.0)
+    assert e._setlist_deferred_idx == 1
+    e._last_sound_lock_t, e._verified = time.time() - 95.0, False
+    e.media.state["position"] = 1885.0
+    e._concert_setlist_tick(1885.0)
+    e._chapter_vocal_pos = 1885.1
+    e._on_vocal_onset()
+    assert e.smooth_calls == [] and e.offset == -1800.0
+
+
+def test_on_time_hold_still_calibrates_from_the_heard_onset():
+    e = _cached_engine(1800.5)
+    e._concert_setlist_tick(1800.5)
+    e.media.state["position"] = 1832.0
+    e._chapter_vocal_pos = 1830.0                   # vocals first heard at 1830
+    e._on_vocal_onset()
+    assert e.smooth_calls == [(-1820.0, "vocal-onset-concert")]   # 10 - (1830-1800)
+
+
+def test_onset_heard_while_fetching_anchors_the_song_through_the_tick():
+    """The hold engaged on time, but the lyrics were still being fetched when
+    the singing started; the onset used to be the frame the fetch LANDED on."""
+    sl = [{"start": 0.0, "title": "Opening Theme Song"},
+          {"start": 1800.0, "title": "Distinctive Second Song"}]
+    e = engine(_concert_setlist=sl, _setlist_idx=0)
+    e.media.state["position"] = 1800.5
+    e._concert_setlist_tick(1800.5)                 # uncached distinctive → fetch
+    assert e._chapter_intro_hold and e.lines == [] and e.fetches
+    _tickable(e, "Concert", "Band", pos=1805.0)
+    e._vocals_active_now = lambda *a, **k: True
+    main.Overlay._tick_body(e)                      # no lyrics yet: remember WHEN
+    assert e._chapter_vocal_pos == pytest.approx(1805.0)
+    e.lines = L((2, 6), (7, 11))                    # the fetch lands at 1812 ...
+    e.media.state["position"] = 1812.0
+    e._vocals_active_now = lambda *a, **k: False    # ... between two phrases
+    main.Overlay._tick_body(e)
+    assert e.smooth_calls == [(-1803.0, "vocal-onset-concert")]   # 2 - (1805-1800)
+    assert not e._chapter_intro_hold
+
+
+def _gen_engine(offset):
+    e = engine(offset=offset, _gen_token=1, _gen_lines=[], _gen_lang="ja",
+               _cur_duration=7200.0, meta={}, _deep_token=0)
+    e._row_visible = lambda row: False
+    e._mc_gate_active = lambda: False
+    return e
+
+
+def test_generation_run_stops_when_the_song_clock_moves(monkeypatch):
+    """A chapter change mid-generation re-anchored the offset; the run kept
+    going, stamping the next chunk on the NEW clock and re-installing the old
+    song's lines on it."""
+    import fetch_lyrics
+    e = _gen_engine(-1500.0)
+    monkeypatch.setattr(fetch_lyrics, "annotate", lambda *a, **k: None)
+    seen = []
+
+    def fake_transcribe(pos, lang=None, seconds=16):
+        seen.append(pos)
+        if len(seen) == 1:
+            e.offset = -1720.0                      # the next chapter's anchor
+            e.media.state["position"] = 1724.0
+            return [{"t": [pos + 1.0, pos + 5.0], "jp": "placeholder-a"}]
+        if len(seen) >= 3:                          # a regression must FAIL, not hang
+            e._gen_token += 100
+            return []
+        return [{"t": [pos + 1.0, pos + 5.0], "jp": "placeholder-b"}]
+
+    monkeypatch.setattr(align, "transcribe_for_generation", fake_transcribe)
+    e.media.state["position"] = 1700.0
+    e._generate_loop(1)
+    assert seen == [200.0]                          # never transcribed on the new clock
+    for _, fn in list(e.root.after_calls):
+        if fn is not None:
+            try:
+                fn()
+            except Exception:
+                pass
+    assert e._gen_token == 2 and e._gen_lines == [] and not e._generating
+
+
+def test_new_song_chapter_cancels_an_in_flight_generation():
+    e = engine(_concert_setlist=list(SETLIST), _setlist_idx=0, _generating=True,
+               _gen_token=3, _gen_lines=[{"t": [1.0, 2.0], "jp": "placeholder"}])
+    e._concert_setlist_tick(310.0)
+    assert e._gen_token == 4 and not e._generating and e._gen_lines == []
+
+
+@pytest.mark.parametrize("knob,kept", [(1, [(121.0, 124.0)]),
+                                       (0, [(121.0, 124.0), (132.0, 135.0)])])
+def test_generation_talk_filter_follows_the_gate_knob(monkeypatch, knob, kept):
+    """With `concert_mc_gate` off the generation loop still dropped segments
+    inside (possibly false) MC — and saved that hole into the cache."""
+    import fetch_lyrics
+    segs = [{"t": [121.0, 124.0], "jp": "placeholder-a"},
+            {"t": [132.0, 135.0], "jp": "placeholder-b"}]
+    monkeypatch.setattr(align, "transcribe_for_generation",
+                        lambda pos, lang=None, seconds=8: [dict(s) for s in segs])
+    monkeypatch.setattr(fetch_lyrics, "annotate", lambda *a, **k: None)
+    e = engine(_concert_mc=((130.0, 300.0),), _gen_token=5, _gen_lines=[], _gen_lang=None,
+               _cur_duration=100.0)
+    e._row_visible = lambda row: False
+    e._tune["concert_mc_gate"] = knob
+    e._tune["concert_relative_sync"] = 0            # generated t == video t
+    e.media.state["position"] = 120.0
+    main.Overlay._generate_loop(e, 5)
+    assert [tuple(d["t"]) for d in e._gen_lines] == kept
+
+
+def test_concert_switch_that_fetches_drops_the_old_body():
+    e = engine(offset=-1500.0, lines=L((10, 14), (15, 20)), idx=1)
+    e._drop_old_body_for_switch("test")
+    assert e.lines == [] and e.idx == -1
+    s = engine(_live_mode=False, lines=L((10, 14)), idx=0)
+    s._drop_old_body_for_switch("test")
+    assert s.lines and s.idx == 0                   # studio: unchanged
+
+
+def _report_wrong_engine():
+    e = engine(_concert_mc=((100.0, 200.0),), lines=L((10, 14)), _lyrics_path=None)
+    for name in ("_blacklist_current_lyrics", "_rotate_provider_order",
+                 "_escalate_to_captions", "_maybe_escalate_ocr"):
+        setattr(e, name, lambda *a, **k: None)
+    e._bump_wrong_streak = lambda: False
+    e._yt_metadata_fetching, e._yt_metadata, e._cover_original_artist = False, None, None
+    e._fetch_key = None
+    return e
+
+
+def test_automatic_report_wrong_is_a_background_identify():
+    e = _report_wrong_engine()
+    main.Overlay.report_wrong(e, user=False)        # load()'s language check
+    assert e.identifies == [{"user": False}]
+    u = _report_wrong_engine()
+    main.Overlay.report_wrong(u)                    # the tray / user button
+    assert u.identifies == [{"user": True}]
+
+
+def test_mc_card_yields_to_a_fresh_hint_then_takes_over():
+    e = engine(_concert_mc=((100.0, 200.0),))
+    e.media.state["position"] = 150.0
+    e._mc_update(e.media.get(), time.time())
+    e._hint("user feedback")
+    e._mc_show_hint()
+    assert e.hints[-1] == "user feedback"           # stays readable
+    e._hint_t = time.time() - 5.0
+    e._mc_show_hint()
+    assert e.hints[-1].startswith("\U0001f3a4 MC") and e._hint_owner == "mc"
+
+
+def test_plan_replace_inside_talk_is_not_a_new_talk_block():
+    e = engine(_concert_mc=((100.0, 200.0),),
+               _last_decision={"t": time.time(), "ranked": [(50.0, "x")]})
+    now = time.time()
+    e.media.state["position"] = 150.0
+    e._mc_update(e.media.get(), now)
+    e._apply_concert_plan(7, [], mc=[[3.0, 62.0], [98.0, 202.0]], partial=False)
+    e._mc_update(e.media.get(), now + 0.1)          # same talk, now index 1
+    assert e.events == ["mc-enter"] and e.recal == [] and e._mc_gate_active()
+    assert not e._last_decision.get("inconclusive")
+
+
+def test_final_plan_dropping_an_earlier_talk_block_is_not_an_edge():
+    part = [[98.0, 162.0], [398.0, 462.0], [898.0, 1002.0]]
+    e = engine()
+    e._apply_concert_plan(7, [], mc=part, partial=True)
+    now = time.time()
+    e.media.state["position"] = 950.0
+    e._mc_update(e.media.get(), now)
+    e._apply_concert_plan(7, [], mc=[part[0], part[2]], partial=False)
+    e._mc_update(e.media.get(), now + 0.1)
+    assert e.events == ["mc-enter"] and e.recal == []
+
+
+def test_seek_between_two_talk_blocks_is_exit_plus_enter():
+    e = engine(_concert_mc=((100.0, 200.0), (900.0, 1000.0)))
+    now = time.time()
+    e.media.state["position"] = 150.0
+    e._mc_update(e.media.get(), now)
+    e.media.state["position"] = 950.0
+    e._mc_update(e.media.get(), now + 1)
+    assert e.events == ["mc-enter", "mc-exit", "mc-enter"]
+
+
+@pytest.mark.parametrize("how", ["knob", "empty_final_plan"])
+def test_gate_release_without_an_exit_edge_still_exits(how):
+    e = engine(_concert_mc=((100.0, 200.0),), lines=L((10, 14)), offset=-50.0,
+               _chapter_intro_hold=True, _intro_anchored=False)
+    now = time.time()
+    e.media.state["position"] = 150.0
+    e._mc_update(e.media.get(), now)
+    e._mc_show_hint()
+    if how == "knob":
+        e._tune["concert_mc_gate"] = 0
+    else:
+        e._apply_concert_plan(7, [], mc=[], partial=False)
+    e._mc_update(e.media.get(), now + 0.1)
+    assert "mc-exit" in e.events and e.recal == [1]
+    assert e._hint_owner is None and not e.cv.find_withtag("hint")   # card gone
+    assert e._chapter_intro_pos0 == 150.0           # backstop re-based
+
+
+def test_user_identify_during_a_background_read_is_parked_then_run():
+    """"/identify" or "Wrong lyrics" pressed while a background read was in
+    flight was a silent no-op; that read then heard MC talk and was dropped."""
+    e = engine(_concert_mc=((100.0, 200.0),))
+    now = time.time()
+    e.media.state["position"] = 130.0
+    e._mc_update(e.media.get(), now)
+    e._identifying, e._identify_user, e._identify_clip_s = True, False, 8.0
+    main.Overlay._start_identify(e, seconds=6, attempts=2, user=True)
+    assert e._identify_user_pending == (6, 2)
+    e._fetch_result = e._translate_result = None
+    e._last_tr_check_t = time.time()
+    e._user_identify_pending, e._null_read_streak, e._pending_switch = False, 0, None
+    e._identify_result = ("done", ("Some Song", "Band", 30.0, time.time() - 12.0))
+    main.Overlay._consume_async(e)                  # dropped: recorded during talk
+    for _, fn in list(e.root.after_calls):
+        if fn is not None:
+            fn()
+    assert {"seconds": 6, "attempts": 2, "user": True} in e.identifies
+    assert e._identify_user_pending is None
+
+
+def test_junk_page_title_drops_the_concert_talk_intervals():
+    e = engine(_concert_mc=((30.0, 90.0),), lines=L((10, 14)), _lyrics_path="x")
+    e._gpu_send_song = lambda: None
+    e._cancel_pending_swap = lambda reason: None
+    e.media.state["position"] = 45.0
+    main.Overlay._on_track_change(e, ("", "Instagram"))
+    assert e._concert_mc == () and e._mc_cur is None
+    e._mc_update(e.media.get(), time.time())
+    assert not e._mc_gate_active()

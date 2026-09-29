@@ -1323,6 +1323,26 @@ def _mc_overlap(ivs, a, b):
     return min(1.0, cov / (b - a))
 
 
+def _same_timing(a, b):
+    """True when two lyric line lists carry the same timing (the same object, or
+    equal length with equal start times).
+
+    ``load(path, keep_idx=True)`` builds a NEW list for the SAME song after a
+    translation backfill, a deep-transcription upgrade or captions, so list
+    identity alone would call that reload "a different song" and throw away a
+    valid resync result. Start times are what an alignment result depends on."""
+    if a is b:
+        return True
+
+    def _start(x):                  # a loaded Line, or a raw {"t": [s, e]} dict
+        s = getattr(x, "start", None)
+        return float(x["t"][0] if s is None else s)
+    try:
+        return len(a) == len(b) and all(_start(x) == _start(y) for x, y in zip(a, b))
+    except Exception:
+        return False
+
+
 # ── TICKET-206: telling the SONG bracket from the WORK it was written for ───
 # Vocabulary that marks a bracket as a tie-in CREDIT ("the anime this song was
 # the ending theme for") rather than the song's own name. Deliberately wider
@@ -4191,6 +4211,14 @@ class Overlay:
         self._chapter_intro_hold = False  # concert chapter just fired → hold lyrics until vocals
         self._chapter_intro_pos0 = 0.0    # video position when the chapter hold engaged (backstop)
         self._chapter_intro_t0 = 0.0      # wall-clock when the chapter hold engaged (backstop)
+        # spec 001 (review): where the hold ACTUALLY engaged (a resume / seek /
+        # re-evaluation can engage it minutes into the chapter), where vocals
+        # were FIRST heard during it (the onset — even while lyrics were still
+        # being fetched), and the crude chapter-start offset the tick wrote
+        # (so a later plan onset may still replace it).
+        self._chapter_intro_engage_pos = None
+        self._chapter_vocal_pos = None
+        self._chapter_crude_off = None
         # spec 001 — offline concert plan + MC (talk) awareness. All reset per
         # track in _on_track_change; installed by _apply_concert_plan.
         self._concert_plan = None         # [song segment dicts] from concert_audio
@@ -4198,16 +4226,19 @@ class Overlay:
         self._concert_plan_final = False  # the FINAL (id-bearing) plan has landed
         self._concert_mc = ()             # normalised MC intervals ((s, e), ...) video s
         self._in_mc = False               # playhead is inside an MC interval now
-        self._mc_idx = -1                 # which interval (edge detection, seeks)
+        self._mc_idx = -1                 # which interval (for /concert's "current")
+        self._mc_cur = None               # that interval by VALUE (edge detection:
+                                          # a plan replace renumbers the intervals)
         self._mc_playing = False          # ...and the player is PLAYING
         self._mc_flag_t = 0.0             # when _in_mc was last evaluated (staleness)
         self._mc_enter_t = 0.0            # wall-clock of the last MC entry
         self._mc_exit_pos = -1.0          # video position of the last MC exit
-        self._mc_hint_t = 0.0             # throttle for the MC hint card
+        self._hint_t = 0.0                # when the last hint card was drawn
         self._hint_owner = None           # "mc" while the MC card is what's on screen
         self._setlist_deferred_idx = None # chapter skipped by the sound-lock hold (Bug E)
         self._vocal_onset_reject_t = 0.0  # rate limit for the concert onset reject log
         self._identify_user = False       # the in-flight identify was user-initiated
+        self._identify_user_pending = None  # a user identify that arrived mid-capture
         self._identify_clip_s = 0.0       # its capture length (MC overlap check)
         self._intro_anchored = True   # have we anchored past this track's intro yet?
         self._track_t0 = 0.0          # wall-clock when the current track started
@@ -4283,6 +4314,12 @@ class Overlay:
         if _is_junk_track_title(title, artist):
             log.info("ignoring non-music page %r — not a song; clearing overlay", title)
             self._track = (artist, title)
+            # spec 001 (review): this branch returns before the per-track reset
+            # below, so drop the previous concert's talk intervals here — else
+            # they are checked against the page's clock and the MC card is
+            # drawn over a social feed.
+            self._concert_mc, self._in_mc, self._mc_idx = (), False, -1
+            self._mc_cur, self._mc_playing = None, False
             if self.lines or self._lyrics_path is not None:
                 self.lines, self.meta, self._lyrics_path = [], {"source": ""}, None
                 self.idx = -1
@@ -4680,9 +4717,13 @@ class Overlay:
         self._concert_mc = ()              # spec 001: MC intervals belong to ONE video
         self._in_mc = False
         self._mc_idx = -1
+        self._mc_cur = None
         self._mc_playing = False
         self._mc_exit_pos = -1.0
         self._setlist_deferred_idx = None
+        self._chapter_intro_engage_pos = None
+        self._chapter_vocal_pos = None
+        self._chapter_crude_off = None
         self._concert_candidates = []      # description-derived candidate songs pool
         self._chapter_intro_hold = False   # cleared per track; re-armed by _concert_setlist_tick
         # v1.1.72: the flag means "this LONG video is non-music" — set here for
@@ -5998,6 +6039,12 @@ class Overlay:
         reliably. ``user=True`` marks a user action (tray / API / wrong-lyrics)
         — never gated by MC talk (spec 001)."""
         if self._identifying:
+            if user:
+                # spec 001 (review): a background read is in flight. If it heard
+                # only MC talk it is dropped, which would silently lose this
+                # request — park it; _consume_async runs it when that read is
+                # consumed empty.
+                self._identify_user_pending = (seconds, attempts)
             return
         # v1.1.56 — SUBTITLE MODE is an explicit USER toggle: identification is
         # pointless (dialogue can't be Shazam'd) and any music-bed match would
@@ -7054,22 +7101,29 @@ class Overlay:
         except Exception:
             return
         seg = self._plan_for_chapter(ch_start, pos) if getattr(self, "_concert_plan", None) else None
-        if (getattr(self, "_chapter_intro_hold", False) and not self._intro_anchored
-                and seg is not None and seg.get("onset") is not None):
-            # The current chapter is holding on the crude chapter-start anchor:
-            # the measured onset is exactly what the tick would have used had the
-            # plan been here first.
+        # Still on the crude chapter-start anchor the tick wrote, with nothing
+        # better since (no Shazam lock; resync / vocal-onset / the user would
+        # have moved the offset) — e.g. a hold that engaged mid-song kept it.
+        crude = getattr(self, "_chapter_crude_off", None)
+        on_crude = (crude is not None and self._sound_song is None
+                    and abs(float(self.offset or 0.0) - float(crude)) < 0.05)
+        held = getattr(self, "_chapter_intro_hold", False) and not self._intro_anchored
+        if (held or on_crude) and seg is not None and seg.get("onset") is not None:
+            # The measured onset is exactly what the tick would have used had
+            # the plan been here first.
             new_off = round(-float(seg["onset"]), 2)
             self._chapter_intro_hold = False
             self._intro_anchored = True
+            self._chapter_crude_off = None
             if self.lines:
                 self._smooth_offset(new_off, "concert-plan-onset")
             else:
                 self.offset = new_off
                 self._pending_offset = None
                 self._pending_note = None
-            log.info("concert-audio: re-anchored the held chapter to its measured "
-                     "vocal onset %.1fs", float(seg["onset"]))
+            log.info("concert-audio: re-anchored the chapter (%s) to its measured "
+                     "vocal onset %.1fs", "held" if held else "crude chapter-start anchor",
+                     float(seg["onset"]))
         elif not self.lines and not self._fetching and not self._generating:
             # Nothing loaded for the current chapter and nothing in flight (e.g.
             # a generic title waiting on Shazam): re-run the tick so a confident
@@ -7149,6 +7203,21 @@ class Overlay:
             return round(-float(anchor), 2), "anchor"
         return round(-pos, 2), "now"
 
+    def _drop_old_body_for_switch(self, why):
+        """spec 001 (review): a CONCERT switch re-times the display to the NEW
+        song's clock at once (``_set_switch_offset``), so the previous song's
+        lines must not keep scrolling on that clock while the new body is being
+        fetched. (The old offset 0.0 pushed them out of range — i.e. blank; this
+        keeps that outcome without the wrong clock.) Outside concert-relative
+        sync nothing changes."""
+        if not (self._live_mode and int(self._tune.get("concert_relative_sync", 1))):
+            return
+        self._cancel_generation(f"song switch: {why}")   # its lines are the old song's
+        if self.lines:
+            self.lines, self.idx = [], -1
+            self._kara = []
+            log.info("switch: cleared the previous song's lines (%s)", why)
+
     def _set_switch_offset(self, song_off=None, t_cap=None, why="switch"):
         """Write the offset for a freshly switched-in song: concert-relative
         (``_concert_switch_offset``) in a concert, else the classic 0.0 baseline.
@@ -7181,50 +7250,64 @@ class Overlay:
         as exit + enter). Cheap: one bisect over a handful of intervals."""
         ivs = getattr(self, "_concert_mc", ()) or ()
         self._mc_flag_t = now
-        if not (ivs and self._live_mode and int(self._tune.get("concert_mc_gate", 1))):
-            if getattr(self, "_mc_idx", -1) >= 0:
-                log.info("MC: gate released (no intervals / not a concert / knob off)")
-            self._in_mc, self._mc_idx, self._mc_playing = False, -1, False
-            return
         st = state or {}
-        self._mc_playing = st.get("status") == PLAYING
         try:
             pos = float(st.get("position") or 0.0)
         except Exception:
             pos = 0.0
-        idx = _mc_find(ivs, pos)
-        prev = getattr(self, "_mc_idx", -1)
-        self._mc_idx = idx
-        self._in_mc = idx >= 0
-        if idx == prev:
+        prev = getattr(self, "_mc_cur", None)
+        if not (ivs and self._live_mode and int(self._tune.get("concert_mc_gate", 1))):
+            self._in_mc, self._mc_idx, self._mc_cur, self._mc_playing = False, -1, None, False
+            if prev is not None:
+                # released WITHOUT an exit edge (the final plan dropped this
+                # talk, the knob went off, the concert ended): still run the
+                # exit bookkeeping so the card goes and listening re-arms.
+                log.info("MC: gate released (no intervals / not a concert / knob off)")
+                self._on_mc_exit(pos, now, prev)
             return
-        if prev >= 0:
+        self._mc_playing = st.get("status") == PLAYING
+        idx = _mc_find(ivs, pos)
+        cur = tuple(ivs[idx]) if idx >= 0 else None
+        self._mc_idx = idx
+        self._in_mc = cur is not None
+        self._mc_cur = cur
+        # Edges are judged by the interval's VALUE, not its index: a plan
+        # replace renumbers the intervals (the final plan can drop talk that
+        # sat inside a merged song), and that must not fire a fake exit+enter
+        # mid-talk. Overlapping intervals are the same talk block.
+        if cur == prev or (cur is not None and prev is not None
+                           and cur[0] < prev[1] and prev[0] < cur[1]):
+            return
+        if prev is not None:
             self._on_mc_exit(pos, now, prev)
-        if idx >= 0:
-            self._on_mc_enter(pos, now, idx)
+        if cur is not None:
+            self._on_mc_enter(pos, now, cur)
 
-    def _on_mc_enter(self, pos, now, idx):
+    def _on_mc_enter(self, pos, now, iv):
         """Talk started: pause, and make sure nothing half-built from the song
-        before (an applause integrator mid-count) fires on the talk."""
-        s, e = self._concert_mc[idx]
+        before (an applause integrator mid-count) fires on the talk. ``iv`` is
+        the talk interval ``(start, end)`` in video seconds."""
+        s, e = iv
         self._mc_enter_t = now
         self._applause_for, self._applause_armed = 0.0, False
-        log.info("MC: entered talk block %d (%.0f-%.0fs) at %.1fs — pausing identify, "
-                 "resync, decide-by-ear, strikes and generation", idx, s, e, pos)
+        log.info("MC: entered talk block %.0f-%.0fs at %.1fs — pausing identify, "
+                 "resync, decide-by-ear, strikes and generation", s, e, pos)
         self._note_event("mc-enter", f"MC talk {int(s)}-{int(e)}s: song recognition paused",
                          sev="info")
 
-    def _on_mc_exit(self, pos, now, idx):
+    def _on_mc_exit(self, pos, now, iv):
         """Talk ended — this is the real "next song is starting" moment.
         Re-arm what the talk paused WITHOUT forcing anything: the recalibration
         pass runs the setlist tick first and identifies only if nothing else is
-        listening, so nothing double-fires."""
+        listening, so nothing double-fires. ``iv`` is the talk interval left."""
         self._mc_exit_pos = pos
         talk_s = now - (getattr(self, "_mc_enter_t", 0.0) or now)
-        # a between-songs hold measures its backstop from the END of the talk
+        # a between-songs hold measures its backstop from the END of the talk,
+        # and a vocal "onset" seen before the talk is not the next song's
         if getattr(self, "_chapter_intro_hold", False) and not self._intro_anchored:
             self._chapter_intro_pos0 = pos
             self._chapter_intro_t0 = now
+            self._chapter_vocal_pos = None
         # talk time must not count toward the 6.5-min stale-song watchdog
         self._concert_song_t = now
         # a decide-by-ear that listened while the host talked proves nothing
@@ -7242,8 +7325,8 @@ class Overlay:
             except Exception:
                 pass
             self._hint_owner = None
-        log.info("MC: exited talk block %d at %.1fs (%.0fs of talk) — listening again",
-                 idx, pos, talk_s)
+        log.info("MC: exited talk block %.0f-%.0fs at %.1fs (%.0fs of talk) — "
+                 "listening again", iv[0], iv[1], pos, talk_s)
         self._note_event("mc-exit", f"MC talk ended at {int(pos)}s: listening for the next song",
                          sev="info")
 
@@ -7270,17 +7353,27 @@ class Overlay:
                 return True
         return False
 
+    # A different card drawn this recently (user feedback such as "Synced by
+    # ear", a Force Sync status) stays readable before the MC card replaces it.
+    _MC_HINT_YIELD_S = 4.0
+
     def _mc_show_hint(self):
-        """Draw the MC card — only when it is not already what's on screen."""
+        """Draw the MC card — only when it is not already what's on screen, and
+        never over another card that is less than ``_MC_HINT_YIELD_S`` old (the
+        tick calls this every frame; without the yield any feedback a click
+        produced during talk vanished within ~80 ms)."""
         try:
-            if (getattr(self, "_hint_owner", None) == "mc"
-                    and self.cv.find_withtag("hint")):
-                return
+            on_screen = bool(self.cv.find_withtag("hint"))
         except Exception:
-            pass
+            on_screen = False
+        owner = getattr(self, "_hint_owner", None)
+        if on_screen and owner == "mc":
+            return
+        if (on_screen and owner != "mc"
+                and time.time() - getattr(self, "_hint_t", 0.0) < self._MC_HINT_YIELD_S):
+            return
         self._hint("🎤 MC — talk between songs")
         self._hint_owner = "mc"
-        self._mc_hint_t = time.time()
 
     # Chapter names that mark NON-SONG segments (talk blocks, intros) — exact,
     # case-insensitive. 'After Talk'/アフタートーク is the standard VTuber
@@ -7340,6 +7433,7 @@ class Overlay:
         if not title or title.strip().lower() in self._SETLIST_SKIP:
             log.info("setlist: chapter %d %r @%.0fs is a non-song segment — waiting",
                      idx, title, pos)
+            self._cancel_generation("non-song chapter")   # talk is not lyrics
             return
         # spec 001: a chapter the offline pass measured as mostly MC TALK is a
         # non-song segment whatever its title says (the "talk block with a
@@ -7351,6 +7445,7 @@ class Overlay:
             log.info("setlist: chapter %d %r @%.0fs is %.0f%% MC talk (offline "
                      "analysis) — non-song segment, waiting", idx, title, pos,
                      100.0 * float(_pseg_mc.get("mc_frac") or 0.0))
+            self._cancel_generation("talk chapter")
             return
         # v1.1.64 P2 (docs/CONCERT_RESEARCH.md §4): opt-in `chapter_no_song_reject`
         # gate. When ON, and a candidate pool is populated (parse_song_candidates
@@ -7417,6 +7512,9 @@ class Overlay:
                  " [audio-onset]" if anchor != chapter_start else "", chapter_dur or -1)
         # fresh song state (mirrors the banner-OCR flow, minus the lock — Shazam
         # remains free to corroborate or veto once the body loads)
+        # spec 001 (review): a generation run for the PREVIOUS chapter would
+        # keep landing that song's lines on this song's clock.
+        self._cancel_generation("new chapter")
         self._title_locked = False
         self._sound_fail_streak = 0
         self._last_heard_contra = None
@@ -7438,14 +7536,22 @@ class Overlay:
         # (line 10609), which is exactly what stranded the sync at chapter
         # boundaries when a plan hadn't landed yet.
         _plan_has_onset = bool(plan_seg and plan_seg.get("onset") is not None)
+        # spec 001 (review): the vocal onset is only observable when the hold
+        # engages near the song's start — remember where it really engaged.
+        self._chapter_intro_engage_pos = float(pos)
+        self._chapter_vocal_pos = None
         if not _plan_has_onset:
             self._chapter_intro_hold = True
             self._chapter_intro_pos0 = float(chapter_start)
             self._chapter_intro_t0 = time.time()
             self._intro_anchored = False
             self._sound_song = None
+            # the crude chapter-start anchor every branch below writes; a later
+            # plan onset may replace it while nothing better has (Bug F)
+            self._chapter_crude_off = round(-float(anchor), 2)
         else:
             self._chapter_intro_hold = False
+            self._chapter_crude_off = None
         artist = (self._track or ("", ""))[0]
         # OFFLINE ID vs CHAPTER LABEL: the fingerprint is most valuable when the
         # chapter title is GENERIC/unhelpful ('La La La' was really a Melt cover;
@@ -7745,7 +7851,17 @@ class Overlay:
                         res = None
                 except Exception as e:
                     log.info("identify: MC check failed (%s)", e)
-            if not res and getattr(self, "_user_identify_pending", False):
+            # spec 001 (review): a USER identify that arrived while this read was
+            # in flight was parked (see _start_identify). If this read came back
+            # empty — or heard only MC talk and was dropped — run the user's
+            # request now instead of losing it (/identify already replied ok).
+            _rerun = getattr(self, "_identify_user_pending", None)
+            self._identify_user_pending = None
+            if _rerun and not res:
+                log.info("identify: running the user's parked identify request")
+                self.root.after(0, lambda a=_rerun: self._start_identify(
+                    seconds=a[0], attempts=a[1], user=True))
+            elif not res and getattr(self, "_user_identify_pending", False):
                 # v1.1.75 (menu audit): a USER-initiated "Identify by sound" that
                 # found nothing must SAY so — Shazam legitimately can't fingerprint
                 # most VTuber originals, and the silent None left a stale
@@ -8424,7 +8540,11 @@ class Overlay:
                         # the new lyrics arrive. The fetch (or cache load) starts
                         # NOW; old lines keep rendering until the boundary fires.
                         deferred = (int(self._tune.get("swap_defer_enabled", 1) or 0) == 1
-                                    and bool(self.lines))
+                                    and bool(self.lines)
+                                    # spec 001: in a concert the clock already moved
+                                    # to the new song — old lines can't keep playing
+                                    and not (self._live_mode and int(
+                                        self._tune.get("concert_relative_sync", 1))))
                         if deferred:
                             self._queue_swap(
                                 kind="wrong-strike", source_site="D",
@@ -8459,6 +8579,7 @@ class Overlay:
                                 self._maybe_translate()
                             else:
                                 log.info("wrong-song correction → fetching %r / %r", f_title, f_artist)
+                                self._drop_old_body_for_switch("wrong-song fetch")
                                 self._hint(f"🔄 Wrong song — switching to {f_title}…")
                                 self._start_fetch(f_artist, f_title, self._cur_duration)
                     else:
@@ -8545,6 +8666,7 @@ class Overlay:
                         self._maybe_translate()
                     else:
                         log.info("correcting -> fetching %r / %r", f_title, f_artist)
+                        self._drop_old_body_for_switch("switch fetch")
                         self._start_fetch(f_artist, f_title, self._cur_duration,
                                           strict=self._clean_source())
 
@@ -8868,6 +8990,7 @@ class Overlay:
         import align
         from fetch_lyrics import annotate
         CHUNK, last_end, idle, first, fails = 16, 0.0, 0, True, 0
+        _prev_gen_off = None
         try:
             while token == self._gen_token:
                 st = self.media.get()
@@ -8893,6 +9016,18 @@ class Overlay:
                             if (self._live_mode
                                 and int(self._tune.get("concert_relative_sync", 1)))
                             else 0.0)
+                # A jump this big is a different SONG (a new chapter / switch
+                # re-anchored the clock), not a sync refinement: this run's
+                # lines belong to the old song — stop instead of mixing clocks.
+                if (_prev_gen_off is not None
+                        and abs(_gen_off - _prev_gen_off) > self._GEN_CLOCK_JUMP_S):
+                    log.info("generation: the song clock moved %+.0fs mid-run — "
+                             "stopping this run", _gen_off - _prev_gen_off)
+                    self.root.after(0, lambda t=token: (
+                        self._cancel_generation("song clock moved")
+                        if t == self._gen_token else None))
+                    return
+                _prev_gen_off = _gen_off
                 pos += _gen_off
                 secs = 8 if first else CHUNK  # short FIRST chunk → lyrics appear sooner
                 first = False
@@ -8916,7 +9051,9 @@ class Overlay:
                     return
                 # spec 001: a chunk captured just before MC started can run into
                 # the talk — drop the segments that land inside MC (video time).
-                _mcs = getattr(self, "_concert_mc", ()) if self._live_mode else ()
+                _mcs = (getattr(self, "_concert_mc", ())
+                        if (self._live_mode
+                            and int(self._tune.get("concert_mc_gate", 1))) else ())
                 if _mcs and chunk:
                     chunk = [d for d in chunk
                              if _mc_find(_mcs, float(d["t"][0]) - _gen_off) < 0]
@@ -8951,6 +9088,27 @@ class Overlay:
                 self.root.after(0, lambda t=token: self._check_gen_stall(t))
             except Exception:
                 pass
+
+    # An offset jump this large inside one generation run means a different
+    # song took over the clock (chapter change / switch), not a resync.
+    _GEN_CLOCK_JUMP_S = 30.0
+
+    def _cancel_generation(self, why):
+        """Stop an in-flight by-ear generation run (spec 001 review). Its lines
+        belong to the song — and, in a concert, the song CLOCK — it started on:
+        a chapter change moves the offset to the next song's anchor, and chunks
+        still in flight would otherwise put the previous song's lines back on
+        screen, timed on the new song's clock. Bumping the token makes the loop
+        thread, its translation callbacks and the stall check all stand down."""
+        if not (self._generating or self._gen_lines):
+            return
+        self._gen_token += 1
+        self._generating = False
+        self._gen_lines = []
+        p = getattr(self, "_pending_swap", None)
+        if p is not None and p.get("force_ai_gen"):
+            self._cancel_pending_swap(f"generation cancelled ({why})")
+        log.info("generation: cancelled (%s)", why)
 
     def _translate_generated(self, token, lines):
         """Fill the English (marked ***) for generated lines, off the capture loop.
@@ -9448,7 +9606,8 @@ class Overlay:
                            f"(source {_xsrc}). "
                            + ("Generating by ear." if _live else "Re-fetching a native one."))
                 self.lines, self.meta, self._lyrics_path = [], {"source": ""}, None
-                self.root.after(50, self._begin_generation if _live else self.report_wrong)
+                self.root.after(50, self._begin_generation if _live
+                                else (lambda: self.report_wrong(user=False)))
                 return
         # Fast-switch language sanity check: a cached body's lang is incompatible
         # with the artist's known language (Kanade / 音乃瀬奏 cover of 怪獣の花唄
@@ -9493,7 +9652,7 @@ class Overlay:
                 # Kick a fresh fetch chain. report_wrong() is the existing
                 # re-identify path — it clears decision state + re-runs the
                 # full provider chain (now under v1.1.10's stricter guards).
-                self.root.after(50, self.report_wrong)
+                self.root.after(50, lambda: self.report_wrong(user=False))
                 return
         except Exception as e:
             log.info("load: language sanity check raised %s — continuing", e)
@@ -10181,6 +10340,13 @@ class Overlay:
             # frozen stale card (no new early return: this path returns anyway)
             if not self.lines and self._mc_gate_active():
                 self._mc_show_hint()
+            elif (not self.lines and state["status"] == PLAYING
+                    and self._chapter_intro_hold and not self._intro_anchored
+                    and self._chapter_vocal_pos is None and self._vocals_active_now()):
+                # spec 001 (review): the next song's lyrics are still being
+                # fetched, but its singing has started — remember WHEN, so the
+                # onset anchor is this moment and not the moment the fetch lands.
+                self._chapter_vocal_pos = float(state.get("position") or 0.0)
             self.root.after(80, self._tick)   # frozen while paused — no advancing
             return
 
@@ -10217,7 +10383,13 @@ class Overlay:
             # released by "vocals" (the talk trips the vocal-band test) nor time
             # out; _on_mc_exit re-bases the backstop to the end of the talk.
             _mc_hold = self._mc_gate_active()
-            if not _mc_hold and self._vocals_active_now():
+            # (an onset already recorded while the lyrics were being fetched
+            # counts even if the singer is between phrases when they land —
+            # concert-relative sync only; the legacy path measures "now")
+            _seen_onset = (self._chapter_intro_hold and self._live_mode
+                           and int(self._tune.get("concert_relative_sync", 1))
+                           and self._chapter_vocal_pos is not None)
+            if not _mc_hold and (_seen_onset or self._vocals_active_now()):
                 # _on_vocal_onset early-returns without setting
                 # _intro_anchored when self.lines is empty (fetch in flight)
                 # or when Shazam already calibrated. For the CHAPTER hold
@@ -10231,6 +10403,8 @@ class Overlay:
                 # to retry). MV / live-arrangement holds keep their
                 # historical "release regardless" semantics — those flows
                 # don't have the mid-track lyric-swap race.
+                if self._chapter_intro_hold and self._chapter_vocal_pos is None:
+                    self._chapter_vocal_pos = float(state["position"])
                 self._on_vocal_onset()
                 if self._intro_anchored:
                     self._chapter_intro_hold = False   # calibration landed
@@ -13404,6 +13578,7 @@ class Overlay:
 
     def _hint(self, msg):
         self._hint_owner = None        # spec 001: any other card replaces the MC card
+        self._hint_t = time.time()     # ...and the MC card yields to it for a while
         self.cv.delete("all")
         self._kara = []
         self._clear_stream()
@@ -15115,19 +15290,41 @@ class Overlay:
         if self._mc_gate_active():
             return
         anchor = -float(self.offset or 0.0)
+        # The onset is where vocals were FIRST heard during this hold (the tick
+        # records it even while the lyrics are still being fetched), not "now":
+        # a fetch that lands after the singing began must not move the song's
+        # start to the moment the fetch landed.
+        seen = getattr(self, "_chapter_vocal_pos", None)
+        if seen is not None and float(seen) <= vpos:
+            vpos = float(seen)
         mc_exit = float(getattr(self, "_mc_exit_pos", -1.0) or -1.0)
         ref = mc_exit if anchor < mc_exit <= vpos else anchor
         intro = vpos - ref
         edge = float(self._tune.get("concert_mc_edge_s", 2.0))
         max_intro = float(self._tune.get("onset_max_intro_s", 90.0))
         if ref != anchor and intro < edge + 1.5:
-            return                          # still the tail of the MC talk
+            self._chapter_vocal_pos = None  # still the tail of the MC talk: look again
+            return
+        # A LATE hold — engaged well after the song's reference point (a resume
+        # or seek into the chapter, a Bug-E re-evaluation) with the vocals
+        # ALREADY going when it engaged — cannot see the onset: the first vocal
+        # frame is just "now". Keep the anchor; the plan onset (see
+        # _apply_concert_plan), Shazam or resync refine it.
+        engage = getattr(self, "_chapter_intro_engage_pos", None)
+        if (engage is not None and float(engage) - ref > edge + 1.5
+                and vpos - float(engage) < 0.5):
+            self._intro_anchored = True
+            log.info("concert vocal onset: the hold engaged %.1fs into the song with "
+                     "vocals already going — keeping the anchor %.1fs",
+                     float(engage) - ref, anchor)
+            return
         now = time.time()
         if intro < 0.0 or intro > first_start + max_intro:
             if now - getattr(self, "_vocal_onset_reject_t", 0.0) > 10.0:
                 self._vocal_onset_reject_t = now
                 log.info("concert vocal onset @%.1fs is %.1fs past the song start "
                          "%.1fs — implausible as an intro, ignored", vpos, intro, ref)
+            self._chapter_vocal_pos = None   # not an onset: keep listening live
             return
         # shift > 0: vocals EARLIER than the lyrics expect → keep the anchor.
         shift = round(first_start - (vpos - anchor), 2)
@@ -15142,6 +15339,7 @@ class Overlay:
                 self._vocal_onset_reject_t = now
                 log.info("concert vocal onset @%.1fs: shift %+.1fs beyond the cap — "
                          "ignored", vpos, shift)
+            self._chapter_vocal_pos = None
             return
         self._intro_anchored = True
         new_off = round(float(self.offset or 0.0) + shift, 2)
@@ -16637,9 +16835,13 @@ class Overlay:
         thr = int(self._tune.get("wrong_streak_force_ai_gen_threshold", 2))
         return self._wrong_streak >= thr
 
-    def report_wrong(self):
+    def report_wrong(self, user=True):
         """User-driven correction: bin the wrong lyrics and identify by SOUND.
-        For covers, also re-fetch using the original artist from the title."""
+        For covers, also re-fetch using the original artist from the title.
+
+        ``user=False`` for the AUTOMATIC callers (the load-time language check,
+        the sync-failure reject): their identify is a background one, so it
+        pauses during concert MC talk like any other (spec 001 review)."""
         # TICKET-112: if a YT-description fetch is in flight, wait briefly
         # for it to land — the user's exact failure ("re-fetch returned the
         # same wrong 'Shooting Star' because the query was unchanged") only
@@ -16740,7 +16942,7 @@ class Overlay:
                 self._start_fetch(self._cover_original_artist, title,
                                   self._cur_duration, cover=True,
                                   swap_token=self._pending_swap["fetch_token"])
-            self._start_identify(user=True)
+            self._start_identify(user=user)
             return
         # legacy immediate path
         self._lyrics_path = None
@@ -16756,7 +16958,7 @@ class Overlay:
                               self._cur_duration, cover=True)
         else:
             self._hint("🎧 Listening to identify the song…")
-        self._start_identify(user=True)
+        self._start_identify(user=user)
 
     def identify_by_sound(self):
         # v1.1.75 (menu audit): make a USER click always land visibly. Surface
@@ -20211,7 +20413,7 @@ class Overlay:
         # browser video the video's OWN captions are the authoritative real lyrics (now
         # fetchable again), so prefer those right after — they override a re-fetched
         # provider LRC and aren't themselves rejectable (source 'youtube-captions').
-        self.report_wrong()
+        self.report_wrong(user=False)
         if getattr(self, "captions_on", False) and not self._live_mode:
             self.root.after(2000, lambda: self.load_youtube_captions(silent=True))
 
@@ -20243,7 +20445,7 @@ class Overlay:
         #    happened to resemble a lyric).
         if res:
             why = None
-            if lines is not None and lines is not self.lines:
+            if lines is not None and not _same_timing(lines, self.lines):
                 why = "lyrics changed during capture"
             elif ref is not None and abs(float(self.offset or 0.0) - float(ref)) > 2.0:
                 why = f"anchor moved {float(self.offset or 0.0) - float(ref):+.1f}s during capture"
