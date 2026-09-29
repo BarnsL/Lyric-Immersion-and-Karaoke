@@ -47,10 +47,14 @@ jobs:
       # pystray's X backend — hence xvfb, exactly like the import gate. The
       # probes never import main. Linux only: the configuration verified for
       # this step (Windows/macOS can be added once they are run there once).
+      # requirements-deps.txt is the optional audio stack the app vendors into
+      # .deps (PyAV, faster-whisper + its Silero VAD, onnxruntime); installing
+      # it here lets the decoder-parity and speech-model tests run instead of
+      # skipping.
       - name: Unit tests (pytest, virtual display)
         if: runner.os == 'Linux'
         run: |
-          pip install pytest
+          pip install pytest -r requirements-deps.txt
           xvfb-run -a python -m pytest tests -q
       - name: Concert + tune-doc probes
         if: runner.os == 'Linux'

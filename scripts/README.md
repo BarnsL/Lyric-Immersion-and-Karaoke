@@ -59,11 +59,13 @@ The suite in `tests/` runs under `pytest` (install it with `pip install
 pytest`; it is not in `requirements.txt`). CI runs exactly this on Linux:
 
 ```
+pip install pytest -r requirements-deps.txt
 python -m pytest tests -q          # Linux without a desktop: xvfb-run -a python -m pytest tests -q
 ```
 
-`tests/test_concert_audio.py` needs only numpy (its two PyAV decoder tests skip
-cleanly without PyAV); `tests/test_concert_sync.py` and
+`tests/test_concert_audio.py` needs only numpy. Its decoder tests need PyAV and
+faster-whisper, from `requirements-deps.txt`, the optional audio stack. They
+skip cleanly without it; CI installs it so they run. `tests/test_concert_sync.py` and
 `tests/test_media_source_policy.py` import `main`, which needs Tk and, on
 Linux, a display for pystray (hence `xvfb-run`). The older `unittest`-based
 files also still run with `python -m unittest discover -s tests`; the spec-001

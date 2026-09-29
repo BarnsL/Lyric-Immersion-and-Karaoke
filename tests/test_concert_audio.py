@@ -271,7 +271,8 @@ def test_chapter_that_opens_with_talk_anchors_after_the_talk():
     two = res["segments"][1]
     assert two["onset"] >= spans[1][2] - 1.0, "onset landed on the MC talk"
     assert two["onset"] <= spans[1][2] + 4.0
-    assert 0.3 < two["mc_frac"] < 0.7
+    # talk is 30 s of this 80 s chapter; smoothing + edges cost a few seconds
+    assert two["mc_frac"] == pytest.approx(30.0 / 80.0, abs=0.12)
 
 
 def test_chapterless_concert_splits_at_talk(song_talk_song):
@@ -290,6 +291,28 @@ def test_mc_detection_can_be_switched_off(song_talk_song):
     res = ca.analyze_concert(pcm=pcm, want_ids=False, tune={"concert_mc_detect": 0},
                              speech_fn=speech_from_spans(spans))
     assert res["mc"] == [] and res["stats"]["mc_detector"] == "off"
+
+
+def test_mc_off_never_merges_segments_so_the_old_output_is_kept():
+    """`concert_mc_detect` = 0 must behave as before spec 001: the same-id merge
+    exists only to undo splits made by MC detection (review finding A3)."""
+    pcm, spans = concert([("song", band_song(50, seed=21)), ("silence", np.zeros(SR * 20)),
+                          ("song", band_song(50, seed=22))])
+
+    def same(x, sr=SR, attempts=2):
+        return ("Same Title", "Artist", 0.0)
+
+    base = ca.analyze_concert(pcm=pcm, want_ids=False, tune={"concert_mc_detect": 0})
+    off = ca.analyze_concert(pcm=pcm, want_ids=True, identify_fn=same,
+                             tune={"concert_mc_detect": 0, "concert_audio_id_workers": 1})
+    key = [(s["start"], s["end"], s["onset"]) for s in base["segments"]]
+    assert len(key) == 2
+    assert [(s["start"], s["end"], s["onset"]) for s in off["segments"]] == key
+    on = ca.analyze_concert(pcm=pcm, want_ids=True, identify_fn=same,
+                            speech_fn=speech_from_spans([]),
+                            tune={"concert_audio_id_workers": 1})
+    assert len(on["segments"]) == 1                  # with MC on, same-id neighbours merge
+    assert on["stats"]["mc_total_s"] == sum(e - s for s, e in on["mc"])
 
 
 def test_same_id_neighbours_merge_and_their_inner_mc_is_dropped():
@@ -323,9 +346,24 @@ def test_chapter_segments_are_never_merged():
     ([("Melt", "A"), ("melt!", "A")], ("Melt", "A", 0.85)),
     ([("Melt", "A"), ("Other", "B")], ("Melt", "A", 0.45)),
     ([("Other", "B"), ("Melt", "A"), ("MELT", "A")], ("Melt", "A", 0.85)),
+    # review A1: Hangul / Cyrillic titles used to normalise to "" and "agree"
+    ([("노래하나", "A"), ("노래둘", "B")], ("노래하나", "A", 0.45)),
+    ([("Песня один", "A"), ("Песня два", "B")], ("Песня один", "A", 0.45)),
+    ([("노래하나", "A"), ("노래하나 ", "A")], ("노래하나", "A", 0.85)),
+    ([("ＭＥＬＴ", "A"), ("melt", "A")], ("ＭＥＬＴ", "A", 0.85)),
+    ([("♪", "A"), ("!!", "B")], ("♪", "A", 0.45)),    # empty keys never match
 ])
 def test_vote(hits, want):
     assert ca._vote(hits) == want
+
+
+def test_different_hangul_titles_are_never_merged():
+    segs = [{"start": 0.0, "end": 60.0, "onset": 2.0, "title": "노래하나", "id_conf": 0.85,
+             "source": "energy"},
+            {"start": 80.0, "end": 150.0, "onset": 81.0, "title": "노래둘", "id_conf": 0.85,
+             "source": "energy"}]
+    out, kept = ca._merge_same_id([dict(s) for s in segs], [[62.0, 78.0]])
+    assert len(out) == 2 and kept == [[62.0, 78.0]]
 
 
 def test_probe_positions_stay_inside_the_segment():
@@ -344,18 +382,21 @@ def test_id_order_is_playhead_first():
 
 
 def test_identify_early_exit_and_playhead_order():
-    pcm = np.zeros(SR * 400, np.float32)
+    # each segment's audio carries its own level, so a probe says which it heard
+    pcm = np.concatenate([np.full(SR * 100, 0.01 * (k + 1), np.float32) for k in range(4)])
     segs = [{"start": s, "end": s + 100.0, "onset": s} for s in (0.0, 100.0, 200.0, 300.0)]
     calls, lock = [], threading.Lock()
 
     def fake(x, sr=SR, attempts=2):
         with lock:
-            calls.append(len(calls))
+            calls.append(int(round(float(np.mean(x)) / 0.01)) - 1)
         return ("Same Title", "Artist", 0.0)
 
     ca._identify_segments(pcm, segs, 12.0, 400.0, 1, fake, lambda: True, 250.0)
     assert len(calls) == 8                        # 2 agreeing probes per segment, no 3rd
     assert all(s["id_conf"] == 0.85 for s in segs)
+    order = [k for i, k in enumerate(calls) if i == 0 or calls[i - 1] != k]
+    assert order == ca._id_order(segs, 250.0) == [2, 3, 1, 0]   # playhead first
 
 
 def test_identify_parallel_fills_every_segment():
@@ -452,3 +493,123 @@ def test_audio_path_is_analysed_and_never_deleted(tmp_path):
     assert path.exists()
     assert res and res["stats"]["decode"] in ("pyav-int16", "decode_audio-f32")
     assert len(res["segments"]) == 2
+
+
+def test_decode_buffer_growth_path_is_bit_identical(tmp_path, monkeypatch):
+    """An unknown / understated container duration makes the pre-sized buffer
+    too small; the ×1.5 growth path must still return exactly the reference."""
+    av = pytest.importorskip("av")
+    fw_audio = pytest.importorskip("faster_whisper.audio")
+    rng = np.random.default_rng(11)
+    x = (rng.standard_normal(SR * 7) * 0.1).astype(np.float32)
+    path = tmp_path / "clip.wav"
+    _write_wav(path, x, SR)
+
+    class NoDuration:                             # the container, minus its duration
+        duration = None
+
+        def __init__(self, c):
+            self._c = c
+
+        def __getattr__(self, k):
+            return getattr(self._c, k)
+
+        def __enter__(self):
+            self._c.__enter__()
+            return self
+
+        def __exit__(self, *a):
+            return self._c.__exit__(*a)
+
+    real_open = av.open
+    monkeypatch.setattr(av, "open", lambda *a, **k: NoDuration(real_open(*a, **k)))
+    monkeypatch.setattr(ca, "_DECODE_MIN_BUF_S", 1.0)   # 1 s buffer → must grow
+    got = ca._decode_pcm16(path)
+    ref = fw_audio.decode_audio(str(path), sampling_rate=SR)
+    assert len(got) == len(ref)
+    np.testing.assert_array_equal(got.astype(np.float32) / 32768.0, ref)
+
+
+@pytest.mark.parametrize("download_ok", [True, False])
+def test_downloaded_audio_is_always_deleted(tmp_path, monkeypatch, download_ok):
+    """The source audio of a URL analysis lives in a private temp dir that is
+    removed on every path (review A7: nothing covered the download branch)."""
+    pytest.importorskip("av")
+    import deep_transcribe
+    pcm, spans = concert([("song", band_song(40, seed=31)), ("talk", talk(20, seed=32)),
+                          ("song", band_song(40, seed=33))])
+    seen = {}
+
+    def fake_download(url, dest, max_dur=None):
+        seen["dir"] = Path(dest)
+        if not download_ok:
+            return None, None
+        out = Path(dest) / "audio.wav"
+        _write_wav(out, pcm, SR)
+        return out, url
+
+    monkeypatch.setattr(deep_transcribe, "_download_audio", fake_download)
+    res = ca.analyze_concert(url="https://example.invalid/v", want_ids=False,
+                             speech_fn=speech_from_spans(spans))
+    assert seen["dir"].name.startswith("dk_concert_")
+    assert not seen["dir"].exists()               # deleted, success or not
+    assert (res is not None) == download_ok
+
+
+class _FakeSilero:
+    """Stands in for faster-whisper's SileroVADModel: one probability per 512-
+    sample window (here: 1.0 where the window is loud), and — like the real
+    one — it ZEROES the last 64 samples of the array it is given."""
+
+    def __init__(self):
+        self.calls, self.owned = [], []
+
+    def __call__(self, audio, num_samples=512, context_size_samples=64):
+        assert audio.ndim == 1 and len(audio) % num_samples == 0
+        self.calls.append(len(audio))
+        # a VIEW here would let the zeroing below reach the next block's warm-up
+        self.owned.append(bool(audio.flags.owndata))
+        w = audio.reshape(-1, num_samples)
+        out = (np.abs(w).mean(axis=1) > 0.05).astype(np.float32)
+        audio[-context_size_samples:] = 0.0       # the real model mutates its input
+        return out
+
+
+def test_default_silero_path_blocks_warms_and_never_mutates(monkeypatch):
+    """The production speech model path (every other test injects speech_fn):
+    frame averaging, ≤ 30 s blocks with warm-up, and the caller's audio is
+    never modified (the real model writes into the array it gets)."""
+    fake = _FakeSilero()
+    monkeypatch.setattr(ca, "_vad_model", lambda: fake)
+    x = np.zeros(SR * 70, np.float32)
+    x[SR * 20:SR * 50] = 0.3                     # "speech" 20-50 s
+    before = x.copy()
+    p = ca._silero_frame_probs(x)
+    np.testing.assert_array_equal(x, before)      # caller's array untouched
+    assert len(fake.calls) >= 3 and all(fake.owned)   # every block got its own copy
+    assert len(p) == 140
+    assert max(fake.calls) <= int((ca._MC_VAD_BLOCK_S + ca._MC_VAD_WARM_S) * SR) + 512
+    t = (np.arange(140) + 0.5) * ca._HOP_S
+    assert np.all(p[(t > 21) & (t < 49)] == 1.0) and np.all(p[(t < 19) | (t > 51)] == 0.0)
+
+
+def test_speech_prob_feeds_long_spans_in_blocks_and_stitches_them():
+    """A long candidate span is converted and evaluated block by block (bounded
+    memory, review A4) and the per-frame results land at the right frames."""
+    nF = 300                                      # 150 s
+    pcm = np.zeros(SR * 150, np.int16)
+    cand = np.zeros(nF, bool)
+    cand[20:280] = True
+    got_len = []
+
+    def frame_index(x, t0=0.0):                   # "probability" = absolute frame index
+        got_len.append(len(x) / SR)
+        n = len(x) // int(SR * ca._HOP_S)
+        return (t0 / ca._HOP_S + np.arange(n)).astype(np.float32)
+
+    sp = ca._speech_prob(pcm, cand, frame_index)
+    pad = int(round(ca._MC_CAND_PAD_S / ca._HOP_S))
+    a, b = 20 - pad, 280 + pad
+    assert max(got_len) <= ca._MC_VAD_BLOCK_S + ca._MC_VAD_WARM_S + 0.5
+    np.testing.assert_array_equal(sp[a:b], np.arange(a, b, dtype=np.float32))
+    assert np.all(sp[:a] == 0) and np.all(sp[b:] == 0)

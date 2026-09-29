@@ -92,11 +92,11 @@ import gc
 import io
 import itertools
 import logging
-import re as _re
 import shutil
 import tempfile
 import threading
 import time
+import unicodedata as _ud
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -154,18 +154,25 @@ _MC_VAD_BLOCK_S = 30.0    # longest single speech-model call: its activations sc
                           # blocks moved MC edges by <=1 s on a 79-min concert)
 _MC_VAD_WARM_S = 1.024    # context prepended to each call so its RNN state is warm
 
+# ── decoding ──────────────────────────────────────────────────────────────────
+_DECODE_MIN_BUF_S = 60.0  # smallest pre-sized decode buffer (grows ×1.5 past it)
+
 # ── fingerprinting ────────────────────────────────────────────────────────────
 _ID_WORKERS = 3           # segments fingerprinted concurrently
 _ID_PROBE2_S = 25.0       # the second probe sits this far after the onset
 _ID_MERGE_GAP_S = 90.0    # same-id ENERGY neighbours closer than this are one song
 
-_ID_NORM_RE = _re.compile(r"[^0-9a-z぀-ヿ一-鿿]+")
-
-
 def _norm_for_id(s):
-    """Normalize a title for probe corroboration (case + spaces + punctuation
-    stripped, CJK kept) so 'Melt (Live)' and 'melt' vote together."""
-    return _ID_NORM_RE.sub("", (s or "").lower())
+    """Normalize a title for probe corroboration: NFKC (full-width forms fold
+    to ASCII), case-folded, keeping the letters and digits of EVERY script —
+    so 'ＭＥＬＴ!' and 'melt' vote together, and two different Hangul or
+    Cyrillic titles stay different. (The old ASCII + kana + CJK filter reduced
+    every Hangul / Cyrillic title to "", so any two of them "agreed" — merging
+    two K-pop songs into one segment and voting a conflict as corroborated.)
+    Callers never treat an EMPTY key (a title with no letters or digits at
+    all) as a match."""
+    t = _ud.normalize("NFKC", s or "").casefold()
+    return "".join(ch for ch in t if ch.isalnum())
 
 
 def _ensure_deps():
@@ -205,18 +212,24 @@ def available() -> bool:
 # buffer plus TWO float32 copies (astype, then "/ 32768"): measured 801 MiB peak
 # RSS for a 79-minute concert. The concert pass only needs int16, so decode to
 # int16 in a stream and convert small blocks to float32 on demand (197 MiB).
-def _ignore_invalid_frames(frames):
-    """Yield decoded frames, silently skipping corrupt ones (same policy as
-    faster-whisper: one bad packet must not abort a 60-minute decode)."""
+def _decoded_frames(container):
+    """Decoded frames of the first audio stream, PACKET BY PACKET, skipping a
+    corrupt packet and carrying on.
+
+    ``container.decode()`` cannot do that: once it raises, its generator is
+    finished, so the "skip" faster-whisper uses (and this module copied) really
+    ENDED the decode — one bad packet ten minutes into a concert left only those
+    ten minutes analysed, with no error. On a clean file this is exactly what
+    ``container.decode(audio=0)`` does internally (demux → packet.decode(), the
+    final empty packet flushes the decoder), so the output is identical."""
     import av
-    it = iter(frames)
-    while True:
+    stream = container.streams.audio[0]
+    for packet in container.demux(stream):
         try:
-            yield next(it)
-        except StopIteration:
-            return
+            frames = packet.decode()
         except av.error.InvalidDataError:
             continue
+        yield from frames
 
 
 def _group_frames(frames, num_samples):
@@ -255,8 +268,8 @@ def _decode_pcm16(path, sr=_SR):
                     est = int(container.duration / 1_000_000 * sr) + sr
             except Exception:
                 est = 0
-            buf = np.empty(max(est, sr * 60), dtype=np.int16)
-            frames = _group_frames(_ignore_invalid_frames(container.decode(audio=0)), 500000)
+            buf = np.empty(max(est, int(sr * _DECODE_MIN_BUF_S)), dtype=np.int16)
+            frames = _group_frames(_decoded_frames(container), 500000)
             for frame in itertools.chain(frames, [None]):       # None flushes
                 for out in resampler.resample(frame):
                     a = out.to_ndarray().reshape(-1)
@@ -538,7 +551,9 @@ def _silero_frame_probs(x, t0=0.0):
     for c0 in range(0, total_ch, blk):
         c1 = min(total_ch, c0 + blk)
         w0 = max(0, c0 - warm)
-        out = np.asarray(model(xp[w0 * CH:c1 * CH])).reshape(-1)
+        # a COPY: faster-whisper's SileroVADModel zeroes the last 64 samples of
+        # the array it is given — on a view that is the next block's warm-up
+        out = np.asarray(model(xp[w0 * CH:c1 * CH].copy())).reshape(-1)
         probs[c0:c1] = out[c0 - w0:c0 - w0 + (c1 - c0)]
     # average the chunks whose START lies inside each 0.5 s frame
     edges = (np.arange(n_frames + 1) * hop) // CH
@@ -622,13 +637,25 @@ def _speech_prob(pcm, cand, speech_fn):
             spans[-1][1] = max(spans[-1][1], b)
         else:
             spans.append([a, b])
+    # Each span is fed to the model in blocks of <= _MC_VAD_BLOCK_S, converted
+    # from the int16 source one block at a time: a whole span as float32 (plus
+    # the model's padded copy) cost ~8 bytes per sample with no bound — about
+    # 600 MiB for an 80-minute video that is all candidate. Blocks after the
+    # first get _MC_VAD_WARM_S of preceding audio (discarded) so the model's
+    # recurrent state is warm at the edge; a span that fits one block is
+    # evaluated exactly as a single call.
+    blk = max(1, int(round(_MC_VAD_BLOCK_S / _HOP_S)))
+    warm = max(1, int(round(_MC_VAD_WARM_S / _HOP_S)))
     for a, b in spans:
-        p = speech_fn(_as_f32(pcm[a * hop:b * hop]), t0=a * _HOP_S)
-        if p is None:
-            return None
-        p = np.asarray(p, dtype="float32")
-        m = min(len(p), b - a)
-        sp[a:a + m] = p[:m]
+        for c0 in range(a, b, blk):
+            c1 = min(b, c0 + blk)
+            w0 = c0 if c0 == a else max(a, c0 - warm)
+            p = speech_fn(_as_f32(pcm[w0 * hop:c1 * hop]), t0=w0 * _HOP_S)
+            if p is None:
+                return None
+            p = np.asarray(p, dtype="float32")[c0 - w0:]
+            m = min(len(p), c1 - c0)
+            sp[c0:c0 + m] = p[:m]
     return sp
 
 
@@ -650,7 +677,7 @@ def _mc_intervals(pcm, n_frames, speech_fn=None, tune=None):
     then an 11-frame majority vote, a minimum run of ``concert_mc_min_s``, and
     runs closer than 4 s joined (a cheer in the middle of a talk block).
     Measured on 23 real songs: 59.5 s flagged in 4880 s (Silero alone: 498 s —
-    it calls rap "speech"; the beat cue removes that) at 92-93 % recall on
+    it calls rap "speech"; the beat cue removes that) at 92 % recall on
     talk (scripts/eval_concert_mc.py --songs).
 
     FALLBACK (no speech model): pulse < 0.22 AND lefr ≥ 0.52 AND depth ≥ 18 dB
@@ -800,6 +827,7 @@ def _merge_same_id(segs, mc):
         if (prev is not None and seg.get("source") == "energy"
                 and prev.get("source") == "energy"
                 and seg.get("title") and prev.get("title")
+                and _norm_for_id(seg["title"])
                 and _norm_for_id(seg["title"]) == _norm_for_id(prev["title"])
                 and min(seg.get("id_conf", 0.0), prev.get("id_conf", 0.0)) >= 0.60
                 and seg["start"] - prev["end"] <= _ID_MERGE_GAP_S):
@@ -848,8 +876,9 @@ def _vote(hits):
     if not hits:
         return None, None, 0.0
     groups = {}
-    for t, a in hits:
-        groups.setdefault(_norm_for_id(t), []).append((t, a))
+    for i, (t, a) in enumerate(hits):
+        # an EMPTY key (no letters or digits) is never "the same title"
+        groups.setdefault(_norm_for_id(t) or ("", i), []).append((t, a))
     best = max(groups.values(), key=len)       # ties → earliest probe
     if len(best) >= 2:
         return best[0][0], best[0][1], 0.85
@@ -1097,10 +1126,14 @@ def analyze_concert(url=None, chapters=None, lang=None, max_dur=_MAX_DUR_S,
             _identify_segments(pcm, segs, id_slice_s, dur_s, workers,
                                identify_fn, _alive, _pos())
             stats["id_s"] = round(time.perf_counter() - t3, 1)
-            if stats["source"] == "energy":
+            # The merge undoes splits that MC detection made inside one song, so
+            # it only runs with MC detection on: with `concert_mc_detect` = 0 the
+            # pass must behave as it did before spec 001 (tune_docs.py says so).
+            if stats["source"] == "energy" and mc_on:
                 segs, mc = _merge_same_id(segs, mc)
                 stats["segments"] = len(segs)
                 stats["mc_count"] = len(mc)
+                stats["mc_total_s"] = round(sum(e - s for s, e in mc), 1)
 
         stats["total_s"] = round(time.perf_counter() - t0, 1)
         if not segs:
