@@ -360,8 +360,8 @@ export function Concerts({ online }: Props) {
           <>
             <p className="lede">
               These chapters are treated as non-song segments: the engine does not fetch
-              lyrics for them, and the previous song's lyrics stay on screen until the
-              next real song chapter begins.
+              lyrics for them. While the audio pass says the host is talking, an MC card
+              replaces the previous song's last line (see below).
             </p>
             <div className="scroll-list">
               {c.mc_segments.map((ch) => <ChapterRow key={ch.i} c={ch} />)}
@@ -369,6 +369,37 @@ export function Concerts({ online }: Props) {
             <p className="note-inline"><AlertTriangle size={12} /> {c.mc_note}</p>
           </>
         )}
+        {/* spec 001: MC talk found by AUDIO (offline pass), and the runtime gate */}
+        {c.mc_audio ? (
+          <>
+            <div className="stat-row">
+              <span>Talk detected by audio</span>
+              <span>
+                {c.mc_audio.count
+                  ? <><strong>{c.mc_audio.count}</strong> interval{c.mc_audio.count === 1 ? "" : "s"}, {secs(c.mc_audio.total_s)} total</>
+                  : <span className="empty-inline">none yet{c.mc_audio.plan_final ? "" : " (analysis pending)"}</span>}
+              </span>
+            </div>
+            <div className="stat-row">
+              <span>Listening gate</span>
+              <span>
+                {!c.mc_audio.gate_on ? <span className="pill">off</span>
+                  : c.mc_audio.in_mc ? <span className="pill warn">paused — host talking</span>
+                  : <span className="pill ok">listening</span>}
+              </span>
+            </div>
+            {c.mc_audio.intervals.length ? (
+              <div className="scroll-list">
+                {c.mc_audio.intervals.map((iv) => (
+                  <div key={iv.start} className={`stat-row${iv.current ? " row-current" : ""}`}>
+                    <span><span className="mono-dim">{clock(iv.start)}–{clock(iv.end)}</span> MC talk</span>
+                    <span>{iv.current ? <span className="pill warn">now</span> : secs(iv.end - iv.start)}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </>
+        ) : null}
       </section>
 
       {/* ── 5. between songs ───────────────────────────────────────────────── */}

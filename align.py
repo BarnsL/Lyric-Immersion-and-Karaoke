@@ -1138,12 +1138,20 @@ def rank_offsets(lines, lang="ja", get_pos=None, seconds=_CAP, top_n=6):
     return deduped[:max(1, top_n)]
 
 
-def capture_and_align(lines, lang="ja", get_pos=None, seconds=_CAP):
+def capture_and_align(lines, lang="ja", get_pos=None, seconds=_CAP, ref_offset=0.0):
     """Listen, transcribe, and return the sync OFFSET (seconds) to set so the
     lyrics line up with what's heard — or None if it can't tell confidently.
 
     `get_pos()` must return the player's CURRENT position (seconds); it's read at
     capture start so we can map the heard line's cached time back to a correction.
+
+    `ref_offset` is the offset the caller is ALREADY running with. The two sanity
+    guards below bound the CORRECTION (`offset - ref_offset`), not the absolute
+    offset. For a normal track the reference is 0.0, so nothing changes. In a
+    CONCERT the offset is roughly minus where the song starts in the video (e.g.
+    -1800 for a song 30 minutes in), and judging that absolute number rejected
+    every read after minute 10 — resync by listening silently died for most of
+    every concert (spec 001, Bug A).
     """
     if not lines:
         return None
@@ -1162,7 +1170,11 @@ def capture_and_align(lines, lang="ja", get_pos=None, seconds=_CAP):
     # The heard line's real song-time is line.start; in the clip it occurred at
     # pos_cap + seg_t. The offset makes displayed (position+offset) == song time.
     offset = round(line.start - (pos_cap + seg_t), 2)
-    if abs(offset) > 600:                            # absolute sanity guard
+    try:
+        jump = offset - float(ref_offset or 0.0)     # the CORRECTION this read implies
+    except Exception:
+        jump = offset
+    if abs(jump) > 600:                              # sanity guard on the correction
         return None
     # A LARGER correction must clear a HIGHER confidence bar. A weak ASR match just
     # over the floor that implies a big jump is almost always a mis-anchor on a
@@ -1170,7 +1182,7 @@ def capture_and_align(lines, lang="ja", get_pos=None, seconds=_CAP):
     # not a real long intro — so scale the required ratio with the jump size. A
     # genuinely large offset (a cinematic intro) still passes if the match is
     # strong; a small drift correction keeps the lenient floor.
-    if ratio < _MIN_RATIO + min(0.30, abs(offset) / 200.0):
+    if ratio < _MIN_RATIO + min(0.30, abs(jump) / 200.0):
         return None
     return offset, round(ratio, 2), line.start
 

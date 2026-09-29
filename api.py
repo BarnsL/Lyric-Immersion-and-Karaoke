@@ -502,7 +502,7 @@ def make_handler(app, log_file, token):
                         return self._err(500, f"{type(e).__name__}: {e}")
                     self._send(200 if res.get("ok") else 400, res)
                 elif path == "/identify":
-                    self._run(lambda: app._start_identify(seconds=6, attempts=2))
+                    self._run(lambda: app._start_identify(seconds=6, attempts=2, user=True))
                     self._send(200, {"ok": True, "action": "identifying by sound"})
                 elif path == "/wrong":
                     self._run(app.refetch)
