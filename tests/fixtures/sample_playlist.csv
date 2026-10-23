@@ -1,0 +1,8 @@
+Track Name,Artist Name(s),Album Name,Duration (ms),Track URI,ISRC
+Stellar Stellar,Hoshimachi Suisei,Stellar Stellar,260000,spotify:track:abc1,JPXX12345678
+ビビデバ,Hoshimachi Suisei,ビビデバ,200000,spotify:track:abc2,JPXX87654321
+Lucky Loud,ReGLOSS,Lucky Loud EP,195000,spotify:track:abc3,JPYY11111111
+アワータイムイエロー,ReGLOSS,アワータイムイエロー,213000,spotify:track:abc4,JPYY22222222
+Stellar Stellar,Hoshimachi Suisei,Stellar Stellar,260000,spotify:track:abc1,JPXX12345678
+,Unknown Artist,,,spotify:track:abc5,
+Song With No Artist,,Albumless,120000,spotify:track:abc6,JPZZ99999999

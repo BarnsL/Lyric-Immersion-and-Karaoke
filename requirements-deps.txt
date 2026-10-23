@@ -1,0 +1,38 @@
+# Pinned "sync/generate by ear" native AI stack — vendored into ./.deps and
+# bundled by DesktopKaraoke.spec (WHISPER = os.path.isdir(".deps")).
+#
+# WHY PINNED (TICKET-176): these packages ship compiled extensions + native DLLs
+# (PyAV's av/_core.pyd + av.libs FFmpeg DLLs, ctranslate2 + onnxruntime runtimes).
+# The DLL filenames embed a per-BUILD hash, so a .pyd and its DLLs MUST come from
+# ONE consistent build. A version skew between ./.deps and the build environment
+# bundled a mismatched mix and silently killed faster-whisper (`import av` →
+# "DLL load failed while importing _core") in every release v1.1.74→76 — no log,
+# every listen feature degraded to a no-op. Pinning the exact known-good set makes
+# ./.deps reproducible so the skew cannot recur.
+#
+# BUILD PREREQUISITE — vendor the stack from this pin (kept off the C: drive):
+#     rmdir /s /q .deps
+#     pip install --target .deps -r requirements-deps.txt
+# Rebuild from scratch (NOT --upgrade into an existing .deps): `pip install
+# --upgrade --target` leaves the OLD dist-info next to the new one, and the bundle
+# becomes a coin-flip (scripts/check_build_deps.py hard-fails on that duplicate).
+#
+# The two build guards enforce this automatically (both wired into build.bat):
+#   - scripts/check_build_deps.py  — pre-build version-consistency + duplicate check
+#   - scripts/check_av_dlls.py     — pre- AND post-build PE-import-table check: every
+#                                    FFmpeg DLL av/_core.pyd imports must be present in
+#                                    av.libs (the DIRECT detector for the skew above)
+#   - <exe> --selftest             — post-build: the frozen app imports the real stack
+#
+# To bump the pin: upgrade the packages in your build env, run a clean build, and
+# once <exe> --selftest passes, update the versions here to the new known-good set.
+
+faster-whisper==1.2.1
+av==18.0.0
+ctranslate2==4.8.1
+tokenizers==0.22.2
+# Transitive runtime deps of faster-whisper that also ship native binaries; pinned
+# so ./.deps is fully reproducible. (numpy is bundled from the base env via
+# requirements.txt / the spec's collect_all — not vendored here.)
+huggingface-hub==1.2.3
+onnxruntime==1.27.0

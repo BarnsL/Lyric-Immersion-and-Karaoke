@@ -1,0 +1,18 @@
+[
+  {
+    "name": "baseline",
+    "tune": {}
+  },
+  {
+    "name": "concert-fast-first-read",
+    "tune": {
+      "concert_first_read_max_s": 2.5
+    }
+  },
+  {
+    "name": "concert-strict",
+    "tune": {
+      "concert_first_read_max_s": 0.0
+    }
+  }
+]

@@ -1,0 +1,21 @@
+import ctypes, time
+ctypes.windll.shcore.SetProcessDpiAwareness(0)
+import tkinter as tk
+root = tk.Tk()
+root.overrideredirect(True)
+root.geometry("2048x1104+0+0")
+root.configure(bg="magenta")
+root.attributes("-topmost", True)
+root.attributes("-transparentcolor", "magenta")
+root.attributes("-alpha", 0.4)
+root.update_idletasks()
+cv = tk.Canvas(root, bg="magenta", highlightthickness=0)
+cv.pack(fill="both", expand=True)
+root.update()
+time.sleep(2)
+root.update()
+with open("test_geom.txt", "w") as f:
+    f.write(f"geometry={root.geometry()}\n")
+    f.write(f"winfo={root.winfo_width()}x{root.winfo_height()}\n")
+    f.write(f"winfo_x={root.winfo_x()} winfo_y={root.winfo_y()}\n")
+root.destroy()
