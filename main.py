@@ -5426,6 +5426,27 @@ class Overlay:
             return False
         return na == nb or na in nb or nb in na
 
+    def _player_title_verdict(self, heard_title, heard_artist):
+        """Does a sound-ID agree with the player's OWN title? Returns 'agree',
+        'contradict', or None when the player title can't vouch either way
+        (none, a concert, a site page, a bare tie-in tag, or a script mismatch
+        that only romanization would bridge).
+
+        The VIOLET bug: nothing was loaded yet, so one Shazam mis-ID ('Gata
+        Only', picked up from Discord call audio) switched instantly and its
+        lyrics ran over VIOLET for ~25 s — while the next read, which AGREED
+        with the player title, had to wait for confirmation."""
+        p_artist, p_title = self._track or ("", "")
+        if (not p_title or self._live_mode or _is_generic_title(p_title)
+                or _is_junk_track_title(p_title, p_artist)):
+            return None
+        if self._same_song_title(p_title, heard_title,
+                                 artist_a=p_artist, artist_b=heard_artist):
+            return "agree"
+        if _has_cjk(p_title) != _has_cjk(heard_title):
+            return None
+        return "contradict"
+
     def _same_song_title(self, a, b, artists=(), artist_a="", artist_b=""):
         """Do two TITLE strings name the same song? Layers, tight → loose:
         (1) plain _titles_match; (2) match after _title_core() strips the
@@ -8009,6 +8030,7 @@ class Overlay:
                                  "— holding sound override until the fetch resolves",
                                  f_title, g_title)
                 elif (self.lines and heard != self._pending_switch
+                      and self._player_title_verdict(f_title, f_artist) != "agree"
                       and not (self._live_mode
                                and self._live_hearing_corroborated(f_title, f_artist))):
                     # Heard a DIFFERENT song while we already have lyrics for the
@@ -8042,6 +8064,18 @@ class Overlay:
                         log.info("heard %r / %r (uncorroborated in a concert, nothing "
                                  "loaded) — holding for a 2nd read before first load",
                                  f_title, f_artist)
+                        return
+                    # Same 2-read hold outside concerts when the hearing
+                    # CONTRADICTS the player's own title and nothing is loaded
+                    # (VIOLET heard as 'Gata Only' from call audio).
+                    if (not self.lines and heard != self._pending_switch
+                            and self._player_title_verdict(f_title, f_artist)
+                            == "contradict"):
+                        self._pending_switch = heard
+                        self._pending_switch_t = time.time()
+                        log.info("heard %r / %r contradicts the player title %r "
+                                 "(nothing loaded) — holding for a 2nd read",
+                                 f_title, f_artist, (self._track or ("", ""))[1])
                         return
                     self._pending_switch = None
                     self._sound_song = heard
